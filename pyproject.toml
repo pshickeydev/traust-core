@@ -38,7 +38,10 @@ exclude = ["/.ci-venv", "/.venv"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = ["integration: requires Postgres (make db-up; TRAUST_TEST_DATABASE_URL)"]
+markers = [
+    "integration: requires Postgres (make db-up; TRAUST_TEST_DATABASE_URL)",
+    "todo(slice, legacy): ported legacy scenario parked for a later slice; skipped until that slice enables it",
+]
 
 [tool.coverage.run]
 source = ["traust_core"]
@@ -46,6 +49,7 @@ branch = true
 parallel = true
 
 [tool.coverage.report]
+fail_under = 80
 show_missing = true
 skip_covered = false
 exclude_lines = [

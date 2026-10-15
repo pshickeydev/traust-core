@@ -33,6 +33,11 @@ from traust_core.v1.services.operations import Materializer
 U = TypeVar("U", bound=UnitOfWork)
 
 
+# NEED(direction): the REST API is a thin adapter over Services, and the SDK becomes a
+# framework (prepare -> run skill -> record) on top of that REST API, not thin wrappers.
+class Services: ...
+
+
 class Context:
     def __init__(
         self,
@@ -83,6 +88,9 @@ class Context:
         return ArtifactPublisher(
             specs, AnalysisResultsRepository(self.object_store, ARTIFACT_FOR_KIND), index
         )
+
+    def services(self) -> Services:
+        raise NotImplementedError("stub: composition root; wires every API service")
 
     def analysis_results(self) -> AnalysisResultsRepository:
         return AnalysisResultsRepository(self.object_store, ARTIFACT_FOR_KIND)

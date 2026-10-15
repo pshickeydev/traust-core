@@ -30,6 +30,7 @@ class DatabaseConfig(_Model):
         return _read_env(self.password_env, "database.password_env")
 
     def engine_url(self) -> sa.URL:
+        # NEED(local): "files-only" goes away; with no url the record store is SQLite under home.
         if self.url is None:
             raise ConfigError("database.url is not set (files-only setup)")
         try:
@@ -49,6 +50,11 @@ class ProcessConfig(_Model):
     timeout_seconds: float = 600.0
 
 
+# NEED(logging): one logging setup from Config — per-logger levels, JSON or text, stderr + rolling
+# file, and a correlation ID set at every entry point and carried on every line (AGENTS.md).
+# NEED(config): too busy and too clunky today. Target: one shape, one home, few keys —
+# home dir, record store (SQLite default, Postgres optional), blob store (local dir or S3),
+# identity, ledger. Pack data (catalogs, product maps) is not config; env only for secrets.
 class Config(_Model):
     database: DatabaseConfig = DatabaseConfig()
     artifacts: ArtifactsConfig = ArtifactsConfig()

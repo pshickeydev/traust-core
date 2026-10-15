@@ -215,6 +215,57 @@ class PrivProfileArtifact(
 ): ...
 
 
+# Skill documents recorded through the domain services (R13); no analysis-results layout.
+class AdapterResultArtifact(Artifact, name="adapter-result", schema="adapter-result"): ...
+
+
+class IsolationReviewArtifact(Artifact, name="isolation-review", schema="isolation-review"): ...
+
+
+class ImpactAnalysisArtifact(Artifact, name="impact-analysis", schema="impact-analysis"): ...
+
+
+class PqcFactsArtifact(Artifact, name="pqc-facts", schema="pqc-facts"): ...
+
+
+class PqcReadinessArtifact(Artifact, name="pqc-readiness", schema="pqc-readiness"): ...
+
+
+class PqcBlockersArtifact(Artifact, name="pqc-blockers", schema="pqc-blockers"): ...
+
+
+class PqcDecisionTreeArtifact(Artifact, name="pqc-decision-tree", schema="pqc-decision-tree"): ...
+
+
+class RemediationArtifact(Artifact, name="remediation", schema="remediation"): ...
+
+
+class FleetFixArtifact(Artifact, name="fleet-fix", schema="fleet-fix"): ...
+
+
+class ComplianceScopeArtifact(Artifact, name="compliance-scope", schema="compliance-scope"): ...
+
+
+class ComplianceAssessmentArtifact(
+    Artifact, name="compliance-assessment", schema="compliance-assessment"
+): ...
+
+
+class DocVarianceArtifact(Artifact, name="doc-variance", schema="doc-variance"): ...
+
+
+class BenchmarkTargetArtifact(Artifact, name="benchmark-target", schema="benchmark-target"): ...
+
+
+AssessmentArtifact = (
+    SecurityAuditArtifact
+    | CloudConfigAuditArtifact
+    | ThreatModelArtifact
+    | PrivProfileArtifact
+    | IsolationReviewArtifact
+)
+PqcArtifact = PqcFactsArtifact | PqcReadinessArtifact | PqcDecisionTreeArtifact
+
 ANALYSIS_ARTIFACTS: tuple[type[Artifact], ...] = (
     SecurityAuditArtifact,
     FindingsCurrentArtifact,
@@ -227,6 +278,3 @@ ANALYSIS_ARTIFACTS: tuple[type[Artifact], ...] = (
     PrivProfileArtifact,
 )
 ARTIFACT_FOR_KIND = {a.kind: a for a in ANALYSIS_ARTIFACTS if a.kind is not None}
-
-Verdict = contracts.enum("verdict")
-Severity = contracts.enum("severity")

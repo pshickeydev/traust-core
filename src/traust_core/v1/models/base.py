@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from uuid import UUID
 
 import pydantic
@@ -14,8 +15,7 @@ class Dto(pydantic.BaseModel):
 
 
 class Entity(Model):
-    id: UUID
-
-
-def new_id() -> UUID:
-    raise NotImplementedError("stub: entity identity is a UUIDv7 minted by the owning service")
+    # None until saved: the database generates id and both timestamps on insert.
+    id: UUID | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None

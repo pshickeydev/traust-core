@@ -9,24 +9,27 @@ export TRAUST_TEST_DATABASE_URL
 
 
 PYTHON ?= python3
-RELEASE := ./release.py
-BUMP_PARTS := patch minor major
 
-.PHONY: help setup sync lint lint-fix test test-integration coverage coverage-html coverage-all db-up db-down status bump $(BUMP_PARTS)
+.PHONY: help setup sync hooks lint lint-fix test test-integration coverage coverage-html coverage-all db-up db-down
 
 help:
 	@echo "Targets ($(notdir $(CURDIR))):"
-	@echo "  make setup            — uv sync (run once per clone)"
+	@echo "  make setup            — uv sync + install git hooks (run once per clone)"
 	@echo "  make lint             — ruff check + format --check"
 	@echo "  make lint-fix         — ruff --fix + format"
 	@echo "  make test             — unit tests (no integration)"
 	@echo "  make test-integration — integration tests against Postgres (make db-up first)"
-	@echo "  make coverage         — unit tests with coverage (term)"
+	@echo "  make coverage         — unit tests with coverage (term), fails under 80%"
 	@echo "  make coverage-html    — unit tests with coverage (term + htmlcov/)"
 	@echo "  make coverage-all     — unit + integration with coverage (needs make db-up)"
 	@echo "  make db-up / db-down  — shared Postgres container ($(DB_CONTAINER)), same as contracts and ledger"
 
-setup: sync
+setup: sync hooks
+	@echo "ready — git hooks enabled (.githooks): lint on commit, conventional subject, lint + coverage on push"
+
+hooks:
+	git config core.hooksPath .githooks
+	@chmod +x .githooks/* 2>/dev/null || true
 
 sync:
 	uv sync
@@ -77,18 +80,4 @@ db-up:
 
 db-down:
 	@podman stop $(DB_CONTAINER) 2>/dev/null || true
-
-status:
-	$(PYTHON) $(RELEASE) status
-
-$(BUMP_PARTS):
-	@:
-
-bump:
-	@part="$(filter $(BUMP_PARTS),$(MAKECMDGOALS))"; \
-	if [ -z "$$part" ]; then \
-		echo "usage: make bump patch|minor|major" >&2; \
-		exit 1; \
-	fi; \
-	$(PYTHON) $(RELEASE) bump $$part
 

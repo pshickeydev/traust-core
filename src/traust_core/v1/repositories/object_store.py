@@ -36,6 +36,8 @@ class ObjectRef:
     size: int
 
 
+# NEED(vendor-agnostic): local disk and S3-compatible object storage behind this one port.
+# Vendor SDKs live in optional adapters selected by config; core never imports one.
 class ObjectStore(Protocol):
     def put(self, key: ObjectKey, data: bytes) -> ObjectRef: ...
     def get(self, ref: ObjectRef) -> bytes: ...

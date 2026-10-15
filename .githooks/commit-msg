@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Conventional commit subject: type(scope): subject. Bypass: git commit --no-verify
+set -euo pipefail
+subject="$(head -n1 "${1:?message file required}")"
+pattern='^(build|chore|ci|docs|feat|fix|perf|refactor|revert|style|test)(\([^)]+\))?!?: .+'
+if [[ "$subject" =~ ^(Merge|Revert|fixup!|squash!) ]] || [[ "$subject" =~ $pattern ]]; then exit 0; fi
+echo "commit-msg: non-conventional subject: '$subject'" >&2
+echo "            expected: type(scope): subject  (e.g. feat(findings): add intake door)" >&2
+exit 1

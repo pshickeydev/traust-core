@@ -36,7 +36,7 @@ jobs:
           enable-cache: true
           python-version: ${{ matrix.python-version }}
       - run: uv sync --frozen
-      - run: make test
+      - run: make coverage   # same tests as make test, fails under 80% (pyproject fail_under)
 
   postgres:
     runs-on: ubuntu-latest

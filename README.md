@@ -1,6 +1,6 @@
 # traust-core
 
-The shared Python base for traust: one clear place to read and write each kind of data, so scripts stop opening their own database connections, building their own paths, writing their own JSON and running their own subprocesses. It is an in-process library for traust (the harness), traust-engine and traust-ledger. No HTTP; an SDK comes later, when needed.
+The shared Python base for traust: one clear place to read and write each kind of data, so scripts stop opening their own database connections, building their own paths, writing their own JSON and running their own subprocesses. Python callers (traust, traust-engine, traust-ledger) use it in-process; other languages (the Go SDK, SCI) will reach the same services through the REST API served from here (resource/ID routes, request IDs, OpenAPI generated from the core models).
 
 All modules live under `traust_core.v1` (see [Versioning](#versioning)).
 
@@ -8,7 +8,7 @@ All modules live under `traust_core.v1` (see [Versioning](#versioning)).
 |---|---|---|---|
 | **Contracts** | `contracts` | the pinned traust-contracts dependency, read as data: `validate(name, doc)` (exact JSON Schema gate), `schema()`, `enum_values()`, `normalize_enum(name, value)` (registry read view), `ddl()`, `storage_profile()` | skills remembering to run `reporting validate` |
 | **Errors** | `errors` | the exception hierarchy every layer raises (`ValidationError`, `NotFoundError`, …) | ad hoc exceptions |
-| **Models** | `models` | what things are, data only: `base` (`Model` strict, `Dto` tolerant, `Entity` with a UUID id), `values` (`HttpsRepoUrl`, `GitSha`, `CveId`), `integrity`, `storage`, `operations` (`JobResult`, `AssetRequest`, `Order`), and one module per subject (`findings`, `portfolio`, …) | dicts passed between scripts |
+| **Models** | `models` | what things are and the rules about their own state: `base` (`Model` strict, `Dto` tolerant, `Entity` with a UUID id), `values` (`HttpsRepoUrl`, `GitSha`, `CveId`), `integrity`, `storage`, `operations` (`JobResult`, `AssetRequest`, `Order`), and one module per subject (`findings`, `portfolio`, …) | dicts passed between scripts |
 | **Artifacts** | `models.artifacts` | the `Artifact` base + `SchemaView` (fields from the installed schema, `doc.findings[0].verdict`, unknown names raise) and the named documents (`TriageArtifact`, `SecurityAuditArtifact`, …, `Verdict`, `Severity`) | `json.load` + `.get("key")` |
 | **Artifact publishing** | `services.artifact_publishing` | `ctx.artifact_publisher(specs).publish(name, subject, raw, run_id)` (LLM) or `.publish_artifact(artifact, subject, run_id)` (code): exact gate → files (always) → index (when `database.url` is set) | writing `analysis-results` files by hand |
 | **Analysis results** | `repositories.analysis_results` | `ctx.analysis_results().read(TriageArtifact, subject)` / `.read_all(TriageArtifact, tree)`; raw `put/get/find(subject, kind)`; today's naming convention in one place | `json.load` + `"-security-audit.json"` path building |
@@ -78,7 +78,7 @@ All in [`tests/v1/example/`](tests/v1/example):
 
 | File | Shows |
 |---|---|
-| `model.py`, `repository.py`, `services.py` | domain model, repository (SQL + in-memory), unit of work, service functions |
+| `model.py`, `repository.py`, `services.py` | domain model, repository (SQL + in-memory), unit of work, service (example predates the one-service-per-domain rule) |
 | `artifact_publishing.py` | a publish spec (`TRIAGE` over `TriageArtifact`) with a rendered markdown companion |
 | `report.py` | read through a repository → pure `build_report` → render → publish |
 | `router.py` | a pure router, table-tested |
@@ -146,21 +146,21 @@ sibling checkout. No dependency pin or historical payload changes are made.
 | **Core** | *what* the data means and *how* it is stored, read and run: models, repositories, services, policies | this repo, by role: `models/<subject>.py`, `repositories/<subject>.py`, `services/<subject>.py` (`services/findings/` is a package) |
 | **Pack policy** | *when / which*: routing rules, cadences, lanes, skills, CLIs | traust (`traust_pack_security`), not this repo |
 
-Everything here is stable `v1` API (additive only). A concrete repository appears per **aggregate** when there is a domain question to answer; its methods are those questions (see `repositories/triage.py`). Tests mirror `src`: `tests/v1/<role>/test_<subject>.py`.
+Everything here is `v1` API, reshaped in place until it is frozen. A concrete repository appears per **aggregate** when there is a domain question to answer; its methods are those questions (see `repositories/triage.py`). Tests mirror `src`: `tests/v1/<role>/test_<subject>.py`.
 
 ## Rules
 
-- Service functions never open connections, build paths, start processes or read env vars; they receive what they need.
+- Services never open connections, build paths, start processes or read env vars; they receive what they need through their constructor.
 - `Context` at entry points only.
 - Data is parsed into a model once, at the edge. No bare `dict` across a function boundary.
 - SQLAlchemy Core only: no ORM mapped classes, no generic CRUD base. Domain objects never know about the database.
 - Unknown or unmeasured values are `None`, never `0`.
 - Every repository, store and provider has contract tests.
-- No imports from other traust repos. No HTTP.
+- traust-core is the hub: other traust repos depend on it, not the reverse. The only code dependency is the traust-ledger client, inside the ledger provider adapter; traust-contracts is pinned data. HTTP only in providers (outbound) and the HTTP adapter (inbound).
 
 ## Domain stubs (not implemented)
 
-Per subject: `models/<subject>.py`, `repositories/<subject>.py` (`Protocol` + unit of work) and `services/<subject>.py`. Every method raises `NotImplementedError("stub: replaces …")` naming the code it replaces. Rules: every repository and service lives here; traust-engine only runs work; the LLM reads and writes documents only; identity is a UUID minted by the owning service (`models.base.new_id`), the fingerprint is only a match key.
+Per subject: `models/<subject>.py`, `repositories/<subject>.py` (`Protocol` + unit of work) and `services/<subject>.py`. Every method raises `NotImplementedError("stub: replaces …")` naming the code it replaces. Rules: every repository and service lives here; traust-engine only runs work; the LLM reads and writes documents only; identity is a database-generated UUID with `created_at` / `updated_at` (`None` until saved), the fingerprint is only a match key.
 
 | Domain | Module | Service | Repository |
 |---|---|---|---|
@@ -186,16 +186,15 @@ Insight (dashboards) has no service: views read repositories and render. Reposit
 | Fingerprint rules (shape fixed; raises until the D5 spec lands) | `models.integrity`, `services.findings.identity` |
 | First real providers (git, forges, feeds) | packages |
 | S3 object store backend | `repositories.object_store` |
-| CI + release | — |
 
 ## Versioning
 
-`traust_core.v1` is the platform API. Within `v1`, changes are additive only. A breaking change goes into a new `traust_core.v2` package alongside `v1`; `v1` stays importable until its consumers move. `v2` may import `v1`; `v1` never imports `v2`.
+`traust_core.v1` is the platform API, reshaped in place until it is frozen. There are no releases: consumers pin a git commit SHA (`[tool.uv.sources] traust-core = { git = "…", rev = "<sha>" }`), the same way core pins traust-contracts.
 
 ## Development
 
 ```bash
-make setup              # uv sync (installs the pinned traust-contracts)
+make setup              # uv sync + git hooks (lint on commit, conventional subject, lint + coverage on push)
 make lint-fix
 make test               # unit tests
 make coverage           # + coverage (coverage-html for htmlcov/)

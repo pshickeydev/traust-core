@@ -25,7 +25,7 @@ class Readiness(Dto):
     detail: str = ""
 
 
-class Provenance(Dto):
+class Acquisition(Dto):
     provider: str
     acquired_at: datetime
     version: str | None = None
@@ -36,7 +36,7 @@ class Provenance(Dto):
 @dataclass(frozen=True, slots=True)
 class Result(Generic[T]):
     data: T
-    provenance: Provenance
+    acquisition: Acquisition
 
 
 class Provider(Protocol[Req, Res]):

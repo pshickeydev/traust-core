@@ -2,30 +2,47 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from typing import Any
+from uuid import UUID
 
 from traust_core.v1.models.artifacts import TriageArtifact
-from traust_core.v1.models.findings import Decision, TriageVerdict
-from traust_core.v1.models.operations import JobResult
+from traust_core.v1.models.common import Principal, Provenance
+from traust_core.v1.models.findings import (
+    Disposition,
+    RecordDecision,
+    TriageInput,
+    TriageRecorded,
+    TriageVerdict,
+)
 from traust_core.v1.models.storage import BindingContext
+from traust_core.v1.models.vocabulary import RestatementReason
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.repositories.findings import FindingUnitOfWork
 from traust_core.v1.repositories.triage import TriageUnitOfWork
-from traust_core.v1.services.findings.transitions import TransitionPolicy
+from traust_core.v1.services.ledger import LedgerService
 from traust_core.v1.services.storage import RecordResult, bind_artifact
 
 
 class FindingDecisions:
-    def __init__(self, uow: FindingUnitOfWork, transitions: TransitionPolicy) -> None:
+    def __init__(self, uow: FindingUnitOfWork, ledger: LedgerService | None) -> None:
         self._uow = uow
-        self._transitions = transitions
+        self._ledger = ledger
 
-    def record(self, decision: Decision) -> None:
-        raise NotImplementedError("stub: replaces emit_*_ledger_events.py")
+    def decide(self, command: RecordDecision) -> Disposition:
+        raise NotImplementedError("stub: replaces emit_*_ledger_events.py, ledger event_handler")
 
-    def record_triage(self, triage: TriageArtifact, context: BindingContext) -> JobResult:
-        raise NotImplementedError(
-            "stub: wraps record_triage as a JobResult; replaces emit_triage_ledger_events.py"
-        )
+    def restate(
+        self, decision_id: UUID, reason: RestatementReason, principal: Principal
+    ) -> Disposition:
+        raise NotImplementedError("stub: replaces ledger events/builders.build_restatement_event")
+
+    def prepare(self, assessment_id: UUID) -> TriageInput:
+        raise NotImplementedError("stub: replaces the triage skill's query_index / precedent CLIs")
+
+    def record(self, doc: TriageArtifact, provenance: Provenance) -> TriageRecorded:
+        raise NotImplementedError("stub: wraps record_triage; replaces emit_triage_ledger_events")
+
+    def rebuild_dispositions(self, repository_id: UUID | None) -> int:
+        raise NotImplementedError("stub: replaces ledger materialize, corpus findings_db")
 
 
 def verdicts_from(triage: TriageArtifact, binding_id: str, digest: str) -> list[TriageVerdict]:

@@ -5,8 +5,8 @@ from typing import Any, Protocol
 
 import sqlalchemy as sa
 
-from traust_core.v1.models.artifacts import Verdict
 from traust_core.v1.models.findings import TriageVerdict
+from traust_core.v1.models.vocabulary import Verdict
 from traust_core.v1.repositories.memory import InMemoryUnitOfWork
 from traust_core.v1.repositories.sql import STORAGE_SCHEMA, SqlRepository, SqlUnitOfWork
 from traust_core.v1.repositories.storage import (

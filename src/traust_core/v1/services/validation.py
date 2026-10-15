@@ -1,29 +1,78 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from uuid import UUID
 
 from traust_core.v1.models.artifacts import ValidationArtifact
-from traust_core.v1.models.operations import JobResult
-from traust_core.v1.models.storage import BindingContext
-from traust_core.v1.models.validation import ValidationAttempt, ValidationPlan
+from traust_core.v1.models.common import Page, PageRequest, Principal, Provenance
+from traust_core.v1.models.validation import (
+    Authorization,
+    FindingChain,
+    RefusalReason,
+    TargetAttestation,
+    TargetObservation,
+    ValidationAttempt,
+    ValidationDimension,
+    ValidationFilter,
+    ValidationInput,
+    ValidationPlan,
+    ValidationRollup,
+    ValidationRun,
+    ValidationScope,
+)
+from traust_core.v1.models.vocabulary import ValidationTechnique
+from traust_core.v1.providers.validation import ValidationAdapter
 from traust_core.v1.repositories.validation import ValidationUnitOfWork
+from traust_core.v1.services.findings.decisions import FindingDecisions
 
 
 class ValidationService:
-    def __init__(self, uow: ValidationUnitOfWork) -> None:
+    def __init__(
+        self,
+        uow: ValidationUnitOfWork,
+        decisions: FindingDecisions,
+        adapters: Sequence[ValidationAdapter],
+    ) -> None:
         self._uow = uow
+        self._decisions = decisions
+        self._adapters = adapters
 
-    def plan(self, finding_id: UUID) -> ValidationPlan:
-        raise NotImplementedError("stub: replaces validate-findings plan.py")
+    def prepare(self, finding_id: UUID) -> ValidationInput:
+        raise NotImplementedError("stub: replaces validate-findings/ingest.py")
 
-    def authorize(self, plan_id: UUID) -> JobResult:
-        raise NotImplementedError("stub: replaces validation/scope.py")
+    def plan(self, finding_id: UUID, technique: ValidationTechnique) -> ValidationPlan:
+        raise NotImplementedError("stub: replaces validate-findings/plan.py, novel.py")
 
-    def attest_target(self, plan_id: UUID) -> JobResult:
+    def chains(self, finding_ids: Sequence[UUID]) -> list[FindingChain]:
+        raise NotImplementedError("stub: replaces validate-findings/chain.py")
+
+    def authorize(
+        self, plan_id: UUID, scope: ValidationScope, principal: Principal
+    ) -> Authorization:
+        raise NotImplementedError("stub: replaces validation/scope.build, approval mode")
+
+    def attest_target(self, plan_id: UUID, observed: TargetObservation) -> TargetAttestation:
         raise NotImplementedError("stub: replaces attest_target.py")
 
-    def record_validation(self, report: ValidationArtifact, context: BindingContext) -> JobResult:
+    def execute(self, plan_id: UUID, authorization: Authorization) -> ValidationRun:
+        raise NotImplementedError("stub: replaces validate-findings/execute.py, run.py")
+
+    def record(self, doc: ValidationArtifact, provenance: Provenance) -> list[ValidationAttempt]:
         raise NotImplementedError("stub: replaces emit_validation_ledger_events.py")
 
-    def history(self, finding_id: UUID) -> list[ValidationAttempt]:
-        raise NotImplementedError("stub: replaces validation-audit.jsonl walks")
+    def refuse(self, plan_id: UUID, reason: RefusalReason) -> ValidationPlan:
+        raise NotImplementedError("stub: replaces validate-findings refusal records")
+
+    def get_plan(self, plan_id: UUID) -> ValidationPlan:
+        raise NotImplementedError("stub: validation read")
+
+    def attempts(self, finding_id: UUID) -> list[ValidationAttempt]:
+        raise NotImplementedError("stub: replaces build_remediation_manifest.latest_validation")
+
+    def list(self, filter: ValidationFilter, page: PageRequest) -> Page[ValidationAttempt]:
+        raise NotImplementedError("stub: replaces validation_current")
+
+    def summary(
+        self, filter: ValidationFilter, group_by: ValidationDimension
+    ) -> list[ValidationRollup]:
+        raise NotImplementedError("stub: replaces validation_exposure, validation-fuzz dashboard")

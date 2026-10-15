@@ -1,17 +1,21 @@
-# Service functions and interfaces
+# Services and interfaces
 
-Service functions (the default):
+Rules: `AGENTS.md` → Design rules. Shape to copy: any domain service, e.g. `services/portfolio.py`.
 
-1. `services/<area>.py`: plain functions taking a unit of work (or a repository) plus `Clock`; see `services/storage.py::record_artifact`.
-2. Validate input first (models, value objects), then open the unit of work, call repositories, commit.
-3. Return `Dto`s or domain `Model`s, never `dict`.
-4. Contract tests run the function against every unit-of-work implementation.
+A domain service:
 
-Interfaces (when traust-engine or traust-ledger owns the implementation):
+1. One class per domain in `services/<subject>.py` (a package only when the domain holds several responsibilities, e.g. `services/findings/`). Before adding a method, check no other service already owns the capability.
+2. Constructor takes its unit of work, the other domains' **services** it needs (never their repositories), providers and `Clock`.
+3. Methods take typed IDs, commands or contracts artifacts and return domain models or `Page[...]` — never `dict`, never `JobResult`.
+4. Skill doors: `prepare(...) -> <X>Input` (extends `SkillInput`) and `record(doc: <X>Artifact, provenance: Provenance)`; `@overload` when the domain records more than one document. Run the document's `Lint` rules inside `record`.
+5. Reads use the shared verbs: `get`, `find_*`, `list(filter, page)`, `summary(filter, group_by)`, `timeline(filter, bucket)`.
+6. Behaviour about one entity's own state goes on the model; rules needing config or several domains go in a policy class next to the service.
+7. Contract tests run the service against every unit-of-work implementation.
 
-1. Request/response `Dto`s in `models/<subject>.py`; the `Protocol` in the service module that consumes it.
-2. The owning repo implements it in-process; core never calls over HTTP.
-3. Export from `services/__init__.py`; README row.
+Interfaces implemented outside core (`Materializer`, `Router`):
+
+1. Request/response models in `models/<subject>.py`; the `Protocol` in the service module that consumes it.
+2. Implemented in the owning repo; export from `services/__init__.py`; README row.
 
 ## Config
 
@@ -22,8 +26,8 @@ Interfaces (when traust-engine or traust-ledger owns the implementation):
 
 ## Job (engine and LLM entry)
 
-1. The work is a service function: takes a unit of work, providers, `Clock`; returns `JobResult` (`succeeded`, `partly(degraded)`, `refused`, `failed`). Never raises on source trouble; report it as degraded.
-2. `Materializer` (`services.operations`): `asset` name + `materialize(AssetRequest) -> JobResult`. Parse partition/params into value objects; bad input → `JobResult.failed`; then call the one service.
+1. The work is a domain service method returning a domain result.
+2. `Materializer` (`services.operations`): `asset` name + `materialize(AssetRequest) -> JobResult`. Parse partition/params into value objects; bad input → `JobResult.failed`; call the one service; turn its result (or degraded/refused outcome) into `JobResult`. No logic beyond that.
 3. CLI for LLMs: argv → `AssetRequest` → the same materializer → print `JobResult` JSON → exit code.
 4. traust-engine registers materializers at startup: `ctx.assets.register(name, factory)`.
-5. Worked example: `tests/v1/example/continuous_ops/`.
+5. Worked example: `tests/v1/example/continuous_ops/` (its service is a module function — predates the one-service-per-domain rule; copy the adapter, not that).
