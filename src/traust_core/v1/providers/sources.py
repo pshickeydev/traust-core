@@ -4,6 +4,8 @@ from pathlib import Path
 from typing import Protocol
 
 from traust_core.v1.models.base import Dto
+from traust_core.v1.models.code_facts import LanguageStats
+from traust_core.v1.models.portfolio import OrgName
 from traust_core.v1.models.values import GitSha, HttpsRepoUrl
 from traust_core.v1.providers.base import Readiness, Result
 
@@ -27,6 +29,9 @@ class RepoInfo(Dto):
     archived: bool | None = None
 
 
+class OwnerHint(Dto): ...
+
+
 class SourceProvider(Protocol):
     name: str
 
@@ -37,3 +42,9 @@ class SourceProvider(Protocol):
     def info(self, repo: HttpsRepoUrl) -> Result[RepoInfo]: ...
 
     def release(self, workspace: Workspace) -> None: ...
+
+    def owners(self, repo: HttpsRepoUrl) -> Result[list[OwnerHint]]: ...
+
+    def list_org(self, org: OrgName) -> Result[list[HttpsRepoUrl]]: ...
+
+    def languages(self, repo: HttpsRepoUrl) -> Result[LanguageStats]: ...

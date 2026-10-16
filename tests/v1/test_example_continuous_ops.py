@@ -19,7 +19,7 @@ from traust_core.v1.context import Config, Context
 from traust_core.v1.errors import ServiceError
 from traust_core.v1.models.operations import AssetRequest, Outcome
 from traust_core.v1.models.values import GitSha, HttpsRepoUrl
-from traust_core.v1.providers.base import Provenance, Readiness, Result
+from traust_core.v1.providers.base import Acquisition, Readiness, Result
 from traust_core.v1.providers.sources import RepoInfo
 from traust_core.v1.repositories import create_database_engine
 
@@ -42,7 +42,7 @@ class FakeForge:
         if str(repo) not in self._heads:
             raise ServiceError(f"{repo}: unreachable")
         info = RepoInfo(repo=repo, head=GitSha(self._heads[str(repo)]))
-        return Result(info, Provenance(provider=self.name, acquired_at=CLOCK.now()))
+        return Result(info, Acquisition(provider=self.name, acquired_at=CLOCK.now()))
 
     def checkout(self, request: object) -> Result[object]:
         raise NotImplementedError

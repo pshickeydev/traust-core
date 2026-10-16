@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 from typing import Protocol, TypeVar
 
 from traust_core.v1.models.base import Dto
+from traust_core.v1.models.exposure import Advisory, Package, Version
 from traust_core.v1.providers.base import Readiness, Result
 
 Rec = TypeVar("Rec", covariant=True)
@@ -29,3 +30,11 @@ class FeedProvider(Protocol[Rec]):
     def status(self) -> FeedStatus: ...
 
     def read(self) -> Result[Rec]: ...
+
+
+class AdvisoryLookup(Protocol):
+    name: str
+
+    def check(self) -> Readiness: ...
+
+    def query(self, package: Package, version: Version) -> Result[list[Advisory]]: ...

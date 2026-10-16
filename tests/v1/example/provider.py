@@ -5,7 +5,7 @@ from pathlib import Path
 
 from traust_core.v1.errors import TraustError
 from traust_core.v1.models.base import Dto
-from traust_core.v1.providers.base import Provenance, Readiness, Result
+from traust_core.v1.providers.base import Acquisition, Readiness, Result
 from traust_core.v1.providers.process import ProcessRunner
 
 
@@ -29,7 +29,7 @@ class LineCountProvider:
     def acquire(self, request: LineCountRequest) -> Result[int]:
         out = self._process.run(["wc", "-l", "--", str(request.path)])
         count = int(out.stdout.split()[0])
-        provenance = Provenance(
+        provenance = Acquisition(
             provider=self.name, acquired_at=datetime.now(UTC), source=str(request.path)
         )
         return Result(count, provenance)

@@ -1,6 +1,6 @@
 from traust_core.v1.services.artifact_publishing import (
-    ArtifactIndex,
     ArtifactPublisher,
+    BindingIndex,
     Companion,
     InputFormat,
     JsonInput,
@@ -17,8 +17,8 @@ from traust_core.v1.services.storage import (
 )
 
 __all__ = [
-    "ArtifactIndex",
     "ArtifactPublisher",
+    "BindingIndex",
     "Companion",
     "InputFormat",
     "JsonInput",

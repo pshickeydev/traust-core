@@ -34,7 +34,7 @@ def test_provider_returns_data_with_provenance(tmp_path: Path) -> None:
     assert provider.check().ready
     result = provider.acquire(LineCountRequest(path=target))
     assert result.data == 3
-    assert result.provenance.provider == "line-count"
+    assert result.acquisition.provider == "line-count"
 
 
 def test_provider_not_ready_when_binary_not_allowed() -> None:

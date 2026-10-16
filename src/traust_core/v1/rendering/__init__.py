@@ -1,3 +1,4 @@
+from traust_core.v1.rendering.html import HtmlRenderer
 from traust_core.v1.rendering.markdown import (
     MarkdownRenderer,
     Renderer,
@@ -9,6 +10,7 @@ from traust_core.v1.rendering.markdown import (
 )
 
 __all__ = [
+    "HtmlRenderer",
     "MarkdownRenderer",
     "Renderer",
     "Report",

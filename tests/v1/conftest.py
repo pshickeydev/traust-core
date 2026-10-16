@@ -54,6 +54,12 @@ def storage_db(kind: str, tmp_path: Path) -> Generator[Engine]:
         eng.dispose()
 
 
+def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    for item in items:
+        if mark := item.get_closest_marker("todo"):
+            item.add_marker(pytest.mark.skip(reason=f"todo({mark.args[0]}): parked"))
+
+
 @pytest.fixture(params=SQL_BACKENDS)
 def engine(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[Engine]:
     with database(request.param, tmp_path) as eng:

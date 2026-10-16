@@ -5,13 +5,8 @@ import pytest
 from tests.v1.services.test_storage import TRIAGE
 from traust_core.v1 import contracts
 from traust_core.v1.errors import DocumentError
-from traust_core.v1.models.artifacts import (
-    ANALYSIS_ARTIFACTS,
-    Artifact,
-    Severity,
-    TriageArtifact,
-    Verdict,
-)
+from traust_core.v1.models.artifacts import ANALYSIS_ARTIFACTS, Artifact, TriageArtifact
+from traust_core.v1.models.vocabulary import Severity, Verdict
 
 FINDING = {
     "id": "f001",

@@ -1,7 +1,7 @@
 # Repository
 
 1. Model in `models/<subject>.py`: `Entity`/`Model` subclass or frozen dataclass. No database types.
-2. Interface: a `Protocol` with only the methods callers need (`add`, `get`, `list_by_<x>`, ...). No generic CRUD.
+2. Interface: a `Protocol` over one aggregate, in `repositories/<subject>.py`, using the shared verbs only as needed: `get(id) -> T` (raises `NotFoundError`), `find_*(...) -> T | None`, `list(filter, page) -> Page[T]`, `add(T) -> T` and `update(T) -> T` returning the saved record (database-generated `id`, `created_at`, `updated_at` via `RETURNING`). IDs are `UUID`, named `<entity>_id`. No generic CRUD base, no cross-domain tables.
 3. Unit-of-work protocol: `class XUnitOfWork(UnitOfWork, Protocol): xs: XRepository`.
 4. SQL implementation:
    - `sa.Table(...)` describing the existing table (DDL is owned by traust-contracts)
@@ -12,19 +12,23 @@
 6. In-memory double implementing the same interface, raising the same errors.
 7. Contract tests parametrized over `["memory", *SQL_BACKENDS]` using `tests/v1/conftest.py::database`. The Postgres case is marked `integration` and runs with `make db-up && make test-integration`.
 
-Service functions take the unit of work:
+The domain service takes the unit of work in its constructor and opens it per use case:
 
 ```python
-def complete(uow: TaskUnitOfWork, task_id: str) -> Task:
-    with uow:
-        task = uow.tasks.get(task_id)
-        ...
-        uow.commit()
+class TaskService:
+    def __init__(self, uow: TaskUnitOfWork) -> None:
+        self._uow = uow
+
+    def complete(self, task_id: UUID) -> Task:
+        with self._uow as uow:
+            done = uow.tasks.update(uow.tasks.get(task_id).complete())  # rule on the model
+            uow.commit()
+        return done
 ```
 
 ## Aggregate repository
 
-One repository per aggregate (the thing the domain asks questions about), not per table. Worked example: `repositories/triage.py`, written by `services/findings/decisions.py::record_triage`.
+One repository per aggregate (the thing the domain asks questions about), not per table. `repositories/triage.py` shows the SQL mechanics (table, mapping, `schema_drift`, idempotency); its string ids and `record_triage` free function are legacy and get replaced in the Findings slice — copy the mechanics, not the shape.
 
 1. Domain model in `models/<subject>.py` (`TriageVerdict` in `models/findings.py`): fields = the projection's columns, typed.
 2. Protocol with the domain questions only (`for_binding`, `for_source_finding`, `true_positives`); no generic CRUD.

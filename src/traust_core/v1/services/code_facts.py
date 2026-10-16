@@ -3,19 +3,41 @@ from __future__ import annotations
 from collections.abc import Sequence
 from uuid import UUID
 
-from traust_core.v1.models.code_facts import CodeFact
-from traust_core.v1.models.operations import JobResult
+from traust_core.v1.models.code_facts import (
+    CodeFact,
+    CodeFactKind,
+    CollectResult,
+    LanguageStats,
+    SymbolFact,
+    SymbolQuery,
+)
+from traust_core.v1.models.common import Page, PageRequest
+from traust_core.v1.providers.sources import SourceProvider
+from traust_core.v1.providers.tools import FactEnumerator
 from traust_core.v1.repositories.code_facts import CodeFactsUnitOfWork
 
 
 class CodeFactsService:
-    def __init__(self, uow: CodeFactsUnitOfWork) -> None:
+    def __init__(
+        self,
+        uow: CodeFactsUnitOfWork,
+        sources: SourceProvider,
+        enumerators: Sequence[FactEnumerator],
+    ) -> None:
         self._uow = uow
+        self._sources = sources
+        self._enumerators = enumerators
 
-    def enumerate(self, revision_id: UUID, kinds: Sequence[str]) -> JobResult:
-        raise NotImplementedError(
-            "stub: replaces secure-code-audit enumerators, enumerate_taint_flows.py"
-        )
+    def collect(self, revision_id: UUID, kinds: Sequence[CodeFactKind]) -> CollectResult:
+        raise NotImplementedError("stub: replaces build_symbol_index, secure-code enumerators")
 
-    def symbol(self, revision_id: UUID, name: str) -> list[CodeFact]:
-        raise NotImplementedError("stub: replaces build_symbol_index.py, query_index.py")
+    def list(
+        self, revision_id: UUID, kinds: Sequence[CodeFactKind], page: PageRequest
+    ) -> Page[CodeFact]:
+        raise NotImplementedError("stub: code facts read")
+
+    def symbols(self, revision_id: UUID, query: SymbolQuery) -> list[SymbolFact]:
+        raise NotImplementedError("stub: replaces query_index.py, build_diff_packet.callers_for")
+
+    def language_stats(self, revision_id: UUID) -> LanguageStats:
+        raise NotImplementedError("stub: replaces loc-dashboard GitHub language fetch")

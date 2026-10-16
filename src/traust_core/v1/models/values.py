@@ -7,6 +7,8 @@ from urllib.parse import urlsplit
 
 from traust_core.v1.errors import ValidationError
 
+# NEED(validation): the str NewTypes elsewhere (ProductSlug, RefName, Cwe, ...) only label meaning;
+# each that needs a rule (git URI, CWE id, semver) becomes a value object here with parse().
 _SHA = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 _CVE = re.compile(r"CVE-\d{4}-\d{4,}")
 _PATH_SEGMENT = re.compile(r"[A-Za-z0-9._-]+")

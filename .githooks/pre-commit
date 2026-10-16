@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Fast lint on staged .py files. Bypass: git commit --no-verify
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+command -v uv >/dev/null 2>&1 || { echo "pre-commit: uv not found — install uv, then run: make setup" >&2; exit 1; }
+staged="$(git diff --cached --name-only --diff-filter=ACM | grep -E '\.py$' || true)"
+[ -z "$staged" ] && exit 0
+uv run ruff check $staged
+uv run ruff format --check $staged

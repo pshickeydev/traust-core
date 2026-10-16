@@ -3,14 +3,17 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Generic, Protocol, TypeVar
+from uuid import UUID
 
 from traust_core.v1.errors import ConfigError, DocumentError, Issue, TraustError
 from traust_core.v1.models.analysis_results import ResultKind, Subject
 from traust_core.v1.models.artifacts import Artifact
 from traust_core.v1.models.base import Dto
+from traust_core.v1.models.common import ArtifactRef, Page, PageRequest
 from traust_core.v1.models.storage import BindingContext
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.repositories.analysis_results import AnalysisResultsRepository, artifact_kind
+from traust_core.v1.repositories.artifacts import ArtifactFilter
 from traust_core.v1.repositories.object_store import ObjectRef
 from traust_core.v1.repositories.storage import StorageUnitOfWork
 from traust_core.v1.services.storage import record_artifact
@@ -69,7 +72,7 @@ class PublishSpecs:
         return sorted(self._specs)
 
 
-class ArtifactIndex(Protocol):
+class BindingIndex(Protocol):
     def record(self, artifact: Artifact, subject: Subject, ref: ObjectRef, run_id: str) -> str: ...
 
 
@@ -102,7 +105,7 @@ class ArtifactPublisher:
         self,
         specs: PublishSpecs,
         results: AnalysisResultsRepository,
-        index: ArtifactIndex | None = None,
+        index: BindingIndex | None = None,
     ) -> None:
         self._specs = specs
         self._results = results
@@ -128,3 +131,23 @@ class ArtifactPublisher:
         except TraustError as e:
             return result.model_copy(update={"index_error": str(e)})
         return result.model_copy(update={"binding_id": binding})
+
+    def get(self, artifact_id: UUID) -> Artifact:
+        raise NotImplementedError("stub: replaces AnalysisResultsRepository.read by path subject")
+
+    def verify(self, artifact_id: UUID) -> DigestCheck:
+        raise NotImplementedError("stub: replaces verify_report_digests.py, ledger report digests")
+
+    def list(self, filter: ArtifactFilter, page: PageRequest) -> Page[ArtifactRef]:
+        raise NotImplementedError("stub: replaces corpus/report_store listing")
+
+
+class DigestCheck(Dto): ...
+
+
+class Redacted(Dto): ...
+
+
+class RedactionPolicy:
+    def redact(self, payload: bytes) -> Redacted:
+        raise NotImplementedError("stub: replaces _util/redact.py")
