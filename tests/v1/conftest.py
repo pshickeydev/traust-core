@@ -7,9 +7,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+import sqlalchemy as sa
 from sqlalchemy.engine import Engine
 
-from tests.v1.example.repository import metadata
+from tests.v1.example import repository as example_repository
 from traust_core.v1 import contracts
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.repositories import apply_schema, create_database_engine
@@ -31,7 +32,9 @@ def _engine(kind: str, tmp_path: Path) -> Engine:
 
 
 @contextmanager
-def database(kind: str, tmp_path: Path) -> Generator[Engine]:
+def database(
+    kind: str, tmp_path: Path, metadata: sa.MetaData = example_repository.metadata
+) -> Generator[Engine]:
     eng = _engine(kind, tmp_path)
     metadata.create_all(eng)
     try:

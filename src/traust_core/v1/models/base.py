@@ -15,7 +15,14 @@ class Dto(pydantic.BaseModel):
 
 
 class Entity(Model):
-    # None until saved: the database generates id and both timestamps on insert.
+    # None until saved: the database generates id and both timestamps; on update
+    # the contracts touch trigger keeps updated_at.
     id: UUID | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
+
+
+class AppendOnly(Model):
+    # None until saved; append-only rows are never updated, so there is no updated_at.
+    id: UUID | None = None
+    created_at: datetime | None = None
