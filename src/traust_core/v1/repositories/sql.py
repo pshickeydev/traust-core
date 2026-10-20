@@ -5,7 +5,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from datetime import UTC, datetime
 from types import TracebackType
 from typing import Any, Literal, Self
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import sqlalchemy as sa
 from sqlalchemy.engine import Connection, CursorResult, Engine
@@ -28,8 +28,10 @@ def create_database_engine(url: str | sa.URL) -> Engine:
         return engine
 
     @sa.event.listens_for(engine, "connect")
-    def _fk_on(dbapi_conn: Any, _: Any) -> None:
+    def _sqlite_functions(dbapi_conn: Any, _: Any) -> None:
         dbapi_conn.execute("PRAGMA foreign_keys = ON")
+        # Contracts' uuid(): ext/misc/uuid.c in other drivers, registered here.
+        dbapi_conn.create_function("uuid", 0, lambda: str(uuid4()))
 
     return engine.execution_options(
         schema_translate_map={STORAGE_SCHEMA: None, LEDGER_SCHEMA: None}
@@ -48,7 +50,13 @@ class UtcTimestamp(sa.TypeDecorator[datetime]):
         return dialect.type_descriptor(sa.Text() if dialect.name == "sqlite" else self.impl)
 
     def process_bind_param(self, value: datetime | None, dialect: sa.Dialect) -> Any:
-        return value.isoformat() if value is not None and dialect.name == "sqlite" else value
+        if value is None or dialect.name != "sqlite":
+            return value
+        # Contracts' TEXT format (millisecond precision, Z) so ordering survives mixed writers.
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=UTC)
+        stamp = value.astimezone(UTC)
+        return stamp.strftime("%Y-%m-%dT%H:%M:%S") + f".{stamp.microsecond // 1000:03d}Z"
 
     def process_result_value(self, value: Any, dialect: sa.Dialect) -> datetime | None:
         if isinstance(value, str):
@@ -56,6 +64,22 @@ class UtcTimestamp(sa.TypeDecorator[datetime]):
         if value is not None and value.tzinfo is None:
             value = value.replace(tzinfo=UTC)  # SQLite CURRENT_TIMESTAMP is UTC without offset
         return value
+
+
+class RecordUuid(sa.TypeDecorator[UUID]):
+    # Native UUID on Postgres; on SQLite the hyphenated text uuid() writes,
+    # so lookups match the stored form.
+    impl = sa.Uuid
+    cache_ok = True
+
+    def load_dialect_impl(self, dialect: sa.Dialect) -> sa.TypeEngine[Any]:
+        return dialect.type_descriptor(sa.Text() if dialect.name == "sqlite" else self.impl)
+
+    def process_bind_param(self, value: UUID | None, dialect: sa.Dialect) -> Any:
+        return str(value) if value is not None and dialect.name == "sqlite" else value
+
+    def process_result_value(self, value: Any, dialect: sa.Dialect) -> UUID | None:
+        return UUID(value) if isinstance(value, str) else value
 
 
 class _GeneratedUuid(sa.FunctionElement[UUID]):
@@ -70,35 +94,39 @@ def _postgres_uuid(element: Any, compiler: Any, **kw: Any) -> str:
 
 @compiles(_GeneratedUuid, "sqlite")
 def _sqlite_uuid(element: Any, compiler: Any, **kw: Any) -> str:
-    # ext/misc/uuid.c isn't loadable everywhere; v4 straight from randomblob, in the
-    # 32-char lowercase hex form the Uuid type binds.
-    return (
-        "substr(lower(hex(randomblob(16))), 1, 12) || '4' "
-        "|| substr(lower(hex(randomblob(16))), 14, 3) "
-        "|| '8' || substr(lower(hex(randomblob(16))), 2, 15)"
-    )
+    return "uuid()"
+
+
+class _DbNow(sa.FunctionElement[datetime]):
+    name = "db_now"
+    inherit_cache = True
+
+
+@compiles(_DbNow, "postgresql")
+def _postgres_now(element: Any, compiler: Any, **kw: Any) -> str:
+    return "now()"
+
+
+@compiles(_DbNow, "sqlite")
+def _sqlite_now(element: Any, compiler: Any, **kw: Any) -> str:
+    # Contracts' TEXT timestamp format, millisecond precision.
+    return "strftime('%Y-%m-%dT%H:%M:%fZ','now')"
 
 
 def record_columns() -> tuple[sa.Column[UUID], sa.Column[datetime], sa.Column[datetime]]:
-    """Mutable base columns: database-generated UUIDv4 id, created_at, updated_at."""
+    """Mutable base columns: UUIDv4 id; the touch trigger keeps updated_at."""
     return (
-        sa.Column("id", sa.Uuid, primary_key=True, server_default=_GeneratedUuid()),
-        sa.Column("created_at", UtcTimestamp, nullable=False, server_default=sa.func.now()),
-        sa.Column(
-            "updated_at",
-            UtcTimestamp,
-            nullable=False,
-            server_default=sa.func.now(),
-            onupdate=sa.func.now(),
-        ),
+        sa.Column("id", RecordUuid, primary_key=True, server_default=_GeneratedUuid()),
+        sa.Column("created_at", UtcTimestamp, nullable=False, server_default=_DbNow()),
+        sa.Column("updated_at", UtcTimestamp, nullable=False, server_default=_DbNow()),
     )
 
 
 def append_only_columns() -> tuple[sa.Column[UUID], sa.Column[datetime]]:
-    """Append-only base columns: database-generated UUIDv4 id and created_at, no updated_at."""
+    """Append-only base columns: UUIDv4 id and created_at, no updated_at."""
     return (
-        sa.Column("id", sa.Uuid, primary_key=True, server_default=_GeneratedUuid()),
-        sa.Column("created_at", UtcTimestamp, nullable=False, server_default=sa.func.now()),
+        sa.Column("id", RecordUuid, primary_key=True, server_default=_GeneratedUuid()),
+        sa.Column("created_at", UtcTimestamp, nullable=False, server_default=_DbNow()),
     )
 
 
@@ -174,7 +202,7 @@ class SqlRepository:
     def _update_record(
         self, operation: str, table: sa.Table, record_id: UUID, values: Mapping[str, Any]
     ) -> dict[str, UUID | datetime]:
-        """UPDATE by id; returns the saved id/created_at/updated_at (updated_at maintained)."""
+        """UPDATE by id; returns the saved base columns (the touch trigger keeps updated_at)."""
         stmt = (
             sa.update(table)
             .where(table.c.id == record_id)
@@ -184,7 +212,18 @@ class SqlRepository:
         row = self._execute(operation, stmt).mappings().first()
         if row is None:
             raise NotFoundError(f"{type(self).__name__}: {operation}: not found")
-        return dict(row)
+        saved = dict(row)
+        if self._connection.dialect.name == "sqlite":
+            # SQLite's AFTER UPDATE trigger fires after RETURNING is computed.
+            saved["updated_at"] = (
+                self._execute(
+                    f"reread {record_id}",
+                    sa.select(table.c.updated_at).where(table.c.id == record_id),
+                )
+                .scalars()
+                .one()
+            )
+        return saved
 
     def _execute(
         self,
