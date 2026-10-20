@@ -9,8 +9,10 @@ from traust_core.v1.repositories.object_store import (
 from traust_core.v1.repositories.sql import (
     SqlRepository,
     SqlUnitOfWork,
+    append_only_columns,
     apply_schema,
     create_database_engine,
+    record_columns,
     schema_drift,
 )
 from traust_core.v1.repositories.unit_of_work import UnitOfWork
@@ -25,7 +27,9 @@ __all__ = [
     "SqlRepository",
     "SqlUnitOfWork",
     "UnitOfWork",
+    "append_only_columns",
     "apply_schema",
     "create_database_engine",
+    "record_columns",
     "schema_drift",
 ]

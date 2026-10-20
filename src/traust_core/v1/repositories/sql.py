@@ -2,15 +2,17 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable, Mapping, Sequence
-from datetime import datetime
+from datetime import UTC, datetime
 from types import TracebackType
 from typing import Any, Literal, Self
+from uuid import UUID
 
 import sqlalchemy as sa
 from sqlalchemy.engine import Connection, CursorResult, Engine
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.ext.compiler import compiles
 
-from traust_core.v1.errors import ConflictError, RepositoryError
+from traust_core.v1.errors import ConflictError, NotFoundError, RepositoryError
 
 STORAGE_SCHEMA = "traust_storage"
 LEDGER_SCHEMA = "traust_ledger"
@@ -49,7 +51,55 @@ class UtcTimestamp(sa.TypeDecorator[datetime]):
         return value.isoformat() if value is not None and dialect.name == "sqlite" else value
 
     def process_result_value(self, value: Any, dialect: sa.Dialect) -> datetime | None:
-        return datetime.fromisoformat(value) if isinstance(value, str) else value
+        if isinstance(value, str):
+            value = datetime.fromisoformat(value)
+        if value is not None and value.tzinfo is None:
+            value = value.replace(tzinfo=UTC)  # SQLite CURRENT_TIMESTAMP is UTC without offset
+        return value
+
+
+class _GeneratedUuid(sa.FunctionElement[UUID]):
+    name = "generated_uuid"
+    inherit_cache = True
+
+
+@compiles(_GeneratedUuid, "postgresql")
+def _postgres_uuid(element: Any, compiler: Any, **kw: Any) -> str:
+    return "gen_random_uuid()"
+
+
+@compiles(_GeneratedUuid, "sqlite")
+def _sqlite_uuid(element: Any, compiler: Any, **kw: Any) -> str:
+    # ext/misc/uuid.c isn't loadable everywhere; v4 straight from randomblob, in the
+    # 32-char lowercase hex form the Uuid type binds.
+    return (
+        "substr(lower(hex(randomblob(16))), 1, 12) || '4' "
+        "|| substr(lower(hex(randomblob(16))), 14, 3) "
+        "|| '8' || substr(lower(hex(randomblob(16))), 2, 15)"
+    )
+
+
+def record_columns() -> tuple[sa.Column[UUID], sa.Column[datetime], sa.Column[datetime]]:
+    """Mutable base columns: database-generated UUIDv4 id, created_at, updated_at."""
+    return (
+        sa.Column("id", sa.Uuid, primary_key=True, server_default=_GeneratedUuid()),
+        sa.Column("created_at", UtcTimestamp, nullable=False, server_default=sa.func.now()),
+        sa.Column(
+            "updated_at",
+            UtcTimestamp,
+            nullable=False,
+            server_default=sa.func.now(),
+            onupdate=sa.func.now(),
+        ),
+    )
+
+
+def append_only_columns() -> tuple[sa.Column[UUID], sa.Column[datetime]]:
+    """Append-only base columns: database-generated UUIDv4 id and created_at, no updated_at."""
+    return (
+        sa.Column("id", sa.Uuid, primary_key=True, server_default=_GeneratedUuid()),
+        sa.Column("created_at", UtcTimestamp, nullable=False, server_default=sa.func.now()),
+    )
 
 
 def apply_schema(engine: Engine, statements: Iterable[str]) -> None:
@@ -110,6 +160,31 @@ class SqlUnitOfWork:
 class SqlRepository:
     def __init__(self, connection: Connection) -> None:
         self._connection = connection
+
+    def _insert_record(
+        self, operation: str, table: sa.Table, values: Mapping[str, Any]
+    ) -> dict[str, UUID | datetime]:
+        """INSERT domain columns; returns the database-generated base columns the table has."""
+        returning = [table.c.id, table.c.created_at]
+        if "updated_at" in table.c:
+            returning.append(table.c.updated_at)
+        stmt = sa.insert(table).values(**values).returning(*returning)
+        return dict(self._execute(operation, stmt).mappings().one())
+
+    def _update_record(
+        self, operation: str, table: sa.Table, record_id: UUID, values: Mapping[str, Any]
+    ) -> dict[str, UUID | datetime]:
+        """UPDATE by id; returns the saved id/created_at/updated_at (updated_at maintained)."""
+        stmt = (
+            sa.update(table)
+            .where(table.c.id == record_id)
+            .values(**values)
+            .returning(table.c.id, table.c.created_at, table.c.updated_at)
+        )
+        row = self._execute(operation, stmt).mappings().first()
+        if row is None:
+            raise NotFoundError(f"{type(self).__name__}: {operation}: not found")
+        return dict(row)
 
     def _execute(
         self,

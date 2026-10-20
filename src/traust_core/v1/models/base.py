@@ -19,3 +19,9 @@ class Entity(Model):
     id: UUID | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
+
+
+class AppendOnly(Model):
+    # None until saved; append-only rows are never updated, so there is no updated_at.
+    id: UUID | None = None
+    created_at: datetime | None = None
