@@ -124,10 +124,10 @@ Python 3.11+ library. The platform API lives in `traust_core.v1`. Overview: [REA
 
 ## Where we're headed
 
-- New code uses traust-core; only touch old code when it's cheap to do so
-- CI's drift ratchet (`python -m traust_core.v1.checks.ratchet`) enforces it: a new hand-wiring hit fails the build (`path:line kind → use <API>`), and baselines only shrink
+- Inside traust-core, new code uses the platform pieces below. Outside traust-core, everything goes through the platform API (`traust-client` or the SDK); old code is deleted by its domain's cut-over plan
+- CI's drift ratchet (`python -m traust_core.v1.checks.ratchet`) fails a new hit (`path:line kind → use <API>`); baselines only shrink
 
-| Hand-wiring | Use the platform API instead |
+| Hand-wiring | Inside traust-core, use |
 | --- | --- |
 | `sqlite3.connect` / `psycopg.connect` | `SqlUnitOfWork` / `SqlRepository` |
 | `subprocess` | `ProcessRunner` or a tool provider |

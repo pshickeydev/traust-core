@@ -11,7 +11,6 @@ __all__ = [
 ]
 
 
-# Lazy import to address the previous PR comments.
 def __getattr__(name: str) -> Any:
     if name in __all__:
         from traust_core.v1.checks import ratchet
