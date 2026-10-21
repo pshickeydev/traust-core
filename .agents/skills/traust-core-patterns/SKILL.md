@@ -46,6 +46,16 @@ SQL rule several readers share? → a view in traust-contracts
 - **Convention over configuration.** Copy the worked example's shape (names, verbs, layout); don't add a setting or flag to choose between behaviours. Config is for what truly differs per deployment, read once in `Context`.
 - **Fallbacks are a decision, not a default.** No silent `except: return default` or "if missing, use X". Missing or malformed input raises a typed `traust_core.v1.errors` error, logged once where handled. A fallback is fine only when the domain defines it as behaviour (a degraded outcome with a reason), and then it's explicit and tested.
 
+## Quality checklist (every PR)
+
+1. Comments only for a non-obvious *why*; nothing that restates the code.
+2. Docstrings: one or two lines on public API where name and types don't say it; none on private helpers or tests.
+3. Don't reinvent: search `src/` for an existing function first and extend it.
+4. Generic logic used in more than one place is one helper where its kind lives (`models/values.py`, a provider, the owning repository).
+5. Tests cover edges: empty, not found, re-runs, invalid values, boundaries, each typed error, rollback.
+6. Integration tests run the real path on SQLite and Postgres with sanitized copies of real data under `tests/fixtures/<domain>/` (people, hosts, org/repo names, tokens replaced). Never live systems.
+7. Minimal code: shrink the diff (inline one-use helpers, merge near-duplicates, drop dead code and unused parameters).
+
 ## No duplicated responsibility
 
 - One query, one place: the owning table's repository. Filtering rows in Python that SQL could filter → a named query.

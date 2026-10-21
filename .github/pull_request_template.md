@@ -12,4 +12,8 @@
 - [ ] Duplicated responsibility touched by this change moved to its owner, copy deleted
 - [ ] Tests: behaviour on SQLite (+ Postgres for new queries) via `uow` / `seed`
 - [ ] Legacy code deleted only with a parity diff attached
+- [ ] Comments only for non-obvious whys; docstrings one or two lines, none on private helpers
+- [ ] No reinvented functions (searched `src/`); shared logic is one helper
+- [ ] Tests cover edge cases; integration tests use sanitized copies of real data
+- [ ] Diff is as small as it can be
 - [ ] `make lint-fix && make test` green
