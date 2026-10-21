@@ -1,0 +1,9 @@
+# Structure of the platform API: models are the contract tables, repositories own their table,
+# context is the composition root. Either owner can approve.
+/src/traust_core/v1/models/        @smith-xyz @chubirka
+/src/traust_core/v1/repositories/  @smith-xyz @chubirka
+/src/traust_core/v1/context/       @smith-xyz @chubirka
+/tests/v1/test_architecture.py     @smith-xyz @chubirka
+/AGENTS.md                         @smith-xyz @chubirka
+/.agents/                          @smith-xyz @chubirka
+/pyproject.toml                    @smith-xyz @chubirka
