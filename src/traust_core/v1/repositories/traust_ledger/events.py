@@ -5,7 +5,7 @@ from uuid import UUID
 
 import sqlalchemy as sa
 
-from traust_core.v1.models.records import EventRecord
+from traust_core.v1.models.ledger import Event
 from traust_core.v1.repositories.tables import (
     TRAUST_LEDGER,
     RecordRepository,
@@ -27,20 +27,20 @@ EVENTS = TableSpec(
 )
 
 
-class EventRepository(RecordRepository[EventRecord], Protocol):
-    def find_by_decision(self, decision_id: UUID) -> EventRecord | None: ...
-    def list_for_layer(self, layer_id: UUID) -> list[EventRecord]: ...
+class EventRepository(RecordRepository[Event], Protocol):
+    def find_by_decision(self, decision_id: UUID) -> Event | None: ...
+    def list_for_layer(self, layer_id: UUID) -> list[Event]: ...
     def last_seq(self, layer_id: UUID) -> int | None: ...
 
 
-class SqlEventRepository(SqlAppendOnlyRepository[EventRecord]):
+class SqlEventRepository(SqlAppendOnlyRepository[Event]):
     spec = EVENTS
-    record = EventRecord
+    record = Event
 
-    def find_by_decision(self, decision_id: UUID) -> EventRecord | None:
+    def find_by_decision(self, decision_id: UUID) -> Event | None:
         return self._one(f"find for {decision_id}", self.table.c.decision_id == decision_id)
 
-    def list_for_layer(self, layer_id: UUID) -> list[EventRecord]:
+    def list_for_layer(self, layer_id: UUID) -> list[Event]:
         c = self.table.c
         return self._many(f"list for {layer_id}", c.layer_id == layer_id, order_by=(c.seq,))
 

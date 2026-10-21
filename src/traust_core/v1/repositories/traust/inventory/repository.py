@@ -4,7 +4,7 @@ from typing import Protocol
 
 import sqlalchemy as sa
 
-from traust_core.v1.models.records import RepositoryRecord
+from traust_core.v1.models.inventory import Repository
 from traust_core.v1.repositories.tables import (
     TRAUST,
     MutableRecordRepository,
@@ -25,13 +25,13 @@ REPOSITORY = TableSpec(
 )
 
 
-class RepositoryRepository(MutableRecordRepository[RepositoryRecord], Protocol):
-    def find_by_url(self, url: str) -> RepositoryRecord | None: ...
+class RepositoryRepository(MutableRecordRepository[Repository], Protocol):
+    def find_by_url(self, url: str) -> Repository | None: ...
 
 
-class SqlRepositoryRepository(SqlMutableRepository[RepositoryRecord]):
+class SqlRepositoryRepository(SqlMutableRepository[Repository]):
     spec = REPOSITORY
-    record = RepositoryRecord
+    record = Repository
 
-    def find_by_url(self, url: str) -> RepositoryRecord | None:
+    def find_by_url(self, url: str) -> Repository | None:
         return self._one(f"find {url}", self.table.c.url == url)

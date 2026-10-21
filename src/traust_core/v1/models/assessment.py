@@ -5,11 +5,9 @@ from enum import StrEnum
 from typing import NewType
 from uuid import UUID
 
-from traust_core.v1.models.base import Entity, Model
-from traust_core.v1.models.common import ArtifactRef
+from traust_core.v1.models.base import AppendOnly, Model
 from traust_core.v1.models.findings import Label, SkillInput
 from traust_core.v1.models.vocabulary import (
-    AuditProfile,
     ChainSeverity,
     IsolationPosture,
     PeachBoundaryType,
@@ -64,7 +62,7 @@ class AssessmentFilter(Model): ...
 class ThreatFilter(Model): ...
 
 
-class AssessmentInput(SkillInput): ...
+class AssessmentSkillInput(SkillInput): ...
 
 
 class Coverage(Model):
@@ -76,16 +74,31 @@ class Coverage(Model):
         raise NotImplementedError("stub: replaces build_coverage_gap_rollup.build_rollup")
 
 
-class Assessment(Entity):
-    revision_id: UUID
-    kind: AssessmentKind
-    profile: AuditProfile | None = None
-    artifact: ArtifactRef
-    assessed_at: datetime
-    coverage: Coverage | None = None
+class Assessment(AppendOnly):
+    """3a · what was examined: a ref (and image), by an assessor, with what outcome."""
+
+    repository_ref_id: UUID
+    image_id: UUID | None = None
+    baseline_assessment_id: UUID | None = None
+    run_order_id: UUID | None = None
+    kind: str
+    status: str
+    assessor: str
+    assessor_version: str
+    occurred_at: datetime
 
 
-class Threat(Entity):
+class Artifact(AppendOnly):
+    """A document an assessment produced (or imported); bytes live at uri."""
+
+    assessment_id: UUID | None = None
+    digest: str
+    kind: str
+    uri: str
+
+
+# Artifact-lane content: read from the assessment's artifacts, never tables.
+class Threat(Model):
     assessment_id: UUID
     label: Label
     title: str
@@ -97,7 +110,7 @@ class Threat(Entity):
     techniques: tuple[AttackTechnique, ...] = ()
 
 
-class AttackChain(Entity):
+class AttackChain(Model):
     assessment_id: UUID
     threat_ids: tuple[UUID, ...]
     severity: ChainSeverity
@@ -116,7 +129,7 @@ class IsolationResult(Model):
 
 
 class Freshness(Model):
-    code_line_id: UUID
+    repository_ref_id: UUID
     last_assessed_at: datetime | None = None
     churn_ratio: float | None = None
 
@@ -127,4 +140,4 @@ class Freshness(Model):
 class Population(Model):
     as_of: datetime
     rows: tuple[PopulationRow, ...] = ()
-    never_assessed_code_line_ids: tuple[UUID, ...] = ()
+    never_assessed_repository_ids: tuple[UUID, ...] = ()

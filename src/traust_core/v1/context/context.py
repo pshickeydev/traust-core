@@ -22,13 +22,13 @@ from traust_core.v1.repositories import (
     create_database_engine,
 )
 from traust_core.v1.repositories.analysis_results import AnalysisResultsRepository
+from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.repositories.sql import Dialect
-from traust_core.v1.repositories.storage import SqlStorageUnitOfWork
 from traust_core.v1.repositories.tables import TableFactory
 from traust_core.v1.services.artifact_publishing import (
     ArtifactPublisher,
     PublishSpecs,
-    StorageIndex,
+    SqlArtifactIndex,
 )
 from traust_core.v1.services.operations import Materializer
 
@@ -89,14 +89,14 @@ class Context:
         return TableFactory.for_dialect(self.dialect)
 
     def unit_of_work(self, factory: Callable[[Engine], U]) -> U:
-        """e.g. unit_of_work(SqlInventoryUnitOfWork); its repositories use this engine's tables."""
+        """e.g. unit_of_work(SqlTraustUnitOfWork): every repository, one transaction."""
         return factory(self.database)
 
     def artifact_publisher(self, specs: PublishSpecs) -> ArtifactPublisher:
         index = None
         if self.config.database.url is not None:
             engine = self.database
-            index = StorageIndex(lambda: SqlStorageUnitOfWork(engine), self.clock)
+            index = SqlArtifactIndex(lambda: SqlTraustUnitOfWork(engine))
         return ArtifactPublisher(
             specs, AnalysisResultsRepository(self.object_store, ARTIFACT_FOR_KIND), index
         )

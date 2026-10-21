@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Protocol
 from uuid import UUID
 
-from traust_core.v1.models.records import FindingCweRecord
+from traust_core.v1.models.findings import FindingCwe
 from traust_core.v1.repositories.tables import (
     TRAUST,
     MutableRecordRepository,
@@ -17,17 +17,17 @@ FINDING_CWE = TableSpec(
 )
 
 
-class FindingCweRepository(MutableRecordRepository[FindingCweRecord], Protocol):
-    def list_for_finding(self, finding_id: UUID) -> list[FindingCweRecord]: ...
-    def list_for_cwe(self, cwe_id: UUID) -> list[FindingCweRecord]: ...
+class FindingCweRepository(MutableRecordRepository[FindingCwe], Protocol):
+    def list_for_finding(self, finding_id: UUID) -> list[FindingCwe]: ...
+    def list_for_cwe(self, cwe_id: UUID) -> list[FindingCwe]: ...
 
 
-class SqlFindingCweRepository(SqlMutableRepository[FindingCweRecord]):
+class SqlFindingCweRepository(SqlMutableRepository[FindingCwe]):
     spec = FINDING_CWE
-    record = FindingCweRecord
+    record = FindingCwe
 
-    def list_for_finding(self, finding_id: UUID) -> list[FindingCweRecord]:
+    def list_for_finding(self, finding_id: UUID) -> list[FindingCwe]:
         return self._many(f"list for {finding_id}", self.table.c.finding_id == finding_id)
 
-    def list_for_cwe(self, cwe_id: UUID) -> list[FindingCweRecord]:
+    def list_for_cwe(self, cwe_id: UUID) -> list[FindingCwe]:
         return self._many(f"list for cwe {cwe_id}", self.table.c.cwe_id == cwe_id)

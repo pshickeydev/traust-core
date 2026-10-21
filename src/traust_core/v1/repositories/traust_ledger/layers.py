@@ -5,7 +5,7 @@ from uuid import UUID
 
 import sqlalchemy as sa
 
-from traust_core.v1.models.records import LayerRecord
+from traust_core.v1.models.ledger import Layer
 from traust_core.v1.repositories.tables import (
     TRAUST_LEDGER,
     MutableRecordRepository,
@@ -31,13 +31,13 @@ LAYERS = TableSpec(
 )
 
 
-class LayerRepository(MutableRecordRepository[LayerRecord], Protocol):
-    def list_for_repository(self, repository_id: UUID) -> list[LayerRecord]: ...
+class LayerRepository(MutableRecordRepository[Layer], Protocol):
+    def list_for_repository(self, repository_id: UUID) -> list[Layer]: ...
 
 
-class SqlLayerRepository(SqlMutableRepository[LayerRecord]):
+class SqlLayerRepository(SqlMutableRepository[Layer]):
     spec = LAYERS
-    record = LayerRecord
+    record = Layer
 
-    def list_for_repository(self, repository_id: UUID) -> list[LayerRecord]:
+    def list_for_repository(self, repository_id: UUID) -> list[Layer]:
         return self._many(f"list for {repository_id}", self.table.c.repository_id == repository_id)

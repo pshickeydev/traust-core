@@ -5,7 +5,7 @@ from uuid import UUID
 
 import sqlalchemy as sa
 
-from traust_core.v1.models.records import LocationRecord
+from traust_core.v1.models.findings import Location
 from traust_core.v1.repositories.tables import (
     TRAUST,
     RecordRepository,
@@ -30,15 +30,15 @@ LOCATION = TableSpec(
 )
 
 
-class LocationRepository(RecordRepository[LocationRecord], Protocol):
-    def list_for_occurrence(self, occurrence_id: UUID) -> list[LocationRecord]: ...
+class LocationRepository(RecordRepository[Location], Protocol):
+    def list_for_occurrence(self, occurrence_id: UUID) -> list[Location]: ...
 
 
-class SqlLocationRepository(SqlAppendOnlyRepository[LocationRecord]):
+class SqlLocationRepository(SqlAppendOnlyRepository[Location]):
     spec = LOCATION
-    record = LocationRecord
+    record = Location
 
-    def list_for_occurrence(self, occurrence_id: UUID) -> list[LocationRecord]:
+    def list_for_occurrence(self, occurrence_id: UUID) -> list[Location]:
         c = self.table.c
         return self._many(
             f"list for {occurrence_id}",

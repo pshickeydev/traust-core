@@ -9,8 +9,7 @@ from uuid import UUID
 
 from pydantic import Field
 
-from traust_core.v1.models.base import Dto, Entity, Model
-from traust_core.v1.models.common import Principal
+from traust_core.v1.models.base import AppendOnly, Dto, Entity, Model
 from traust_core.v1.models.vocabulary import BudgetEnforcement
 
 AssetName = NewType("AssetName", str)
@@ -72,11 +71,8 @@ class Route(Dto):
     reason: str
 
 
-# Members land with the Operations slice (traust-engine run loop).
+# Members land with the Operations slice (contracts run-order-state, to add).
 class OrderState(StrEnum): ...
-
-
-class OrderEventKind(StrEnum): ...
 
 
 # Shapes land with their implementation slice.
@@ -113,40 +109,55 @@ class SpendRollup(Model): ...
 class StaleItem(Model): ...
 
 
-class Order(Entity):
-    request: AssetRequest
-    state: OrderState
-    requested_by: Principal
-    depends_on_ids: tuple[UUID, ...] = ()
-    progress: OrderProgress | None = None
+class RunBatch(Entity):
+    """4a · a tranche: one per (kind, period), e.g. drain_tranche / 2026-W31."""
 
-    def transition(self, event: OrderEventKind, at: datetime) -> Order:
-        raise NotImplementedError("stub: replaces cron/subprocess orchestration state")
+    kind: str
+    period: str
 
 
-class Lease(Model):
-    order_id: UUID
-    worker: WorkerId
-    expires_at: datetime
+class RunOrder(Entity):
+    """4a · one unit of work; queued, leased by a worker, finished with an outcome."""
 
-    def expired(self, now: datetime) -> bool:
-        raise NotImplementedError("stub: order lease for the traust-engine run loop")
+    run_batch_id: UUID | None = None
+    repository_id: UUID | None = None
+    artifact_id: UUID | None = None
+    rule: str | None = None
+    event_source: str | None = None
+    lane: str
+    state: str
+    priority: int
+    reason: str | None = None
+    requested_by: str
+    lease_holder: str | None = None
+    lease_expires_at: datetime | None = None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
 
 
-class OrderEvent(Entity):
-    order_id: UUID
-    kind: OrderEventKind
-    detail: str | None = None
-
-
-class SpendEvent(Entity):
-    order_id: UUID | None = None
-    provider: ProviderName
-    model: ModelName | None = None
-    skill: SkillName | None = None
-    tokens: int | None = None
+class SpendEvent(AppendOnly):
+    run_order_id: UUID | None = None
+    provider: str
+    model: str
+    skill: str | None = None
+    tokens_in: int
+    tokens_out: int
     cost_usd: Decimal
-    at: datetime
+    occurred_at: datetime
+
+
+class FeedSnapshot(AppendOnly):
+    run_order_id: UUID | None = None
+    artifact_id: UUID
+    feed: str
+    retrieved_at: datetime
+
+
+class AssessmentInput(AppendOnly):
+    """Which feed snapshot an assessment used."""
+
+    assessment_id: UUID
+    feed_snapshot_id: UUID
 
 
 class Budget(Model):

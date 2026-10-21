@@ -5,7 +5,7 @@ from uuid import UUID
 
 import sqlalchemy as sa
 
-from traust_core.v1.models.records import DependencyRecord
+from traust_core.v1.models.dependencies import Dependency
 from traust_core.v1.repositories.tables import (
     TRAUST,
     RecordRepository,
@@ -28,18 +28,18 @@ DEPENDENCY = TableSpec(
 )
 
 
-class DependencyRepository(RecordRepository[DependencyRecord], Protocol):
-    def list_for_sbom(self, sbom_id: UUID) -> list[DependencyRecord]: ...
-    def list_for_package(self, package_id: UUID) -> list[DependencyRecord]: ...
+class DependencyRepository(RecordRepository[Dependency], Protocol):
+    def list_for_sbom(self, sbom_id: UUID) -> list[Dependency]: ...
+    def list_for_package(self, package_id: UUID) -> list[Dependency]: ...
 
 
-class SqlDependencyRepository(SqlAppendOnlyRepository[DependencyRecord]):
+class SqlDependencyRepository(SqlAppendOnlyRepository[Dependency]):
     spec = DEPENDENCY
-    record = DependencyRecord
+    record = Dependency
 
-    def list_for_sbom(self, sbom_id: UUID) -> list[DependencyRecord]:
+    def list_for_sbom(self, sbom_id: UUID) -> list[Dependency]:
         return self._many(f"list for sbom {sbom_id}", self.table.c.sbom_id == sbom_id)
 
-    def list_for_package(self, package_id: UUID) -> list[DependencyRecord]:
+    def list_for_package(self, package_id: UUID) -> list[Dependency]:
         """SBOMs that include the package (advisory sweep, usage query)."""
         return self._many(f"list for package {package_id}", self.table.c.package_id == package_id)

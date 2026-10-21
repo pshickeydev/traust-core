@@ -7,7 +7,6 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from traust_core.v1.repositories.tables import SqlTablesUnitOfWork
 from traust_core.v1.repositories.traust_ledger.events import (
     EVENTS,
     EventRepository,
@@ -28,13 +27,6 @@ class LedgerUnitOfWork(UnitOfWork, Protocol):
     events: EventRepository
 
 
-class SqlLedgerUnitOfWork(SqlTablesUnitOfWork):
-    def _open_repositories(self) -> None:
-        conn, tables = self.connection, self.tables
-        self.layers = SqlLayerRepository(conn, tables)
-        self.events = SqlEventRepository(conn, tables)
-
-
 __all__ = [
     "TABLES",
     "EventRepository",
@@ -42,5 +34,4 @@ __all__ = [
     "LedgerUnitOfWork",
     "SqlEventRepository",
     "SqlLayerRepository",
-    "SqlLedgerUnitOfWork",
 ]

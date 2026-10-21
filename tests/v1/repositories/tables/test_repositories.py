@@ -11,40 +11,29 @@ from sqlalchemy.engine import Engine
 
 from tests.v1.conftest import SQL_BACKENDS, contract_db
 from traust_core.v1.errors import ConflictError, RepositoryError
-from traust_core.v1.models.records import (
-    AdvisoryPackageRecord,
-    AdvisoryRecord,
-    ArtifactRecord,
-    AssessmentRecord,
-    ComponentRecord,
-    CweRecord,
-    DecisionRecord,
-    DependencyRecord,
-    EventRecord,
-    FeedSnapshotRecord,
-    FindingCweRecord,
-    FindingRecord,
-    LayerRecord,
-    LocationRecord,
-    OccurrenceRecord,
-    OwnershipRecord,
-    PackageRecord,
-    ProductRecord,
-    ReleaseRecord,
-    RepositoryRecord,
-    RepositoryRefRecord,
-    ReviewItemRecord,
-    RunOrderRecord,
-    SbomRecord,
-    SpendEventRecord,
-    TeamRecord,
+from traust_core.v1.models.assessment import Artifact, Assessment
+from traust_core.v1.models.dependencies import Advisory, AdvisoryPackage, Dependency, Package, Sbom
+from traust_core.v1.models.findings import (
+    Cwe,
+    Decision,
+    Finding,
+    FindingCwe,
+    Location,
+    Occurrence,
+    ReviewItem,
 )
-from traust_core.v1.repositories.traust.assessments import SqlAssessmentsUnitOfWork
-from traust_core.v1.repositories.traust.dependencies import SqlDependenciesUnitOfWork
-from traust_core.v1.repositories.traust.findings import SqlFindingsUnitOfWork
-from traust_core.v1.repositories.traust.inventory import SqlInventoryUnitOfWork
-from traust_core.v1.repositories.traust_ledger import SqlLedgerUnitOfWork
-from traust_core.v1.repositories.traust_ops import SqlOpsUnitOfWork
+from traust_core.v1.models.inventory import (
+    Component,
+    Ownership,
+    Product,
+    Release,
+    Repository,
+    RepositoryRef,
+    Team,
+)
+from traust_core.v1.models.ledger import Event, Layer
+from traust_core.v1.models.operations import FeedSnapshot, RunOrder, SpendEvent
+from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 
 T0 = datetime(2026, 10, 5, tzinfo=UTC)
 SHA = "a" * 40
@@ -58,27 +47,27 @@ def engine(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[Engine]:
 
 @dataclass
 class Scanned:
-    repository: RepositoryRecord
-    ref: RepositoryRefRecord
-    assessment: AssessmentRecord
-    finding: FindingRecord
+    repository: Repository
+    ref: RepositoryRef
+    assessment: Assessment
+    finding: Finding
 
 
 @pytest.fixture
 def scanned(engine: Engine) -> Scanned:
-    with SqlInventoryUnitOfWork(engine) as inv:
-        repo = inv.repositories.add(RepositoryRecord(url="https://github.com/o/r", public=True))
+    with SqlTraustUnitOfWork(engine) as inv:
+        repo = inv.repositories.add(Repository(url="https://github.com/o/r", public=True))
         assert repo.id is not None
         ref = inv.repository_refs.add(
-            RepositoryRefRecord(
+            RepositoryRef(
                 repository_id=repo.id, name="main", kind="branch", is_default=True, sha=SHA
             )
         )
         inv.commit()
     assert ref.id is not None
-    with SqlAssessmentsUnitOfWork(engine) as a:
+    with SqlTraustUnitOfWork(engine) as a:
         assessment = a.assessments.add(
-            AssessmentRecord(
+            Assessment(
                 repository_ref_id=ref.id,
                 kind="audit",
                 status="completed",
@@ -88,11 +77,9 @@ def scanned(engine: Engine) -> Scanned:
             )
         )
         a.commit()
-    with SqlFindingsUnitOfWork(engine) as f:
+    with SqlTraustUnitOfWork(engine) as f:
         finding = f.findings.add(
-            FindingRecord(
-                repository_id=repo.id, fingerprint_algo="v3", fingerprint="fp1", title="SQLi"
-            )
+            Finding(repository_id=repo.id, fingerprint_algo="v3", fingerprint="fp1", title="SQLi")
         )
         f.commit()
     return Scanned(repo, ref, assessment, finding)
@@ -101,19 +88,15 @@ def scanned(engine: Engine) -> Scanned:
 def test_inventory_round_trip_and_natural_keys(engine: Engine, scanned: Scanned) -> None:
     repo, ref = scanned.repository, scanned.ref
     assert repo.id is not None and ref.id is not None
-    with SqlInventoryUnitOfWork(engine) as inv:
-        product = inv.products.add(ProductRecord(slug="ocp", name="OpenShift"))
+    with SqlTraustUnitOfWork(engine) as inv:
+        product = inv.products.add(Product(slug="ocp", name="OpenShift"))
         assert product.id is not None
-        release = inv.releases.add(ReleaseRecord(product_id=product.id, version="4.22"))
+        release = inv.releases.add(Release(product_id=product.id, version="4.22"))
         assert release.id is not None
-        component = inv.components.add(
-            ComponentRecord(release_id=release.id, repository_ref_id=ref.id)
-        )
-        team = inv.teams.add(TeamRecord(name="core"))
+        component = inv.components.add(Component(release_id=release.id, repository_ref_id=ref.id))
+        team = inv.teams.add(Team(name="core"))
         assert team.id is not None
-        owned = inv.ownerships.add(
-            OwnershipRecord(repository_id=repo.id, team_id=team.id, valid_from=T0)
-        )
+        owned = inv.ownerships.add(Ownership(repository_id=repo.id, team_id=team.id, valid_from=T0))
         inv.commit()
 
         assert inv.products.find_by_slug("ocp") == product
@@ -133,15 +116,13 @@ def test_closing_ownership_is_an_update_the_database_touches(
 ) -> None:
     repo = scanned.repository
     assert repo.id is not None
-    with SqlInventoryUnitOfWork(engine) as inv:
-        team = inv.teams.add(TeamRecord(name="core"))
+    with SqlTraustUnitOfWork(engine) as inv:
+        team = inv.teams.add(Team(name="core"))
         assert team.id is not None
-        owned = inv.ownerships.add(
-            OwnershipRecord(repository_id=repo.id, team_id=team.id, valid_from=T0)
-        )
+        owned = inv.ownerships.add(Ownership(repository_id=repo.id, team_id=team.id, valid_from=T0))
         inv.commit()
     sleep(0.01)
-    with SqlInventoryUnitOfWork(engine) as inv:
+    with SqlTraustUnitOfWork(engine) as inv:
         closed = inv.ownerships.update(owned.model_copy(update={"valid_to": T0 + timedelta(1)}))
         inv.commit()
         assert inv.ownerships.current(repo.id) == []
@@ -150,25 +131,25 @@ def test_closing_ownership_is_an_update_the_database_touches(
 
 
 def test_duplicate_natural_key_is_a_conflict(engine: Engine, scanned: Scanned) -> None:
-    with SqlInventoryUnitOfWork(engine) as inv, pytest.raises(ConflictError):
-        inv.repositories.add(RepositoryRecord(url=scanned.repository.url, public=False))
+    with SqlTraustUnitOfWork(engine) as inv, pytest.raises(ConflictError):
+        inv.repositories.add(Repository(url=scanned.repository.url, public=False))
 
 
 def test_dependencies_trace_a_package_to_the_refs_that_ship_it(
     engine: Engine, scanned: Scanned
 ) -> None:
-    with SqlDependenciesUnitOfWork(engine) as d:
-        sbom = d.sboms.add(SbomRecord(digest="sha256:sbom"))
-        package = d.packages.add(PackageRecord(ecosystem="go", name="golang.org/x/crypto"))
+    with SqlTraustUnitOfWork(engine) as d:
+        sbom = d.sboms.add(Sbom(digest="sha256:sbom"))
+        package = d.packages.add(Package(ecosystem="go", name="golang.org/x/crypto"))
         assert sbom.id is not None and package.id is not None
         dep = d.dependencies.add(
-            DependencyRecord(sbom_id=sbom.id, package_id=package.id, version="0.1.0", direct=True)
+            Dependency(sbom_id=sbom.id, package_id=package.id, version="0.1.0", direct=True)
         )
-        advisory = d.advisories.add(AdvisoryRecord(identifier="CVE-2026-0001"))
+        advisory = d.advisories.add(Advisory(identifier="CVE-2026-0001"))
         assert advisory.id is not None
-        alias = d.advisories.add(AdvisoryRecord(identifier="GHSA-x", alias_of_id=advisory.id))
+        alias = d.advisories.add(Advisory(identifier="GHSA-x", alias_of_id=advisory.id))
         hit = d.advisory_packages.add(
-            AdvisoryPackageRecord(advisory_id=advisory.id, package_id=package.id)
+            AdvisoryPackage(advisory_id=advisory.id, package_id=package.id)
         )
         d.commit()
 
@@ -184,9 +165,9 @@ def test_findings_chain_and_decisions_are_idempotent_by_statement(
 ) -> None:
     finding, assessment = scanned.finding, scanned.assessment
     assert finding.id is not None and assessment.id is not None
-    with SqlAssessmentsUnitOfWork(engine) as a:
+    with SqlTraustUnitOfWork(engine) as a:
         occurrence = a.occurrences.add(
-            OccurrenceRecord(
+            Occurrence(
                 finding_id=finding.id,
                 assessment_id=assessment.id,
                 severity="high",
@@ -195,10 +176,10 @@ def test_findings_chain_and_decisions_are_idempotent_by_statement(
         )
         assert occurrence.id is not None
         location = a.locations.add(
-            LocationRecord(occurrence_id=occurrence.id, path="a.go", line_start=3, line_end=4)
+            Location(occurrence_id=occurrence.id, path="a.go", line_start=3, line_end=4)
         )
         artifact = a.artifacts.add(
-            ArtifactRecord(assessment_id=assessment.id, digest="sha256:r", kind="report", uri="f")
+            Artifact(assessment_id=assessment.id, digest="sha256:r", kind="report", uri="f")
         )
         a.commit()
         assert a.occurrences.list_for_assessment(assessment.id) == [occurrence]
@@ -207,12 +188,12 @@ def test_findings_chain_and_decisions_are_idempotent_by_statement(
         assert a.artifacts.find(assessment.id, "sha256:r") == artifact
         assert a.assessments.latest(scanned.ref.id, "audit") == assessment  # type: ignore[arg-type]
 
-    with SqlFindingsUnitOfWork(engine) as f:
-        cwe = f.cwes.add(CweRecord(identifier="CWE-89", abstraction="base"))
+    with SqlTraustUnitOfWork(engine) as f:
+        cwe = f.cwes.add(Cwe(identifier="CWE-89", abstraction="base"))
         assert cwe.id is not None
-        f.finding_cwes.add(FindingCweRecord(finding_id=finding.id, cwe_id=cwe.id))
+        f.finding_cwes.add(FindingCwe(finding_id=finding.id, cwe_id=cwe.id))
         decision = f.decisions.add(
-            DecisionRecord(
+            Decision(
                 finding_id=finding.id,
                 assessment_id=assessment.id,
                 statement_key="k1",
@@ -221,7 +202,7 @@ def test_findings_chain_and_decisions_are_idempotent_by_statement(
             )
         )
         review = f.review_items.add(
-            ReviewItemRecord(finding_id=finding.id, decision_id=decision.id, status="pending")
+            ReviewItem(finding_id=finding.id, decision_id=decision.id, status="pending")
         )
         f.commit()
         assert f.findings.find_by_fingerprint(finding.repository_id, "v3", "fp1") == finding
@@ -234,7 +215,7 @@ def test_findings_chain_and_decisions_are_idempotent_by_statement(
 
 
 def test_append_only_rows_reject_mutation_in_the_database(engine: Engine, scanned: Scanned) -> None:
-    with SqlAssessmentsUnitOfWork(engine) as a:
+    with SqlTraustUnitOfWork(engine) as a:
         table = a.assessments.table
         with pytest.raises((RepositoryError, ConflictError)):
             a.assessments._execute("raw update", sa.update(table).values(status="failed"))
@@ -243,8 +224,8 @@ def test_append_only_rows_reject_mutation_in_the_database(engine: Engine, scanne
 def test_run_orders_claim_in_priority_order_and_leases_expire(
     engine: Engine, scanned: Scanned
 ) -> None:
-    def order(priority: int) -> RunOrderRecord:
-        return RunOrderRecord(
+    def order(priority: int) -> RunOrder:
+        return RunOrder(
             repository_id=scanned.repository.id,
             lane="audit",
             state="queued",
@@ -252,7 +233,7 @@ def test_run_orders_claim_in_priority_order_and_leases_expire(
             requested_by="user:me",
         )
 
-    with SqlOpsUnitOfWork(engine) as ops:
+    with SqlTraustUnitOfWork(engine) as ops:
         later = ops.run_orders.add(order(5))
         sooner = ops.run_orders.add(order(1))
         ops.commit()
@@ -270,13 +251,13 @@ def test_run_orders_claim_in_priority_order_and_leases_expire(
 
 
 def test_ops_spend_and_feed_snapshots(engine: Engine, scanned: Scanned) -> None:
-    with SqlAssessmentsUnitOfWork(engine) as a:
-        artifact = a.artifacts.add(ArtifactRecord(digest="sha256:osv", kind="feed", uri="f"))
+    with SqlTraustUnitOfWork(engine) as a:
+        artifact = a.artifacts.add(Artifact(digest="sha256:osv", kind="feed", uri="f"))
         a.commit()
     assert artifact.id is not None
-    with SqlOpsUnitOfWork(engine) as ops:
+    with SqlTraustUnitOfWork(engine) as ops:
         spend = ops.spend_events.add(
-            SpendEventRecord(
+            SpendEvent(
                 provider="anthropic",
                 model="m",
                 tokens_in=10,
@@ -286,10 +267,10 @@ def test_ops_spend_and_feed_snapshots(engine: Engine, scanned: Scanned) -> None:
             )
         )
         old = ops.feed_snapshots.add(
-            FeedSnapshotRecord(artifact_id=artifact.id, feed="osv", retrieved_at=T0)
+            FeedSnapshot(artifact_id=artifact.id, feed="osv", retrieved_at=T0)
         )
         new = ops.feed_snapshots.add(
-            FeedSnapshotRecord(artifact_id=artifact.id, feed="osv", retrieved_at=T0 + timedelta(1))
+            FeedSnapshot(artifact_id=artifact.id, feed="osv", retrieved_at=T0 + timedelta(1))
         )
         ops.commit()
         assert ops.spend_events.list_between(T0, T0 + timedelta(1)) == [spend]
@@ -299,24 +280,52 @@ def test_ops_spend_and_feed_snapshots(engine: Engine, scanned: Scanned) -> None:
 def test_ledger_events_prove_one_decision_each(engine: Engine, scanned: Scanned) -> None:
     finding = scanned.finding
     assert finding.id is not None and scanned.repository.id is not None
-    with SqlFindingsUnitOfWork(engine) as f:
+    with SqlTraustUnitOfWork(engine) as f:
         decision = f.decisions.add(
-            DecisionRecord(
-                finding_id=finding.id, actor="user:me", statement_key="k", occurred_at=T0
-            )
+            Decision(finding_id=finding.id, actor="user:me", statement_key="k", occurred_at=T0)
         )
         f.commit()
     assert decision.id is not None
-    with SqlLedgerUnitOfWork(engine) as led:
+    with SqlTraustUnitOfWork(engine) as led:
         layer = led.layers.add(
-            LayerRecord(repository_id=scanned.repository.id, merkle_signing_method="none")
+            Layer(repository_id=scanned.repository.id, merkle_signing_method="none")
         )
         assert layer.id is not None
         assert led.events.last_seq(layer.id) is None
         event = led.events.add(
-            EventRecord(layer_id=layer.id, decision_id=decision.id, seq=0, event_payload=b"\x00")
+            Event(layer_id=layer.id, decision_id=decision.id, seq=0, event_payload=b"\x00")
         )
         led.commit()
         assert led.events.find_by_decision(decision.id) == event
         assert led.events.last_seq(layer.id) == 0
         assert led.layers.list_for_repository(scanned.repository.id) == [layer]
+
+
+def test_one_unit_of_work_spans_sections_in_one_transaction(engine: Engine) -> None:
+    with SqlTraustUnitOfWork(engine) as uow:
+        repo = uow.repositories.add(Repository(url="https://github.com/o/tx", public=True))
+        assert repo.id is not None
+        ref = uow.repository_refs.add(RepositoryRef(repository_id=repo.id, sha=SHA))
+        assert ref.id is not None
+        assessment = uow.assessments.add(
+            Assessment(
+                repository_ref_id=ref.id,
+                kind="audit",
+                status="completed",
+                assessor="skill:audit",
+                assessor_version="1.0",
+                occurred_at=T0,
+            )
+        )
+        finding = uow.findings.add(
+            Finding(repository_id=repo.id, fingerprint_algo="v3", fingerprint="t", title="t")
+        )
+        assert assessment.id is not None and finding.id is not None
+        uow.occurrences.add(
+            Occurrence(finding_id=finding.id, assessment_id=assessment.id, severity="low")
+        )
+        uow.rollback()  # e.g. a later decision failed: nothing from any section lands
+
+    with SqlTraustUnitOfWork(engine) as uow:
+        assert uow.repositories.find_by_url("https://github.com/o/tx") is None
+        assert uow.findings.list_for_repository(repo.id) == []

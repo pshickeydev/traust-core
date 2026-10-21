@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Protocol
 from uuid import UUID
 
-from traust_core.v1.models.records import FindingRecord
+from traust_core.v1.models.findings import Finding
 from traust_core.v1.repositories.tables import (
     TRAUST,
     MutableRecordRepository,
@@ -28,22 +28,22 @@ FINDING = TableSpec(
 )
 
 
-class FindingRepository(MutableRecordRepository[FindingRecord], Protocol):
+class FindingRepository(MutableRecordRepository[Finding], Protocol):
     def find_by_fingerprint(
         self, repository_id: UUID, fingerprint_algo: str, fingerprint: str
-    ) -> FindingRecord | None: ...
+    ) -> Finding | None: ...
 
-    def list_for_repository(self, repository_id: UUID) -> list[FindingRecord]: ...
-    def list_for_advisory(self, advisory_id: UUID) -> list[FindingRecord]: ...
+    def list_for_repository(self, repository_id: UUID) -> list[Finding]: ...
+    def list_for_advisory(self, advisory_id: UUID) -> list[Finding]: ...
 
 
-class SqlFindingRepository(SqlMutableRepository[FindingRecord]):
+class SqlFindingRepository(SqlMutableRepository[Finding]):
     spec = FINDING
-    record = FindingRecord
+    record = Finding
 
     def find_by_fingerprint(
         self, repository_id: UUID, fingerprint_algo: str, fingerprint: str
-    ) -> FindingRecord | None:
+    ) -> Finding | None:
         c = self.table.c
         return self._one(
             f"find {fingerprint_algo}:{fingerprint}",
@@ -52,10 +52,10 @@ class SqlFindingRepository(SqlMutableRepository[FindingRecord]):
             c.fingerprint == fingerprint,
         )
 
-    def list_for_repository(self, repository_id: UUID) -> list[FindingRecord]:
+    def list_for_repository(self, repository_id: UUID) -> list[Finding]:
         return self._many(f"list for {repository_id}", self.table.c.repository_id == repository_id)
 
-    def list_for_advisory(self, advisory_id: UUID) -> list[FindingRecord]:
+    def list_for_advisory(self, advisory_id: UUID) -> list[Finding]:
         return self._many(
             f"list for advisory {advisory_id}", self.table.c.advisory_id == advisory_id
         )

@@ -124,15 +124,6 @@ def resolve(schema_name: str, node: Mapping[str, Any]) -> list[tuple[str, Mappin
 
 
 @cache
-def _profiles() -> dict[str, dict[str, Any]]:
-    return _read_json(_root() / "storage/v1/profiles.json")["artifacts"]
-
-
-def storage_profile(name: str) -> dict[str, Any]:
-    return _profiles().get(name, {})
-
-
-@cache
 def _registry() -> Registry:
     resources_ = []
     for path in _schema_dir().glob("*.schema.json"):

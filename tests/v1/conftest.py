@@ -49,19 +49,6 @@ def database(
 
 
 @contextmanager
-def storage_db(kind: str, tmp_path: Path) -> Generator[Engine]:
-    eng = _engine(kind, tmp_path)
-    apply_contract_ddl(eng, "storage")  # type: ignore[arg-type]  # parked: storage-retire
-    try:
-        yield eng
-    finally:
-        if kind == "postgres":
-            with eng.begin() as conn:
-                conn.exec_driver_sql("DROP SCHEMA traust_storage CASCADE")
-        eng.dispose()
-
-
-@contextmanager
 def contract_db(kind: str, tmp_path: Path) -> Generator[Engine]:
     """A fresh database bootstrapped from the whole contracts db (every namespace)."""
     eng = _engine(kind, tmp_path)

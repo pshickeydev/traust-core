@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Protocol
 from uuid import UUID
 
-from traust_core.v1.models.records import AssessmentInputRecord
+from traust_core.v1.models.operations import AssessmentInput
 from traust_core.v1.repositories.tables import (
     TRAUST_OPS,
     RecordRepository,
@@ -20,19 +20,19 @@ ASSESSMENT_INPUT = TableSpec(
 )
 
 
-class AssessmentInputRepository(RecordRepository[AssessmentInputRecord], Protocol):
-    def list_for_assessment(self, assessment_id: UUID) -> list[AssessmentInputRecord]: ...
-    def list_for_snapshot(self, feed_snapshot_id: UUID) -> list[AssessmentInputRecord]: ...
+class AssessmentInputRepository(RecordRepository[AssessmentInput], Protocol):
+    def list_for_assessment(self, assessment_id: UUID) -> list[AssessmentInput]: ...
+    def list_for_snapshot(self, feed_snapshot_id: UUID) -> list[AssessmentInput]: ...
 
 
-class SqlAssessmentInputRepository(SqlAppendOnlyRepository[AssessmentInputRecord]):
+class SqlAssessmentInputRepository(SqlAppendOnlyRepository[AssessmentInput]):
     spec = ASSESSMENT_INPUT
-    record = AssessmentInputRecord
+    record = AssessmentInput
 
-    def list_for_assessment(self, assessment_id: UUID) -> list[AssessmentInputRecord]:
+    def list_for_assessment(self, assessment_id: UUID) -> list[AssessmentInput]:
         return self._many(f"list for {assessment_id}", self.table.c.assessment_id == assessment_id)
 
-    def list_for_snapshot(self, feed_snapshot_id: UUID) -> list[AssessmentInputRecord]:
+    def list_for_snapshot(self, feed_snapshot_id: UUID) -> list[AssessmentInput]:
         return self._many(
             f"list for snapshot {feed_snapshot_id}",
             self.table.c.feed_snapshot_id == feed_snapshot_id,

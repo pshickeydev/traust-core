@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Protocol
 from uuid import UUID
 
-from traust_core.v1.models.records import AdvisoryPackageRecord
+from traust_core.v1.models.dependencies import AdvisoryPackage
 from traust_core.v1.repositories.tables import (
     TRAUST,
     MutableRecordRepository,
@@ -17,17 +17,17 @@ ADVISORY_PACKAGE = TableSpec(
 )
 
 
-class AdvisoryPackageRepository(MutableRecordRepository[AdvisoryPackageRecord], Protocol):
-    def find(self, advisory_id: UUID, package_id: UUID) -> AdvisoryPackageRecord | None: ...
-    def list_for_advisory(self, advisory_id: UUID) -> list[AdvisoryPackageRecord]: ...
-    def list_for_package(self, package_id: UUID) -> list[AdvisoryPackageRecord]: ...
+class AdvisoryPackageRepository(MutableRecordRepository[AdvisoryPackage], Protocol):
+    def find(self, advisory_id: UUID, package_id: UUID) -> AdvisoryPackage | None: ...
+    def list_for_advisory(self, advisory_id: UUID) -> list[AdvisoryPackage]: ...
+    def list_for_package(self, package_id: UUID) -> list[AdvisoryPackage]: ...
 
 
-class SqlAdvisoryPackageRepository(SqlMutableRepository[AdvisoryPackageRecord]):
+class SqlAdvisoryPackageRepository(SqlMutableRepository[AdvisoryPackage]):
     spec = ADVISORY_PACKAGE
-    record = AdvisoryPackageRecord
+    record = AdvisoryPackage
 
-    def find(self, advisory_id: UUID, package_id: UUID) -> AdvisoryPackageRecord | None:
+    def find(self, advisory_id: UUID, package_id: UUID) -> AdvisoryPackage | None:
         c = self.table.c
         return self._one(
             f"find {advisory_id}/{package_id}",
@@ -35,8 +35,8 @@ class SqlAdvisoryPackageRepository(SqlMutableRepository[AdvisoryPackageRecord]):
             c.package_id == package_id,
         )
 
-    def list_for_advisory(self, advisory_id: UUID) -> list[AdvisoryPackageRecord]:
+    def list_for_advisory(self, advisory_id: UUID) -> list[AdvisoryPackage]:
         return self._many(f"list for {advisory_id}", self.table.c.advisory_id == advisory_id)
 
-    def list_for_package(self, package_id: UUID) -> list[AdvisoryPackageRecord]:
+    def list_for_package(self, package_id: UUID) -> list[AdvisoryPackage]:
         return self._many(f"list for package {package_id}", self.table.c.package_id == package_id)

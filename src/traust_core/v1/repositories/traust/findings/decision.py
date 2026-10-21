@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Protocol
 from uuid import UUID
 
-from traust_core.v1.models.records import DecisionRecord
+from traust_core.v1.models.findings import Decision
 from traust_core.v1.repositories.tables import (
     TRAUST,
     RecordRepository,
@@ -39,32 +39,32 @@ DECISION = TableSpec(
 )
 
 
-class DecisionRepository(RecordRepository[DecisionRecord], Protocol):
-    def find_by_statement(self, finding_id: UUID, statement_key: str) -> DecisionRecord | None:
+class DecisionRepository(RecordRepository[Decision], Protocol):
+    def find_by_statement(self, finding_id: UUID, statement_key: str) -> Decision | None:
         """The idempotency key: a retried or re-spelled statement is the same decision."""
         ...
 
-    def list_for_finding(self, finding_id: UUID) -> list[DecisionRecord]: ...
-    def list_since(self, since: datetime, limit: int) -> list[DecisionRecord]: ...
+    def list_for_finding(self, finding_id: UUID) -> list[Decision]: ...
+    def list_since(self, since: datetime, limit: int) -> list[Decision]: ...
 
 
-class SqlDecisionRepository(SqlAppendOnlyRepository[DecisionRecord]):
+class SqlDecisionRepository(SqlAppendOnlyRepository[Decision]):
     spec = DECISION
-    record = DecisionRecord
+    record = Decision
 
-    def find_by_statement(self, finding_id: UUID, statement_key: str) -> DecisionRecord | None:
+    def find_by_statement(self, finding_id: UUID, statement_key: str) -> Decision | None:
         c = self.table.c
         return self._one(
             f"find {statement_key}", c.finding_id == finding_id, c.statement_key == statement_key
         )
 
-    def list_for_finding(self, finding_id: UUID) -> list[DecisionRecord]:
+    def list_for_finding(self, finding_id: UUID) -> list[Decision]:
         c = self.table.c
         return self._many(
             f"list for {finding_id}", c.finding_id == finding_id, order_by=(c.occurred_at,)
         )
 
-    def list_since(self, since: datetime, limit: int) -> list[DecisionRecord]:
+    def list_since(self, since: datetime, limit: int) -> list[Decision]:
         c = self.table.c
         stmt = (
             self._select()

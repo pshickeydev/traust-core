@@ -22,11 +22,11 @@ from traust_core.v1.models.detection_quality import (
     Scorecard,
 )
 from traust_core.v1.models.vocabulary import ComplianceFramework
-from traust_core.v1.repositories.detection_quality import DetectionQualityUnitOfWork
+from traust_core.v1.repositories.traust.assessments import AssessmentsUnitOfWork
 
 
 class DetectionQualityService:
-    def __init__(self, uow: DetectionQualityUnitOfWork) -> None:
+    def __init__(self, uow: AssessmentsUnitOfWork) -> None:
         self._uow = uow
 
     def record(self, doc: BenchmarkTargetArtifact, provenance: Provenance) -> BenchmarkTarget:

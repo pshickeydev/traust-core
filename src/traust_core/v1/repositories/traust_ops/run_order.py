@@ -6,7 +6,7 @@ from uuid import UUID
 
 import sqlalchemy as sa
 
-from traust_core.v1.models.records import RunOrderRecord
+from traust_core.v1.models.operations import RunOrder
 from traust_core.v1.repositories.tables import (
     TRAUST_OPS,
     MutableRecordRepository,
@@ -43,21 +43,21 @@ QUEUED = "queued"
 LEASED = "leased"
 
 
-class RunOrderRepository(MutableRecordRepository[RunOrderRecord], Protocol):
-    def claim(self, worker: str, now: datetime, lease_for: timedelta) -> RunOrderRecord | None:
+class RunOrderRepository(MutableRecordRepository[RunOrder], Protocol):
+    def claim(self, worker: str, now: datetime, lease_for: timedelta) -> RunOrder | None:
         """Lease the next queued order (priority, then age); None when the queue is empty."""
         ...
 
     def release_expired(self, now: datetime) -> int: ...
-    def list_for_batch(self, run_batch_id: UUID) -> list[RunOrderRecord]: ...
-    def list_for_repository(self, repository_id: UUID, state: str) -> list[RunOrderRecord]: ...
+    def list_for_batch(self, run_batch_id: UUID) -> list[RunOrder]: ...
+    def list_for_repository(self, repository_id: UUID, state: str) -> list[RunOrder]: ...
 
 
-class SqlRunOrderRepository(SqlMutableRepository[RunOrderRecord]):
+class SqlRunOrderRepository(SqlMutableRepository[RunOrder]):
     spec = RUN_ORDER
-    record = RunOrderRecord
+    record = RunOrder
 
-    def claim(self, worker: str, now: datetime, lease_for: timedelta) -> RunOrderRecord | None:
+    def claim(self, worker: str, now: datetime, lease_for: timedelta) -> RunOrder | None:
         c = self.table.c
         # SKIP LOCKED on Postgres; SQLite serialises writers and drops FOR UPDATE.
         next_id = (
@@ -87,12 +87,12 @@ class SqlRunOrderRepository(SqlMutableRepository[RunOrderRecord]):
         )
         return self._execute(f"release expired at {now}", stmt).rowcount
 
-    def list_for_batch(self, run_batch_id: UUID) -> list[RunOrderRecord]:
+    def list_for_batch(self, run_batch_id: UUID) -> list[RunOrder]:
         return self._many(
             f"list for batch {run_batch_id}", self.table.c.run_batch_id == run_batch_id
         )
 
-    def list_for_repository(self, repository_id: UUID, state: str) -> list[RunOrderRecord]:
+    def list_for_repository(self, repository_id: UUID, state: str) -> list[RunOrder]:
         c = self.table.c
         return self._many(
             f"list {state} for {repository_id}",

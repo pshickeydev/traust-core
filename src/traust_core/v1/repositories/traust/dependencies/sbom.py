@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from traust_core.v1.models.records import SbomRecord
+from traust_core.v1.models.dependencies import Sbom
 from traust_core.v1.repositories.tables import (
     TRAUST,
     RecordRepository,
@@ -20,13 +20,13 @@ SBOM = TableSpec(
 )
 
 
-class SbomRepository(RecordRepository[SbomRecord], Protocol):
-    def find_by_digest(self, digest: str) -> SbomRecord | None: ...
+class SbomRepository(RecordRepository[Sbom], Protocol):
+    def find_by_digest(self, digest: str) -> Sbom | None: ...
 
 
-class SqlSbomRepository(SqlAppendOnlyRepository[SbomRecord]):
+class SqlSbomRepository(SqlAppendOnlyRepository[Sbom]):
     spec = SBOM
-    record = SbomRecord
+    record = Sbom
 
-    def find_by_digest(self, digest: str) -> SbomRecord | None:
+    def find_by_digest(self, digest: str) -> Sbom | None:
         return self._one(f"find {digest}", self.table.c.digest == digest)

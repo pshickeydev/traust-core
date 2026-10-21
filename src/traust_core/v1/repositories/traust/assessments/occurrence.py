@@ -5,7 +5,7 @@ from uuid import UUID
 
 import sqlalchemy as sa
 
-from traust_core.v1.models.records import OccurrenceRecord
+from traust_core.v1.models.findings import Occurrence
 from traust_core.v1.repositories.tables import (
     TRAUST,
     RecordRepository,
@@ -30,17 +30,17 @@ OCCURRENCE = TableSpec(
 )
 
 
-class OccurrenceRepository(RecordRepository[OccurrenceRecord], Protocol):
-    def find(self, finding_id: UUID, assessment_id: UUID) -> OccurrenceRecord | None: ...
-    def list_for_assessment(self, assessment_id: UUID) -> list[OccurrenceRecord]: ...
-    def list_for_finding(self, finding_id: UUID) -> list[OccurrenceRecord]: ...
+class OccurrenceRepository(RecordRepository[Occurrence], Protocol):
+    def find(self, finding_id: UUID, assessment_id: UUID) -> Occurrence | None: ...
+    def list_for_assessment(self, assessment_id: UUID) -> list[Occurrence]: ...
+    def list_for_finding(self, finding_id: UUID) -> list[Occurrence]: ...
 
 
-class SqlOccurrenceRepository(SqlAppendOnlyRepository[OccurrenceRecord]):
+class SqlOccurrenceRepository(SqlAppendOnlyRepository[Occurrence]):
     spec = OCCURRENCE
-    record = OccurrenceRecord
+    record = Occurrence
 
-    def find(self, finding_id: UUID, assessment_id: UUID) -> OccurrenceRecord | None:
+    def find(self, finding_id: UUID, assessment_id: UUID) -> Occurrence | None:
         c = self.table.c
         return self._one(
             f"find {finding_id}/{assessment_id}",
@@ -48,8 +48,8 @@ class SqlOccurrenceRepository(SqlAppendOnlyRepository[OccurrenceRecord]):
             c.assessment_id == assessment_id,
         )
 
-    def list_for_assessment(self, assessment_id: UUID) -> list[OccurrenceRecord]:
+    def list_for_assessment(self, assessment_id: UUID) -> list[Occurrence]:
         return self._many(f"list for {assessment_id}", self.table.c.assessment_id == assessment_id)
 
-    def list_for_finding(self, finding_id: UUID) -> list[OccurrenceRecord]:
+    def list_for_finding(self, finding_id: UUID) -> list[Occurrence]:
         return self._many(f"list for finding {finding_id}", self.table.c.finding_id == finding_id)

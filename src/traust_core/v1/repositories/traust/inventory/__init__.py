@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from traust_core.v1.repositories.tables import SqlTablesUnitOfWork
 from traust_core.v1.repositories.traust.inventory.component import (
     COMPONENT,
     ComponentRepository,
@@ -55,18 +54,6 @@ class InventoryUnitOfWork(UnitOfWork, Protocol):
     ownerships: OwnershipRepository
 
 
-class SqlInventoryUnitOfWork(SqlTablesUnitOfWork):
-    def _open_repositories(self) -> None:
-        conn, tables = self.connection, self.tables
-        self.products = SqlProductRepository(conn, tables)
-        self.releases = SqlReleaseRepository(conn, tables)
-        self.components = SqlComponentRepository(conn, tables)
-        self.repositories = SqlRepositoryRepository(conn, tables)
-        self.repository_refs = SqlRepositoryRefRepository(conn, tables)
-        self.teams = SqlTeamRepository(conn, tables)
-        self.ownerships = SqlOwnershipRepository(conn, tables)
-
-
 __all__ = [
     "TABLES",
     "ComponentRepository",
@@ -77,7 +64,6 @@ __all__ = [
     "RepositoryRefRepository",
     "RepositoryRepository",
     "SqlComponentRepository",
-    "SqlInventoryUnitOfWork",
     "SqlOwnershipRepository",
     "SqlProductRepository",
     "SqlReleaseRepository",

@@ -1,17 +1,14 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from datetime import datetime, timedelta
 from uuid import UUID
 
 from traust_core.v1.models.common import Page, PageRequest
-from traust_core.v1.models.portfolio import (
-    CodeLine,
+from traust_core.v1.models.inventory import (
     Component,
     ComponentFilter,
-    ComponentSpec,
-    Designation,
+    ExposureClass,
     ForgeHost,
-    ImageRef,
     Liveness,
     OrgName,
     Ownership,
@@ -20,54 +17,58 @@ from traust_core.v1.models.portfolio import (
     ProductSlug,
     RefName,
     Release,
+    ReleaseChange,
     Repository,
     RepositoryFilter,
+    RepositoryRef,
     RepoState,
-    Revision,
-    Segment,
+    RiskTier,
     SyncReport,
     VersionLabel,
 )
 from traust_core.v1.models.values import GitSha, HttpsRepoUrl
 from traust_core.v1.models.vocabulary import RefKind
 from traust_core.v1.providers.sources import SourceProvider
-from traust_core.v1.repositories.portfolio import PortfolioUnitOfWork
+from traust_core.v1.repositories.traust.inventory import InventoryUnitOfWork
 from traust_core.v1.services.assessment import AssessmentService
 from traust_core.v1.services.findings.service import FindingService
 
 
 class PortfolioService:
-    def __init__(self, uow: PortfolioUnitOfWork) -> None:
+    def __init__(self, uow: InventoryUnitOfWork) -> None:
         self._uow = uow
 
-    def register_product(self, slug: ProductSlug, segment: Segment | None) -> Product:
+    def register_product(self, slug: ProductSlug, name: str) -> Product:
         raise NotImplementedError("stub: replaces registry/products.py, inventory.py")
 
-    def register_repository(self, url: HttpsRepoUrl) -> Repository:
+    def register_repository(self, url: HttpsRepoUrl, public: bool) -> Repository:
         raise NotImplementedError("stub: replaces corpus_intake.py, add-inputs")
 
-    def register_code_line(self, repository_id: UUID, ref: RefName, kind: RefKind) -> CodeLine:
+    def register_ref(
+        self, repository_id: UUID, sha: GitSha, name: RefName | None, kind: RefKind | None
+    ) -> RepositoryRef:
         raise NotImplementedError("stub: replaces product_repo (product, repo, ref) rows")
 
-    def register_revision(self, repository_id: UUID, sha: GitSha) -> Revision:
-        raise NotImplementedError("stub: replaces corpus/store_ingest repo@sha keys")
-
-    def add_component(self, product_id: UUID, code_line_id: UUID, spec: ComponentSpec) -> Component:
-        raise NotImplementedError("stub: replaces product_repo upserts")
-
-    def record_release(
-        self, component_id: UUID, version: VersionLabel, images: Sequence[ImageRef]
-    ) -> Release:
+    def record_release(self, product_id: UUID, version: VersionLabel) -> Release:
         raise NotImplementedError("stub: replaces product_repo_version, build_release_events")
 
-    def assign_ownership(self, component_id: UUID, ownership: Ownership) -> Component:
+    def add_component(self, release_id: UUID, repository_ref_id: UUID) -> Component:
+        raise NotImplementedError("stub: replaces product_repo upserts")
+
+    def release_changes(self, release_id: UUID, previous_id: UUID) -> ReleaseChange:
+        raise NotImplementedError("stub: replaces build_release_events.diff_container")
+
+    def assign_owner(self, repository_id: UUID, team: str, at: datetime) -> Ownership:
         raise NotImplementedError("stub: replaces repo_owner, subject_ownership")
 
-    def set_designation(self, repository_id: UUID, designation: Designation) -> Repository:
-        raise NotImplementedError("stub: replaces build_rescan_worklist.load_designations")
+    def exposure_class(self, repository_id: UUID, liveness: Liveness) -> ExposureClass:
+        raise NotImplementedError("stub: replaces build_rescan_worklist.exposure_class")
 
-    def record_liveness(self, repository_id: UUID, liveness: Liveness) -> Repository:
-        raise NotImplementedError("stub: replaces check_repo_liveness.py")
+    def is_dormant(self, liveness: Liveness, now: datetime, after: timedelta) -> bool:
+        raise NotImplementedError("stub: replaces check_repo_liveness.classify")
+
+    def risk_tier(self, repository_id: UUID, open_critical_high: int, now: datetime) -> RiskTier:
+        raise NotImplementedError("stub: replaces build_rescan_worklist.risk_tier")
 
     def get_repository(self, repository_id: UUID) -> Repository:
         raise NotImplementedError("stub: portfolio read")
@@ -93,7 +94,7 @@ class PortfolioSync:
         self._portfolio = portfolio
         self._sources = sources
 
-    def refresh(self, repository_id: UUID) -> Repository:
+    def liveness(self, repository_id: UUID) -> Liveness:
         raise NotImplementedError("stub: replaces check_repo_liveness.gh_repo_info")
 
     def import_org(self, org: OrgName, host: ForgeHost) -> SyncReport:

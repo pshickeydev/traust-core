@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from traust_core.v1.repositories.tables import SqlTablesUnitOfWork
 from traust_core.v1.repositories.traust.dependencies.advisory import (
     ADVISORY,
     AdvisoryRepository,
@@ -49,17 +48,6 @@ class DependenciesUnitOfWork(UnitOfWork, Protocol):
     advisory_packages: AdvisoryPackageRepository
 
 
-class SqlDependenciesUnitOfWork(SqlTablesUnitOfWork):
-    def _open_repositories(self) -> None:
-        conn, tables = self.connection, self.tables
-        self.packages = SqlPackageRepository(conn, tables)
-        self.sboms = SqlSbomRepository(conn, tables)
-        self.dependencies = SqlDependencyRepository(conn, tables)
-        self.images = SqlImageRepository(conn, tables)
-        self.advisories = SqlAdvisoryRepository(conn, tables)
-        self.advisory_packages = SqlAdvisoryPackageRepository(conn, tables)
-
-
 __all__ = [
     "TABLES",
     "AdvisoryPackageRepository",
@@ -71,7 +59,6 @@ __all__ = [
     "SbomRepository",
     "SqlAdvisoryPackageRepository",
     "SqlAdvisoryRepository",
-    "SqlDependenciesUnitOfWork",
     "SqlDependencyRepository",
     "SqlImageRepository",
     "SqlPackageRepository",

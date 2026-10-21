@@ -14,7 +14,7 @@ from traust_core.v1.models.findings import (
     FindingView,
 )
 from traust_core.v1.models.vocabulary import Severity
-from traust_core.v1.repositories.findings import FindingUnitOfWork
+from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.services.findings.decisions import FindingDecisions
 from traust_core.v1.services.findings.intake import FindingIntake
 from traust_core.v1.services.findings.precedents import FindingPrecedents
@@ -24,7 +24,7 @@ from traust_core.v1.services.findings.review import FindingReview
 class FindingService:
     def __init__(
         self,
-        uow: FindingUnitOfWork,
+        uow: TraustUnitOfWork,
         intake: FindingIntake,
         decisions: FindingDecisions,
         review: FindingReview,

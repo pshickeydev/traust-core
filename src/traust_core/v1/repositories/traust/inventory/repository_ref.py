@@ -5,7 +5,7 @@ from uuid import UUID
 
 import sqlalchemy as sa
 
-from traust_core.v1.models.records import RepositoryRefRecord
+from traust_core.v1.models.inventory import RepositoryRef
 from traust_core.v1.repositories.tables import (
     TRAUST,
     MutableRecordRepository,
@@ -29,31 +29,31 @@ REPOSITORY_REF = TableSpec(
 )
 
 
-class RepositoryRefRepository(MutableRecordRepository[RepositoryRefRecord], Protocol):
-    def find(self, repository_id: UUID, name: str | None, sha: str) -> RepositoryRefRecord | None:
+class RepositoryRefRepository(MutableRecordRepository[RepositoryRef], Protocol):
+    def find(self, repository_id: UUID, name: str | None, sha: str) -> RepositoryRef | None:
         """A named ref by (repository, name, sha); name None = the bare commit."""
         ...
 
-    def list_for(self, repository_id: UUID) -> list[RepositoryRefRecord]: ...
-    def default(self, repository_id: UUID) -> RepositoryRefRecord | None: ...
-    def list_for_manifest_sbom(self, sbom_id: UUID) -> list[RepositoryRefRecord]: ...
+    def list_for(self, repository_id: UUID) -> list[RepositoryRef]: ...
+    def default(self, repository_id: UUID) -> RepositoryRef | None: ...
+    def list_for_manifest_sbom(self, sbom_id: UUID) -> list[RepositoryRef]: ...
 
 
-class SqlRepositoryRefRepository(SqlMutableRepository[RepositoryRefRecord]):
+class SqlRepositoryRefRepository(SqlMutableRepository[RepositoryRef]):
     spec = REPOSITORY_REF
-    record = RepositoryRefRecord
+    record = RepositoryRef
 
-    def find(self, repository_id: UUID, name: str | None, sha: str) -> RepositoryRefRecord | None:
+    def find(self, repository_id: UUID, name: str | None, sha: str) -> RepositoryRef | None:
         c = self.table.c
         named = c.name.is_(None) if name is None else c.name == name
         return self._one(
             f"find {name or 'bare'}@{sha}", c.repository_id == repository_id, named, c.sha == sha
         )
 
-    def list_for(self, repository_id: UUID) -> list[RepositoryRefRecord]:
+    def list_for(self, repository_id: UUID) -> list[RepositoryRef]:
         return self._many(f"list for {repository_id}", self.table.c.repository_id == repository_id)
 
-    def default(self, repository_id: UUID) -> RepositoryRefRecord | None:
+    def default(self, repository_id: UUID) -> RepositoryRef | None:
         """The latest ref recorded as the default branch."""
         c = self.table.c
         stmt = (
@@ -65,5 +65,5 @@ class SqlRepositoryRefRepository(SqlMutableRepository[RepositoryRefRecord]):
         row = self._execute(f"default for {repository_id}", stmt).mappings().first()
         return None if row is None else self._to_record(row)
 
-    def list_for_manifest_sbom(self, sbom_id: UUID) -> list[RepositoryRefRecord]:
+    def list_for_manifest_sbom(self, sbom_id: UUID) -> list[RepositoryRef]:
         return self._many(f"list for sbom {sbom_id}", self.table.c.manifest_sbom_id == sbom_id)

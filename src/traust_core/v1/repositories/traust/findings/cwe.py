@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from traust_core.v1.models.records import CweRecord
+from traust_core.v1.models.findings import Cwe
 from traust_core.v1.repositories.tables import (
     TRAUST,
     MutableRecordRepository,
@@ -23,13 +23,13 @@ CWE = TableSpec(
 )
 
 
-class CweRepository(MutableRecordRepository[CweRecord], Protocol):
-    def find_by_identifier(self, identifier: str) -> CweRecord | None: ...
+class CweRepository(MutableRecordRepository[Cwe], Protocol):
+    def find_by_identifier(self, identifier: str) -> Cwe | None: ...
 
 
-class SqlCweRepository(SqlMutableRepository[CweRecord]):
+class SqlCweRepository(SqlMutableRepository[Cwe]):
     spec = CWE
-    record = CweRecord
+    record = Cwe
 
-    def find_by_identifier(self, identifier: str) -> CweRecord | None:
+    def find_by_identifier(self, identifier: str) -> Cwe | None:
         return self._one(f"find {identifier}", self.table.c.identifier == identifier)

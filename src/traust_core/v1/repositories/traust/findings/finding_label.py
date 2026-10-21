@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Protocol
 from uuid import UUID
 
-from traust_core.v1.models.records import FindingLabelRecord
+from traust_core.v1.models.findings import FindingLabel
 from traust_core.v1.repositories.tables import (
     TRAUST,
     MutableRecordRepository,
@@ -20,18 +20,18 @@ FINDING_LABEL = TableSpec(
 )
 
 
-class FindingLabelRepository(MutableRecordRepository[FindingLabelRecord], Protocol):
-    def list_for_finding(self, finding_id: UUID) -> list[FindingLabelRecord]: ...
-    def list_with(self, taxonomy: str, label: str) -> list[FindingLabelRecord]: ...
+class FindingLabelRepository(MutableRecordRepository[FindingLabel], Protocol):
+    def list_for_finding(self, finding_id: UUID) -> list[FindingLabel]: ...
+    def list_with(self, taxonomy: str, label: str) -> list[FindingLabel]: ...
 
 
-class SqlFindingLabelRepository(SqlMutableRepository[FindingLabelRecord]):
+class SqlFindingLabelRepository(SqlMutableRepository[FindingLabel]):
     spec = FINDING_LABEL
-    record = FindingLabelRecord
+    record = FindingLabel
 
-    def list_for_finding(self, finding_id: UUID) -> list[FindingLabelRecord]:
+    def list_for_finding(self, finding_id: UUID) -> list[FindingLabel]:
         return self._many(f"list for {finding_id}", self.table.c.finding_id == finding_id)
 
-    def list_with(self, taxonomy: str, label: str) -> list[FindingLabelRecord]:
+    def list_with(self, taxonomy: str, label: str) -> list[FindingLabel]:
         c = self.table.c
         return self._many(f"list {taxonomy}:{label}", c.taxonomy == taxonomy, c.label == label)

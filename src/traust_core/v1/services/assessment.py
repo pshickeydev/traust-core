@@ -8,8 +8,8 @@ from traust_core.v1.models.artifacts import AssessmentArtifact
 from traust_core.v1.models.assessment import (
     Assessment,
     AssessmentFilter,
-    AssessmentInput,
     AssessmentKind,
+    AssessmentSkillInput,
     CoverageRow,
     Freshness,
     Population,
@@ -20,34 +20,34 @@ from traust_core.v1.models.assessment import (
     ToolRun,
 )
 from traust_core.v1.models.common import Page, PageRequest, Provenance
-from traust_core.v1.repositories.assessment import AssessmentUnitOfWork
+from traust_core.v1.repositories.traust.assessments import AssessmentsUnitOfWork
 from traust_core.v1.services.findings.intake import FindingIntake
 
 
 class AssessmentService:
-    def __init__(self, uow: AssessmentUnitOfWork, intake: FindingIntake) -> None:
+    def __init__(self, uow: AssessmentsUnitOfWork, intake: FindingIntake) -> None:
         self._uow = uow
         self._intake = intake
 
-    def run_tools(self, revision_id: UUID, tools: Sequence[ToolName]) -> ToolRun:
+    def run_tools(self, repository_ref_id: UUID, tools: Sequence[ToolName]) -> ToolRun:
         raise NotImplementedError("stub: replaces run_checkov.py, adapters _contract_bridge")
 
     def prepare(
-        self, revision_id: UUID, kind: AssessmentKind, base_id: UUID | None
-    ) -> AssessmentInput:
+        self, repository_ref_id: UUID, kind: AssessmentKind, base_id: UUID | None
+    ) -> AssessmentSkillInput:
         raise NotImplementedError(
             "stub: replaces build_diff_packet.py, resolve_baseline.py, threat-model inputs"
         )
 
     def record(
-        self, doc: AssessmentArtifact, revision_id: UUID, provenance: Provenance
+        self, doc: AssessmentArtifact, repository_ref_id: UUID, provenance: Provenance
     ) -> Assessment:
         raise NotImplementedError("stub: replaces corpus/store_ingest.py, threat_model.py")
 
     def get(self, assessment_id: UUID) -> Assessment:
         raise NotImplementedError("stub: assessment read")
 
-    def latest(self, code_line_id: UUID, kind: AssessmentKind) -> Assessment | None:
+    def latest(self, repository_ref_id: UUID, kind: AssessmentKind) -> Assessment | None:
         raise NotImplementedError("stub: replaces corpus/resolver latest report")
 
     def list(self, filter: AssessmentFilter, page: PageRequest) -> Page[Assessment]:
@@ -56,7 +56,7 @@ class AssessmentService:
     def population(self, as_of: datetime, filter: AssessmentFilter) -> Population:
         raise NotImplementedError("stub: replaces census/build_census.py, corpus/resolver")
 
-    def freshness(self, code_line_id: UUID) -> Freshness:
+    def freshness(self, repository_ref_id: UUID) -> Freshness:
         raise NotImplementedError("stub: replaces build_rescan_worklist audit_age / churn")
 
     def threats(self, filter: ThreatFilter, page: PageRequest) -> Page[Threat]:

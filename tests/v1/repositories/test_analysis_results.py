@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.v1.services.test_storage import TRIAGE
+from tests.v1.fixtures import TRIAGE
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.analysis_results import ResultKind, Subject
 from traust_core.v1.models.artifacts import ARTIFACT_FOR_KIND

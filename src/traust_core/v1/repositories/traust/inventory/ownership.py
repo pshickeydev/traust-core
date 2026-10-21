@@ -6,7 +6,7 @@ from uuid import UUID
 
 import sqlalchemy as sa
 
-from traust_core.v1.models.records import OwnershipRecord
+from traust_core.v1.models.inventory import Ownership
 from traust_core.v1.repositories.tables import (
     TRAUST,
     MutableRecordRepository,
@@ -28,23 +28,23 @@ OWNERSHIP = TableSpec(
 )
 
 
-class OwnershipRepository(MutableRecordRepository[OwnershipRecord], Protocol):
-    def current(self, repository_id: UUID) -> list[OwnershipRecord]: ...
-    def as_of(self, repository_id: UUID, at: datetime) -> list[OwnershipRecord]: ...
-    def list_for_team(self, team_id: UUID) -> list[OwnershipRecord]: ...
+class OwnershipRepository(MutableRecordRepository[Ownership], Protocol):
+    def current(self, repository_id: UUID) -> list[Ownership]: ...
+    def as_of(self, repository_id: UUID, at: datetime) -> list[Ownership]: ...
+    def list_for_team(self, team_id: UUID) -> list[Ownership]: ...
 
 
-class SqlOwnershipRepository(SqlMutableRepository[OwnershipRecord]):
+class SqlOwnershipRepository(SqlMutableRepository[Ownership]):
     spec = OWNERSHIP
-    record = OwnershipRecord
+    record = Ownership
 
-    def current(self, repository_id: UUID) -> list[OwnershipRecord]:
+    def current(self, repository_id: UUID) -> list[Ownership]:
         c = self.table.c
         return self._many(
             f"current for {repository_id}", c.repository_id == repository_id, c.valid_to.is_(None)
         )
 
-    def as_of(self, repository_id: UUID, at: datetime) -> list[OwnershipRecord]:
+    def as_of(self, repository_id: UUID, at: datetime) -> list[Ownership]:
         c = self.table.c
         return self._many(
             f"as of {at} for {repository_id}",
@@ -53,5 +53,5 @@ class SqlOwnershipRepository(SqlMutableRepository[OwnershipRecord]):
             sa.or_(c.valid_to.is_(None), c.valid_to > at),
         )
 
-    def list_for_team(self, team_id: UUID) -> list[OwnershipRecord]:
+    def list_for_team(self, team_id: UUID) -> list[Ownership]:
         return self._many(f"list for team {team_id}", self.table.c.team_id == team_id)

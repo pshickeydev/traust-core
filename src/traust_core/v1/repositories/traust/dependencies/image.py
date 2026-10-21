@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Protocol
 from uuid import UUID
 
-from traust_core.v1.models.records import ImageRecord
+from traust_core.v1.models.dependencies import Image
 from traust_core.v1.repositories.tables import (
     TRAUST,
     RecordRepository,
@@ -26,25 +26,25 @@ IMAGE = TableSpec(
 )
 
 
-class ImageRepository(RecordRepository[ImageRecord], Protocol):
-    def find_by_digest(self, digest: str) -> ImageRecord | None: ...
-    def list_built_from(self, repository_ref_id: UUID) -> list[ImageRecord]: ...
-    def list_with_sbom(self, sbom_id: UUID) -> list[ImageRecord]: ...
+class ImageRepository(RecordRepository[Image], Protocol):
+    def find_by_digest(self, digest: str) -> Image | None: ...
+    def list_built_from(self, repository_ref_id: UUID) -> list[Image]: ...
+    def list_with_sbom(self, sbom_id: UUID) -> list[Image]: ...
 
 
-class SqlImageRepository(SqlAppendOnlyRepository[ImageRecord]):
+class SqlImageRepository(SqlAppendOnlyRepository[Image]):
     spec = IMAGE
-    record = ImageRecord
+    record = Image
 
-    def find_by_digest(self, digest: str) -> ImageRecord | None:
+    def find_by_digest(self, digest: str) -> Image | None:
         return self._one(f"find {digest}", self.table.c.digest == digest)
 
-    def list_built_from(self, repository_ref_id: UUID) -> list[ImageRecord]:
+    def list_built_from(self, repository_ref_id: UUID) -> list[Image]:
         """Images whose declared provenance names this commit."""
         return self._many(
             f"list built from {repository_ref_id}",
             self.table.c.repository_ref_id == repository_ref_id,
         )
 
-    def list_with_sbom(self, sbom_id: UUID) -> list[ImageRecord]:
+    def list_with_sbom(self, sbom_id: UUID) -> list[Image]:
         return self._many(f"list with sbom {sbom_id}", self.table.c.sbom_id == sbom_id)

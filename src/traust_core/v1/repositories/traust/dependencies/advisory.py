@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Protocol
 from uuid import UUID
 
-from traust_core.v1.models.records import AdvisoryRecord
+from traust_core.v1.models.dependencies import Advisory
 from traust_core.v1.repositories.tables import (
     TRAUST,
     MutableRecordRepository,
@@ -25,17 +25,17 @@ ADVISORY = TableSpec(
 )
 
 
-class AdvisoryRepository(MutableRecordRepository[AdvisoryRecord], Protocol):
-    def find_by_identifier(self, identifier: str) -> AdvisoryRecord | None: ...
-    def list_aliases(self, advisory_id: UUID) -> list[AdvisoryRecord]: ...
+class AdvisoryRepository(MutableRecordRepository[Advisory], Protocol):
+    def find_by_identifier(self, identifier: str) -> Advisory | None: ...
+    def list_aliases(self, advisory_id: UUID) -> list[Advisory]: ...
 
 
-class SqlAdvisoryRepository(SqlMutableRepository[AdvisoryRecord]):
+class SqlAdvisoryRepository(SqlMutableRepository[Advisory]):
     spec = ADVISORY
-    record = AdvisoryRecord
+    record = Advisory
 
-    def find_by_identifier(self, identifier: str) -> AdvisoryRecord | None:
+    def find_by_identifier(self, identifier: str) -> Advisory | None:
         return self._one(f"find {identifier}", self.table.c.identifier == identifier)
 
-    def list_aliases(self, advisory_id: UUID) -> list[AdvisoryRecord]:
+    def list_aliases(self, advisory_id: UUID) -> list[Advisory]:
         return self._many(f"aliases of {advisory_id}", self.table.c.alias_of_id == advisory_id)

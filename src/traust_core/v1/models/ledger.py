@@ -4,10 +4,31 @@ from datetime import datetime
 from enum import StrEnum
 from uuid import UUID
 
-from traust_core.v1.models.attestation import Attestation
-from traust_core.v1.models.base import Model
+from traust_core.v1.models.base import AppendOnly, Entity, Model
 from traust_core.v1.models.common import Principal
 from traust_core.v1.models.findings import Decision
+
+
+class Layer(Entity):
+    """5 · one Merkle tree of decision events for a repository (or one line), signed per root."""
+
+    repository_id: UUID
+    line: str | None = None
+    merkle_root: str | None = None
+    merkle_epoch: int | None = None
+    merkle_size: int | None = None
+    merkle_root_signature: str | None = None
+    merkle_signing_method: str
+    merkle_signature_format: int | None = None
+
+
+class Event(AppendOnly):
+    """5 · the proof of one decision: its leaf in a layer."""
+
+    layer_id: UUID
+    decision_id: UUID
+    seq: int
+    event_payload: bytes
 
 
 # Members land with the Ledger slice (from traust-ledger _internal/kinds.py).
@@ -33,10 +54,6 @@ class LedgerEvent(Model):
     @classmethod
     def from_decision(cls, decision: Decision, stream_id: UUID) -> LedgerEvent:
         raise NotImplementedError("stub: replaces ledger events/builders.py, lib/event_time.py")
-
-    @classmethod
-    def from_attestation(cls, attestation: Attestation, stream_id: UUID) -> LedgerEvent:
-        raise NotImplementedError("stub: replaces ledger events/builders.build_human_event")
 
 
 class Checkpoint(Model):

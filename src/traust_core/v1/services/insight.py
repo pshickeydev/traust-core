@@ -5,7 +5,7 @@ from typing import Protocol
 
 from traust_core.v1.models.common import Provenance
 from traust_core.v1.models.insight import ViewFilter, ViewModel, ViewName
-from traust_core.v1.models.operations import Order
+from traust_core.v1.models.operations import RunOrder
 from traust_core.v1.services.artifact_publishing import ArtifactPublisher, PublishResult
 from traust_core.v1.services.operations import OpsService
 
@@ -30,7 +30,7 @@ class InsightService:
     def publish(self, view: ViewName, filter: ViewFilter, provenance: Provenance) -> PublishResult:
         raise NotImplementedError("stub: replaces dashboards' md/html/json writes")
 
-    def refresh(self, views: Sequence[ViewName] | None) -> list[Order]:
+    def refresh(self, views: Sequence[ViewName] | None) -> list[RunOrder]:
         raise NotImplementedError("stub: replaces cli/refresh_dashboards.py")
 
 

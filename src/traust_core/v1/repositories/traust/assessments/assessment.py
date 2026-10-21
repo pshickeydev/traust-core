@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Protocol
 from uuid import UUID
 
-from traust_core.v1.models.records import AssessmentRecord
+from traust_core.v1.models.assessment import Assessment
 from traust_core.v1.repositories.tables import (
     TRAUST,
     RecordRepository,
@@ -32,17 +32,17 @@ ASSESSMENT = TableSpec(
 )
 
 
-class AssessmentRepository(RecordRepository[AssessmentRecord], Protocol):
-    def latest(self, repository_ref_id: UUID, kind: str) -> AssessmentRecord | None: ...
-    def list_for_ref(self, repository_ref_id: UUID) -> list[AssessmentRecord]: ...
-    def list_for_run_order(self, run_order_id: UUID) -> list[AssessmentRecord]: ...
+class AssessmentRepository(RecordRepository[Assessment], Protocol):
+    def latest(self, repository_ref_id: UUID, kind: str) -> Assessment | None: ...
+    def list_for_ref(self, repository_ref_id: UUID) -> list[Assessment]: ...
+    def list_for_run_order(self, run_order_id: UUID) -> list[Assessment]: ...
 
 
-class SqlAssessmentRepository(SqlAppendOnlyRepository[AssessmentRecord]):
+class SqlAssessmentRepository(SqlAppendOnlyRepository[Assessment]):
     spec = ASSESSMENT
-    record = AssessmentRecord
+    record = Assessment
 
-    def latest(self, repository_ref_id: UUID, kind: str) -> AssessmentRecord | None:
+    def latest(self, repository_ref_id: UUID, kind: str) -> Assessment | None:
         c = self.table.c
         stmt = (
             self._select()
@@ -53,7 +53,7 @@ class SqlAssessmentRepository(SqlAppendOnlyRepository[AssessmentRecord]):
         row = self._execute(f"latest {kind} for {repository_ref_id}", stmt).mappings().first()
         return None if row is None else self._to_record(row)
 
-    def list_for_ref(self, repository_ref_id: UUID) -> list[AssessmentRecord]:
+    def list_for_ref(self, repository_ref_id: UUID) -> list[Assessment]:
         c = self.table.c
         return self._many(
             f"list for {repository_ref_id}",
@@ -61,7 +61,7 @@ class SqlAssessmentRepository(SqlAppendOnlyRepository[AssessmentRecord]):
             order_by=(c.occurred_at,),
         )
 
-    def list_for_run_order(self, run_order_id: UUID) -> list[AssessmentRecord]:
+    def list_for_run_order(self, run_order_id: UUID) -> list[Assessment]:
         return self._many(
             f"list for order {run_order_id}", self.table.c.run_order_id == run_order_id
         )

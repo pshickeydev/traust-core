@@ -5,7 +5,7 @@ from typing import Protocol
 
 from traust_core.v1.models.base import Dto
 from traust_core.v1.models.code_facts import LanguageStats
-from traust_core.v1.models.portfolio import OrgName
+from traust_core.v1.models.inventory import OrgName
 from traust_core.v1.models.values import GitSha, HttpsRepoUrl
 from traust_core.v1.providers.base import Readiness, Result
 

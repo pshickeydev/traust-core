@@ -6,7 +6,6 @@ from uuid import UUID
 
 from traust_core.v1.models.base import Model
 from traust_core.v1.models.common import TimeWindow
-from traust_core.v1.models.portfolio import BusinessUnit, TeamName
 
 
 class ViewName(StrEnum):
@@ -34,7 +33,6 @@ class ViewModel(Model): ...
 
 class ViewFilter(Model):
     product_ids: tuple[UUID, ...] = ()
-    business_units: tuple[BusinessUnit, ...] = ()
-    teams: tuple[TeamName, ...] = ()
+    team_ids: tuple[UUID, ...] = ()
     as_of: datetime | None = None
     window: TimeWindow | None = None

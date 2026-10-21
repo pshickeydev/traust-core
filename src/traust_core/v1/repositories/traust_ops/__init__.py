@@ -7,7 +7,6 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from traust_core.v1.repositories.tables import SqlTablesUnitOfWork
 from traust_core.v1.repositories.traust_ops.assessment_input import (
     ASSESSMENT_INPUT,
     AssessmentInputRepository,
@@ -46,16 +45,6 @@ class OpsUnitOfWork(UnitOfWork, Protocol):
     assessment_inputs: AssessmentInputRepository
 
 
-class SqlOpsUnitOfWork(SqlTablesUnitOfWork):
-    def _open_repositories(self) -> None:
-        conn, tables = self.connection, self.tables
-        self.run_batches = SqlRunBatchRepository(conn, tables)
-        self.run_orders = SqlRunOrderRepository(conn, tables)
-        self.spend_events = SqlSpendEventRepository(conn, tables)
-        self.feed_snapshots = SqlFeedSnapshotRepository(conn, tables)
-        self.assessment_inputs = SqlAssessmentInputRepository(conn, tables)
-
-
 __all__ = [
     "TABLES",
     "AssessmentInputRepository",
@@ -66,7 +55,6 @@ __all__ = [
     "SpendEventRepository",
     "SqlAssessmentInputRepository",
     "SqlFeedSnapshotRepository",
-    "SqlOpsUnitOfWork",
     "SqlRunBatchRepository",
     "SqlRunOrderRepository",
     "SqlSpendEventRepository",

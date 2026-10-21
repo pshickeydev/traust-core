@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from traust_core.v1.repositories.tables import SqlTablesUnitOfWork
 from traust_core.v1.repositories.traust.assessments.artifact import (
     ARTIFACT,
     ArtifactRepository,
@@ -37,15 +36,6 @@ class AssessmentsUnitOfWork(UnitOfWork, Protocol):
     locations: LocationRepository
 
 
-class SqlAssessmentsUnitOfWork(SqlTablesUnitOfWork):
-    def _open_repositories(self) -> None:
-        conn, tables = self.connection, self.tables
-        self.assessments = SqlAssessmentRepository(conn, tables)
-        self.artifacts = SqlArtifactRepository(conn, tables)
-        self.occurrences = SqlOccurrenceRepository(conn, tables)
-        self.locations = SqlLocationRepository(conn, tables)
-
-
 __all__ = [
     "TABLES",
     "ArtifactRepository",
@@ -55,7 +45,6 @@ __all__ = [
     "OccurrenceRepository",
     "SqlArtifactRepository",
     "SqlAssessmentRepository",
-    "SqlAssessmentsUnitOfWork",
     "SqlLocationRepository",
     "SqlOccurrenceRepository",
 ]

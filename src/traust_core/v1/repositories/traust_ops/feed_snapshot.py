@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from traust_core.v1.models.records import FeedSnapshotRecord
+from traust_core.v1.models.operations import FeedSnapshot
 from traust_core.v1.repositories.tables import (
     TRAUST_OPS,
     RecordRepository,
@@ -26,15 +26,15 @@ FEED_SNAPSHOT = TableSpec(
 )
 
 
-class FeedSnapshotRepository(RecordRepository[FeedSnapshotRecord], Protocol):
-    def latest(self, feed: str) -> FeedSnapshotRecord | None: ...
+class FeedSnapshotRepository(RecordRepository[FeedSnapshot], Protocol):
+    def latest(self, feed: str) -> FeedSnapshot | None: ...
 
 
-class SqlFeedSnapshotRepository(SqlAppendOnlyRepository[FeedSnapshotRecord]):
+class SqlFeedSnapshotRepository(SqlAppendOnlyRepository[FeedSnapshot]):
     spec = FEED_SNAPSHOT
-    record = FeedSnapshotRecord
+    record = FeedSnapshot
 
-    def latest(self, feed: str) -> FeedSnapshotRecord | None:
+    def latest(self, feed: str) -> FeedSnapshot | None:
         c = self.table.c
         stmt = (
             self._select()

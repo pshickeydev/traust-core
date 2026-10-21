@@ -6,7 +6,7 @@ from uuid import UUID
 
 import sqlalchemy as sa
 
-from traust_core.v1.models.records import SpendEventRecord
+from traust_core.v1.models.operations import SpendEvent
 from traust_core.v1.repositories.tables import (
     TRAUST_OPS,
     RecordRepository,
@@ -34,19 +34,19 @@ SPEND_EVENT = TableSpec(
 )
 
 
-class SpendEventRepository(RecordRepository[SpendEventRecord], Protocol):
-    def list_for_order(self, run_order_id: UUID) -> list[SpendEventRecord]: ...
-    def list_between(self, start: datetime, end: datetime) -> list[SpendEventRecord]: ...
+class SpendEventRepository(RecordRepository[SpendEvent], Protocol):
+    def list_for_order(self, run_order_id: UUID) -> list[SpendEvent]: ...
+    def list_between(self, start: datetime, end: datetime) -> list[SpendEvent]: ...
 
 
-class SqlSpendEventRepository(SqlAppendOnlyRepository[SpendEventRecord]):
+class SqlSpendEventRepository(SqlAppendOnlyRepository[SpendEvent]):
     spec = SPEND_EVENT
-    record = SpendEventRecord
+    record = SpendEvent
 
-    def list_for_order(self, run_order_id: UUID) -> list[SpendEventRecord]:
+    def list_for_order(self, run_order_id: UUID) -> list[SpendEvent]:
         return self._many(f"list for {run_order_id}", self.table.c.run_order_id == run_order_id)
 
-    def list_between(self, start: datetime, end: datetime) -> list[SpendEventRecord]:
+    def list_between(self, start: datetime, end: datetime) -> list[SpendEvent]:
         """Spend with start <= occurred_at < end."""
         c = self.table.c
         return self._many(

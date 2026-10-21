@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from tests.v1.services.test_storage import TRIAGE
+from tests.v1.fixtures import TRIAGE
 from traust_core.v1 import contracts
 from traust_core.v1.errors import DocumentError
 from traust_core.v1.models.artifacts import ANALYSIS_ARTIFACTS, Artifact, TriageArtifact

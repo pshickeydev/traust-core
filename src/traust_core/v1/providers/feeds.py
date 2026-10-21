@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 from typing import Protocol, TypeVar
 
 from traust_core.v1.models.base import Dto
-from traust_core.v1.models.exposure import Advisory, Package, Version
+from traust_core.v1.models.dependencies import Advisory, Package, Version
 from traust_core.v1.providers.base import Readiness, Result
 
 Rec = TypeVar("Rec", covariant=True)
