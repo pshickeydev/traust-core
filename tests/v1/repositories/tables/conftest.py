@@ -92,9 +92,7 @@ def repository_for(uow: SqlTraustUnitOfWork, table: str) -> SqlTableRepository[A
 
 
 def same_rows(actual: Sequence[Model], expected: Sequence[Model]) -> bool:
-    """Equal as sets of rows. Rows written in one Postgres transaction share created_at
-    (now() is the transaction's start), so list order is only asserted where a
-    query defines it (occurred_at, seq, priority)."""
+    """Equal as sets of rows; list order is asserted only where a query defines it."""
     key = lambda m: str(m.id)  # type: ignore[attr-defined]  # noqa: E731
     return sorted(actual, key=key) == sorted(expected, key=key)
 
