@@ -4,7 +4,7 @@
 
 ## Checklist
 
-- [ ] Targets `development`
+- [ ] Targets `main` (traust-core is pre-release; other repos target `development`)
 - [ ] Only this domain's service and its section's repositories changed; other domains reached through their services
 - [ ] No new tables, columns or row models (model gaps are raised, not worked around)
 - [ ] New SQL is a named query on the owning table's repository
