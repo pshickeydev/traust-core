@@ -1,3 +1,4 @@
+import http.client as http_client
 import urllib.error
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -106,4 +107,21 @@ def test_gives_up_after_max_attempts(monkeypatch: pytest.MonkeyPatch) -> None:
     calls = _patch(monkeypatch, [TimeoutError("slow")] * 3)
     with pytest.raises(ServiceError, match="gave up after 3 attempts"):
         _fetcher([]).get("http://feed.test")
+    assert len(calls) == 3
+
+
+def test_truncated_body_retries_then_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
+    slept: list[float] = []
+    calls = _patch(monkeypatch, [http_client.IncompleteRead(b"partial", 100), b"the full body"])
+    fetcher = _fetcher(slept)
+    assert fetcher.get("http://feed.test/x") == b"the full body"
+    assert len(calls) == 2
+
+
+def test_truncated_body_gives_up_as_service_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    slept: list[float] = []
+    calls = _patch(monkeypatch, [http_client.IncompleteRead(b"partial", 100)] * 3)
+    fetcher = _fetcher(slept)
+    with pytest.raises(ServiceError):
+        fetcher.get("http://feed.test/x")
     assert len(calls) == 3

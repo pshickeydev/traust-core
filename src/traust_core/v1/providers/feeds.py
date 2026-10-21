@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import zlib
 from datetime import datetime, timedelta
 from pathlib import PurePosixPath
 from typing import Protocol, TypeVar
@@ -50,8 +51,6 @@ def validate_payload(raw: bytes, filename: str) -> None:
     For feeds that publish no checksum, "corrupt" means "not well-formed gzip /
     JSON / UTF-8 CSV", so a garbage 200 never replaces a good cached copy.
     """
-    if not raw:
-        raise ValidationError(f"{filename}: empty payload")
     suffixes = PurePosixPath(filename).suffixes
     try:
         if suffixes[-1:] == [".gz"]:
@@ -61,5 +60,7 @@ def validate_payload(raw: bytes, filename: str) -> None:
             json.loads(raw)
         elif suffixes[-1:] == [".csv"]:
             raw.decode("utf-8")
-    except (OSError, EOFError, ValueError) as e:
+    except (OSError, EOFError, ValueError, zlib.error) as e:
         raise ValidationError(f"{filename}: corrupt payload: {e}") from e
+    if not raw:  # after decompression: an empty gzip body is an empty payload
+        raise ValidationError(f"{filename}: empty payload")

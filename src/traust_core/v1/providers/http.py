@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import http.client
 import random
 import time
 import urllib.error
@@ -56,7 +57,12 @@ class HttpFetcher:
                 delay = (
                     self._backoff(attempt) if after is None else min(after, policy.max_wait_seconds)
                 )
-            except (urllib.error.URLError, TimeoutError, OSError) as e:
+            except (
+                urllib.error.URLError,
+                TimeoutError,
+                OSError,
+                http.client.IncompleteRead,
+            ) as e:
                 last = str(e)
                 delay = self._backoff(attempt)
             if attempt + 1 < policy.max_attempts:

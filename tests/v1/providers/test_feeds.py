@@ -26,6 +26,8 @@ def test_well_formed_payload_passes(raw: bytes, filename: str) -> None:
         (b"not a gzip payload", "epss.csv.gz"),
         (b"{broken", "kev.json"),
         (b"\xff\xfe", "rh-cve.csv"),
+        (gzip.compress(b""), "epss_scores-current.csv.gz"),
+        (gzip.compress(b"cve,epss\n")[:10] + b"\xff\xff", "epss_scores-current.csv.gz"),
     ],
 )
 def test_corrupt_payload_raises(raw: bytes, filename: str) -> None:
