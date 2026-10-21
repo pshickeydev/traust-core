@@ -95,5 +95,13 @@ jobs:
           enable-cache: true
           python-version: "3.12"
       - run: uv sync --frozen
-      # Drift ratchet (XWING-2210): fails on new hand-wiring; the baseline only shrinks.
-      - run: uv run python -m traust_core.v1.checks.ratchet src --baseline .ratchet.json
+      # Drift ratchet (XWING-2210): fails on new hand-wiring; the baseline only
+      # shrinks - compared against the base branch's baseline, so a PR cannot
+      # raise its own to cover new hand-wiring.
+      - run: |
+          git fetch --depth=1 origin main
+          REF=""
+          if git show origin/main:.ratchet.json > /tmp/ratchet-reference.json 2>/dev/null; then
+            REF="--reference /tmp/ratchet-reference.json"
+          fi
+          uv run python -m traust_core.v1.checks.ratchet src --baseline .ratchet.json $REF

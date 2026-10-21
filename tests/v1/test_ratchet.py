@@ -87,3 +87,52 @@ def test_matching_baseline_passes(tmp_path: Path) -> None:
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+def test_keyword_and_concatenated_json_writes_are_caught():
+    from traust_core.v1.checks import scan_source
+
+    hits = scan_source(
+        "import json\n"
+        "from pathlib import Path\n"
+        'Path("/tmp/x").write_text(json.dumps({"a": 1}) + "\\n")\n'
+        'Path("/tmp/x").write_text(data=json.dumps({"a": 1}))\n'
+    )
+    assert [kind for _, kind in hits] == ["json-write", "json-write"]
+
+
+def test_os_environ_copy_is_caught():
+    from traust_core.v1.checks import scan_source
+
+    hits = scan_source("import os\n\nsettings = os.environ.copy()\n")
+    assert [kind for _, kind in hits] == ["env"]
+
+
+def test_a_pr_cannot_raise_its_own_baseline(tmp_path):
+    import json
+
+    from traust_core.v1.checks.ratchet import main
+
+    root = tmp_path / "roots"
+    root.mkdir()
+    reference = tmp_path / "ref.json"
+    baseline = tmp_path / "baseline.json"
+    reference.write_text(json.dumps({"src/a.py": {"env": 1}}))
+    baseline.write_text(json.dumps({"src/a.py": {"env": 2}}))
+
+    assert main([str(root), "--baseline", str(baseline), "--reference", str(reference)]) == 1
+
+
+def test_reference_check_passes_when_the_baseline_only_shrinks(tmp_path):
+    import json
+
+    from traust_core.v1.checks.ratchet import main
+
+    root = tmp_path / "roots"
+    root.mkdir()
+    reference = tmp_path / "ref.json"
+    baseline = tmp_path / "baseline.json"
+    reference.write_text(json.dumps({"src/a.py": {"env": 1}}))
+    baseline.write_text(json.dumps({"src/a.py": {"env": 0}}))
+
+    assert main([str(root), "--baseline", str(baseline), "--reference", str(reference)]) == 0

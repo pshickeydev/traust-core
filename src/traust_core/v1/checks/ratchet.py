@@ -1,3 +1,11 @@
+"""Drift ratchet over common hand-wiring forms (AST-based).
+
+A finite checker, not a prohibition: it catches the frequent shapes -
+direct calls, keyword arguments, simple concatenation - and the baseline
+only shrinks when CI passes --reference (the base branch's baseline).
+Novel forms are caught by review; add them here when they appear.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -35,14 +43,15 @@ RULES: tuple[Rule, ...] = (
     Rule(
         "env",
         "a field on Config / Context",
-        calls=frozenset({"os.getenv", "os.environ.get"}),
+        calls=frozenset({"os.getenv", "os.environ.get", "os.environ.copy"}),
         allowed=("*/context/*",),
     ),
     Rule(
         "json-write",
         "ObjectStore / ArtifactPublisher",
         calls=frozenset({"json.dump"}),
-        allowed=("*/repositories/*",),
+        # the ratchet writes its own baseline; that is the sanctioned writer
+        allowed=("*/repositories/*", "*/checks/ratchet.py"),
     ),
     Rule("clock", "an injected Clock", calls=frozenset({"datetime.now", "datetime.utcnow"})),
     Rule(
@@ -123,6 +132,16 @@ def _module_match(name: str, modules: frozenset[str]) -> bool:
     return any(name == m or name.startswith(f"{m}.") for m in modules)
 
 
+def _dumps_inside(expr: ast.expr, aliases: dict[str, str]) -> bool:
+    """json.dumps as the written value, alone or concatenated (x + "\n")."""
+    if isinstance(expr, ast.Call):
+        inner = _dotted(expr.func)
+        return inner is not None and _resolve(inner, aliases) == "json.dumps"
+    if isinstance(expr, ast.BinOp):
+        return _dumps_inside(expr.left, aliases) or _dumps_inside(expr.right, aliases)
+    return False
+
+
 def scan_source(source: str) -> list[tuple[int, str]]:
     """Return (line, kind) hits for one module's source, before path exemptions."""
     tree = ast.parse(source)
@@ -149,12 +168,10 @@ def scan_source(source: str) -> list[tuple[int, str]]:
             recv = _dotted(func.value)
             if recv and _resolve(recv, aliases).endswith("datetime"):
                 hits.append((node.lineno, "clock"))
-        if isinstance(func, ast.Attribute) and func.attr == "write_text" and node.args:
-            first = node.args[0]
-            if isinstance(first, ast.Call):
-                inner = _dotted(first.func)
-                if inner and _resolve(inner, aliases) == "json.dumps":
-                    hits.append((node.lineno, "json-write"))
+        if isinstance(func, ast.Attribute) and func.attr == "write_text":
+            args = list(node.args[:1]) + [kw.value for kw in node.keywords]
+            if any(_dumps_inside(arg, aliases) for arg in args):
+                hits.append((node.lineno, "json-write"))
         dotted = _dotted(func)
         if dotted is None:
             continue
@@ -208,6 +225,17 @@ def compare(hits: Sequence[Hit], baseline: Counts) -> Result:
     return Result(tuple(new), tuple(sorted(shrinkable)))
 
 
+def baseline_growth(baseline: Counts, reference: Counts) -> list[tuple[str, str, int, int]]:
+    """Where a baseline rose above the reference (the base branch's)."""
+    growth: list[tuple[str, str, int, int]] = []
+    for path, kinds in baseline.items():
+        for kind, n in kinds.items():
+            ref_n = reference.get(path, {}).get(kind, 0)
+            if n > ref_n:
+                growth.append((path, kind, ref_n, n))
+    return sorted(growth)
+
+
 def load_baseline(path: Path) -> Counts:
     if not path.is_file():
         return {}
@@ -224,6 +252,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--baseline", type=Path, default=Path(".ratchet.json"))
     parser.add_argument("--write-baseline", action="store_true")
     parser.add_argument("--summary", action="store_true")
+    parser.add_argument(
+        "--reference",
+        type=Path,
+        help="the base branch's baseline; the PR baseline may not grow past it",
+    )
     args = parser.parse_args(argv)
 
     hits = scan(args.roots)
@@ -233,14 +266,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"wrote baseline {args.baseline} ({len(hits)} entries)")
         return 0
 
-    result = compare(hits, load_baseline(args.baseline))
+    baseline = load_baseline(args.baseline)
+    result = compare(hits, baseline)
     for hit in result.new:
         print(f"{hit.path}:{hit.line} {hit.kind} → use {_USE[hit.kind]}")
     for path, kind, base_n, now_n in result.shrinkable:
         print(f"baseline can shrink: {path} {kind} {base_n}→{now_n}")
+    failed = not result.ok
+    if args.reference is not None:
+        reference = load_baseline(args.reference)
+        for path, kind, ref_n, now_n in baseline_growth(baseline, reference):
+            print(f"baseline grew over reference: {path} {kind} {ref_n}→{now_n}")
+            failed = True
     if args.summary:
         print(f"{len(hits)} hits across {len(counts(hits))} files")
-    return 0 if result.ok else 1
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
