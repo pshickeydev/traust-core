@@ -111,7 +111,7 @@ class _DbNow(sa.FunctionElement[datetime]):
 
 @compiles(_DbNow, "postgresql")
 def _postgres_now(element: Any, compiler: Any, **kw: Any) -> str:
-    return "now()"
+    return "statement_timestamp()"
 
 
 @compiles(_DbNow, "sqlite")
