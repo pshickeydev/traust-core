@@ -121,3 +121,17 @@ Python 3.11+ library. The platform API lives in `traust_core.v1`. Overview: [REA
 - Smallest change that does the job; no drive-by refactors
 - A new public module needs a README row and contract tests before merge
 - Lint: line length 100; ruff E/W/F/I/UP/B/SIM/PTH/RUF
+
+## Where we're headed
+
+- Inside traust-core, new code uses the platform pieces below. Outside traust-core, everything goes through the platform API (`traust-client` or the SDK); old code is deleted by its domain's cut-over plan
+- CI's drift ratchet (`python -m traust_core.v1.checks.ratchet`) fails a new hit (`path:line kind → use <API>`); baselines only shrink
+
+| Hand-wiring | Inside traust-core, use |
+| --- | --- |
+| `sqlite3.connect` / `psycopg.connect` | `SqlUnitOfWork` / `SqlRepository` |
+| `subprocess` | `ProcessRunner` or a tool provider |
+| `os.getenv` / `os.environ` | `Config` / `Context` |
+| `json.dump` / `write_text(json…)` | `ObjectStore` / `ArtifactPublisher` |
+| `datetime.now()` / `datetime.utcnow()` | `Clock` |
+| `requests` / `httpx` / `urllib.request` | a core provider (`SourceProvider`, `FeedProvider`, tool provider) |
