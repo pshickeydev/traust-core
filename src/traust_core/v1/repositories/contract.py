@@ -1,4 +1,4 @@
-"""The whole contracts db: every table spec, and one unit of work over all of them.
+"""Every contract table spec, and one unit of work over all of them.
 
 Section protocols (InventoryUnitOfWork, FindingsUnitOfWork, ...) are what a
 service declares it needs; SqlTraustUnitOfWork satisfies every one of them on
@@ -11,11 +11,8 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from sqlalchemy.engine import Engine
-
 from traust_core.v1.repositories import traust_ledger, traust_ops
-from traust_core.v1.repositories.sql import Dialect, schema_drift
-from traust_core.v1.repositories.tables import SqlTablesUnitOfWork, TableFactory, TableSpec
+from traust_core.v1.repositories.tables import SqlTablesUnitOfWork, TableSpec
 from traust_core.v1.repositories.traust import assessments, dependencies, findings, inventory
 from traust_core.v1.repositories.traust.assessments import AssessmentsUnitOfWork
 from traust_core.v1.repositories.traust.dependencies import DependenciesUnitOfWork
@@ -32,19 +29,6 @@ CONTRACT_TABLES: tuple[TableSpec, ...] = (
     *traust_ops.TABLES,
     *traust_ledger.TABLES,
 )
-
-
-def contract_tables(dialect: Dialect) -> TableFactory:
-    """The dialect's factory with every contract table built onto its MetaData."""
-    tables = TableFactory.for_dialect(dialect)
-    for spec in CONTRACT_TABLES:
-        tables.table(spec)
-    return tables
-
-
-def contract_drift(engine: Engine) -> list[str]:
-    """Where the database and the declared tables disagree; empty = in step."""
-    return schema_drift(engine, contract_tables(Dialect.of(engine)).metadata)
 
 
 class TraustUnitOfWork(

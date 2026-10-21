@@ -64,7 +64,7 @@ class TableSpec:
 
 
 class TableFactory:
-    """Every contract table for one dialect, on one MetaData (used by schema_drift)."""
+    """Every contract table for one dialect, built once on one MetaData."""
 
     def __init__(self, dialect: Dialect) -> None:
         self.dialect = dialect

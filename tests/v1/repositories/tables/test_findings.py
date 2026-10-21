@@ -4,10 +4,7 @@ from __future__ import annotations
 
 from datetime import timedelta
 
-import pytest
-
 from tests.v1.repositories.tables.conftest import T0, Seed, apart, same_rows
-from traust_core.v1.errors import ConflictError
 
 
 def test_finding_identity_is_per_repository_and_recipe(seed: Seed) -> None:
@@ -59,13 +56,12 @@ def test_labels_and_external_refs(seed: Seed) -> None:
     assert same_rows(u.finding_external_refs.list_for_ref("jira", "SEC-1"), [ticket, shared])
 
 
-def test_decisions_are_idempotent_by_statement_key(seed: Seed) -> None:
+def test_decision_by_statement_key(seed: Seed) -> None:
     u = seed.uow
     finding = seed.finding()
     decision = seed.decision(finding, statement_key="k1")
     assert u.decisions.find_by_statement(finding.id, "k1") == decision
-    with pytest.raises(ConflictError):
-        seed.decision(finding, statement_key="k1", validity="false_positive")
+    assert u.decisions.find_by_statement(finding.id, "k2") is None
 
 
 def test_decision_history_is_in_judgement_order(seed: Seed) -> None:

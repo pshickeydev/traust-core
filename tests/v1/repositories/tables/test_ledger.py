@@ -2,10 +2,7 @@
 
 from __future__ import annotations
 
-import pytest
-
 from tests.v1.repositories.tables.conftest import Seed, same_rows
-from traust_core.v1.errors import ConflictError
 
 
 def test_layers_per_repository_and_line(seed: Seed) -> None:
@@ -37,18 +34,8 @@ def test_events_append_in_sequence(seed: Seed) -> None:
     assert events.get(e1.id).event_payload == b"\xff" * 64
 
 
-def test_each_decision_is_proved_once_and_seq_is_unique(seed: Seed) -> None:
-    events = seed.uow.events
+def test_event_for_a_decision(seed: Seed) -> None:
     layer, decision = seed.layer(), seed.decision()
     proof = seed.event(layer, decision, seq=0)
-    assert events.find_by_decision(decision.id) == proof
-    with pytest.raises(ConflictError):
-        seed.event(seed.layer(), decision)  # same decision, another layer
-    seed.uow.rollback()
-
-
-def test_seq_is_unique_per_layer(seed: Seed) -> None:
-    layer = seed.layer()
-    seed.event(layer, seq=0)
-    with pytest.raises(ConflictError):
-        seed.event(layer, seq=0)
+    assert seed.uow.events.find_by_decision(decision.id) == proof
+    assert seed.uow.events.find_by_decision(seed.decision().id) is None

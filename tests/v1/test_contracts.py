@@ -7,7 +7,7 @@ import sqlalchemy as sa
 from tests.v1.conftest import apply_contract_db
 from traust_core.v1 import contracts
 from traust_core.v1.errors import DocumentError
-from traust_core.v1.repositories import create_database_engine, schema_drift
+from traust_core.v1.repositories import create_database_engine
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -29,13 +29,3 @@ def test_database_ddl_applies_every_namespace_on_sqlite(tmp_path: Path) -> None:
     apply_contract_db(engine)
     names = set(sa.inspect(engine).get_table_names())
     assert {"repository", "ops_run_order", "ledger_events"} <= names
-
-
-def test_schema_drift_flags_disagreements(tmp_path: Path) -> None:
-    engine = create_database_engine(f"sqlite:///{tmp_path}/c.db")
-    apply_contract_db(engine)
-    wrong = sa.MetaData()
-    sa.Table("ledger_layers", wrong, sa.Column("not_in_ddl", sa.Text))
-    problems = schema_drift(engine, wrong)
-    assert any("not_in_ddl: missing in database" in p for p in problems)
-    assert any("not declared in Table" in p for p in problems)

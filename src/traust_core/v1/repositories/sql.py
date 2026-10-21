@@ -250,25 +250,3 @@ class SqlRepository:
             raise ConflictError(f"{name}: {operation}: {e.orig}") from e
         except SQLAlchemyError as e:
             raise RepositoryError(f"{name}: {operation} failed: {e}") from e
-
-
-def schema_drift(engine: Engine, metadata: sa.MetaData) -> list[str]:
-    inspector = sa.inspect(engine)
-    problems: list[str] = []
-    for table in metadata.sorted_tables:
-        schema = table.schema
-        if not inspector.has_table(table.name, schema=schema):
-            problems.append(f"{table.name}: missing in database")
-            continue
-        actual = {c["name"]: c for c in inspector.get_columns(table.name, schema=schema)}
-        for column in table.columns:
-            found = actual.pop(column.name, None)
-            if found is None:
-                problems.append(f"{table.name}.{column.name}: missing in database")
-            elif found["nullable"] != column.nullable and not column.primary_key:
-                problems.append(
-                    f"{table.name}.{column.name}: nullable {found['nullable']} in database, "
-                    f"{column.nullable} in Table"
-                )
-        problems += [f"{table.name}.{name}: not declared in Table" for name in sorted(actual)]
-    return problems
