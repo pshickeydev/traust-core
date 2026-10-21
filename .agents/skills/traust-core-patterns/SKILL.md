@@ -41,6 +41,11 @@ outside the process?            → provider
 SQL rule several readers share? → a view in traust-contracts
 ```
 
+## Two defaults
+
+- **Convention over configuration.** Copy the worked example's shape (names, verbs, layout); don't add a setting or flag to choose between behaviours. Config is for what truly differs per deployment, read once in `Context`.
+- **Fallbacks are a decision, not a default.** No silent `except: return default` or "if missing, use X". Missing or malformed input raises a typed `traust_core.v1.errors` error, logged once where handled. A fallback is fine only when the domain defines it as behaviour (a degraded outcome with a reason), and then it's explicit and tested.
+
 ## No duplicated responsibility
 
 - One query, one place: the owning table's repository. Filtering rows in Python that SQL could filter → a named query.
