@@ -63,7 +63,7 @@ class SqlRunOrderRepository(SqlMutableRepository[RunOrder]):
         next_id = (
             sa.select(c.id)
             .where(c.state == QUEUED)
-            .order_by(c.priority, c.created_at)
+            .order_by(c.priority, c.created_at, c.id)
             .limit(1)
             .with_for_update(skip_locked=True)
             .scalar_subquery()

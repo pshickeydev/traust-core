@@ -153,7 +153,11 @@ class SqlTableRepository(SqlRepository, Generic[R]):
         *where: sa.ColumnElement[bool],
         order_by: Sequence[sa.ColumnElement[Any]] = (),
     ) -> list[R]:
-        stmt = self._select().where(*where).order_by(*order_by, self.table.c.created_at)
+        stmt = (
+            self._select()
+            .where(*where)
+            .order_by(*order_by, self.table.c.created_at, self.table.c.id)
+        )
         return [self._to_record(r) for r in self._execute(operation, stmt).mappings()]
 
 
