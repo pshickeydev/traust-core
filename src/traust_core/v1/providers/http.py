@@ -23,12 +23,8 @@ class RetryPolicy:
 
 
 class HttpFetcher:
-    """Outbound GET for providers, with bounded retries.
-
-    429 waits out Retry-After (capped by max_wait_seconds); 5xx and timeouts use
-    capped exponential backoff; any other 4xx fails at once (retrying a 403/404
-    just burns the rate-limit window).
-    """
+    """Outbound GET for providers: Retry-After on 429, capped backoff on
+    5xx/timeouts, fail at once on any other 4xx."""
 
     def __init__(
         self,
@@ -52,6 +48,7 @@ class HttpFetcher:
                 with urllib.request.urlopen(req, timeout=policy.timeout_seconds) as r:
                     return r.read()
             except urllib.error.HTTPError as e:
+                # retrying a 403/404 just burns the rate-limit window
                 if e.code != 429 and not 500 <= e.code < 600:
                     raise ServiceError(f"{url}: HTTP {e.code}", status=e.code) from e
                 last = f"HTTP {e.code}"
