@@ -11,6 +11,7 @@ from traust_core.v1.repositories.tables import (
     TRAUST,
     TRAUST_LEDGER,
     TRAUST_OPS,
+    SqlTableRepository,
     TableFactory,
 )
 from traust_core.v1.repositories.traust.inventory import REPOSITORY
@@ -81,3 +82,24 @@ def _is_view(stem: str, dialect: Dialect) -> bool:
 def test_declared_tables_match_the_contracts_ddl(kind: str, tmp_path: Path) -> None:
     with contract_db(kind, tmp_path) as engine:
         assert contract_drift(engine) == []
+
+
+def _table_repositories() -> list[type[SqlTableRepository]]:
+    pending, found = list(SqlTableRepository.__subclasses__()), []
+    while pending:
+        cls = pending.pop()
+        pending += cls.__subclasses__()
+        if "spec" in vars(cls):
+            found.append(cls)
+    return found
+
+
+def test_each_table_has_one_repository_and_its_model_matches_the_columns() -> None:
+    import traust_core.v1.repositories.contract  # noqa: F401  (registers every repository)
+
+    repos = _table_repositories()
+    assert sorted(r.spec.name for r in repos) == sorted(s.name for s in CONTRACT_TABLES)
+    tables = contract_tables(Dialect.SQLITE)
+    for repo in repos:
+        columns = set(tables.table(repo.spec).c.keys())
+        assert set(repo.record.model_fields) == columns, repo.spec.name

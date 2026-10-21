@@ -8,7 +8,7 @@ from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.analysis_results import ResultKind, Subject
 from traust_core.v1.models.artifacts import ARTIFACT_FOR_KIND
 from traust_core.v1.repositories import InMemoryObjectStore, LocalObjectStore, ObjectKey
-from traust_core.v1.repositories.analysis_results import (
+from traust_core.v1.repositories.objects.analysis_results import (
     AnalysisResultsRepository,
     ResultsLayout,
     ResultsRepository,

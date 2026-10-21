@@ -13,8 +13,8 @@ from traust_core.v1.errors import ConfigError, DocumentError, RepositoryError
 from traust_core.v1.models.analysis_results import ResultKind, Subject
 from traust_core.v1.models.artifacts import TriageArtifact
 from traust_core.v1.repositories import InMemoryObjectStore
-from traust_core.v1.repositories.analysis_results import AnalysisResultsRepository
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
+from traust_core.v1.repositories.objects.analysis_results import AnalysisResultsRepository
 from traust_core.v1.services.artifact_publishing import ArtifactPublisher, SqlArtifactIndex
 
 SUBJECT = Subject(tree="findings", product="openshift", repo_dir="oc", base="oc")

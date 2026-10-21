@@ -21,8 +21,8 @@ from traust_core.v1.repositories import (
     UnitOfWork,
     create_database_engine,
 )
-from traust_core.v1.repositories.analysis_results import AnalysisResultsRepository
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
+from traust_core.v1.repositories.objects.analysis_results import AnalysisResultsRepository
 from traust_core.v1.repositories.sql import Dialect
 from traust_core.v1.repositories.tables import TableFactory
 from traust_core.v1.services.artifact_publishing import (

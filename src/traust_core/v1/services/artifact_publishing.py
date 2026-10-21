@@ -10,8 +10,11 @@ from traust_core.v1.models.analysis_results import ResultKind, Subject
 from traust_core.v1.models.artifacts import Artifact
 from traust_core.v1.models.assessment import Artifact as ArtifactRow
 from traust_core.v1.models.base import Dto
-from traust_core.v1.repositories.analysis_results import AnalysisResultsRepository, artifact_kind
-from traust_core.v1.repositories.object_store import ObjectRef
+from traust_core.v1.repositories.objects.analysis_results import (
+    AnalysisResultsRepository,
+    artifact_kind,
+)
+from traust_core.v1.repositories.objects.store import ObjectRef
 from traust_core.v1.repositories.traust.assessments import AssessmentsUnitOfWork
 
 A = TypeVar("A", bound=Artifact)

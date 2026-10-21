@@ -1,5 +1,5 @@
 from traust_core.v1.repositories.memory import InMemoryUnitOfWork
-from traust_core.v1.repositories.object_store import (
+from traust_core.v1.repositories.objects.store import (
     InMemoryObjectStore,
     LocalObjectStore,
     ObjectKey,
