@@ -5,13 +5,13 @@ from typing import Protocol, TypeVar
 
 from traust_core.v1.errors import ConfigError
 from traust_core.v1.models.analysis_results import ResultKind, Subject
-from traust_core.v1.models.artifacts import Artifact
+from traust_core.v1.models.artifacts import ArtifactDocument
 from traust_core.v1.repositories.objects.store import ObjectKey, ObjectRef, ObjectStore
 
-A = TypeVar("A", bound=Artifact)
+A = TypeVar("A", bound=ArtifactDocument)
 
 
-def artifact_kind(artifact: type[Artifact]) -> ResultKind:
+def artifact_kind(artifact: type[ArtifactDocument]) -> ResultKind:
     if artifact.kind is None:
         raise ConfigError(f"artifact {artifact.name!r} has no analysis-results file kind")
     return artifact.kind
@@ -47,7 +47,7 @@ class AnalysisResultsRepository:
     def __init__(
         self,
         objects: ObjectStore,
-        artifacts: Mapping[ResultKind, type[Artifact]] | None = None,
+        artifacts: Mapping[ResultKind, type[ArtifactDocument]] | None = None,
         layout: ResultsLayout | None = None,
     ) -> None:
         self._objects = objects

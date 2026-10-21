@@ -5,7 +5,7 @@ import pytest
 from tests.v1.fixtures import TRIAGE
 from traust_core.v1 import contracts
 from traust_core.v1.errors import DocumentError
-from traust_core.v1.models.artifacts import ANALYSIS_ARTIFACTS, Artifact, TriageArtifact
+from traust_core.v1.models.artifacts import ANALYSIS_ARTIFACTS, ArtifactDocument, TriageArtifact
 from traust_core.v1.models.vocabulary import Severity, Verdict
 
 FINDING = {
@@ -62,7 +62,7 @@ def test_cross_file_refs_resolve_into_the_target_schema() -> None:
 def test_artifact_subclasses_must_declare_a_schema() -> None:
     with pytest.raises(TypeError):
 
-        class Broken(Artifact): ...
+        class Broken(ArtifactDocument): ...
 
 
 def test_schema_path_points_at_the_installed_contract() -> None:

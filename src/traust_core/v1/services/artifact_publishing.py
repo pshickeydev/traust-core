@@ -7,8 +7,8 @@ from uuid import UUID
 
 from traust_core.v1.errors import ConfigError, DocumentError, Issue, TraustError
 from traust_core.v1.models.analysis_results import ResultKind, Subject
-from traust_core.v1.models.artifacts import Artifact
-from traust_core.v1.models.assessment import Artifact as ArtifactRow
+from traust_core.v1.models.artifacts import ArtifactDocument
+from traust_core.v1.models.assessment import Artifact
 from traust_core.v1.models.base import Dto
 from traust_core.v1.repositories.objects.analysis_results import (
     AnalysisResultsRepository,
@@ -17,7 +17,7 @@ from traust_core.v1.repositories.objects.analysis_results import (
 from traust_core.v1.repositories.objects.store import ObjectRef
 from traust_core.v1.repositories.traust.assessments import AssessmentsUnitOfWork
 
-A = TypeVar("A", bound=Artifact)
+A = TypeVar("A", bound=ArtifactDocument)
 
 
 class InputFormat(Protocol):
@@ -72,7 +72,9 @@ class PublishSpecs:
 
 
 class ArtifactIndex(Protocol):
-    def record(self, artifact: Artifact, subject: Subject, ref: ObjectRef, run_id: str) -> UUID: ...
+    def record(
+        self, artifact: ArtifactDocument, subject: Subject, ref: ObjectRef, run_id: str
+    ) -> UUID: ...
 
 
 class SqlArtifactIndex:
@@ -81,10 +83,12 @@ class SqlArtifactIndex:
     def __init__(self, uow: Callable[[], AssessmentsUnitOfWork]) -> None:
         self._uow = uow
 
-    def record(self, artifact: Artifact, subject: Subject, ref: ObjectRef, run_id: str) -> UUID:
+    def record(
+        self, artifact: ArtifactDocument, subject: Subject, ref: ObjectRef, run_id: str
+    ) -> UUID:
         with self._uow() as u:
             row = u.artifacts.find(None, ref.sha256) or u.artifacts.add(
-                ArtifactRow(digest=ref.sha256, kind=artifact.schema, uri=str(ref.key))
+                Artifact(digest=ref.sha256, kind=artifact.schema, uri=str(ref.key))
             )
             u.commit()
         assert row.id is not None
@@ -118,7 +122,9 @@ class ArtifactPublisher:
         artifact = spec.artifact.parse(spec.input.to_json(name, raw))
         return self.publish_artifact(artifact, subject, run_id)
 
-    def publish_artifact(self, artifact: Artifact, subject: Subject, run_id: str) -> PublishResult:
+    def publish_artifact(
+        self, artifact: ArtifactDocument, subject: Subject, run_id: str
+    ) -> PublishResult:
         spec = self._specs.get(artifact.name)
         primary = self._results.put(subject, artifact_kind(spec.artifact), artifact.payload)
         written = [
@@ -134,13 +140,13 @@ class ArtifactPublisher:
             return result.model_copy(update={"index_error": str(e)})
         return result.model_copy(update={"artifact_id": artifact_id})
 
-    def get(self, artifact_id: UUID) -> Artifact:
+    def get(self, artifact_id: UUID) -> ArtifactDocument:
         raise NotImplementedError("stub: replaces AnalysisResultsRepository.read by path subject")
 
     def verify(self, artifact_id: UUID) -> DigestCheck:
         raise NotImplementedError("stub: replaces verify_report_digests.py, ledger report digests")
 
-    def list_for_assessment(self, assessment_id: UUID) -> list[ArtifactRow]:
+    def list_for_assessment(self, assessment_id: UUID) -> list[Artifact]:
         raise NotImplementedError("stub: replaces corpus/report_store listing")
 
 

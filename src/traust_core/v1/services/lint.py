@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Protocol
 
-from traust_core.v1.models.artifacts import Artifact
+from traust_core.v1.models.artifacts import ArtifactDocument
 from traust_core.v1.models.base import Model
 
 
@@ -23,14 +23,14 @@ class LintReport(Model): ...
 class LintRule(Protocol):
     id: LintRuleId
 
-    def check(self, subject: Artifact, context: LintContext) -> list[Violation]: ...
+    def check(self, subject: ArtifactDocument, context: LintContext) -> list[Violation]: ...
 
 
 class Lint:
-    def __init__(self, rules: Mapping[type[Artifact], Sequence[LintRule]]) -> None:
+    def __init__(self, rules: Mapping[type[ArtifactDocument], Sequence[LintRule]]) -> None:
         self._rules = rules
 
-    def run(self, subject: Artifact, context: LintContext) -> LintReport:
+    def run(self, subject: ArtifactDocument, context: LintContext) -> LintReport:
         raise NotImplementedError(
             "stub: replaces check_citations, lint_verdict_citations,"
             " validate_compliance_assessment, validate_isolation_review,"
