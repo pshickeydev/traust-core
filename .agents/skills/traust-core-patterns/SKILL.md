@@ -20,6 +20,38 @@ Rules live in `AGENTS.md` → **Design rules**: one owner per capability, one se
 | A config field | [service.md](service.md#config) | `src/traust_core/v1/context/` |
 | A contracts bump or a named artifact | [contracts.md](contracts.md) | `src/traust_core/v1/models/artifacts.py`, `tests/v1/models/test_artifacts.py` |
 
+## Who owns what
+
+| Layer | Owns | Never |
+|---|---|---|
+| Model (`models/<section>.py`) | a contract table row (`Entity`/`AppendOnly`, fields = columns); other types are plain `Model`; pure rules on one value | I/O, database types, behaviour on row models |
+| Repository (`repositories/traust*/<section>/<table>.py`) | SQL for its one table: inherited `add`/`get`/`update` + named queries | rules, joins to another section, files |
+| Unit of work (`SqlTraustUnitOfWork`) | one connection, one transaction across every repository | logic |
+| Policy | pure rules needing config or spanning domains | I/O |
+| Service (`services/<domain>.py`) | use cases: read via repositories, apply policies, write, commit | SQL, another domain's repositories, files, env, clocks |
+| Provider (`providers/`) | anything outside the process | domain rules |
+| Route / CLI / materializer | validate → call one service → return its result | logic |
+
+```text
+needs SQL?                      → named query on the table's repository (one table)
+several tables of one section?  → service method over that section's repositories
+two domains?                    → call the other domain's service; compose by <entity>_id
+rule with no I/O?               → policy (or the model, if it's about one value)
+outside the process?            → provider
+SQL rule several readers share? → a view in traust-contracts
+```
+
+## No duplicated responsibility
+
+- One query, one place: the owning table's repository. Filtering rows in Python that SQL could filter → a named query.
+- A repository never decides (thresholds, status rules) → policy.
+- One model per concept: extend it; never a parallel `ObservedX` / flattened copy of a DTO.
+- One id scheme: `<entity>_id: UUID`.
+- No `Protocol` without a second implementation.
+- When a change touches a module that duplicates a responsibility, move it to its owner in the same PR and delete the copy.
+
+`tests/v1/test_architecture.py` enforces the structural rules (row models are tables, services use their own section, no file/sqlite access in services or table repositories, no side repositories, no in-memory stand-ins in `src/`, one engine in `Context`). If it fails, the code is in the wrong place; don't widen the allowlists without review.
+
 Python style (typing, models, errors, idioms): [../python-patterns/SKILL.md](../python-patterns/SKILL.md).
 
 Finish every change with `make lint-fix && make test`.
