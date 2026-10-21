@@ -9,8 +9,8 @@ Rules live in `AGENTS.md` → **Design rules**: one owner per capability, one se
 
 | Adding | Recipe | Worked example |
 |---|---|---|
-| An aggregate repository over a contracts table | [repository.md](repository.md#aggregate-repository) | `src/traust_core/v1/repositories/triage.py` (mechanics only; legacy ids) |
-| A table and its repository | [repository.md](repository.md) | `tests/v1/example/repository.py`; over a contracts table: `src/traust_core/v1/repositories/storage.py` |
+| A repository (or a query) over a contracts table | [repository.md](repository.md) | `src/traust_core/v1/repositories/traust/inventory/repository.py`; tests in `tests/v1/repositories/tables/` |
+| Cross-section writes in one transaction | [repository.md](repository.md#unit-of-work) | `src/traust_core/v1/repositories/contract.py` (`SqlTraustUnitOfWork`) |
 | A domain service, policy or interface | [service.md](service.md) | `src/traust_core/v1/services/portfolio.py` (shape) |
 | A tool, source or feed provider | [provider.md](provider.md) | `tests/v1/example/provider.py` |
 | An artifact type the harness/LLM produces | [artifacts.md](artifacts.md) | `tests/v1/example/artifact_publishing.py` (`TRIAGE`) |

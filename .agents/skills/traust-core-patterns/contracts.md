@@ -10,7 +10,7 @@ Bump the pin:
 Write (exact):
 
 - `contracts.validate(name, document)` / `contracts.validate_json(name, payload)` → `DocumentError` with `{path, message}` issues
-- `ArtifactPublisher` and `record_artifact` already call it
+- `ArtifactPublisher` already calls it
 
 Read:
 
@@ -22,4 +22,5 @@ Read:
 
 Database:
 
-- `apply_schema(engine, contracts.ddl("storage", dialect))`; check repositories with `schema_drift`
+- `apply_schema(engine, contracts.database_ddl(dialect))` creates every namespace (traust, traust_ops, traust_ledger) in bootstrap order
+- The DDL is contracts' to own and test; core declares each table once as a `TableSpec` and tests repository behaviour (see [repository.md](repository.md))
