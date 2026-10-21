@@ -1,0 +1,143 @@
+from __future__ import annotations
+
+import json
+from collections.abc import Sequence
+from datetime import datetime
+from pathlib import Path
+from uuid import NAMESPACE_URL, UUID, uuid5
+
+from traust_core.v1.models.observation import ComparisonStatus, ObservationTarget
+from traust_core.v1.models.vocabulary import Severity
+from traust_core.v1.providers.base import Acquisition, Result
+from traust_core.v1.providers.clock import FixedClock
+from traust_core.v1.providers.sources import ChangedFile, Comparison, Quota, RepoInfo, SourceError
+from traust_core.v1.repositories.observation import InMemoryObservationStore
+from traust_core.v1.services.assessment import AssessmentService
+from traust_core.v1.services.portfolio import PortfolioPolicy, PortfolioService, RepoStateQuery
+
+REFERENCE = json.loads(
+    (Path(__file__).parents[1] / "fixtures/observations/reference.json").read_text()
+)
+NOW = datetime.fromisoformat(REFERENCE["now"])
+HOSTS = {"github.com": "github", "gitlab.com": "gitlab"}
+
+
+def repository_id_for(repo_url: str | None, repo_key: str) -> UUID:
+    """A stable repository id per fixture repo (the model supplies real UUIDs)."""
+    return uuid5(NAMESPACE_URL, repo_url or f"key:{repo_key}")
+
+
+class FakeSource:
+    def __init__(self, info=None, comparison=None, quota=100):
+        self.info_data = info if info is not None else REFERENCE["cases"][0]["info"]
+        self.comparison_data = (
+            comparison if comparison is not None else REFERENCE["cases"][0]["compare"]
+        )
+        self.remaining = quota
+        self.calls = []
+
+    def result(self, data):
+        return Result(data, Acquisition(provider="fake", acquired_at=NOW))
+
+    def info(self, repo):
+        self.calls.append("info")
+        data = {k: v for k, v in self.info_data.items() if k != "ok"}
+        if not self.info_data["ok"]:
+            raise SourceError(data.get("error") or "source failed", ComparisonStatus(data["kind"]))
+        return self.result(RepoInfo(repo=repo, **data))
+
+    def compare(self, repo, baseline, branch):
+        self.calls.append("compare")
+        data = self.comparison_data
+        if not data["ok"]:
+            raise SourceError(data.get("error") or "source failed", ComparisonStatus(data["kind"]))
+        return self.result(
+            Comparison(
+                ahead_by=data["ahead_by"],
+                truncated=data["truncated"],
+                files=tuple(ChangedFile(**f) for f in data["files"]),
+            )
+        )
+
+    def quota(self, repo):
+        self.calls.append("quota")
+        return self.result(Quota(remaining=self.remaining))
+
+
+class FixedOpenCounts:
+    """The finding_status view double: N open critical/high findings for a repo."""
+
+    def __init__(self) -> None:
+        self.counts: dict[UUID, int] = {}
+
+    def open_count(self, repository_id: UUID, severities: Sequence[Severity]) -> int:
+        if Severity.CRITICAL not in severities and Severity.HIGH not in severities:
+            return 0
+        return self.counts.get(repository_id, 0)
+
+
+class FixedBaselineAssessment(AssessmentService):
+    def __init__(self, target, clock):
+        super().__init__(None, clock=clock)  # uow unused: target and baseline are fixed
+        self.target = target
+
+    def observation_target(self, **kwargs):
+        return self.target
+
+
+def observer(case=None, *, store=None, **changes):
+    case = case or REFERENCE["cases"][0]
+    data = {**case["repo"], **changes}
+    live = data.pop("live_crit_high", 0)
+    repo_key = data.pop("repo_key")
+    repo_url = data.pop("repo_url", None)
+    target = ObservationTarget(
+        repository_id=repository_id_for(repo_url, repo_key),
+        repo_url=repo_url,
+        **data,
+    )
+    clock = FixedClock(NOW)
+    assessment = FixedBaselineAssessment(target, clock)
+    counts = FixedOpenCounts()
+    counts.counts[target.repository_id] = live
+    sources = FakeSource(case["info"], case["compare"])
+    store = store if store is not None else InMemoryObservationStore()
+    service = PortfolioService(
+        None,  # contract uow unused: observation writes go to the store
+        PortfolioPolicy(),
+        store=store,
+        assessment=assessment,
+        sources=sources,
+        clock=clock,
+        hosts=HOSTS,
+    )
+    harness = _Harness(
+        service,
+        RepoStateQuery(
+            service,
+            assessment,
+            None,  # findings service: open counts come from the counts port
+            counts,
+            PortfolioPolicy(),
+            clock=clock,
+            hosts=HOSTS,
+        ),
+    )
+    return harness, store, assessment, counts, sources
+
+
+class _Harness:
+    """Exposes both the observation write path and the composite read."""
+
+    def __init__(self, service, query):
+        self._service, self.query = service, query
+
+    @property
+    def repository_id(self) -> UUID:
+        return self._service._assessment.target.repository_id
+
+    def record_forge_facts(self, **kwargs):
+        return self._service.record_forge_facts(**kwargs)
+
+    def observed(self, **kwargs):
+        return self.query.observed(**kwargs)

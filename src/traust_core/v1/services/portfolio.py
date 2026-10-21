@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import datetime, timedelta
 from uuid import UUID
 
+from traust_core.v1.errors import ConfigError, NotFoundError, ValidationError
 from traust_core.v1.models.common import Page, PageRequest
 from traust_core.v1.models.inventory import (
+    DEFAULT_FORGE_HOSTS,
     Component,
     ComponentFilter,
     ExposureClass,
@@ -26,17 +29,106 @@ from traust_core.v1.models.inventory import (
     SyncReport,
     VersionLabel,
 )
+from traust_core.v1.models.observation import (
+    Designation,
+    ForgeFacts,
+    ObservationTarget,
+    ObservedRepoState,
+)
 from traust_core.v1.models.values import GitSha, HttpsRepoUrl
-from traust_core.v1.models.vocabulary import RefKind
+from traust_core.v1.models.vocabulary import RefKind, Severity
+from traust_core.v1.providers.clock import Clock, SystemClock
 from traust_core.v1.providers.sources import SourceProvider
+from traust_core.v1.repositories.designations import DesignationRepository
+from traust_core.v1.repositories.observation import ObservationStore
+from traust_core.v1.repositories.traust.findings import OpenCounts
 from traust_core.v1.repositories.traust.inventory import InventoryUnitOfWork
-from traust_core.v1.services.assessment import AssessmentService
+from traust_core.v1.services.assessment import AssessmentService, parse_audit_date
 from traust_core.v1.services.findings.service import FindingService
+from traust_core.v1.services.observation import BanBreaker, observe_forge_facts
+
+DORMANT_DAYS = 365
+
+P0_MIN_LIVE = 5
+
+
+class PortfolioPolicy:
+    def __init__(self, *, p0_min_live: int = P0_MIN_LIVE, dormant_days: int = DORMANT_DAYS) -> None:
+        if p0_min_live < 1 or dormant_days < 0:
+            raise ValidationError("portfolio policy thresholds must be positive")
+        self.p0_min_live, self.dormant_days = p0_min_live, dormant_days
+
+    def exposure_class(
+        self, designation: Designation | None, public: bool | None, public_upstream: bool | None
+    ) -> ExposureClass:
+        if public:
+            return (
+                ExposureClass.PUBLIC_INTERNAL
+                if designation == Designation.INTERNAL_TOOLING
+                else ExposureClass.PUBLIC_EXTERNAL
+            )
+        if designation == Designation.EXTERNAL:
+            return (
+                ExposureClass.PUBLIC_EXTERNAL if public_upstream else ExposureClass.PRIVATE_EXTERNAL
+            )
+        return ExposureClass.PUBLIC_INTERNAL if public_upstream else ExposureClass.PRIVATE_INTERNAL
+
+    def risk_tier(self, open_critical_high: int, archived: bool, dormant: bool) -> RiskTier:
+        if open_critical_high >= self.p0_min_live:
+            return RiskTier.P0
+        if open_critical_high >= 1:
+            return RiskTier.P1
+        return RiskTier.P3 if archived or dormant else RiskTier.P2
 
 
 class PortfolioService:
-    def __init__(self, uow: InventoryUnitOfWork) -> None:
-        self._uow = uow
+    def __init__(
+        self,
+        uow: InventoryUnitOfWork,
+        policy: PortfolioPolicy,
+        *,
+        store: ObservationStore,
+        assessment: AssessmentService | None = None,
+        sources: SourceProvider | None = None,
+        clock: Clock | None = None,
+        hosts: Mapping[str, str] | None = None,
+    ) -> None:
+        self._uow, self._policy, self._store = uow, policy, store
+        self._assessment, self._sources = assessment, sources
+        self._clock = clock or SystemClock()
+        self._hosts = dict(hosts or DEFAULT_FORGE_HOSTS)
+
+    def _target(
+        self, *, repository_id: UUID | None = None, repo_url: str | None = None
+    ) -> ObservationTarget:
+        if self._assessment is None:
+            raise ConfigError("repository observation requires AssessmentService")
+        return self._assessment.observation_target(repository_id=repository_id, repo_url=repo_url)
+
+    def record_forge_facts(
+        self,
+        *,
+        repository_id: UUID | None = None,
+        repo_url: str | None = None,
+        network: bool = True,
+        breaker: BanBreaker | None = None,
+        quota_deferred: bool | None = None,
+    ) -> ForgeFacts:
+        target = self._target(repository_id=repository_id, repo_url=repo_url)
+        facts = observe_forge_facts(
+            target,
+            self._sources,
+            self._clock.now(),
+            hosts=self._hosts,
+            network=network,
+            breaker=breaker,
+            quota_deferred=quota_deferred,
+        )
+        self._store.save(facts)
+        return facts
+
+    def forge_facts(self, repository_id: UUID) -> ForgeFacts | None:
+        return self._store.find(repository_id)
 
     def register_product(self, slug: ProductSlug, name: str) -> Product:
         raise NotImplementedError("stub: replaces registry/products.py, inventory.py")
@@ -105,12 +197,88 @@ class PortfolioSync:
 
 
 class RepoStateQuery:
+    """Composite read across portfolio, assessments and findings (traust#58)."""
+
     def __init__(
-        self, portfolio: PortfolioService, assessments: AssessmentService, findings: FindingService
+        self,
+        portfolio: PortfolioService,
+        assessments: AssessmentService,
+        findings: FindingService,
+        counts: OpenCounts,
+        policy: PortfolioPolicy,
+        *,
+        designations: DesignationRepository | None = None,
+        clock: Clock | None = None,
+        hosts: Mapping[str, str] | None = None,
     ) -> None:
         self._portfolio = portfolio
         self._assessments = assessments
         self._findings = findings
+        self._counts, self._policy = counts, policy
+        self._designations = designations
+        self._clock = clock or SystemClock()
+        self._hosts = dict(hosts or DEFAULT_FORGE_HOSTS)
+
+    def observed(
+        self, *, repository_id: UUID | None = None, repo_url: str | None = None
+    ) -> ObservedRepoState:
+        """The routing state derived from one repository's latest observation."""
+        target = self._assessments.observation_target(
+            repository_id=repository_id, repo_url=repo_url
+        )
+        facts = self._portfolio.forge_facts(target.repository_id)
+        if facts is None:
+            raise NotFoundError(f"no forge observation for {target.repo_url}; observe it first")
+        if (facts.audited_sha, facts.audit_date, facts.has_audit) != (
+            target.pinned_sha,
+            target.audit_date,
+            target.has_audit,
+        ):
+            raise NotFoundError(f"audit baseline changed for {target.repo_url}; observe it again")
+        live = self._counts.open_count(target.repository_id, (Severity.CRITICAL, Severity.HIGH))
+        now = self._clock.now()
+        fresh = self._assessments.freshness(
+            baseline=target, changed_lines=facts.changed_lines, as_of=now
+        )
+        designation = target.designation
+        if self._designations:
+            designation = next(
+                (
+                    row.designation
+                    for row in self._designations.entries()
+                    if target.repo_url
+                    and (
+                        target.repo_url == row.match
+                        or (row.match.endswith("/") and target.repo_url.startswith(row.match))
+                    )
+                ),
+                target.designation,
+            )
+        pushed = parse_audit_date(facts.pushed_at)
+        audited = parse_audit_date(target.audit_date) if target.has_audit else None
+        dormant = bool(pushed and (now.date() - pushed).days > self._policy.dormant_days)
+        return ObservedRepoState(
+            repository_id=target.repository_id,
+            repo=facts.repo,
+            status=facts.status,
+            risk_tier=self._policy.risk_tier(live, bool(facts.archived), dormant),
+            exposure=self._policy.exposure_class(
+                designation,
+                (facts.visibility or "").lower() == "public",
+                bool(facts.fork and facts.parent),
+            ),
+            audit_age_days=fresh.age_days(now),
+            churn_ratio=fresh.churn_ratio,
+            changed_lines=facts.changed_lines,
+            sensitive_changed=facts.sensitive_changed,
+            sensitive_lines=facts.sensitive_lines,
+            deps_only=facts.deps_only,
+            ahead_by=facts.ahead_by,
+            compare_truncated=facts.compare_truncated,
+            push_changed=pushed >= audited if pushed and audited else None,
+            observed_at=facts.observed_at,
+            error=facts.error,
+        )
 
     def repo_state(self, repository_id: UUID) -> RepoState:
         raise NotImplementedError("stub: replaces traust#58 observe_repo")

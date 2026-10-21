@@ -74,6 +74,10 @@ class Coverage(Model):
         raise NotImplementedError("stub: replaces build_coverage_gap_rollup.build_rollup")
 
 
+# NEED(contracts): the assessment-status enum, once it lands, owns these values.
+ASSESSMENT_COMPLETED = "completed"
+
+
 class Assessment(AppendOnly):
     """3a · what was examined: a ref (and image), by an assessor, with what outcome."""
 
@@ -129,12 +133,14 @@ class IsolationResult(Model):
 
 
 class Freshness(Model):
-    repository_ref_id: UUID
+    repository_ref_id: UUID | None = None
     last_assessed_at: datetime | None = None
     churn_ratio: float | None = None
 
     def age_days(self, now: datetime) -> int | None:
-        raise NotImplementedError("stub: replaces build_rescan_worklist audit_age_days")
+        if self.last_assessed_at is None:
+            return None
+        return (now.date() - self.last_assessed_at.date()).days
 
 
 class Population(Model):

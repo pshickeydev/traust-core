@@ -266,3 +266,20 @@ def test_saved_record_round_trips_by_id(uow: RecordUnitOfWork) -> None:
     with uow as u:
         reread = u.records.get(saved.id)
     assert reread == saved
+
+
+def test_unit_of_work_is_reentrant(engine) -> None:
+    from traust_core.v1.repositories.sql import SqlUnitOfWork
+
+    outer = SqlUnitOfWork(engine)
+    with outer as first:
+        with outer as second:  # a collaborating service re-enters the same unit
+            assert second is first
+            assert second.connection is first.connection
+        # the nested exit must not close the session connection
+        assert first.connection.execute(sa.text("SELECT 1")).scalar() == 1
+    # only the outermost exit closes
+    from traust_core.v1.errors import RepositoryError
+
+    with pytest.raises(RepositoryError):
+        _ = first.connection

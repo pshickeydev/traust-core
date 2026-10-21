@@ -152,9 +152,14 @@ def apply_schema(engine: Engine, statements: Iterable[str]) -> None:
 
 
 class SqlUnitOfWork:
+    """Re-entrant: collaborating services share one instance; the outermost `with`
+    owns the connection and the rollback.
+    """
+
     def __init__(self, engine: Engine) -> None:
         self._engine = engine
         self._connection: Connection | None = None
+        self._depth = 0
 
     @property
     def connection(self) -> Connection:
@@ -166,11 +171,13 @@ class SqlUnitOfWork:
         pass
 
     def __enter__(self) -> Self:
-        try:
-            self._connection = self._engine.connect()
-        except SQLAlchemyError as e:
-            raise RepositoryError(f"{type(self).__name__}: connect failed: {e}") from e
-        self._open_repositories()
+        if self._depth == 0:
+            try:
+                self._connection = self._engine.connect()
+            except SQLAlchemyError as e:
+                raise RepositoryError(f"{type(self).__name__}: connect failed: {e}") from e
+            self._open_repositories()
+        self._depth += 1
         return self
 
     def __exit__(
@@ -179,6 +186,9 @@ class SqlUnitOfWork:
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
+        self._depth -= 1
+        if self._depth > 0:
+            return  # nested use: the outer owner owns the transaction
         try:
             self.rollback()
         finally:

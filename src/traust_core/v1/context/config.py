@@ -8,6 +8,7 @@ import sqlalchemy as sa
 import yaml
 
 from traust_core.v1.errors import ConfigError
+from traust_core.v1.models.inventory import DEFAULT_FORGE_HOSTS
 
 
 class _Model(pydantic.BaseModel):
@@ -60,6 +61,7 @@ class Config(_Model):
     artifacts: ArtifactsConfig = ArtifactsConfig()
     process: ProcessConfig = ProcessConfig()
     allowed_repo_hosts: tuple[str, ...] = ()
+    forge_hosts: dict[str, str] = pydantic.Field(default_factory=lambda: dict(DEFAULT_FORGE_HOSTS))
 
     @classmethod
     def from_file(cls, path: Path) -> Config:
