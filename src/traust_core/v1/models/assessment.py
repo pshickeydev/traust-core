@@ -129,12 +129,14 @@ class IsolationResult(Model):
 
 
 class Freshness(Model):
-    repository_ref_id: UUID
+    repository_ref_id: UUID | None = None
     last_assessed_at: datetime | None = None
     churn_ratio: float | None = None
 
     def age_days(self, now: datetime) -> int | None:
-        raise NotImplementedError("stub: replaces build_rescan_worklist audit_age_days")
+        if self.last_assessed_at is None:
+            return None
+        return (now.date() - self.last_assessed_at.date()).days
 
 
 class Population(Model):

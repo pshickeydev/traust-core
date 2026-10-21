@@ -78,6 +78,9 @@ class RiskTier(StrEnum):
     P3 = "P3"
 
 
+DEFAULT_FORGE_HOSTS: dict[str, str] = {"github.com": "github", "gitlab.com": "gitlab"}
+
+
 class ForgeHost(StrEnum):
     GITHUB = "github"
     GITLAB = "gitlab"

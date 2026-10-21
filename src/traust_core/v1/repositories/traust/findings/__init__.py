@@ -35,6 +35,7 @@ from traust_core.v1.repositories.traust.findings.review_item import (
     ReviewItemRepository,
     SqlReviewItemRepository,
 )
+from traust_core.v1.repositories.traust.findings.status import OpenCounts, SqlOpenCounts
 from traust_core.v1.repositories.unit_of_work import UnitOfWork
 
 TABLES = (
@@ -56,6 +57,7 @@ class FindingsUnitOfWork(UnitOfWork, Protocol):
     finding_external_refs: FindingExternalRefRepository
     decisions: DecisionRepository
     review_items: ReviewItemRepository
+    open_counts: OpenCounts
 
 
 __all__ = [
@@ -67,6 +69,7 @@ __all__ = [
     "FindingLabelRepository",
     "FindingRepository",
     "FindingsUnitOfWork",
+    "OpenCounts",
     "ReviewItemRepository",
     "SqlCweRepository",
     "SqlDecisionRepository",
@@ -74,5 +77,6 @@ __all__ = [
     "SqlFindingExternalRefRepository",
     "SqlFindingLabelRepository",
     "SqlFindingRepository",
+    "SqlOpenCounts",
     "SqlReviewItemRepository",
 ]

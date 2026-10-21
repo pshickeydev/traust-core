@@ -70,6 +70,7 @@ class SqlTraustUnitOfWork(SqlTablesUnitOfWork):
         self.finding_external_refs = findings.SqlFindingExternalRefRepository(conn, tables)
         self.decisions = findings.SqlDecisionRepository(conn, tables)
         self.review_items = findings.SqlReviewItemRepository(conn, tables)
+        self.open_counts = findings.SqlOpenCounts(conn)
         self.run_batches = traust_ops.SqlRunBatchRepository(conn, tables)
         self.run_orders = traust_ops.SqlRunOrderRepository(conn, tables)
         self.spend_events = traust_ops.SqlSpendEventRepository(conn, tables)

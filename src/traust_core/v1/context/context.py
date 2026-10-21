@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
 from typing import Any, TypeVar
@@ -8,6 +10,7 @@ from typing import Any, TypeVar
 from sqlalchemy.engine import Engine
 
 from traust_core.v1.context.config import Config
+from traust_core.v1.context.observation import command_source
 from traust_core.v1.models.artifacts import ARTIFACT_FOR_KIND
 from traust_core.v1.providers.base import ProviderRegistry
 from traust_core.v1.providers.clock import Clock, SystemClock
@@ -22,7 +25,9 @@ from traust_core.v1.repositories import (
     create_database_engine,
 )
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
+from traust_core.v1.repositories.designations import FileDesignationRepository
 from traust_core.v1.repositories.objects.analysis_results import AnalysisResultsRepository
+from traust_core.v1.repositories.observation import InMemoryObservationStore
 from traust_core.v1.repositories.sql import Dialect
 from traust_core.v1.repositories.tables import TableFactory
 from traust_core.v1.services.artifact_publishing import (
@@ -30,7 +35,13 @@ from traust_core.v1.services.artifact_publishing import (
     PublishSpecs,
     SqlArtifactIndex,
 )
+from traust_core.v1.services.assessment import AssessmentService
 from traust_core.v1.services.operations import Materializer
+from traust_core.v1.services.portfolio import (
+    PortfolioPolicy,
+    PortfolioService,
+    RepoStateQuery,
+)
 
 U = TypeVar("U", bound=UnitOfWork)
 
@@ -106,3 +117,51 @@ class Context:
 
     def analysis_results(self) -> AnalysisResultsRepository:
         return AnalysisResultsRepository(self.object_store, ARTIFACT_FOR_KIND)
+
+
+@dataclass(frozen=True)
+class _Observation:
+    """What the observation door yields: the write path, the composite read, the store."""
+
+    service: PortfolioService
+    query: RepoStateQuery
+    store: InMemoryObservationStore
+
+    @contextmanager
+    def repository_observation(
+        self,
+        *,
+        designations: Path | None = None,
+    ) -> Iterator[_Observation]:
+        """Observe repositories: forge facts in, derived routing state out.
+
+        Reads inventory, assessments and open counts from the contract tables;
+        the observation store is in memory until contracts lands
+        repository_observation (NEED marker in repositories/observation.py).
+        """
+        uow = SqlTraustUnitOfWork(self.database)
+        store = InMemoryObservationStore()
+        policy = PortfolioPolicy()
+        assessment = AssessmentService(uow, clock=self.clock, hosts=self.config.forge_hosts)
+        service = PortfolioService(
+            uow,
+            policy,
+            store=store,
+            assessment=assessment,
+            sources=command_source(self.config.forge_hosts, clock=self.clock),
+            clock=self.clock,
+            hosts=self.config.forge_hosts,
+        )
+        query = RepoStateQuery(
+            service,
+            assessment,
+            None,  # findings service: open counts come from the finding_status view
+            uow.open_counts,
+            policy,
+            designations=(
+                FileDesignationRepository(designations) if designations is not None else None
+            ),
+            clock=self.clock,
+            hosts=self.config.forge_hosts,
+        )
+        yield _Observation(service=service, query=query, store=store)
