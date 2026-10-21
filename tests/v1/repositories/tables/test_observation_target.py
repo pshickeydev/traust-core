@@ -6,7 +6,6 @@ from datetime import UTC, datetime
 from uuid import UUID
 
 import pytest
-from sqlalchemy.engine import Engine
 
 from tests.v1.repositories.tables.conftest import Seed
 from traust_core.v1.errors import NotFoundError, ValidationError
@@ -16,12 +15,12 @@ from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services.assessment import AssessmentService
 
 
-def service(engine: Engine) -> AssessmentService:
-    """A service over its own unit of work, as the context door builds it."""
-    return AssessmentService(SqlTraustUnitOfWork(engine))
+def service(uow: SqlTraustUnitOfWork) -> AssessmentService:
+    """A service sharing the open unit of work, as the observation door wires it."""
+    return AssessmentService(uow)
 
 
-def test_resolves_latest_audit_and_pinned_commit(uow, seed: Seed, engine: Engine):
+def test_resolves_latest_audit_and_pinned_commit(uow, seed: Seed):
     repo = seed.repository(url="https://github.com/org/audited")
     old_ref = seed.repository_ref(repository=repo, sha="a" * 40)
     new_ref = seed.repository_ref(repository=repo, sha="b" * 40)
@@ -41,9 +40,7 @@ def test_resolves_latest_audit_and_pinned_commit(uow, seed: Seed, engine: Engine
         kind=AssessmentKind.THREAT_MODEL,
         occurred_at=datetime(2026, 10, 1, tzinfo=UTC),
     )
-    uow.commit()
-
-    target = service(engine).observation_target(repo_url="https://github.com/org/audited")
+    target = service(uow).observation_target(repo_url="https://github.com/org/audited")
     assert target == ObservationTarget(
         repository_id=repo.id,
         repo_url="https://github.com/org/audited",
@@ -52,34 +49,66 @@ def test_resolves_latest_audit_and_pinned_commit(uow, seed: Seed, engine: Engine
         pinned_sha="b" * 40,
         repository_ref_id=new_ref.id,
     )
-    by_id = service(engine).observation_target(repository_id=repo.id)
+    by_id = service(uow).observation_target(repository_id=repo.id)
     assert by_id == target
 
 
-def test_observation_target_without_an_audit_is_never_audited(uow, seed: Seed, engine: Engine):
-    repo = seed.repository(url="https://github.com/org/never-audited")
-    uow.commit()
+def test_a_failed_audit_is_never_the_baseline(uow, seed: Seed):
+    repo = seed.repository(url="https://github.com/org/flaky")
+    ref = seed.repository_ref(repository=repo, sha="a" * 40)
+    seed.assessment(
+        ref=ref,
+        kind=AssessmentKind.SECURE_CODE,
+        occurred_at=datetime(2026, 9, 1, tzinfo=UTC),
+    )
+    # a newer run that failed must not displace the completed baseline
+    seed.assessment(
+        ref=ref,
+        kind=AssessmentKind.SECURE_CODE,
+        status="failed",
+        occurred_at=datetime(2026, 10, 1, tzinfo=UTC),
+    )
 
-    target = service(engine).observation_target(repo_url="https://github.com/org/never-audited")
+    target = service(uow).observation_target(repo_url="https://github.com/org/flaky")
+    assert target.audit_date == "2026-09-01"
+
+
+def test_only_failed_audits_count_as_never_audited(uow, seed: Seed):
+    repo = seed.repository(url="https://github.com/org/all-failed")
+    ref = seed.repository_ref(repository=repo, sha="a" * 40)
+    seed.assessment(
+        ref=ref,
+        kind=AssessmentKind.SECURE_CODE,
+        status="failed",
+        occurred_at=datetime(2026, 10, 1, tzinfo=UTC),
+    )
+
+    target = service(uow).observation_target(repo_url="https://github.com/org/all-failed")
+    assert target.has_audit is False
+
+
+def test_observation_target_without_an_audit_is_never_audited(uow, seed: Seed):
+    repo = seed.repository(url="https://github.com/org/never-audited")
+    target = service(uow).observation_target(repo_url="https://github.com/org/never-audited")
     assert target.has_audit is False
     assert target.repository_id == repo.id
 
 
-def test_observation_target_requires_inventory_membership(uow, seed: Seed, engine: Engine):
+def test_observation_target_requires_inventory_membership(uow, seed: Seed):
     with pytest.raises(NotFoundError):
-        service(engine).observation_target(repo_url="https://github.com/org/unknown")
+        service(uow).observation_target(repo_url="https://github.com/org/unknown")
 
 
-def test_observation_target_takes_exactly_one_selector(engine: Engine):
+def test_observation_target_takes_exactly_one_selector(uow):
     with pytest.raises(ValidationError):
-        service(engine).observation_target()
+        service(uow).observation_target()
     with pytest.raises(ValidationError):
-        service(engine).observation_target(
+        service(uow).observation_target(
             repository_id=UUID(int=1), repo_url="https://github.com/org/x"
         )
 
 
-def test_open_counts_read_the_finding_status_view(uow, seed: Seed, engine: Engine):
+def test_open_counts_read_the_finding_status_view(uow, seed: Seed):
     from traust_core.v1.models.vocabulary import Severity
 
     repo = seed.repository()

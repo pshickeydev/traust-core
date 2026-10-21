@@ -7,6 +7,7 @@ from uuid import UUID
 from traust_core.v1.errors import NotFoundError, ValidationError
 from traust_core.v1.models.artifacts import AssessmentArtifact
 from traust_core.v1.models.assessment import (
+    ASSESSMENT_COMPLETED,
     Assessment,
     AssessmentFilter,
     AssessmentKind,
@@ -113,7 +114,10 @@ class AssessmentService:
                 raise NotFoundError(f"repository not in inventory: {repository_id or repo_url}")
             latest = None
             for ref in uow.repository_refs.list_for(repo.id):
-                found = uow.assessments.latest(ref.id, AssessmentKind.SECURE_CODE)
+                # a degraded or failed run is never read as clean (the DDL rule)
+                found = uow.assessments.latest(
+                    ref.id, AssessmentKind.SECURE_CODE, status=ASSESSMENT_COMPLETED
+                )
                 if found is not None and (
                     latest is None or found.occurred_at > latest[1].occurred_at
                 ):

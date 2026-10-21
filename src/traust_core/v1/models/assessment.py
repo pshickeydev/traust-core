@@ -74,6 +74,10 @@ class Coverage(Model):
         raise NotImplementedError("stub: replaces build_coverage_gap_rollup.build_rollup")
 
 
+# NEED(contracts): the assessment-status enum, once it lands, owns these values.
+ASSESSMENT_COMPLETED = "completed"
+
+
 class Assessment(AppendOnly):
     """3a · what was examined: a ref (and image), by an assessor, with what outcome."""
 

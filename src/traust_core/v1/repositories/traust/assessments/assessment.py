@@ -33,7 +33,9 @@ ASSESSMENT = TableSpec(
 
 
 class AssessmentRepository(RecordRepository[Assessment], Protocol):
-    def latest(self, repository_ref_id: UUID, kind: str) -> Assessment | None: ...
+    def latest(
+        self, repository_ref_id: UUID, kind: str, status: str | None = None
+    ) -> Assessment | None: ...
     def list_for_ref(self, repository_ref_id: UUID) -> list[Assessment]: ...
     def list_for_run_order(self, run_order_id: UUID) -> list[Assessment]: ...
 
@@ -42,11 +44,16 @@ class SqlAssessmentRepository(SqlAppendOnlyRepository[Assessment]):
     spec = ASSESSMENT
     record = Assessment
 
-    def latest(self, repository_ref_id: UUID, kind: str) -> Assessment | None:
+    def latest(
+        self, repository_ref_id: UUID, kind: str, status: str | None = None
+    ) -> Assessment | None:
         c = self.table.c
+        conditions = [c.repository_ref_id == repository_ref_id, c.kind == kind]
+        if status is not None:
+            conditions.append(c.status == status)
         stmt = (
             self._select()
-            .where(c.repository_ref_id == repository_ref_id, c.kind == kind)
+            .where(*conditions)
             .order_by(c.occurred_at.desc(), c.created_at.desc())
             .limit(1)
         )
