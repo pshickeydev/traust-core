@@ -1,0 +1,55 @@
+from __future__ import annotations
+
+from typing import Protocol
+from uuid import UUID
+
+import sqlalchemy as sa
+
+from traust_core.v1.models.records import OccurrenceRecord
+from traust_core.v1.repositories.tables import (
+    TRAUST,
+    RecordRepository,
+    SqlAppendOnlyRepository,
+    TableSpec,
+    text_column,
+    uuid_column,
+)
+
+OCCURRENCE = TableSpec(
+    TRAUST,
+    "occurrence",
+    lambda: (
+        uuid_column("finding_id"),
+        uuid_column("assessment_id"),
+        text_column("severity"),
+        text_column("cvss_vector", nullable=True),
+        sa.Column("cvss_score", sa.Numeric, nullable=True),
+        text_column("rule", nullable=True),
+    ),
+    append_only=True,
+)
+
+
+class OccurrenceRepository(RecordRepository[OccurrenceRecord], Protocol):
+    def find(self, finding_id: UUID, assessment_id: UUID) -> OccurrenceRecord | None: ...
+    def list_for_assessment(self, assessment_id: UUID) -> list[OccurrenceRecord]: ...
+    def list_for_finding(self, finding_id: UUID) -> list[OccurrenceRecord]: ...
+
+
+class SqlOccurrenceRepository(SqlAppendOnlyRepository[OccurrenceRecord]):
+    spec = OCCURRENCE
+    record = OccurrenceRecord
+
+    def find(self, finding_id: UUID, assessment_id: UUID) -> OccurrenceRecord | None:
+        c = self.table.c
+        return self._one(
+            f"find {finding_id}/{assessment_id}",
+            c.finding_id == finding_id,
+            c.assessment_id == assessment_id,
+        )
+
+    def list_for_assessment(self, assessment_id: UUID) -> list[OccurrenceRecord]:
+        return self._many(f"list for {assessment_id}", self.table.c.assessment_id == assessment_id)
+
+    def list_for_finding(self, finding_id: UUID) -> list[OccurrenceRecord]:
+        return self._many(f"list for finding {finding_id}", self.table.c.finding_id == finding_id)

@@ -22,7 +22,9 @@ from traust_core.v1.repositories import (
     create_database_engine,
 )
 from traust_core.v1.repositories.analysis_results import AnalysisResultsRepository
+from traust_core.v1.repositories.sql import Dialect
 from traust_core.v1.repositories.storage import SqlStorageUnitOfWork
+from traust_core.v1.repositories.tables import TableFactory
 from traust_core.v1.services.artifact_publishing import (
     ArtifactPublisher,
     PublishSpecs,
@@ -77,7 +79,17 @@ class Context:
     def database(self) -> Engine:
         return create_database_engine(self.config.database.engine_url())
 
+    @cached_property
+    def dialect(self) -> Dialect:
+        return Dialect.of(self.database)
+
+    @cached_property
+    def tables(self) -> TableFactory:
+        """Contract tables for the configured database: schemas on Postgres, prefixes on SQLite."""
+        return TableFactory.for_dialect(self.dialect)
+
     def unit_of_work(self, factory: Callable[[Engine], U]) -> U:
+        """e.g. unit_of_work(SqlInventoryUnitOfWork); its repositories use this engine's tables."""
         return factory(self.database)
 
     def artifact_publisher(self, specs: PublishSpecs) -> ArtifactPublisher:

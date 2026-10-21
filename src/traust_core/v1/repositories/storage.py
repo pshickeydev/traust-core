@@ -10,13 +10,13 @@ from sqlalchemy.dialects import postgresql, sqlite
 from traust_core.v1.models.storage import ArtifactBinding, BindingContext, Evidence
 from traust_core.v1.repositories.memory import InMemoryUnitOfWork
 from traust_core.v1.repositories.sql import (
-    STORAGE_SCHEMA,
     SqlRepository,
     SqlUnitOfWork,
     UtcTimestamp,
 )
 from traust_core.v1.repositories.unit_of_work import UnitOfWork
 
+STORAGE_SCHEMA = "traust_storage"  # retired by the one-owner contract; parked: storage-retire
 metadata = sa.MetaData(schema=STORAGE_SCHEMA)
 
 artifact_evidence = sa.Table(

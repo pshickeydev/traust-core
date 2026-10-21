@@ -1,0 +1,46 @@
+from __future__ import annotations
+
+from typing import Protocol
+from uuid import UUID
+
+from traust_core.v1.models.records import ReviewItemRecord
+from traust_core.v1.repositories.tables import (
+    TRAUST,
+    MutableRecordRepository,
+    SqlMutableRepository,
+    TableSpec,
+    text_column,
+    uuid_column,
+)
+
+REVIEW_ITEM = TableSpec(
+    TRAUST,
+    "review_item",
+    lambda: (
+        uuid_column("finding_id"),
+        uuid_column("decision_id", nullable=True),
+        uuid_column("resolved_by_decision_id", nullable=True),
+        text_column("reason", nullable=True),
+        text_column("status"),
+    ),
+)
+
+PENDING = "pending"  # classifier plan: ReviewItem.status; the partial index's predicate
+
+
+class ReviewItemRepository(MutableRecordRepository[ReviewItemRecord], Protocol):
+    def list_for_finding(self, finding_id: UUID) -> list[ReviewItemRecord]: ...
+    def pending(self, limit: int) -> list[ReviewItemRecord]: ...
+
+
+class SqlReviewItemRepository(SqlMutableRepository[ReviewItemRecord]):
+    spec = REVIEW_ITEM
+    record = ReviewItemRecord
+
+    def list_for_finding(self, finding_id: UUID) -> list[ReviewItemRecord]:
+        return self._many(f"list for {finding_id}", self.table.c.finding_id == finding_id)
+
+    def pending(self, limit: int) -> list[ReviewItemRecord]:
+        c = self.table.c
+        stmt = self._select().where(c.status == PENDING).order_by(c.created_at).limit(limit)
+        return [self._to_record(r) for r in self._execute("pending", stmt).mappings()]
