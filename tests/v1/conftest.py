@@ -25,6 +25,10 @@ def apply_contract_ddl(engine: Engine, area: contracts.Area) -> None:
     apply_schema(engine, contracts.ddl(area, contract_dialect(engine)))
 
 
+def apply_contract_db(engine: Engine) -> None:
+    apply_schema(engine, contracts.database_ddl(contract_dialect(engine)))
+
+
 def _engine(kind: str, tmp_path: Path) -> Engine:
     if kind == "postgres" and not PG_URL:
         pytest.skip("TRAUST_TEST_DATABASE_URL not set")
@@ -47,7 +51,7 @@ def database(
 @contextmanager
 def storage_db(kind: str, tmp_path: Path) -> Generator[Engine]:
     eng = _engine(kind, tmp_path)
-    apply_contract_ddl(eng, "storage")
+    apply_contract_ddl(eng, "storage")  # type: ignore[arg-type]  # parked: storage-retire
     try:
         yield eng
     finally:
@@ -55,6 +59,27 @@ def storage_db(kind: str, tmp_path: Path) -> Generator[Engine]:
             with eng.begin() as conn:
                 conn.exec_driver_sql("DROP SCHEMA traust_storage CASCADE")
         eng.dispose()
+
+
+@contextmanager
+def contract_db(kind: str, tmp_path: Path) -> Generator[Engine]:
+    """A fresh database bootstrapped from the whole contracts db (every namespace)."""
+    eng = _engine(kind, tmp_path)
+    if kind == "postgres":
+        _drop_namespaces(eng)
+    apply_contract_db(eng)
+    try:
+        yield eng
+    finally:
+        if kind == "postgres":
+            _drop_namespaces(eng)
+        eng.dispose()
+
+
+def _drop_namespaces(engine: Engine) -> None:
+    with engine.begin() as conn:
+        for area in reversed(contracts.AREAS):
+            conn.exec_driver_sql(f"DROP SCHEMA IF EXISTS {area} CASCADE")
 
 
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:

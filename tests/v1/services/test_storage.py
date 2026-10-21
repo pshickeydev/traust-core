@@ -17,6 +17,8 @@ from traust_core.v1.repositories.storage import (
 )
 from traust_core.v1.services.storage import get_binding, record_artifact
 
+pytestmark = pytest.mark.todo("storage-retire: traust_storage DDL and profiles left contracts")
+
 DIGEST = "a" * 64
 RUN = BindingContext(subject_id="org/repo", run_id="r1")
 TRIAGE = json.dumps(

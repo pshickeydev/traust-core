@@ -17,6 +17,8 @@ from traust_core.v1.repositories.storage import InMemoryStorageUnitOfWork, SqlSt
 from traust_core.v1.services.artifact_publishing import ArtifactPublisher, StorageIndex
 from traust_core.v1.services.storage import get_binding
 
+STORAGE_RETIRED = pytest.mark.todo("storage-retire: traust_storage DDL and profiles left contracts")
+
 SUBJECT = Subject(tree="findings", product="openshift", repo_dir="oc", base="oc")
 FINDING = {
     "id": "f001",
@@ -34,7 +36,13 @@ def triage_with(*findings: dict) -> bytes:
     return json.dumps(doc).encode()
 
 
-@pytest.fixture(params=["files-only", "memory-index", "sqlite-index"])
+@pytest.fixture(
+    params=[
+        "files-only",
+        pytest.param("memory-index", marks=STORAGE_RETIRED),
+        pytest.param("sqlite-index", marks=STORAGE_RETIRED),
+    ]
+)
 def setup(
     request: pytest.FixtureRequest, tmp_path: Path
 ) -> Iterator[tuple[ArtifactPublisher, object]]:
@@ -152,6 +160,7 @@ def test_resubmitting_is_idempotent(setup: tuple[ArtifactPublisher, object]) -> 
     assert (again.written, again.binding_id) == (first.written, first.binding_id)
 
 
+@STORAGE_RETIRED
 def test_context_builds_files_only_or_indexed_from_config(tmp_path: Path) -> None:
     files_only = Context(Config.model_validate({"artifacts": {"path": str(tmp_path / "ar")}}))
     assert (

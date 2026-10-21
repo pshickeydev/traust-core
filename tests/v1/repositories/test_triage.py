@@ -18,6 +18,8 @@ from traust_core.v1.repositories.triage import (
 )
 from traust_core.v1.services.findings import record_triage
 
+pytestmark = pytest.mark.todo("storage-retire: traust_storage DDL and profiles left contracts")
+
 BACKENDS = ["memory", *SQL_BACKENDS]
 
 
