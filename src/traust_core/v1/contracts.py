@@ -1,56 +1,27 @@
 from __future__ import annotations
 
 import json
-import sqlite3
-from collections.abc import Iterator, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from functools import cache
 from importlib import resources
 from importlib.metadata import distribution
 from pathlib import Path
-from types import MappingProxyType
+from types import MappingProxyType, ModuleType
 from typing import Any, Literal
 
 from jsonschema import Draft202012Validator, FormatChecker
 from referencing import Registry, Resource
+from traust_contracts.v1.ledger import sql as ledger_sql
+from traust_contracts.v1.ops import sql as ops_sql
+from traust_contracts.v1.storage import sql as storage_sql
 
 from traust_core.v1.errors import ConfigError, DocumentError, Issue
 
 Dialect = Literal["sqlite", "postgres"]
-Area = Literal["storage", "ledger"]
-
-
-@dataclass(frozen=True, slots=True)
-class _Bootstrap:
-    first_tables: tuple[str, ...]
-    view_order: tuple[str, ...] = ()
-
-
-# Bootstrap order is in traust-contracts' Python today; to move into its data.
-_BOOTSTRAP: dict[Area, _Bootstrap] = {
-    "storage": _Bootstrap(
-        first_tables=("artifact_evidence", "artifact_binding", "artifact_location"),
-        view_order=(
-            "binding_current",
-            "report_current",
-            "ownership_current",
-            "current_finding",
-            "threat_current",
-            "validation_current",
-            "finding_first_seen",
-            "finding_timeline",
-            "pqc_posture",
-            "sla_clock",
-            "sla_threshold",
-            "pattern_exposure",
-            "attack_coverage",
-        ),
-    ),
-    "ledger": _Bootstrap(
-        first_tables=("schema_revision", "layers", "events", "materialized_findings")
-    ),
-}
+Area = Literal["traust", "traust_ops", "traust_ledger"]
+AREAS: tuple[Area, ...] = ("traust", "traust_ops", "traust_ledger")
 
 
 @cache
@@ -69,8 +40,12 @@ def _read_json(path: Path) -> dict[str, Any]:
         raise ConfigError(f"traust-contracts has no {path.relative_to(_root())}") from None
 
 
+def _schema_dir() -> Path:
+    return _root() / "artifacts_schema/v1"
+
+
 def schema_path(name: str) -> Path:
-    return _root() / "schemas/v1" / f"{name}.schema.json"
+    return _schema_dir() / f"{name}.schema.json"
 
 
 def schema(name: str) -> dict[str, Any]:
@@ -78,9 +53,7 @@ def schema(name: str) -> dict[str, Any]:
 
 
 def schema_names() -> list[str]:
-    return sorted(
-        p.name.removesuffix(".schema.json") for p in (_root() / "schemas/v1").glob("*.json")
-    )
+    return sorted(p.name.removesuffix(".schema.json") for p in _schema_dir().glob("*.json"))
 
 
 def enum_values(name: str) -> tuple[str, ...]:
@@ -151,18 +124,9 @@ def resolve(schema_name: str, node: Mapping[str, Any]) -> list[tuple[str, Mappin
 
 
 @cache
-def _profiles() -> dict[str, dict[str, Any]]:
-    return _read_json(_root() / "storage/v1/profiles.json")["artifacts"]
-
-
-def storage_profile(name: str) -> dict[str, Any]:
-    return _profiles().get(name, {})
-
-
-@cache
 def _registry() -> Registry:
     resources_ = []
-    for path in (_root() / "schemas/v1").glob("*.schema.json"):
+    for path in _schema_dir().glob("*.schema.json"):
         resource = Resource.from_contents(json.loads(path.read_text()))
         resources_ += [(path.name, resource), (resource.id() or path.name, resource)]
     return Registry().with_resources(resources_)
@@ -190,29 +154,22 @@ def validate_json(name: str, payload: bytes) -> Any:
     return document
 
 
+def _loader(area: Area) -> ModuleType:
+    # One db contract, three namespaces; bootstrap order: traust, then ops, then ledger.
+    return {"traust": storage_sql, "traust_ops": ops_sql, "traust_ledger": ledger_sql}[area]
+
+
 def ddl_files(area: Area, dialect: Dialect) -> list[Path]:
-    plan = _BOOTSTRAP[area]
-    root = _root() / f"{area}/v1" / dialect
-    tables = {p.stem: p for p in (root / "schema").glob("*.sql")}
-    first = [tables.pop(t) for t in plan.first_tables]
-    views = {p.stem: p for p in (root / "views").glob("*.sql")} if (root / "views").is_dir() else {}
-    ordered_views = [views.pop(v) for v in plan.view_order if v in views]
-    namespace = [root / "namespace.sql"] if dialect == "postgres" else []
-    return [*namespace, *first, *sorted(tables.values()), *ordered_views, *sorted(views.values())]
-
-
-def _statements(dialect: Dialect, path: Path) -> Iterator[str]:
-    sql = path.read_text(encoding="utf-8")
-    if dialect == "postgres":
-        yield sql
-        return
-    statement = ""
-    for line in sql.splitlines(keepends=True):
-        statement += line
-        if sqlite3.complete_statement(statement):
-            yield statement
-            statement = ""
+    return _loader(area).bootstrap_files(dialect)
 
 
 def ddl(area: Area, dialect: Dialect) -> list[str]:
-    return [s for path in ddl_files(area, dialect) for s in _statements(dialect, path)]
+    loader = _loader(area)
+    return [
+        s for path in ddl_files(area, dialect) for s in loader.bootstrap_statements(dialect, path)
+    ]
+
+
+def database_ddl(dialect: Dialect) -> list[str]:
+    """Every namespace, in bootstrap order: the whole db contract."""
+    return [s for area in AREAS for s in ddl(area, dialect)]

@@ -18,7 +18,7 @@ ORDER = [
 ]
 THIRD_PARTY = {
     "errors": set(),
-    "contracts": {"jsonschema", "referencing"},
+    "contracts": {"jsonschema", "referencing", "traust_contracts"},
     "models": {"pydantic"},
     "providers": {"pydantic"},
     "repositories": {"sqlalchemy", "psycopg", "pydantic"},

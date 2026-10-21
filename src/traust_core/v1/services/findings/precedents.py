@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from traust_core.v1.models.findings import FindingCandidate, Precedent
-from traust_core.v1.repositories.findings import FindingUnitOfWork
+from traust_core.v1.repositories.contract import TraustUnitOfWork
 
 
 class FindingPrecedents:
-    def __init__(self, uow: FindingUnitOfWork) -> None:
+    def __init__(self, uow: TraustUnitOfWork) -> None:
         self._uow = uow
 
     def for_candidate(self, candidate: FindingCandidate, limit: int) -> list[Precedent]:

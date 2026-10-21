@@ -13,19 +13,19 @@ from traust_core.v1.models.pqc import (
     PqcReadinessInput,
     PqcRollup,
 )
-from traust_core.v1.repositories.assessment import PqcUnitOfWork
+from traust_core.v1.repositories.traust.assessments import AssessmentsUnitOfWork
 from traust_core.v1.services.code_facts import CodeFactsService
 
 
 class PqcService:
-    def __init__(self, uow: PqcUnitOfWork, code_facts: CodeFactsService) -> None:
+    def __init__(self, uow: AssessmentsUnitOfWork, code_facts: CodeFactsService) -> None:
         self._uow = uow
         self._code_facts = code_facts
 
-    def prescan(self, revision_id: UUID) -> PqcReadiness:
+    def prescan(self, repository_ref_id: UUID) -> PqcReadiness:
         raise NotImplementedError("stub: replaces bulk_prescan, l2_prepass, scan_xcrypto_usage")
 
-    def prepare(self, revision_id: UUID) -> PqcReadinessInput:
+    def prepare(self, repository_ref_id: UUID) -> PqcReadinessInput:
         raise NotImplementedError("stub: replaces pqc-readiness skill inputs")
 
     @overload

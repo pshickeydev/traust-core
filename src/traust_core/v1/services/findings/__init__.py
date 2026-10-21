@@ -1,4 +1,4 @@
-from traust_core.v1.services.findings.decisions import FindingDecisions, record_triage
+from traust_core.v1.services.findings.decisions import FindingDecisions
 from traust_core.v1.services.findings.identity import IdentityPolicy
 from traust_core.v1.services.findings.intake import FindingIntake
 from traust_core.v1.services.findings.precedents import FindingPrecedents
@@ -17,5 +17,4 @@ __all__ = [
     "RatingPolicy",
     "ReviewPolicy",
     "TaxonomyPolicy",
-    "record_triage",
 ]

@@ -1,5 +1,5 @@
 from traust_core.v1.repositories.memory import InMemoryUnitOfWork
-from traust_core.v1.repositories.object_store import (
+from traust_core.v1.repositories.objects.store import (
     InMemoryObjectStore,
     LocalObjectStore,
     ObjectKey,
@@ -13,7 +13,6 @@ from traust_core.v1.repositories.sql import (
     apply_schema,
     create_database_engine,
     record_columns,
-    schema_drift,
 )
 from traust_core.v1.repositories.unit_of_work import UnitOfWork
 
@@ -31,5 +30,4 @@ __all__ = [
     "apply_schema",
     "create_database_engine",
     "record_columns",
-    "schema_drift",
 ]

@@ -2,25 +2,23 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from datetime import datetime
+from decimal import Decimal
 from enum import StrEnum
 from typing import NewType
 from uuid import UUID
 
-from traust_core.v1.models.base import Entity, Model
-from traust_core.v1.models.common import ArtifactRef, Location, Principal, Provenance
-from traust_core.v1.models.integrity import Fingerprint
+from traust_core.v1.models.base import AppendOnly, Entity, Model
+from traust_core.v1.models.common import CodeSpan
 from traust_core.v1.models.vocabulary import (
     DispositionAssurance,
-    DispositionEmbargo,
     DispositionResolution,
-    EvidenceGrade,
     FindingOrigin,
     Severity,
     Validity,
 )
 
 Label = NewType("Label", str)
-Cwe = NewType("Cwe", str)
+CweId = NewType("CweId", str)
 Category = NewType("Category", str)
 Confidence = NewType("Confidence", float)
 Rationale = NewType("Rationale", str)
@@ -49,12 +47,6 @@ class FindingDimension(StrEnum):
 class WeaknessLabels(Model): ...
 
 
-class SeverityOverride(Model): ...
-
-
-class ReviewContext(Model): ...
-
-
 class PrecedentReason(Model): ...
 
 
@@ -65,9 +57,6 @@ class IntakeResult(Model): ...
 
 
 class RecordDecision(Model): ...
-
-
-class TriageRecorded(Model): ...
 
 
 class ReviewCase(Model): ...
@@ -92,9 +81,9 @@ class FindingCandidate(Model):
     label: Label
     repository_id: UUID
     title: str
-    cwes: tuple[Cwe, ...] = ()
+    cwes: tuple[CweId, ...] = ()
     category: Category | None = None
-    locations: tuple[Location, ...] = ()
+    locations: tuple[CodeSpan, ...] = ()
     reported_severity: Severity
     confidence: Confidence
     origin: FindingOrigin
@@ -105,50 +94,99 @@ class FindingCandidate(Model):
 
 
 class Finding(Entity):
+    """3b · one weakness or vulnerability in a repository, identified by fingerprint."""
+
     repository_id: UUID
-    match_key: Fingerprint
+    advisory_id: UUID | None = None
+    advisory_match: str | None = None
+    fingerprint_algo: str
+    fingerprint: str
+    kind: str | None = None
     title: str
-    cwes: tuple[Cwe, ...] = ()
-    category: Category | None = None
-    labels: WeaknessLabels
-    origin: FindingOrigin
-    first_seen_at: datetime
 
 
-class Occurrence(Entity):
+class Occurrence(AppendOnly):
+    """A finding as one assessment reported it."""
+
     finding_id: UUID
     assessment_id: UUID
-    label: Label
-    locations: tuple[Location, ...] = ()
-    reported_severity: Severity
-    confidence: Confidence
-    artifact: ArtifactRef
+    severity: str
+    cvss_vector: str | None = None
+    cvss_score: Decimal | None = None
+    rule: str | None = None
 
 
-class Decision(Entity):
+class Location(AppendOnly):
+    """The location table: where an occurrence was reported, relative to its commit."""
+
+    occurrence_id: UUID
+    path: str
+    line_start: int | None = None
+    line_end: int | None = None
+    language: str | None = None
+    symbol: str | None = None
+
+
+class Cwe(Entity):
+    """MITRE CWE catalog entry - reference data, loaded read-only."""
+
+    identifier: str
+    abstraction: str | None = None
+    mapping_usage: str | None = None
+    catalog_version: str | None = None
+
+
+class FindingCwe(Entity):
     finding_id: UUID
-    code_line_id: UUID | None = None
-    validity: Validity | None = None
-    resolution: DispositionResolution | None = None
-    severity_override: SeverityOverride | None = None
-    evidence_grade: EvidenceGrade
-    evidence: tuple[EvidenceRef, ...] = ()
-    embargo: DispositionEmbargo | None = None
-    actor: Principal
-    provenance: Provenance
-    rationale: Rationale
-    review: ReviewContext | None = None
+    cwe_id: UUID
+
+
+class FindingLabel(Entity):
+    finding_id: UUID
+    taxonomy: str
+    label: str
+
+
+class FindingExternalRef(Entity):
+    finding_id: UUID
+    system: str
+    ref: str
+
+
+class Decision(AppendOnly):
+    """A judgement on a finding; corrections are new decisions (restates_id)."""
+
+    finding_id: UUID
+    assessment_id: UUID | None = None
+    fixed_repository_ref_id: UUID | None = None
+    repository_ref_id: UUID | None = None
     restates_id: UUID | None = None
+    artifact_id: UUID | None = None
+    statement_key: str
+    validity: str | None = None
+    resolution: str | None = None
+    evidence_grade: str | None = None
+    reason: str | None = None
+    severity: str | None = None
+    source_channel: str | None = None
+    actor: str | None = None
+    occurred_at: datetime
 
-    def statement_key(self) -> StatementKey:
-        raise NotImplementedError("stub: replaces ledger compute_event_id (classifier steps 9/12)")
+
+class ReviewItem(Entity):
+    finding_id: UUID
+    decision_id: UUID | None = None
+    resolved_by_decision_id: UUID | None = None
+    reason: str | None = None
+    status: str
 
 
+# Read models over the views (current_decision, current_resolution, finding_status).
 class Disposition(Model):
     finding_id: UUID
-    code_line_id: UUID
-    validity: Validity
-    resolution: DispositionResolution
+    line: str | None = None
+    validity: Validity | None = None
+    resolution: DispositionResolution | None = None
     assurance: DispositionAssurance
     conflict: bool = False
     fp_overridden: bool = False
@@ -209,16 +247,3 @@ class FindingSeriesPoint(Model):
     regressions: int
     mttr_days: float | None = None
     risk_index: float
-
-
-# Legacy triage row; becomes a Decision in the Findings slice.
-class TriageVerdict(Model):
-    binding_id: str
-    artifact_digest: str
-    finding_id: str
-    source_finding_id: str | None = None
-    triage_completed: str
-    verdict: str
-    severity: str | None = None
-    vote_breakdown: Mapping[str, int] | None = None
-    rationale: str | None = None

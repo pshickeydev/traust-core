@@ -67,12 +67,12 @@ class Principal(Model):
         raise NotImplementedError("stub: replaces ledger require_admin / restatement authority")
 
 
-class Location(Model):
+class CodeSpan(Model):
     path: RepoPath
     line: int | None = None
 
     @classmethod
-    def parse(cls, raw: str) -> Location:
+    def parse(cls, raw: str) -> CodeSpan:
         raise NotImplementedError("stub: replaces check_location_paths.py")
 
 

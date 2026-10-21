@@ -10,7 +10,7 @@ export TRAUST_TEST_DATABASE_URL
 
 PYTHON ?= python3
 
-.PHONY: help setup sync hooks lint lint-fix test test-integration coverage coverage-html coverage-all db-up db-down
+.PHONY: help setup sync hooks lint lint-fix test test-integration test-repositories coverage coverage-html coverage-all db-up db-down
 
 help:
 	@echo "Targets ($(notdir $(CURDIR))):"
@@ -19,6 +19,7 @@ help:
 	@echo "  make lint-fix         — ruff --fix + format"
 	@echo "  make test             — unit tests (no integration)"
 	@echo "  make test-integration — integration tests against Postgres (make db-up first)"
+	@echo "  make test-repositories — repository layer on SQLite and Postgres (make db-up first)"
 	@echo "  make coverage         — unit tests with coverage (term), fails under 80%"
 	@echo "  make coverage-html    — unit tests with coverage (term + htmlcov/)"
 	@echo "  make coverage-all     — unit + integration with coverage (needs make db-up)"
@@ -47,6 +48,9 @@ test:
 
 test-integration:
 	uv run --extra postgres pytest tests/ -q -m integration
+
+test-repositories:
+	uv run --extra postgres pytest tests/v1/repositories/tables -q -m "integration or not integration"
 
 coverage:
 	uv run pytest tests/ --cov=traust_core --cov-report=term-missing -q -m "not integration"

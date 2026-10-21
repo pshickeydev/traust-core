@@ -7,18 +7,17 @@ from uuid import UUID
 
 from traust_core.v1.errors import ConfigError, DocumentError, Issue, TraustError
 from traust_core.v1.models.analysis_results import ResultKind, Subject
-from traust_core.v1.models.artifacts import Artifact
+from traust_core.v1.models.artifacts import ArtifactDocument
+from traust_core.v1.models.assessment import Artifact
 from traust_core.v1.models.base import Dto
-from traust_core.v1.models.common import ArtifactRef, Page, PageRequest
-from traust_core.v1.models.storage import BindingContext
-from traust_core.v1.providers.clock import Clock
-from traust_core.v1.repositories.analysis_results import AnalysisResultsRepository, artifact_kind
-from traust_core.v1.repositories.artifacts import ArtifactFilter
-from traust_core.v1.repositories.object_store import ObjectRef
-from traust_core.v1.repositories.storage import StorageUnitOfWork
-from traust_core.v1.services.storage import record_artifact
+from traust_core.v1.repositories.objects.analysis_results import (
+    AnalysisResultsRepository,
+    artifact_kind,
+)
+from traust_core.v1.repositories.objects.store import ObjectRef
+from traust_core.v1.repositories.traust.assessments import AssessmentsUnitOfWork
 
-A = TypeVar("A", bound=Artifact)
+A = TypeVar("A", bound=ArtifactDocument)
 
 
 class InputFormat(Protocol):
@@ -72,27 +71,34 @@ class PublishSpecs:
         return sorted(self._specs)
 
 
-class BindingIndex(Protocol):
-    def record(self, artifact: Artifact, subject: Subject, ref: ObjectRef, run_id: str) -> str: ...
+class ArtifactIndex(Protocol):
+    def record(
+        self, artifact: ArtifactDocument, subject: Subject, ref: ObjectRef, run_id: str
+    ) -> UUID: ...
 
 
-class StorageIndex:
-    def __init__(self, storage: Callable[[], StorageUnitOfWork], clock: Clock) -> None:
-        self._storage = storage
-        self._clock = clock
+class SqlArtifactIndex:
+    """Records each published document as an artifact row; same bytes, same row."""
 
-    def record(self, artifact: Artifact, subject: Subject, ref: ObjectRef, run_id: str) -> str:
-        context = BindingContext(subject_id=subject.key, run_id=run_id, role=artifact.role)
-        result = record_artifact(
-            self._storage(), artifact.schema, artifact.payload, self._clock, context, [str(ref.key)]
-        )
-        return result.binding_id
+    def __init__(self, uow: Callable[[], AssessmentsUnitOfWork]) -> None:
+        self._uow = uow
+
+    def record(
+        self, artifact: ArtifactDocument, subject: Subject, ref: ObjectRef, run_id: str
+    ) -> UUID:
+        with self._uow() as u:
+            row = u.artifacts.find(None, ref.sha256) or u.artifacts.add(
+                Artifact(digest=ref.sha256, kind=artifact.schema, uri=str(ref.key))
+            )
+            u.commit()
+        assert row.id is not None
+        return row.id
 
 
 class PublishResult(Dto):
     artifact: str
     written: tuple[str, ...]
-    binding_id: str | None = None
+    artifact_id: UUID | None = None
     index_error: str | None = None
 
     @property
@@ -105,7 +111,7 @@ class ArtifactPublisher:
         self,
         specs: PublishSpecs,
         results: AnalysisResultsRepository,
-        index: BindingIndex | None = None,
+        index: ArtifactIndex | None = None,
     ) -> None:
         self._specs = specs
         self._results = results
@@ -116,7 +122,9 @@ class ArtifactPublisher:
         artifact = spec.artifact.parse(spec.input.to_json(name, raw))
         return self.publish_artifact(artifact, subject, run_id)
 
-    def publish_artifact(self, artifact: Artifact, subject: Subject, run_id: str) -> PublishResult:
+    def publish_artifact(
+        self, artifact: ArtifactDocument, subject: Subject, run_id: str
+    ) -> PublishResult:
         spec = self._specs.get(artifact.name)
         primary = self._results.put(subject, artifact_kind(spec.artifact), artifact.payload)
         written = [
@@ -127,18 +135,18 @@ class ArtifactPublisher:
         if self._index is None:
             return result
         try:
-            binding = self._index.record(artifact, subject, primary, run_id)
+            artifact_id = self._index.record(artifact, subject, primary, run_id)
         except TraustError as e:
             return result.model_copy(update={"index_error": str(e)})
-        return result.model_copy(update={"binding_id": binding})
+        return result.model_copy(update={"artifact_id": artifact_id})
 
-    def get(self, artifact_id: UUID) -> Artifact:
+    def get(self, artifact_id: UUID) -> ArtifactDocument:
         raise NotImplementedError("stub: replaces AnalysisResultsRepository.read by path subject")
 
     def verify(self, artifact_id: UUID) -> DigestCheck:
         raise NotImplementedError("stub: replaces verify_report_digests.py, ledger report digests")
 
-    def list(self, filter: ArtifactFilter, page: PageRequest) -> Page[ArtifactRef]:
+    def list_for_assessment(self, assessment_id: UUID) -> list[Artifact]:
         raise NotImplementedError("stub: replaces corpus/report_store listing")
 
 

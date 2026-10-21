@@ -26,12 +26,12 @@ from traust_core.v1.models.remediation import (
     WorkItemFilter,
 )
 from traust_core.v1.models.vocabulary import FixStrategy, RemediationStatus
-from traust_core.v1.repositories.remediation import RemediationUnitOfWork
+from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.services.findings.service import FindingService
 
 
 class RemediationService:
-    def __init__(self, uow: RemediationUnitOfWork, findings: FindingService) -> None:
+    def __init__(self, uow: TraustUnitOfWork, findings: FindingService) -> None:
         self._uow = uow
         self._findings = findings
 
@@ -80,14 +80,14 @@ class RemediationService:
 
 
 class VerificationService:
-    def __init__(self, uow: RemediationUnitOfWork, findings: FindingService) -> None:
+    def __init__(self, uow: TraustUnitOfWork, findings: FindingService) -> None:
         self._uow = uow
         self._findings = findings
 
     def prepare(self, work_item_id: UUID) -> VerificationInput:
         raise NotImplementedError("stub: replaces verify-remediation/build_verify_sweep.py")
 
-    def differential(self, work_item_id: UUID, revision_id: UUID) -> EvidenceItem:
+    def differential(self, work_item_id: UUID, repository_ref_id: UUID) -> EvidenceItem:
         raise NotImplementedError("stub: replaces verify-remediation/scanner_differential.py")
 
     def propagation(self, work_item_id: UUID, component_id: UUID) -> Propagation:

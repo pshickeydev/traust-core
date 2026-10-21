@@ -6,15 +6,15 @@ All modules live under `traust_core.v1` (see [Versioning](#versioning)).
 
 | API | Module | Use it for | Instead of |
 |---|---|---|---|
-| **Contracts** | `contracts` | the pinned traust-contracts dependency, read as data: `validate(name, doc)` (exact JSON Schema gate), `schema()`, `enum_values()`, `normalize_enum(name, value)` (registry read view), `ddl()`, `storage_profile()` | skills remembering to run `reporting validate` |
+| **Contracts** | `contracts` | the pinned traust-contracts dependency, read as data: `validate(name, doc)` (exact JSON Schema gate), `schema()`, `enum_values()`, `normalize_enum(name, value)` (registry read view), `database_ddl(dialect)` (every namespace, bootstrap order) | skills remembering to run `reporting validate` |
 | **Errors** | `errors` | the exception hierarchy every layer raises (`ValidationError`, `NotFoundError`, …) | ad hoc exceptions |
-| **Models** | `models` | what things are and the rules about their own state: `base` (`Model` strict, `Dto` tolerant, `Entity` with a database-generated UUIDv4 id, `AppendOnly` for tables that are never updated), `values` (`HttpsRepoUrl`, `GitSha`, `CveId`), `integrity`, `storage`, `operations` (`JobResult`, `AssetRequest`, `Order`), and one module per subject (`findings`, `portfolio`, …) | dicts passed between scripts |
-| **Artifacts** | `models.artifacts` | the `Artifact` base + `SchemaView` (fields from the installed schema, `doc.findings[0].verdict`, unknown names raise) and the named documents (`TriageArtifact`, `SecurityAuditArtifact`, …, `Verdict`, `Severity`) | `json.load` + `.get("key")` |
-| **Artifact publishing** | `services.artifact_publishing` | `ctx.artifact_publisher(specs).publish(name, subject, raw, run_id)` (LLM) or `.publish_artifact(artifact, subject, run_id)` (code): exact gate → files (always) → index (when `database.url` is set) | writing `analysis-results` files by hand |
-| **Analysis results** | `repositories.analysis_results` | `ctx.analysis_results().read(TriageArtifact, subject)` / `.read_all(TriageArtifact, tree)`; raw `put/get/find(subject, kind)`; today's naming convention in one place | `json.load` + `"-security-audit.json"` path building |
-| **Storage records** | `repositories.storage`, `services.storage` | `record_artifact()` / `get_binding()` over contracts storage/v1 tables | contracts `Store.ingest/get_binding` |
-| **Records (pattern)** | `repositories.sql` | `SqlUnitOfWork` + one `SqlRepository` per aggregate on SQLAlchemy Core; sqlite or Postgres by URL. `record_columns()` (mutable: UUIDv4 id + `created_at` + `updated_at`) / `append_only_columns()` (UUIDv4 id + `created_at`, no `updated_at`) + `_insert_record`/`_update_record`, database-generated via `RETURNING`; `updated_at` kept by the contracts touch trigger, SQLite `uuid()` registered by `create_database_engine` | `sqlite3.connect`, inline SQL, client-minted ids/timestamps |
-| **Object store** | `repositories.object_store` | `ObjectStore.put/get/list` raw bytes by key, digest-verified (local dir; S3 later) | `write_text`, `json.dump` |
+| **Models** | `models` | one model per contract table, grouped by section — `inventory`, `dependencies`, `assessment`, `findings`, `operations`, `ledger` (fields = columns) — next to that section's service types; `base` (`Model` strict, `Dto` tolerant, `Entity` with a database-generated UUIDv4 id, `AppendOnly` for tables that are never updated), `values` (`HttpsRepoUrl`, `GitSha`, `CveId`), `integrity` | dicts passed between scripts |
+| **Artifacts** | `models.artifacts` | the `ArtifactDocument` base + `SchemaView` (fields from the installed schema, `doc.findings[0].verdict`, unknown names raise) and the named documents (`TriageArtifact`, `SecurityAuditArtifact`, …, `Verdict`, `Severity`) | `json.load` + `.get("key")` |
+| **Artifact publishing** | `services.artifact_publishing` | `ctx.artifact_publisher(specs).publish(name, subject, raw, run_id)` (LLM) or `.publish_artifact(artifact, subject, run_id)` (code): exact gate → files (always) → an `artifact` row (when `database.url` is set) | writing `analysis-results` files by hand |
+| **Analysis results** | `repositories.objects.analysis_results` | `ctx.analysis_results().read(TriageArtifact, subject)` / `.read_all(TriageArtifact, tree)`; raw `put/get/find(subject, kind)`; today's naming convention in one place | `json.load` + `"-security-audit.json"` path building |
+| **Table repositories** | `repositories.traust.*`, `repositories.traust_ops`, `repositories.traust_ledger`, `repositories.contract` | one repository per contract table (`uow.findings.find_by_fingerprint(...)`, `uow.run_orders.claim(...)`); `SqlTraustUnitOfWork(engine)` opens all 31 on one connection — one transaction across sections | `sqlite3.connect`, inline SQL, per-script tables |
+| **Records (pattern)** | `repositories.sql`, `repositories.tables` | `TableSpec` (columns once) + `TableFactory` (Postgres schemas or SQLite `ops_`/`ledger_` prefixes, by engine) + `SqlTableRepository` (`add`/`get`/`update`) on SQLAlchemy Core; sqlite or Postgres by URL. `record_columns()` (mutable: UUIDv4 id + `created_at` + `updated_at`) / `append_only_columns()` (UUIDv4 id + `created_at`, no `updated_at`) + `_insert_record`/`_update_record`, database-generated via `RETURNING`; `updated_at` kept by the contracts touch trigger, SQLite `uuid()` registered by `create_database_engine` | `sqlite3.connect`, inline SQL, client-minted ids/timestamps |
+| **Object store** | `repositories.objects.store` | `ObjectStore.put/get/list` raw bytes by key, digest-verified (local dir; S3 later) | `write_text`, `json.dump` |
 | **Rendering** | `rendering` | `Report` → `MarkdownRenderer` → `publish()`; `markdown_table()` | 18 copies of `render_md` |
 | **Jobs** | `models.operations`, `services.operations` | `Materializer.materialize(AssetRequest) -> JobResult` (succeeded · degraded · refused · failed): the seam traust-engine calls; `Router` for continuous-ops `route()` | each CLI inventing its own exit codes |
 | **Providers** | `providers` | the outside world: `base` (`Provider`, `Readiness`, `Provenance`, registry), `tools`, `sources`, `feeds`, `process` (`ProcessRunner`, the only subprocess path), `clock` | ad hoc `subprocess`/`git`/fetch code, 22 private `run` wrappers |
@@ -54,9 +54,9 @@ traust, traust-engine and traust-ledger import core and call services in-process
 | | Local user | SCI / team |
 |---|---|---|
 | Config | `artifacts.path` only | + `database.url` (Postgres), object store |
-| `ArtifactPublisher.publish` | validate → files | validate → files → storage binding |
+| `ArtifactPublisher.publish` | validate → files | validate → files → `artifact` row |
 
-The database schema is created from the traust-contracts repo by whoever provisions the database; traust-core reads and writes rows and checks its tables with `schema_drift()`.
+The database schema is created from the traust-contracts DDL by whoever provisions the database (`apply_schema(engine, contracts.database_ddl(dialect))`); traust-core reads and writes rows. Contracts owns and tests the schema; core tests repository behaviour.
 
 ## Usage
 
@@ -78,23 +78,23 @@ All in [`tests/v1/example/`](tests/v1/example):
 
 | File | Shows |
 |---|---|
-| `model.py`, `repository.py`, `services.py` | domain model, repository (SQL + in-memory), unit of work, service (example predates the one-service-per-domain rule) |
+| `model.py`, `repository.py`, `services.py` | SQL + in-memory repository mechanics over a non-contract table, unit of work, service (predates one-service-per-domain; for contract tables copy `repositories/traust/inventory/repository.py`) |
 | `artifact_publishing.py` | a publish spec (`TRIAGE` over `TriageArtifact`) with a rendered markdown companion |
 | `report.py` | read through a repository → pure `build_report` → render → publish |
 | `router.py` | a pure router, table-tested |
 | `provider.py` | a tool provider: request DTO, `check()`, `acquire()` with provenance |
 | `continuous_ops/` | engine → materializer → service → repository → `JobResult`, then a pure router reads the stored state; the same service reached from a CLI |
 
-The real (non-example) aggregate repository to copy is `src/traust_core/v1/repositories/triage.py` (`TriageVerdictRepository`), written by `services/findings/decisions.py::record_triage`.
+The real table repository to copy is `src/traust_core/v1/repositories/traust/inventory/repository.py` (a `TableSpec`, a narrow protocol, a `SqlTableRepository` subclass); its tests are in `tests/v1/repositories/tables/`.
 
 ## Contracts
 
-traust-contracts is a pinned dependency (`[tool.uv.sources]` git rev in `pyproject.toml`). traust-core reads its **data files** (schemas, enums, DDL, profiles) from the installed package and never imports its Python. Nothing is copied or generated.
+traust-contracts is a pinned dependency (`[tool.uv.sources]` git rev in `pyproject.toml`). traust-core reads its **data files** (schemas, enums, DDL) from the installed package, through `traust_core.v1.contracts` only. Nothing is copied or generated.
 
 ```mermaid
 flowchart LR
   C["traust-contracts @ pinned rev<br/>(installed dependency: schemas · enums · DDL)"] --> G["contracts.validate()<br/>write gate, exact"]
-  C --> D["contracts.ddl()<br/>create tables"]
+  C --> D["contracts.database_ddl()<br/>create tables"]
   C --> R["models.artifacts.TriageArtifact, ...<br/>fields from the schema"]
 ```
 
@@ -102,7 +102,7 @@ flowchart LR
 |---|---|
 | Move to a new contracts version | change the `rev` in `pyproject.toml`, `uv sync`, `make test` |
 | Try an unreleased contracts change | `uv add --editable ../traust-contracts` locally (don't commit) |
-| Add a named artifact | one line in `models/artifacts.py`: `class XArtifact(Artifact, name=…, schema=…, kind=…)` |
+| Add a named artifact | one line in `models/artifacts.py`: `class XArtifact(ArtifactDocument, name=…, schema=…, kind=…)` |
 | See an artifact's fields | `TriageArtifact.describe()` (field tree with types, required/optional); `TriageArtifact.schema_path()` |
 
 ### Registry reader review candidate
@@ -143,49 +143,47 @@ sibling checkout. No dependency pin or historical payload changes are made.
 
 | Kind | Answers | Lives in |
 |---|---|---|
-| **Core** | *what* the data means and *how* it is stored, read and run: models, repositories, services, policies | this repo, by role: `models/<subject>.py`, `repositories/<subject>.py`, `services/<subject>.py` (`services/findings/` is a package) |
+| **Core** | *what* the data means and *how* it is stored, read and run: models, repositories, services, policies | this repo, by role: `models/<section>.py`, `repositories/traust/<section>/<table>.py` (+ `traust_ops/`, `traust_ledger/`), `services/<subject>.py` (`services/findings/` is a package) |
 | **Pack policy** | *when / which*: routing rules, cadences, lanes, skills, CLIs | traust (`traust_pack_security`), not this repo |
 
-Everything here is `v1` API, reshaped in place until it is frozen. A concrete repository appears per **aggregate** when there is a domain question to answer; its methods are those questions (see `repositories/triage.py`). Tests mirror `src`: `tests/v1/<role>/test_<subject>.py`.
+Everything here is `v1` API, reshaped in place until it is frozen. Each contract table has one repository; beyond `add`/`get`/`update` its methods are the questions asked of that table. Tests mirror `src`: `tests/v1/<role>/test_<subject>.py`.
 
 ## Rules
 
 - Services never open connections, build paths, start processes or read env vars; they receive what they need through their constructor.
 - `Context` at entry points only.
 - Data is parsed into a model once, at the edge. No bare `dict` across a function boundary.
-- SQLAlchemy Core only: no ORM mapped classes, no generic CRUD base. Domain objects never know about the database.
+- SQLAlchemy Core only: no ORM mapped classes. Models never know about the database; the shared repository base gives only `add`/`get`/`update`.
 - Unknown or unmeasured values are `None`, never `0`.
-- Every repository, store and provider has contract tests.
+- Every table repository has behaviour tests on SQLite and Postgres; stores and providers have contract tests.
 - traust-core is the hub: other traust repos depend on it, not the reverse. The only code dependency is the traust-ledger client, inside the ledger provider adapter; traust-contracts is pinned data. HTTP only in providers (outbound) and the HTTP adapter (inbound).
 
-## Domain stubs (not implemented)
+## Domain services (stubs)
 
-Per subject: `models/<subject>.py`, `repositories/<subject>.py` (`Protocol` + unit of work) and `services/<subject>.py`. Every method raises `NotImplementedError("stub: replaces …")` naming the code it replaces. Rules: every repository and service lives here; traust-engine only runs work; the LLM reads and writes documents only; identity is a database-generated UUID with `created_at` / `updated_at` (`None` until saved), the fingerprint is only a match key.
+Repositories are real; services are mostly stubs. Every stub raises `NotImplementedError("stub: replaces …")` naming the code it replaces. A service declares the section unit of work it needs; `SqlTraustUnitOfWork` satisfies every one on one connection.
 
-| Domain | Module | Service | Repository |
-|---|---|---|---|
-| Portfolio: what we protect | `services.portfolio` | `PortfolioService` + `PortfolioPolicy` (`exposure_class`, `risk_tier`) | `PortfolioRepository` |
-| Assessment: what we looked at | `services.assessment` | `AssessmentService` | `AssessmentRepository` |
-| Code facts: deterministic facts per commit | `services.code_facts` | `CodeFactsService` | `CodeFactsRepository` |
-| Exposure: known vulns reaching us | `services.exposure` | `ExposureService` | `AdvisoryRepository`, `DependencyGraphRepository` |
-| Findings: what's wrong and every decision on it | `services.findings` | `FindingService` (`services/findings/service.py`) wires `intake`, `decisions`, `review`, `precedents` and the stateless `IdentityPolicy`, `TransitionPolicy`, `RatingPolicy` | `FindingRepository` (reads: `current`, `history`, `disposition`, `baseline`, `open_count`) |
-| Validation: prove or refute live | `services.validation` | `ValidationService` | `ValidationRepository` |
-| Remediation: fix and verify the fix | `services.remediation` | `RemediationService` | `RemediationRepository` |
-| Compliance: obligations met | `services.compliance` | `ComplianceService` | `ComplianceRepository` |
-| Detection quality: how good detection is | `services.detection_quality` | `DetectionQualityService` | `DetectionQualityRepository` |
-| Operations: order, lease, approval, spend state | `services.operations` | `OpsService` | `OpsRepository`, `SpendRepository` |
-| Attestation: human sign-off | `services.attestation` | `AttestationService` | `AttestationRepository` |
+| Domain | Service | Unit of work (tables) |
+|---|---|---|
+| Portfolio: what we protect | `services.portfolio` · `PortfolioService`, `PortfolioSync`, `RepoStateQuery` | `InventoryUnitOfWork` (product, release, component, repository, repository_ref, team, ownership) |
+| Exposure: known vulns reaching us | `services.exposure` · `ExposureService` | `TraustUnitOfWork` (package, sbom, dependency, image, advisory, advisory_package + findings) |
+| Assessment: what we looked at | `services.assessment` · `AssessmentService` | `AssessmentsUnitOfWork` (assessment, artifact, occurrence, location) |
+| Findings: what's wrong and every decision on it | `services.findings` · `FindingService` + `intake`, `decisions`, `review`, `precedents`; `IdentityPolicy`, `RatingPolicy` | `TraustUnitOfWork` (finding, cwe, finding_cwe, finding_label, finding_external_ref, decision, review_item); dispositions are SQL views over `decision` |
+| Attestation: human sign-off | `services.attestation` · `AttestationService` | `FindingsUnitOfWork` — a human answer is a `decision` that resolves a `review_item` |
+| Operations: orders, leases, spend | `services.operations` · `OpsService`, `SpendService` | `OpsUnitOfWork` (run_batch, run_order, spend_event, feed_snapshot, assessment_input) |
+| Ledger: proof of decisions | `services.ledger` · `LedgerService` | `LedgerUnitOfWork` (layers, events) |
+| PQC, code facts, compliance, detection quality | `services.pqc`, `services.code_facts`, `services.compliance`, `services.detection_quality` | `AssessmentsUnitOfWork` — content is read from the assessment's artifacts, never tables |
+| Validation, remediation | `services.validation`, `services.remediation` | `TraustUnitOfWork` — assessments + decisions + external refs + artifacts |
 
-Insight (dashboards) has no service: views read repositories and render. Repository protocols are empty until a service implementation needs a question; `FindingRepository` already lists its known reads. Model fields beyond identity are pending the open modelling questions (one Finding, one Decision, Subject/CodeLine).
+Insight (dashboards) has no repository: views read services and render.
 
 ## Not built yet
 
 | Item | Where |
 |---|---|
-| Layout contract (path template + kinds) replacing today's hard-coded convention | traust-contracts, `repositories.analysis_results` |
+| Layout contract (path template + kinds) replacing today's hard-coded convention | traust-contracts, `repositories.objects.analysis_results` |
 | Fingerprint rules (shape fixed; raises until the D5 spec lands) | `models.integrity`, `services.findings.identity` |
 | First real providers (git, forges, feeds) | packages |
-| S3 object store backend | `repositories.object_store` |
+| S3 object store backend | `repositories.objects.store` |
 
 ## Versioning
 
@@ -201,5 +199,6 @@ make coverage           # + coverage (coverage-html for htmlcov/)
 
 make db-up              # shared traust-postgres container (same as contracts and ledger)
 make test-integration   # Postgres tests (marked `integration`)
+make test-repositories  # repository layer on SQLite and Postgres
 make db-down
 ```

@@ -10,11 +10,11 @@ Bump the pin:
 Write (exact):
 
 - `contracts.validate(name, document)` / `contracts.validate_json(name, payload)` → `DocumentError` with `{path, message}` issues
-- `ArtifactPublisher` and `record_artifact` already call it
+- `ArtifactPublisher` already calls it
 
 Read:
 
-- Named artifact types live in `src/traust_core/v1/models/artifacts.py`; add one line per new artifact: `class XArtifact(Artifact, name="x", schema="x", kind=ResultKind.X): ...`
+- Named artifact types live in `src/traust_core/v1/models/artifacts.py`; add one line per new artifact: `class XArtifact(ArtifactDocument, name="x", schema="x", kind=ResultKind.X): ...`
 - Fields come from the installed schema; never declare them by hand
 - To see what fields exist: `XArtifact.describe()` (types, required/optional) or open `XArtifact.schema_path()`
 - `ctx.analysis_results().read(XArtifact, subject)` / `.read_all(XArtifact, tree)`; `XArtifact.parse(raw)` when you have bytes
@@ -22,4 +22,5 @@ Read:
 
 Database:
 
-- `apply_schema(engine, contracts.ddl("storage", dialect))`; check repositories with `schema_drift`
+- `apply_schema(engine, contracts.database_ddl(dialect))` creates every namespace (traust, traust_ops, traust_ledger) in bootstrap order
+- The DDL is contracts' to own and test; core declares each table once as a `TableSpec` and tests repository behaviour (see [repository.md](repository.md))

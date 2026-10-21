@@ -14,13 +14,13 @@ from traust_core.v1.models.code_facts import (
 from traust_core.v1.models.common import Page, PageRequest
 from traust_core.v1.providers.sources import SourceProvider
 from traust_core.v1.providers.tools import FactEnumerator
-from traust_core.v1.repositories.code_facts import CodeFactsUnitOfWork
+from traust_core.v1.repositories.traust.assessments import AssessmentsUnitOfWork
 
 
 class CodeFactsService:
     def __init__(
         self,
-        uow: CodeFactsUnitOfWork,
+        uow: AssessmentsUnitOfWork,
         sources: SourceProvider,
         enumerators: Sequence[FactEnumerator],
     ) -> None:
@@ -28,16 +28,16 @@ class CodeFactsService:
         self._sources = sources
         self._enumerators = enumerators
 
-    def collect(self, revision_id: UUID, kinds: Sequence[CodeFactKind]) -> CollectResult:
+    def collect(self, repository_ref_id: UUID, kinds: Sequence[CodeFactKind]) -> CollectResult:
         raise NotImplementedError("stub: replaces build_symbol_index, secure-code enumerators")
 
     def list(
-        self, revision_id: UUID, kinds: Sequence[CodeFactKind], page: PageRequest
+        self, repository_ref_id: UUID, kinds: Sequence[CodeFactKind], page: PageRequest
     ) -> Page[CodeFact]:
         raise NotImplementedError("stub: code facts read")
 
-    def symbols(self, revision_id: UUID, query: SymbolQuery) -> list[SymbolFact]:
+    def symbols(self, repository_ref_id: UUID, query: SymbolQuery) -> list[SymbolFact]:
         raise NotImplementedError("stub: replaces query_index.py, build_diff_packet.callers_for")
 
-    def language_stats(self, revision_id: UUID) -> LanguageStats:
+    def language_stats(self, repository_ref_id: UUID) -> LanguageStats:
         raise NotImplementedError("stub: replaces loc-dashboard GitHub language fetch")

@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Protocol
 
 from traust_core.v1.models.base import Model
-from traust_core.v1.repositories.object_store import ObjectKey, ObjectRef, ObjectStore
+from traust_core.v1.repositories.objects.store import ObjectKey, ObjectRef, ObjectStore
 
 
 class Table(Model):

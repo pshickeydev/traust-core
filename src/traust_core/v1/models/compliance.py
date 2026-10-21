@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import NewType
 from uuid import UUID
 
-from traust_core.v1.models.base import Entity, Model
+from traust_core.v1.models.base import Model
 from traust_core.v1.models.common import ArtifactRef, Principal, Sha256
 from traust_core.v1.models.findings import SkillInput
 from traust_core.v1.models.vocabulary import (
@@ -86,7 +86,7 @@ class Assertion(Model):
         raise NotImplementedError("stub: replaces compliance_assert.eval_assertion")
 
 
-class ComplianceScope(Entity):
+class ComplianceScope(Model):
     product_id: UUID
     frameworks: tuple[ComplianceFramework, ...] = ()
     targets: tuple[ComplianceTarget, ...] = ()
@@ -104,7 +104,7 @@ class ControlResult(Model):
     evidence: tuple[EvidenceId, ...] = ()
 
 
-class ComplianceAssessment(Entity):
+class ComplianceAssessment(Model):
     scope_id: UUID
     framework: ComplianceFramework
     assessed_at: datetime
@@ -115,7 +115,7 @@ class ComplianceAssessment(Entity):
         raise NotImplementedError("stub: replaces compliance/dashboard.latest_per_target_framework")
 
 
-class Adr(Entity):
+class Adr(Model):
     product_id: UUID
     number: int
     title: str
@@ -123,7 +123,7 @@ class Adr(Entity):
     artifact: ArtifactRef
 
 
-class DocVariance(Entity):
+class DocVariance(Model):
     product_id: UUID
     kind: DocVarianceKind
     disposition: DocVarianceDisposition

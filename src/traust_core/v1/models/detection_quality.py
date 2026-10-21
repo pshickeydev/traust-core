@@ -3,9 +3,9 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import UUID
 
-from traust_core.v1.models.base import Entity, Model
+from traust_core.v1.models.base import Model
 from traust_core.v1.models.common import ArtifactRef
-from traust_core.v1.models.exposure import AdvisoryIdentifier
+from traust_core.v1.models.dependencies import AdvisoryIdentifier
 from traust_core.v1.models.vocabulary import (
     BenchmarkTargetEmbargo,
     BenchmarkTargetEvidenceKind,
@@ -49,10 +49,10 @@ class BenchmarkFilter(Model): ...
 class MissFilter(Model): ...
 
 
-class BenchmarkTarget(Entity):
+class BenchmarkTarget(Model):
     advisory: AdvisoryIdentifier
     repository_id: UUID
-    fix_revision_id: UUID
+    fix_repository_ref_id: UUID
     provenance: BenchmarkTargetProvenance
     embargo: BenchmarkTargetEmbargo
     evidence: BenchmarkTargetEvidenceKind
@@ -66,7 +66,7 @@ class BenchmarkMatch(Model):
     injection_score: float | None = None
 
 
-class BenchmarkRun(Entity):
+class BenchmarkRun(Model):
     rule_pack_id: UUID
     started_at: datetime
     matches: tuple[BenchmarkMatch, ...] = ()
@@ -75,13 +75,13 @@ class BenchmarkRun(Entity):
         raise NotImplementedError("stub: replaces match_benchmark.score, sweep/benchmark.cmd_score")
 
 
-class RulePack(Entity):
+class RulePack(Model):
     name: str
     version: str
     rules: tuple[RuleRef, ...] = ()
 
 
-class RuleDraft(Entity):
+class RuleDraft(Model):
     source: RuleDraftSource
     language: Language
     artifact: ArtifactRef
@@ -95,7 +95,7 @@ class Calibration(Model):
     delta: CalibrationDelta
 
 
-class CriticalMiss(Entity):
+class CriticalMiss(Model):
     advisory: AdvisoryIdentifier
     repository_id: UUID
     reason: MissReason

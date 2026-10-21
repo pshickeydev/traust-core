@@ -1,21 +1,21 @@
 import json
 from collections.abc import Iterator
 from pathlib import Path
+from uuid import UUID
 
 import pytest
 
-from tests.v1.conftest import CLOCK, apply_contract_ddl, storage_db
+from tests.v1.conftest import apply_contract_db, contract_db
 from tests.v1.example.artifact_publishing import example_specs as default_specs
-from tests.v1.services.test_storage import TRIAGE
+from tests.v1.fixtures import TRIAGE
 from traust_core.v1.context import Config, Context
 from traust_core.v1.errors import ConfigError, DocumentError, RepositoryError
 from traust_core.v1.models.analysis_results import ResultKind, Subject
 from traust_core.v1.models.artifacts import TriageArtifact
 from traust_core.v1.repositories import InMemoryObjectStore
-from traust_core.v1.repositories.analysis_results import AnalysisResultsRepository
-from traust_core.v1.repositories.storage import InMemoryStorageUnitOfWork, SqlStorageUnitOfWork
-from traust_core.v1.services.artifact_publishing import ArtifactPublisher, StorageIndex
-from traust_core.v1.services.storage import get_binding
+from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
+from traust_core.v1.repositories.objects.analysis_results import AnalysisResultsRepository
+from traust_core.v1.services.artifact_publishing import ArtifactPublisher, SqlArtifactIndex
 
 SUBJECT = Subject(tree="findings", product="openshift", repo_dir="oc", base="oc")
 FINDING = {
@@ -34,26 +34,20 @@ def triage_with(*findings: dict) -> bytes:
     return json.dumps(doc).encode()
 
 
-@pytest.fixture(params=["files-only", "memory-index", "sqlite-index"])
+@pytest.fixture(params=["files-only", "sqlite-index"])
 def setup(
     request: pytest.FixtureRequest, tmp_path: Path
 ) -> Iterator[tuple[ArtifactPublisher, object]]:
     results = AnalysisResultsRepository(InMemoryObjectStore())
     if request.param == "files-only":
         yield ArtifactPublisher(default_specs(), results), None
-    elif request.param == "memory-index":
-        uow = InMemoryStorageUnitOfWork()
-        yield (
-            ArtifactPublisher(default_specs(), results, StorageIndex(lambda: uow, CLOCK)),
-            lambda: uow,
-        )
-    else:
-        with storage_db("sqlite", tmp_path) as engine:
+        return
+    with contract_db("sqlite", tmp_path) as engine:
 
-            def make() -> SqlStorageUnitOfWork:
-                return SqlStorageUnitOfWork(engine)
+        def make() -> SqlTraustUnitOfWork:
+            return SqlTraustUnitOfWork(engine)
 
-            yield ArtifactPublisher(default_specs(), results, StorageIndex(make, CLOCK)), make
+        yield ArtifactPublisher(default_specs(), results, SqlArtifactIndex(make)), make
 
 
 def test_submit_writes_json_then_rendered_markdown(setup: tuple[ArtifactPublisher, object]) -> None:
@@ -77,17 +71,19 @@ def test_markdown_is_rendered_from_the_validated_document() -> None:
     )
 
 
-def test_index_records_a_binding_that_points_at_the_json_file(
+def test_index_records_an_artifact_row_that_points_at_the_json_file(
     setup: tuple[ArtifactPublisher, object],
 ) -> None:
-    service, storage = setup
+    service, uow = setup
     result = service.publish("triage", SUBJECT, triage_with(FINDING), run_id="r1")
-    if storage is None:
-        assert result.binding_id is None
+    if uow is None:
+        assert result.artifact_id is None
         return
-    binding = get_binding(storage(), result.binding_id)
-    assert binding.references == ("findings/openshift/oc/oc-triage.json",)
-    assert binding.context.subject_id == SUBJECT.key
+    assert result.artifact_id is not None
+    with uow() as u:  # type: ignore[operator]
+        row = u.artifacts.get(result.artifact_id)
+    assert row.uri == "findings/openshift/oc/oc-triage.json"
+    assert row.kind == "triage" and row.assessment_id is None
 
 
 def test_invalid_input_writes_nothing_and_returns_every_issue() -> None:
@@ -134,7 +130,7 @@ def test_reader_returns_the_named_artifact(tmp_path: Path) -> None:
 
 def test_index_failure_keeps_files_and_reports_degraded() -> None:
     class BrokenIndex:
-        def record(self, *_: object) -> str:
+        def record(self, *_: object) -> UUID:
             raise RepositoryError("database down")
 
     results = AnalysisResultsRepository(InMemoryObjectStore())
@@ -149,7 +145,7 @@ def test_resubmitting_is_idempotent(setup: tuple[ArtifactPublisher, object]) -> 
     service, _ = setup
     first = service.publish("triage", SUBJECT, triage_with(FINDING), run_id="r1")
     again = service.publish("triage", SUBJECT, triage_with(FINDING), run_id="r1")
-    assert (again.written, again.binding_id) == (first.written, first.binding_id)
+    assert (again.written, again.artifact_id) == (first.written, first.artifact_id)
 
 
 def test_context_builds_files_only_or_indexed_from_config(tmp_path: Path) -> None:
@@ -157,7 +153,7 @@ def test_context_builds_files_only_or_indexed_from_config(tmp_path: Path) -> Non
     assert (
         files_only.artifact_publisher(default_specs())
         .publish("triage", SUBJECT, TRIAGE, "r1")
-        .binding_id
+        .artifact_id
         is None
     )
 
@@ -168,9 +164,8 @@ def test_context_builds_files_only_or_indexed_from_config(tmp_path: Path) -> Non
                 "database": {"url": f"sqlite:///{tmp_path}/db.sqlite"},
             }
         ),
-        clock=CLOCK,
     )
-    apply_contract_ddl(indexed.database, "storage")
+    apply_contract_db(indexed.database)
     published = indexed.artifact_publisher(default_specs()).publish("triage", SUBJECT, TRIAGE, "r1")
-    assert published.binding_id is not None
+    assert published.artifact_id is not None
     assert (tmp_path / "ar2/findings/openshift/oc/oc-triage.md").is_file()

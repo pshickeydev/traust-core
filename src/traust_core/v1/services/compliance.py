@@ -24,11 +24,11 @@ from traust_core.v1.models.compliance import (
     ScopeFilter,
 )
 from traust_core.v1.models.vocabulary import ComplianceFramework
-from traust_core.v1.repositories.compliance import ComplianceUnitOfWork
+from traust_core.v1.repositories.traust.assessments import AssessmentsUnitOfWork
 
 
 class ComplianceService:
-    def __init__(self, uow: ComplianceUnitOfWork) -> None:
+    def __init__(self, uow: AssessmentsUnitOfWork) -> None:
         self._uow = uow
 
     def set_scope(self, doc: ComplianceScopeArtifact, principal: Principal) -> ComplianceScope:

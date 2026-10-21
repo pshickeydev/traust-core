@@ -3,8 +3,9 @@ from __future__ import annotations
 import json
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import UTC, datetime
+from enum import StrEnum
 from types import TracebackType
-from typing import Any, Literal, Self
+from typing import Any, Self
 from uuid import UUID, uuid4
 
 import sqlalchemy as sa
@@ -14,8 +15,16 @@ from sqlalchemy.ext.compiler import compiles
 
 from traust_core.v1.errors import ConflictError, NotFoundError, RepositoryError
 
-STORAGE_SCHEMA = "traust_storage"
-LEDGER_SCHEMA = "traust_ledger"
+
+class Dialect(StrEnum):
+    """The two databases the contracts DDL ships for; names match its directories."""
+
+    SQLITE = "sqlite"
+    POSTGRES = "postgres"
+
+    @classmethod
+    def of(cls, bind: Engine | Connection) -> Dialect:
+        return cls.POSTGRES if bind.dialect.name == "postgresql" else cls.SQLITE
 
 
 def _compact_json(value: Any) -> str:
@@ -33,13 +42,11 @@ def create_database_engine(url: str | sa.URL) -> Engine:
         # Contracts' uuid(): ext/misc/uuid.c in other drivers, registered here.
         dbapi_conn.create_function("uuid", 0, lambda: str(uuid4()))
 
-    return engine.execution_options(
-        schema_translate_map={STORAGE_SCHEMA: None, LEDGER_SCHEMA: None}
-    )
+    return engine
 
 
-def contract_dialect(engine: Engine | Connection) -> Literal["sqlite", "postgres"]:
-    return "postgres" if engine.dialect.name == "postgresql" else "sqlite"
+def contract_dialect(engine: Engine | Connection) -> Dialect:
+    return Dialect.of(engine)
 
 
 class UtcTimestamp(sa.TypeDecorator[datetime]):
@@ -104,7 +111,7 @@ class _DbNow(sa.FunctionElement[datetime]):
 
 @compiles(_DbNow, "postgresql")
 def _postgres_now(element: Any, compiler: Any, **kw: Any) -> str:
-    return "now()"
+    return "statement_timestamp()"
 
 
 @compiles(_DbNow, "sqlite")
@@ -243,26 +250,3 @@ class SqlRepository:
             raise ConflictError(f"{name}: {operation}: {e.orig}") from e
         except SQLAlchemyError as e:
             raise RepositoryError(f"{name}: {operation} failed: {e}") from e
-
-
-def schema_drift(engine: Engine, metadata: sa.MetaData) -> list[str]:
-    inspector = sa.inspect(engine)
-    translate = engine.get_execution_options().get("schema_translate_map", {})
-    problems: list[str] = []
-    for table in metadata.sorted_tables:
-        schema = translate.get(table.schema, table.schema)
-        if not inspector.has_table(table.name, schema=schema):
-            problems.append(f"{table.name}: missing in database")
-            continue
-        actual = {c["name"]: c for c in inspector.get_columns(table.name, schema=schema)}
-        for column in table.columns:
-            found = actual.pop(column.name, None)
-            if found is None:
-                problems.append(f"{table.name}.{column.name}: missing in database")
-            elif found["nullable"] != column.nullable and not column.primary_key:
-                problems.append(
-                    f"{table.name}.{column.name}: nullable {found['nullable']} in database, "
-                    f"{column.nullable} in Table"
-                )
-        problems += [f"{table.name}.{name}: not declared in Table" for name in sorted(actual)]
-    return problems

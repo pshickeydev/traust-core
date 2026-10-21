@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import UUID
 
-from traust_core.v1.models.base import Entity, Model
+from traust_core.v1.models.base import Model
 from traust_core.v1.models.findings import EvidenceRef, SkillInput
 from traust_core.v1.models.vocabulary import (
     ValidationAdapterKind,
@@ -81,7 +81,7 @@ class ValidationScope(Model):
         raise NotImplementedError("stub: replaces validation/scope.py x2, browser scope.py")
 
 
-class ValidationPlan(Entity):
+class ValidationPlan(Model):
     finding_id: UUID
     target: ValidationTarget
     technique: ValidationTechnique
@@ -94,7 +94,7 @@ class ValidationPlan(Entity):
         raise NotImplementedError("stub: replaces validate-findings approval mode")
 
 
-class ValidationAttempt(Entity):
+class ValidationAttempt(Model):
     plan_id: UUID
     verdict: ValidationVerdict
     evidence: tuple[EvidenceRef, ...] = ()

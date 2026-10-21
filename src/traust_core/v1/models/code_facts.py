@@ -3,8 +3,8 @@ from __future__ import annotations
 from enum import StrEnum
 from uuid import UUID
 
-from traust_core.v1.models.base import Entity, Model
-from traust_core.v1.models.common import Location
+from traust_core.v1.models.base import Model
+from traust_core.v1.models.common import CodeSpan
 
 
 class CodeFactKind(StrEnum):
@@ -76,8 +76,8 @@ class SymbolQuery(Model): ...
 class CollectResult(Model): ...
 
 
-class CodeFact(Entity):
-    revision_id: UUID
+class CodeFact(Model):
+    repository_ref_id: UUID
     kind: CodeFactKind
-    location: Location | None = None
+    location: CodeSpan | None = None
     detail: CodeFactDetail

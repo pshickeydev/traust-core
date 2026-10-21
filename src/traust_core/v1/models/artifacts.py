@@ -101,7 +101,7 @@ def describe(nodes: Sequence[Node], depth: int = 0, max_depth: int = 4) -> list[
     return lines
 
 
-class Artifact(ABC):
+class ArtifactDocument(ABC):
     name: ClassVar[str]
     schema: ClassVar[str]
     kind: ClassVar[ResultKind | None]
@@ -159,7 +159,7 @@ class Artifact(ABC):
 
 
 class SecurityAuditArtifact(
-    Artifact,
+    ArtifactDocument,
     name="security-audit",
     schema="report",
     kind=ResultKind.SECURITY_AUDIT,
@@ -168,7 +168,7 @@ class SecurityAuditArtifact(
 
 
 class FindingsCurrentArtifact(
-    Artifact,
+    ArtifactDocument,
     name="findings-current",
     schema="report",
     kind=ResultKind.FINDINGS_CURRENT,
@@ -177,25 +177,25 @@ class FindingsCurrentArtifact(
 
 
 class FindingsLayerArtifact(
-    Artifact, name="findings-layer", schema="layer", kind=ResultKind.FINDINGS_LAYER
+    ArtifactDocument, name="findings-layer", schema="layer", kind=ResultKind.FINDINGS_LAYER
 ): ...
 
 
-class TriageArtifact(Artifact, name="triage", schema="triage", kind=ResultKind.TRIAGE): ...
+class TriageArtifact(ArtifactDocument, name="triage", schema="triage", kind=ResultKind.TRIAGE): ...
 
 
 class ThreatModelArtifact(
-    Artifact, name="threat-model", schema="threat-model", kind=ResultKind.THREAT_MODEL
+    ArtifactDocument, name="threat-model", schema="threat-model", kind=ResultKind.THREAT_MODEL
 ): ...
 
 
 class ValidationArtifact(
-    Artifact, name="validation", schema="validation", kind=ResultKind.VALIDATION
+    ArtifactDocument, name="validation", schema="validation", kind=ResultKind.VALIDATION
 ): ...
 
 
 class VerificationArtifact(
-    Artifact,
+    ArtifactDocument,
     name="remediation-verification",
     schema="verification",
     kind=ResultKind.REMEDIATION_VERIFICATION,
@@ -203,7 +203,7 @@ class VerificationArtifact(
 
 
 class CloudConfigAuditArtifact(
-    Artifact,
+    ArtifactDocument,
     name="cloud-config-audit",
     schema="cloud-config-audit",
     kind=ResultKind.CLOUD_CONFIG_AUDIT,
@@ -211,50 +211,63 @@ class CloudConfigAuditArtifact(
 
 
 class PrivProfileArtifact(
-    Artifact, name="priv-profile", schema="operator-priv-profile", kind=ResultKind.PRIV_PROFILE
+    ArtifactDocument,
+    name="priv-profile",
+    schema="operator-priv-profile",
+    kind=ResultKind.PRIV_PROFILE,
 ): ...
 
 
 # Skill documents recorded through the domain services (R13); no analysis-results layout.
-class AdapterResultArtifact(Artifact, name="adapter-result", schema="adapter-result"): ...
+class AdapterResultArtifact(ArtifactDocument, name="adapter-result", schema="adapter-result"): ...
 
 
-class IsolationReviewArtifact(Artifact, name="isolation-review", schema="isolation-review"): ...
-
-
-class ImpactAnalysisArtifact(Artifact, name="impact-analysis", schema="impact-analysis"): ...
-
-
-class PqcFactsArtifact(Artifact, name="pqc-facts", schema="pqc-facts"): ...
-
-
-class PqcReadinessArtifact(Artifact, name="pqc-readiness", schema="pqc-readiness"): ...
-
-
-class PqcBlockersArtifact(Artifact, name="pqc-blockers", schema="pqc-blockers"): ...
-
-
-class PqcDecisionTreeArtifact(Artifact, name="pqc-decision-tree", schema="pqc-decision-tree"): ...
-
-
-class RemediationArtifact(Artifact, name="remediation", schema="remediation"): ...
-
-
-class FleetFixArtifact(Artifact, name="fleet-fix", schema="fleet-fix"): ...
-
-
-class ComplianceScopeArtifact(Artifact, name="compliance-scope", schema="compliance-scope"): ...
-
-
-class ComplianceAssessmentArtifact(
-    Artifact, name="compliance-assessment", schema="compliance-assessment"
+class IsolationReviewArtifact(
+    ArtifactDocument, name="isolation-review", schema="isolation-review"
 ): ...
 
 
-class DocVarianceArtifact(Artifact, name="doc-variance", schema="doc-variance"): ...
+class ImpactAnalysisArtifact(
+    ArtifactDocument, name="impact-analysis", schema="impact-analysis"
+): ...
 
 
-class BenchmarkTargetArtifact(Artifact, name="benchmark-target", schema="benchmark-target"): ...
+class PqcFactsArtifact(ArtifactDocument, name="pqc-facts", schema="pqc-facts"): ...
+
+
+class PqcReadinessArtifact(ArtifactDocument, name="pqc-readiness", schema="pqc-readiness"): ...
+
+
+class PqcBlockersArtifact(ArtifactDocument, name="pqc-blockers", schema="pqc-blockers"): ...
+
+
+class PqcDecisionTreeArtifact(
+    ArtifactDocument, name="pqc-decision-tree", schema="pqc-decision-tree"
+): ...
+
+
+class RemediationArtifact(ArtifactDocument, name="remediation", schema="remediation"): ...
+
+
+class FleetFixArtifact(ArtifactDocument, name="fleet-fix", schema="fleet-fix"): ...
+
+
+class ComplianceScopeArtifact(
+    ArtifactDocument, name="compliance-scope", schema="compliance-scope"
+): ...
+
+
+class ComplianceAssessmentArtifact(
+    ArtifactDocument, name="compliance-assessment", schema="compliance-assessment"
+): ...
+
+
+class DocVarianceArtifact(ArtifactDocument, name="doc-variance", schema="doc-variance"): ...
+
+
+class BenchmarkTargetArtifact(
+    ArtifactDocument, name="benchmark-target", schema="benchmark-target"
+): ...
 
 
 AssessmentArtifact = (
@@ -266,7 +279,7 @@ AssessmentArtifact = (
 )
 PqcArtifact = PqcFactsArtifact | PqcReadinessArtifact | PqcDecisionTreeArtifact
 
-ANALYSIS_ARTIFACTS: tuple[type[Artifact], ...] = (
+ANALYSIS_ARTIFACTS: tuple[type[ArtifactDocument], ...] = (
     SecurityAuditArtifact,
     FindingsCurrentArtifact,
     FindingsLayerArtifact,

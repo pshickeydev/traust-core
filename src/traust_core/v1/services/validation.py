@@ -22,14 +22,14 @@ from traust_core.v1.models.validation import (
 )
 from traust_core.v1.models.vocabulary import ValidationTechnique
 from traust_core.v1.providers.validation import ValidationAdapter
-from traust_core.v1.repositories.validation import ValidationUnitOfWork
+from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.services.findings.decisions import FindingDecisions
 
 
 class ValidationService:
     def __init__(
         self,
-        uow: ValidationUnitOfWork,
+        uow: TraustUnitOfWork,
         decisions: FindingDecisions,
         adapters: Sequence[ValidationAdapter],
     ) -> None:

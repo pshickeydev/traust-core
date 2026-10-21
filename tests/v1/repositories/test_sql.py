@@ -105,7 +105,7 @@ END;
 _TOUCH_POSTGRES = """
 CREATE OR REPLACE FUNCTION base_records_touch_updated_at() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
-  NEW.updated_at := now();
+  NEW.updated_at := statement_timestamp();
   RETURN NEW;
 END
 $$;

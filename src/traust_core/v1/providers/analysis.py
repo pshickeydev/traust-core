@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from traust_core.v1.models.exposure import Advisory, Dependency, ImpactEvidence
+from traust_core.v1.models.dependencies import Advisory, Dependency, ImpactEvidence
 from traust_core.v1.providers.base import Readiness, Result
 from traust_core.v1.providers.tools import ToolRequest
 

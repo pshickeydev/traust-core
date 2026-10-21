@@ -1,39 +1,39 @@
 # Repository
 
-1. Model in `models/<subject>.py`: `Entity`/`Model` subclass or frozen dataclass. No database types.
-2. Interface: a `Protocol` over one aggregate, in `repositories/<subject>.py`, using the shared verbs only as needed: `get(id) -> T` (raises `NotFoundError`), `find_*(...) -> T | None`, `list(filter, page) -> Page[T]`, `add(T) -> T` and `update(T) -> T` returning the saved record (database-generated `id`, `created_at`, `updated_at` via `RETURNING`). IDs are `UUID`, named `<entity>_id`. No generic CRUD base, no cross-domain tables.
-3. Unit-of-work protocol: `class XUnitOfWork(UnitOfWork, Protocol): xs: XRepository`.
-4. SQL implementation:
-   - `sa.Table(...)` describing the existing table (DDL is owned by traust-contracts)
-   - `class SqlXRepository(SqlRepository)`; every statement goes through `self._execute("<operation> <id>", stmt)`
-   - `_to_row(model)` / `_to_model(row)` private functions; rows never leave the repository
-   - missing row → `NotFoundError`; duplicates surface as `ConflictError` from `_execute`
-5. `class SqlXUnitOfWork(SqlUnitOfWork)` attaching the repository in `_open_repositories`.
-6. In-memory double implementing the same interface, raising the same errors.
-7. Contract tests parametrized over `["memory", *SQL_BACKENDS]` using `tests/v1/conftest.py::database`. The Postgres case is marked `integration` and runs with `make db-up && make test-integration`.
+One repository per contract table. The DDL is owned by traust-contracts; you never write DDL, and a table that isn't in the pinned contracts yet is a gap to report, not one to invent.
 
-The domain service takes the unit of work in its constructor and opens it per use case:
+## Add a table repository
+
+Files mirror the contracts namespaces: `repositories/traust/<section>/<table>.py`, `repositories/traust_ops/<table>.py`, `repositories/traust_ledger/<table>.py`. Copy `repositories/traust/inventory/repository.py`.
+
+1. **Model** in `models/<section>.py`: subclass `Entity` (mutable table) or `AppendOnly` (append-only table); fields are the columns, named as in the DDL; no behaviour, no database types.
+2. **Spec**: `TableSpec(TRAUST | TRAUST_OPS | TRAUST_LEDGER, "<table>", lambda: (<domain columns>), append_only=...)` using `uuid_column` / `text_column` / `timestamp_column` (or `sa.Column` for booleans, integers, numerics). Base columns come from the spec; don't declare them. `TableFactory` builds it per dialect (Postgres schema or SQLite `ops_`/`ledger_` prefix).
+3. **Protocol**: `class XRepository(MutableRecordRepository[X] | RecordRepository[X], Protocol)` listing only this table's queries.
+4. **SQL class**: `class SqlXRepository(SqlMutableRepository[X] | SqlAppendOnlyRepository[X])` with `spec = X_SPEC`, `record = X`. `add`/`get`/`update` are inherited; each query uses `self._one(...)` / `self._many(..., order_by=...)` over `self.table.c`. Missing row → `NotFoundError`; database refusals surface as `ConflictError` from `_execute`.
+5. **Register**: add the spec to the section `__init__.py` `TABLES`, the repository to its section unit-of-work protocol, and the attribute to `SqlTraustUnitOfWork` in `repositories/contract.py`.
+6. **Seed + tests**: add `new_<table>()` / `<table>()` to `Seed` in `tests/v1/repositories/tables/conftest.py` — the per-table CRUD tests then cover it automatically — and a test per query in the section's test module.
+
+New reads go on the owning table's module: no duplicate queries of the same data, no speculative helpers, never reshape a table to fit a caller.
+
+## Unit of work
+
+Services declare the narrow protocol they need (`InventoryUnitOfWork`, `FindingsUnitOfWork`, …, `TraustUnitOfWork` across sections). `SqlTraustUnitOfWork(engine)` opens every repository on one connection, so one `commit()` or `rollback()` covers every section. Services that write together share one instance.
 
 ```python
-class TaskService:
-    def __init__(self, uow: TaskUnitOfWork) -> None:
+class FindingIntake:
+    def __init__(self, uow: TraustUnitOfWork) -> None:
         self._uow = uow
 
-    def complete(self, task_id: UUID) -> Task:
+    def accept(self, assessment_id: UUID, candidates: Sequence[FindingCandidate]) -> IntakeResult:
         with self._uow as uow:
-            done = uow.tasks.update(uow.tasks.get(task_id).complete())  # rule on the model
-            uow.commit()
-        return done
+            ...  # occurrences, findings, decisions
+            uow.commit()  # all or nothing
 ```
 
-## Aggregate repository
+## Tests
 
-One repository per aggregate (the thing the domain asks questions about), not per table. `repositories/triage.py` shows the SQL mechanics (table, mapping, `schema_drift`, idempotency); its string ids and `record_triage` free function are legacy and get replaced in the Findings slice — copy the mechanics, not the shape.
+Behaviour only, in `tests/v1/repositories/tables/`, each test running on SQLite and Postgres (`make test-repositories`; Postgres needs `make db-up`). Use the `uow` and `seed` fixtures; a test states only what it is about: `seed.decision(seed.finding(), severity="high")`.
 
-1. Domain model in `models/<subject>.py` (`TriageVerdict` in `models/findings.py`): fields = the projection's columns, typed.
-2. Protocol with the domain questions only (`for_binding`, `for_source_finding`, `true_positives`); no generic CRUD.
-3. `sa.Table` describing the contracts table (DDL from traust-contracts); match JSON columns' encoding to existing writers (`JSON(none_as_null=True)`, compact serializer from `create_database_engine`).
-4. SQL + in-memory implementations; a unit of work that exposes it alongside any repository it must write with (`evidence` + `triage_verdicts`).
-5. Domain service writes in one transaction: `bind_artifact(...)` then the projection, then `commit()`.
-6. Tests: contract tests on memory/sqlite (+ Postgres `integration`), `schema_drift` against the DDL, idempotency.
-7. Files go by role then subject: `models/<subject>.py`, `repositories/<subject>.py`, `services/<subject>.py`; tests mirror under `tests/v1/<role>/`.
+- Per query: the right rows come back (and `None` / `[]` when they shouldn't).
+- Assert list order only where the query defines it (`occurred_at`, `seq`, `priority`); otherwise compare with `same_rows`.
+- Never restate the DDL (columns, constraints, triggers, indexes): contracts owns and tests that.

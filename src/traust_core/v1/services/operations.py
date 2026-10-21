@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from datetime import timedelta
 from decimal import Decimal
 from typing import Protocol, TypeVar
 from uuid import UUID
@@ -13,13 +14,11 @@ from traust_core.v1.models.operations import (
     BudgetVerdict,
     JobResult,
     LaneName,
-    Lease,
-    Order,
-    OrderEvent,
     OrderFilter,
     OrderProgress,
     Refusal,
     Route,
+    RunOrder,
     SchedulePlan,
     SpendAttribution,
     SpendDimension,
@@ -33,7 +32,7 @@ from traust_core.v1.models.operations import (
 )
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.feeds import FeedProvider
-from traust_core.v1.repositories.operations import OpsUnitOfWork, SpendUnitOfWork
+from traust_core.v1.repositories.traust_ops import OpsUnitOfWork
 from traust_core.v1.services.provider_catalog import ProviderCatalog
 
 S = TypeVar("S", contravariant=True)
@@ -55,42 +54,40 @@ class OpsService:
         self._uow = uow
         self._clock = clock
 
-    def submit(self, request: AssetRequest, principal: Principal) -> Order:
+    def submit(self, request: AssetRequest, principal: Principal) -> RunOrder:
         raise NotImplementedError("stub: replaces cron/subprocess orchestration, */ops.py facades")
 
-    def claim(self, worker: WorkerId) -> Lease | None:
+    def claim(self, worker: WorkerId, lease_for: timedelta) -> RunOrder | None:
         raise NotImplementedError("stub: order lease for the traust-engine run loop")
 
-    def heartbeat(self, lease: Lease) -> Lease:
+    def heartbeat(self, order_id: UUID, worker: WorkerId, lease_for: timedelta) -> RunOrder:
         raise NotImplementedError("stub: order lease renewal for the traust-engine run loop")
 
-    def save_progress(self, lease: Lease, progress: OrderProgress) -> Order:
+    def save_progress(self, order_id: UUID, progress: OrderProgress) -> UUID:
+        """Progress goes to the run manifest artifact; returns its artifact id."""
         raise NotImplementedError("stub: replaces cli/checkpoint.py skill phase state")
 
-    def complete(self, lease: Lease, result: JobResult) -> Order:
+    def complete(self, order_id: UUID, result: JobResult) -> RunOrder:
         raise NotImplementedError("stub: replaces per-CLI exit codes and progress files")
 
-    def approve(self, order_id: UUID, attestation_id: UUID) -> Order:
+    def approve(self, order_id: UUID, decision_id: UUID) -> RunOrder:
         raise NotImplementedError("stub: replaces remediation push gates")
 
-    def schedule(self, plan: SchedulePlan) -> list[Order]:
+    def schedule(self, plan: SchedulePlan) -> list[RunOrder]:
         raise NotImplementedError("stub: replaces refresh_dashboards.build_stages")
 
-    def get(self, order_id: UUID) -> Order:
+    def get(self, order_id: UUID) -> RunOrder:
         raise NotImplementedError("stub: order read")
 
-    def list(self, filter: OrderFilter, page: PageRequest) -> Page[Order]:
+    def list(self, filter: OrderFilter, page: PageRequest) -> Page[RunOrder]:
         raise NotImplementedError("stub: order read")
-
-    def events(self, order_id: UUID) -> list[OrderEvent]:
-        raise NotImplementedError("stub: order event read")
 
     def timeline(self, filter: OrderFilter, bucket: TimeBucket) -> list[ThroughputPoint]:
         raise NotImplementedError("stub: replaces metrics/history.py, collect_harness_metrics")
 
 
 class SpendService:
-    def __init__(self, uow: SpendUnitOfWork, budgets: Sequence[Budget]) -> None:
+    def __init__(self, uow: OpsUnitOfWork, budgets: Sequence[Budget]) -> None:
         self._uow = uow
         self._budgets = budgets
 

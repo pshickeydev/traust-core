@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from traust_core.v1.models.base import Entity, Model
+from traust_core.v1.models.base import Model
 from traust_core.v1.models.code_facts import CryptoFact
-from traust_core.v1.models.exposure import Package
+from traust_core.v1.models.dependencies import Package
 from traust_core.v1.models.findings import SkillInput
 from traust_core.v1.models.vocabulary import (
     PqcBlastRadius,
@@ -32,7 +32,7 @@ class PqcBlocker(Model):
     vendor: str | None = None
 
 
-class PqcReadiness(Entity):
+class PqcReadiness(Model):
     assessment_id: UUID
     bucket: PqcReadinessBucket
     classification: PqcClassification

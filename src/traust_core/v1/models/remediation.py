@@ -3,10 +3,10 @@ from __future__ import annotations
 from enum import StrEnum
 from uuid import UUID
 
-from traust_core.v1.models.base import Entity, Model
+from traust_core.v1.models.base import Model
 from traust_core.v1.models.common import ArtifactRef
 from traust_core.v1.models.findings import SkillInput
-from traust_core.v1.models.portfolio import OrgName
+from traust_core.v1.models.inventory import OrgName
 from traust_core.v1.models.values import HttpsRepoUrl
 from traust_core.v1.models.vocabulary import (
     CrossRepoPropagation,
@@ -77,7 +77,7 @@ class Fork(Model):
     visibility: ForkVisibility
 
 
-class WorkItem(Entity):
+class WorkItem(Model):
     finding_ids: tuple[UUID, ...]
     component_id: UUID
     status: RemediationStatus
@@ -94,16 +94,16 @@ class WorkItem(Entity):
         raise NotImplementedError("stub: replaces next_pending_remediation.is_done")
 
 
-class FleetFix(Entity):
+class FleetFix(Model):
     matcher: FleetFixMatcher
     spec: FleetFixSpec
     target_ids: tuple[UUID, ...] = ()
     approval_id: UUID | None = None
 
 
-class Verification(Entity):
+class Verification(Model):
     work_item_id: UUID
-    revision_id: UUID
+    repository_ref_id: UUID
     verdict: VerificationVerdict
     regression_ids: tuple[UUID, ...] = ()
     artifact: ArtifactRef
