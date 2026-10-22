@@ -68,7 +68,14 @@ def test_decision_history_is_in_judgement_order(seed: Seed) -> None:
     finding = seed.finding()
     later = seed.decision(finding, occurred_at=T0 + timedelta(days=2), resolution="resolved")
     first = seed.decision(finding, occurred_at=T0)
-    correction = seed.decision(finding, occurred_at=T0 + timedelta(days=3), restates_id=later.id)
+    correction = seed.decision(
+        finding,
+        occurred_at=T0 + timedelta(days=3),
+        restates_id=later.id,
+        ticket="T-1",
+        reason="data_error",
+        rationale="resolved on the wrong line",
+    )
     assert seed.uow.decisions.list_for_finding(finding.id) == [first, later, correction]
 
 

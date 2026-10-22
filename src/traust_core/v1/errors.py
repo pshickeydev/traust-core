@@ -21,6 +21,10 @@ class ConflictError(RepositoryError):
     pass
 
 
+class ForbiddenError(TraustError, PermissionError):
+    """The caller is known but may not do this (a gate refused it)."""
+
+
 class IntegrityError(TraustError):
     pass
 

@@ -3,8 +3,7 @@ from __future__ import annotations
 from typing import Protocol
 from uuid import UUID
 
-from traust_core.v1.models.attestation import Credential, DirectoryStatus
-from traust_core.v1.models.common import Principal
+from traust_core.v1.models.identity import Credential, DirectoryStatus, Principal
 from traust_core.v1.providers.base import Readiness
 
 

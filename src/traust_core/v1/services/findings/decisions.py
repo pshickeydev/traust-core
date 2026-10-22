@@ -3,7 +3,7 @@ from __future__ import annotations
 from uuid import UUID
 
 from traust_core.v1.models.artifacts import TriageArtifact
-from traust_core.v1.models.common import Principal, Provenance
+from traust_core.v1.models.common import Provenance
 from traust_core.v1.models.findings import (
     Decision,
     Disposition,
@@ -11,6 +11,7 @@ from traust_core.v1.models.findings import (
     StatementKey,
     TriageInput,
 )
+from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.vocabulary import RestatementReason
 from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.services.ledger import LedgerService

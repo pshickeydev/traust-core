@@ -1,19 +1,25 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
+from types import MappingProxyType
 from typing import NewType
 from uuid import UUID
 
+from traust_core.v1.errors import ForbiddenError, ValidationError
 from traust_core.v1.models.base import AppendOnly, Entity, Model
 from traust_core.v1.models.common import CodeSpan
+from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.vocabulary import (
+    ActorKind,
     DispositionAssurance,
     DispositionResolution,
     FindingOrigin,
     Severity,
+    SourceType,
     Validity,
 )
 
@@ -170,6 +176,9 @@ class Decision(AppendOnly):
     severity: str | None = None
     source_channel: str | None = None
     actor: str | None = None
+    rationale: str | None = None
+    ticket: str | None = None
+    auto_accept_tier: bool = False
     occurred_at: datetime
 
 
@@ -181,8 +190,96 @@ class ReviewItem(Entity):
     status: str
 
 
+RATIONALE_MIN_LENGTH = 10
+FUTURE_LIMIT = timedelta(hours=24)
+_NO_SOURCES: Mapping[UUID, SourceType] = MappingProxyType({})
+_EXECUTION = frozenset({SourceType.VALIDATION_REPORT, SourceType.VERIFICATION_REPORT})
+_RESOLUTION_TIERS = {SourceType.VERIFICATION_REPORT: 0, SourceType.JIRA: 1}
+_CLOSED_VALIDITY = frozenset({Validity.FALSE_POSITIVE, "not_affected"})
+_CLOSED_RESOLUTION = frozenset(
+    {DispositionResolution.RESOLVED, DispositionResolution.RISK_ACCEPTED}
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _Statement:
+    decision: Decision
+    source: str | None
+
+    @property
+    def at(self) -> datetime:
+        return self.decision.occurred_at
+
+    @property
+    def human(self) -> bool:
+        return (self.decision.actor or "").startswith(f"{ActorKind.HUMAN}:")
+
+    @property
+    def auto_accepted(self) -> bool:
+        return self.decision.auto_accept_tier
+
+    @property
+    def evidence_class(self) -> int:
+        """1 execution-proven, 2 human, 3 machine static; E2/E3 evidence demotes to 3."""
+        if self.decision.evidence_grade in ("E2", "E3"):
+            return 3
+        return 2 if self.human else 1 if self.source in _EXECUTION else 3
+
+    @property
+    def resolution_tier(self) -> int:
+        return _RESOLUTION_TIERS.get(self.source, 2)
+
+
+def _statements(
+    decisions: Sequence[Decision], sources: Mapping[UUID, SourceType]
+) -> list[_Statement]:
+    """Decisions in judgement order, without those a restatement replaced."""
+    restated = {d.restates_id for d in decisions if d.restates_id}
+    kept = sorted(
+        (d for d in decisions if d.id is None or d.id not in restated),
+        key=lambda d: (d.occurred_at, d.created_at is None, d.created_at or d.occurred_at),
+    )
+    return [
+        _Statement(d, sources.get(d.assessment_id) if d.assessment_id else d.source_channel)
+        for d in kept
+    ]
+
+
+def _admit_statement(
+    history: Sequence[Decision],
+    decision: Decision,
+    actor: Principal | None,
+    now: datetime,
+    sources: Mapping[UUID, SourceType],
+) -> None:
+    """The gates on a direct statement (no assessment), as traust-ledger enforced them."""
+    if actor is None or decision.actor != actor.ref:
+        raise ForbiddenError("a direct statement is made by the calling principal, as its actor")
+    if actor.kind != ActorKind.HUMAN:
+        raise ForbiddenError(f"{actor.ref}: a machine judges a finding through an assessment")
+    if len(decision.rationale or "") < RATIONALE_MIN_LENGTH:
+        raise ValidationError(f"a rationale of at least {RATIONALE_MIN_LENGTH} characters")
+    if decision.occurred_at > now + FUTURE_LIMIT:
+        raise ValidationError(f"occurred_at {decision.occurred_at} is more than a day ahead")
+    if decision.validity != Validity.FALSE_POSITIVE:
+        return
+    if not actor.is_verified_human():
+        raise ForbiddenError(f"{actor.ref}: a false positive needs a verified human")
+    said = _statements(history, sources)
+    proven = any(s.source in _EXECUTION and s.decision.validity == Validity.CONFIRMED for s in said)
+    if proven and any(
+        s.human and s.decision.validity == Validity.FALSE_POSITIVE and s.decision.actor == actor.ref
+        for s in said
+    ):
+        raise ForbiddenError(
+            f"{actor.ref}: execution confirmed this finding; a second verified human must concur"
+        )
+
+
 # Read models over the views (current_decision, current_resolution, finding_status).
 class Disposition(Model):
+    """A finding's merged judgement: evidence-class precedence, moved from traust-ledger."""
+
     finding_id: UUID
     line: str | None = None
     validity: Validity | None = None
@@ -195,14 +292,88 @@ class Disposition(Model):
     last_decision_at: datetime | None = None
 
     @classmethod
-    def fold(cls, finding_id: UUID, decisions: Sequence[Decision]) -> Disposition:
-        raise NotImplementedError("stub: replaces ledger derive_disposition, corpus/disposition.py")
+    def fold(
+        cls,
+        finding_id: UUID,
+        decisions: Sequence[Decision],
+        sources: Mapping[UUID, SourceType] = _NO_SOURCES,
+    ) -> Disposition:
+        """Merge every decision; `sources` names each assessment's report kind (validation, ...)."""
+        said = _statements(decisions, sources)
+        valid = [s for s in said if s.decision.validity]
+        execution = [s for s in valid if s.evidence_class == 1]
+        human = [s for s in valid if s.evidence_class == 2]
+        machine = [s for s in valid if s.evidence_class == 3]
+        fp, confirmed = Validity.FALSE_POSITIVE, Validity.CONFIRMED
 
-    def admit(self, decision: Decision) -> Disposition:
-        raise NotImplementedError("stub: replaces ledger _internal/gates.py")
+        validity: str | None = None
+        if human:
+            validity = human[-1].decision.validity
+        elif machine and (machine[-1].decision.validity != fp or machine[-1].auto_accepted):
+            validity = machine[-1].decision.validity
+        overridden = blocked = False
+        if proofs := [s for s in execution if s.decision.validity != fp]:
+            proof = proofs[-1]
+            validity = proof.decision.validity
+            if validity == confirmed:
+                human_fp = [s for s in human if s.decision.validity == fp]
+                overridden = any(s.at <= proof.at for s in human_fp)
+                later = [s for s in human_fp if s.at > proof.at]
+                if len({s.decision.actor for s in later}) >= 2:
+                    validity, overridden = fp, False
+                elif later:
+                    blocked = True
+
+        seen = {s.decision.validity for s in valid}
+        conflict = {confirmed, fp} <= seen
+        awaiting = (
+            any(s.decision.validity == fp and not s.human and not s.auto_accepted for s in valid)
+            and validity != fp
+            and not human
+            and not conflict
+        )
+        assurance = (
+            DispositionAssurance.EXECUTION_PROVEN
+            if execution
+            else DispositionAssurance.HUMAN_REVIEWED
+            if human
+            else DispositionAssurance.MACHINE_VERIFIED
+            if machine
+            else DispositionAssurance.CLAIMED
+        )
+        resolved = [s for s in said if s.decision.resolution]
+        if resolved:
+            tier = min(s.resolution_tier for s in resolved)
+            resolution = [s for s in resolved if s.resolution_tier == tier][-1].decision.resolution
+        return cls(
+            finding_id=finding_id,
+            validity=validity,
+            resolution=resolution if resolved else None,
+            assurance=assurance,
+            conflict=conflict,
+            fp_overridden=overridden,
+            fp_reassertion_blocked=blocked,
+            awaiting_signoff=awaiting,
+            last_decision_at=said[-1].at if said else None,
+        )
+
+    @classmethod
+    def admit(
+        cls,
+        history: Sequence[Decision],
+        decision: Decision,
+        actor: Principal | None,
+        now: datetime,
+        sources: Mapping[UUID, SourceType] = _NO_SOURCES,
+    ) -> Disposition:
+        """The disposition with `decision` added, if its author may make it; else a typed error."""
+        if decision.assessment_id is None:
+            _admit_statement(history, decision, actor, now, sources)
+        return cls.fold(decision.finding_id, [*history, decision], sources)
 
     def is_open(self) -> bool:
-        raise NotImplementedError("stub: replaces build_trends.state_of")
+        """Not affirmatively closed; the same rule as the finding_status view."""
+        return self.validity not in _CLOSED_VALIDITY and self.resolution not in _CLOSED_RESOLUTION
 
 
 class Precedent(Model):
