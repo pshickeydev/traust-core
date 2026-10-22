@@ -71,8 +71,29 @@ class Route(Dto):
     reason: str
 
 
-# Members land with the Operations slice (contracts run-order-state, to add).
-class OrderState(StrEnum): ...
+# Becomes contracts.enum("run-order-state") once contracts registers it; values match the DDL.
+class OrderState(StrEnum):
+    PLANNED = "planned"
+    AWAITING_APPROVAL = "awaiting_approval"
+    QUEUED = "queued"
+    LEASED = "leased"
+    SUCCEEDED = "succeeded"
+    DEGRADED = "degraded"
+    REFUSED = "refused"
+    WITHHELD = "withheld"
+    FAILED = "failed"
+
+
+class OrderRequest(Model):
+    """What admission puts on the queue: one asset for one partition, routed or not."""
+
+    asset: AssetName
+    priority: int
+    repository_id: UUID | None = None
+    run_batch_id: UUID | None = None
+    lane: LaneName | None = None
+    rule: str | None = None
+    event_source: str | None = None
 
 
 # Shapes land with their implementation slice.
@@ -124,8 +145,9 @@ class RunOrder(Entity):
     artifact_id: UUID | None = None
     rule: str | None = None
     event_source: str | None = None
-    lane: str
-    state: str
+    asset: str
+    lane: str | None = None
+    state: OrderState
     priority: int
     reason: str | None = None
     requested_by: str

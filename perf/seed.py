@@ -1,0 +1,105 @@
+"""A Postgres contracts database seeded at production volume, built once and reused.
+
+The database name carries a digest of the DDL and this seed, so a schema or seed change
+rebuilds it and an unchanged one is reused across runs.
+"""
+
+from __future__ import annotations
+
+import hashlib
+
+import sqlalchemy as sa
+from sqlalchemy.engine import Engine
+
+from traust_core.v1 import contracts
+from traust_core.v1.repositories import apply_schema, create_database_engine
+from traust_core.v1.repositories.sql import Dialect
+
+# 1% of leases have lapsed; the rest never expire, so a reused database keeps that shape.
+# Past a year of continuous ops on a ~10k-repository estate; retention prunes finished orders
+# long before this, so queries that hold here hold in production.
+REPOSITORIES = 10_000
+RUN_BATCHES = 52
+RUN_ORDERS = 2_000_000
+OPEN_ORDERS = 20_000
+
+ROUTED = ("full-audit", "diff-scan", "diff-scan-quarterly", "threat-model-review", "deps-lane")
+UNROUTED = ("feeds_cache", "repo_state", "dashboards")
+
+SEED = (
+    f"""INSERT INTO traust.repository (url, public)
+    SELECT 'https://forge.example/org/r' || g, true FROM generate_series(1, {REPOSITORIES}) g""",
+    f"""INSERT INTO traust_ops.run_batch (kind, period)
+    SELECT 'drain_tranche', '2026-W' || lpad(g::text, 2, '0')
+    FROM generate_series(1, {RUN_BATCHES}) g""",
+    f"""INSERT INTO traust_ops.run_order (run_batch_id, repository_id, asset, lane, state,
+        priority, requested_by, lease_holder, lease_expires_at, started_at, finished_at, created_at)
+    SELECT b.id, CASE WHEN o.lane IS NULL AND o.asset <> 'repo_state' THEN NULL ELSE r.id END,
+        o.asset, o.lane, o.state, mod(o.g, 100), 'machine:engine',
+        CASE WHEN o.state = 'leased' THEN 'worker-' || mod(o.g, 50) END,
+        CASE WHEN o.state = 'leased' AND mod(o.g, 100) = 2 THEN o.at + interval '5 minutes'
+            WHEN o.state = 'leased' THEN now() + interval '100 years' END,
+        CASE WHEN o.state IN ('leased', 'succeeded', 'degraded', 'refused', 'failed') THEN o.at END,
+        CASE WHEN o.g > {OPEN_ORDERS} AND o.state <> 'withheld'
+            THEN o.at + interval '10 minutes' END,
+        o.at
+    FROM (
+        SELECT g, now() - make_interval(secs => g * 15) AS at,
+            CASE WHEN mod(g, 8) < 5 THEN replace(replace(w.lane, '-quarterly', ''), '-', '_')
+                ELSE w.asset END AS asset,
+            CASE WHEN mod(g, 8) < 5 THEN w.lane END AS lane,
+            CASE WHEN g <= {OPEN_ORDERS}
+                THEN (ARRAY['planned', 'queued', 'leased', 'awaiting_approval'])[1 + mod(g, 4)]
+                ELSE (ARRAY['succeeded', 'succeeded', 'succeeded', 'degraded', 'failed',
+                    'refused', 'withheld'])[1 + mod(g, 7)] END AS state
+        FROM generate_series(1, {RUN_ORDERS}) g,
+        LATERAL (SELECT (ARRAY{list(ROUTED)})[1 + mod(g, {len(ROUTED)})] AS lane,
+                        (ARRAY{list(UNROUTED)})[1 + mod(g, {len(UNROUTED)})] AS asset) w
+    ) o
+    JOIN (SELECT row_number() OVER (ORDER BY id) AS n, id FROM traust.repository) r
+        ON r.n = 1 + mod(o.g, {REPOSITORIES})
+    LEFT JOIN (SELECT row_number() OVER (ORDER BY id) AS n, id FROM traust_ops.run_batch) b
+        ON mod(o.g, 10) = 0 AND b.n = 1 + mod(o.g / 10, {RUN_BATCHES})""",
+)
+
+
+def _name() -> str:
+    ddl = contracts.database_ddl(Dialect.POSTGRES)
+    digest = hashlib.sha256("\n".join([*ddl, *SEED]).encode()).hexdigest()[:12]
+    return f"traust_perf_{digest}"
+
+
+def seeded_database(url: str) -> Engine:
+    name = _name()
+    admin = sa.create_engine(url, isolation_level="AUTOCOMMIT")
+    with admin.connect() as conn:
+        existing = set(
+            conn.exec_driver_sql(
+                "SELECT datname FROM pg_database WHERE starts_with(datname, 'traust_perf_')"
+            ).scalars()
+        )
+        for stale in existing - {name}:
+            conn.exec_driver_sql(f"DROP DATABASE {stale} WITH (FORCE)")
+        fresh = name not in existing
+        if fresh:
+            conn.exec_driver_sql(f"CREATE DATABASE {name}")
+    admin.dispose()
+    engine = create_database_engine(sa.make_url(url).set(database=name))
+    if fresh:
+        try:
+            apply_schema(engine, contracts.database_ddl(Dialect.POSTGRES))
+            apply_schema(engine, SEED)
+            with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+                conn.exec_driver_sql("VACUUM (ANALYZE) traust_ops.run_order")
+        except BaseException:
+            engine.dispose()
+            _drop(url, name)  # never leave a half-seeded database to be reused
+            raise
+    return engine
+
+
+def _drop(url: str, name: str) -> None:
+    admin = sa.create_engine(url, isolation_level="AUTOCOMMIT")
+    with admin.connect() as conn:
+        conn.exec_driver_sql(f"DROP DATABASE IF EXISTS {name} WITH (FORCE)")
+    admin.dispose()

@@ -1,0 +1,61 @@
+"""4 · Operations queries at volume: the engine and runners issue these every tick and claim."""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime, timedelta
+from uuid import UUID
+
+from perf.harness import Explained, Profile
+from traust_core.v1.models.operations import OrderState
+from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
+
+NOW = datetime.now(UTC)
+LEASE = timedelta(minutes=5)
+
+
+def fast(e: Explained, index: str, budget_ms: float) -> None:
+    assert e.uses_index(index), e.plan
+    assert not e.seq_scans(), e.plan
+    assert e.execution_ms < budget_ms, e.plan
+
+
+def test_claim_takes_the_queue_head_by_index(explained: Profile) -> None:
+    lease, reread = explained(lambda uow: uow.run_orders.claim("perf", NOW, LEASE))
+    fast(lease, "idx_ops_run_order_claim", 5)
+    fast(reread, "run_order_pkey", 1)
+
+
+def test_order_lock_is_a_primary_key_lookup(explained: Profile) -> None:
+    def lock(uow: SqlTraustUnitOfWork) -> None:
+        (order,) = uow.run_orders.list_for_batch(_any_batch(uow))[:1]
+        assert order.id is not None
+        uow.run_orders.get_for_update(order.id)
+
+    *_, locked = explained(lock)
+    fast(locked, "run_order_pkey", 1)
+
+
+def test_reaper_finds_expired_leases_by_index(explained: Profile) -> None:
+    (requeue,) = explained(lambda uow: uow.run_orders.requeue_expired(NOW))
+    fast(requeue, "idx_ops_run_order_lease", 5)
+
+
+def test_a_tranches_orders_by_index(explained: Profile) -> None:
+    *_, listed = explained(lambda uow: uow.run_orders.list_for_batch(_any_batch(uow)))
+    fast(listed, "idx_ops_run_order_batch", 100)
+
+
+def test_a_repositorys_open_orders_by_index(explained: Profile) -> None:
+    def open_orders(uow: SqlTraustUnitOfWork) -> None:
+        repo = uow.repositories.find_by_url("https://forge.example/org/r1")
+        assert repo is not None and repo.id is not None
+        uow.run_orders.list_for_repository(repo.id, OrderState.QUEUED)
+
+    *_, listed = explained(open_orders)
+    fast(listed, "idx_ops_run_order_repository_state", 1)
+
+
+def _any_batch(uow: SqlTraustUnitOfWork) -> UUID:
+    batch = uow.run_batches.find("drain_tranche", "2026-W01")
+    assert batch is not None and batch.id is not None
+    return batch.id
