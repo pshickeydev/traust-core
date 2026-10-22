@@ -15,7 +15,7 @@ RID = repository_id_for(None, "test")
 def test_recorded_legacy_observation_parity(case):
     service, _, _, _, source = observer(case)
     service.record_forge_facts(repo_url=case["repo"]["repo_url"])
-    state = service.observed(repo_url=case["repo"]["repo_url"])
+    state = service.repo_state(repo_url=case["repo"]["repo_url"])
     assert state.status == case["status"]
     for new, old in {
         "changed_lines": "C",
@@ -40,12 +40,12 @@ def test_recorded_legacy_observation_parity(case):
 def test_state_recomputes_findings_and_age_without_contacting_forge():
     service, portfolio, _assessment, findings, source = observer(live_crit_high=5)
     service.record_forge_facts(repository_id=RID)
-    before = service.observed(repository_id=RID)
+    before = service.repo_state(repository_id=RID)
     stored = portfolio.forge_facts(RID)
     calls = list(source.calls)
     findings.counts.clear()
     service._clock = service.query._clock = FixedClock(NOW + timedelta(days=3))
-    after = service.observed(repository_id=RID)
+    after = service.repo_state(repository_id=RID)
     assert before.risk_tier == "P0" and after.risk_tier == "P2"
     assert after.audit_age_days == before.audit_age_days + 3
     assert portfolio.forge_facts(RID) == stored
@@ -60,15 +60,15 @@ def test_changed_baseline_cannot_reuse_comparison(field, value):
     service.record_forge_facts(repository_id=RID)
     assessment.target = assessment.target.model_copy(update={field: value})
     with pytest.raises(NotFoundError, match="baseline changed"):
-        service.observed(repository_id=RID)
+        service.repo_state(repository_id=RID)
 
 
 def test_new_lines_reviewed_recomputes_churn_without_refetch():
     service, _, assessment, _, source = observer(lines_reviewed=100)
     service.record_forge_facts(repository_id=RID)
-    before = service.observed(repository_id=RID)
+    before = service.repo_state(repository_id=RID)
     assessment.target = assessment.target.model_copy(update={"lines_reviewed": 200})
-    assert service.observed(repository_id=RID).churn_ratio == before.churn_ratio / 2
+    assert service.repo_state(repository_id=RID).churn_ratio == before.churn_ratio / 2
     assert source.calls.count("compare") == 1
 
 
@@ -99,7 +99,7 @@ def test_status_is_stored_and_reassembled(status):
     ):
         source.info_data = {"ok": False, "kind": status}
     facts = service.record_forge_facts(repository_id=RID, **kwargs)
-    assert facts.status == service.observed(repository_id=RID).status == status
+    assert facts.status == service.repo_state(repository_id=RID).status == status
 
 
 def test_no_network_never_contacts_source():
