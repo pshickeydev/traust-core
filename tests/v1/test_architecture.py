@@ -186,3 +186,13 @@ def test_context_opens_only_the_configured_database() -> None:
                     connects.append(where)
     assert len(engines) <= 1, f"Context creates more than one engine: {engines}"
     assert not connects, f"Context opens connections itself (use a unit of work): {connects}"
+
+
+def test_only_the_ledger_service_imports_traust_ledger() -> None:
+    """traust-ledger is the one traust code dependency (AGENTS.md); one module holds it."""
+    importers = sorted(
+        str(path.relative_to(SRC))
+        for path in SRC.rglob("*.py")
+        if any(name.split(".")[0] == "traust_ledger" for name in _imported_modules(path))
+    )
+    assert importers == ["services/ledger.py"]

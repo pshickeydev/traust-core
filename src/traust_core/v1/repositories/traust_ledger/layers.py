@@ -34,6 +34,10 @@ LAYERS = TableSpec(
 class LayerRepository(MutableRecordRepository[Layer], Protocol):
     def list_for_repository(self, repository_id: UUID) -> list[Layer]: ...
 
+    def find_for_update(self, repository_id: UUID) -> Layer | None:
+        """The repository layer (line null), row-locked until the transaction ends."""
+        ...
+
 
 class SqlLayerRepository(SqlMutableRepository[Layer]):
     spec = LAYERS
@@ -41,3 +45,13 @@ class SqlLayerRepository(SqlMutableRepository[Layer]):
 
     def list_for_repository(self, repository_id: UUID) -> list[Layer]:
         return self._many(f"list for {repository_id}", self.table.c.repository_id == repository_id)
+
+    def find_for_update(self, repository_id: UUID) -> Layer | None:
+        c = self.table.c
+        stmt = (
+            self._select()
+            .where(c.repository_id == repository_id, c.line.is_(None))
+            .with_for_update()
+        )
+        row = self._execute(f"lock layer for {repository_id}", stmt).mappings().one_or_none()
+        return None if row is None else self._to_record(row)

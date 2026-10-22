@@ -23,6 +23,14 @@ RUN_BATCHES = 52
 RUN_ORDERS = 2_000_000
 OPEN_ORDERS = 20_000
 
+# A year of decisions (Appendix D: ~250k), each proved by one ledger event in its repository's
+# layer. Every 25th lands on HOT_REPOSITORY, a monorepo-sized layer of 10k events; the rest
+# average ~24 per layer. UNLEDGERED more decisions per repository wait to be appended.
+DECISIONS = 250_000
+HOT_REPOSITORY = "https://forge.example/org/r1"
+TYPICAL_REPOSITORY = "https://forge.example/org/r2"
+UNLEDGERED = 50
+
 ROUTED = ("full-audit", "diff-scan", "diff-scan-quarterly", "threat-model-review", "deps-lane")
 UNROUTED = ("feeds_cache", "repo_state", "dashboards")
 
@@ -60,6 +68,37 @@ SEED = (
         ON r.n = 1 + mod(o.g, {REPOSITORIES})
     LEFT JOIN (SELECT row_number() OVER (ORDER BY id) AS n, id FROM traust_ops.run_batch) b
         ON mod(o.g, 10) = 0 AND b.n = 1 + mod(o.g / 10, {RUN_BATCHES})""",
+    f"""INSERT INTO traust.finding (repository_id, fingerprint_algo, fingerprint, title)
+    SELECT r.id, 'v2', 'fp-' || f.g, 'finding ' || f.g
+    FROM (
+        SELECT g, CASE WHEN mod(g, 25) = 0 THEN '{HOT_REPOSITORY}'
+            ELSE 'https://forge.example/org/r' || (1 + mod(g, {REPOSITORIES})) END AS url
+        FROM generate_series(1, {DECISIONS}) g
+        UNION ALL
+        SELECT {DECISIONS} + g, CASE WHEN g <= {UNLEDGERED} THEN '{HOT_REPOSITORY}'
+            ELSE '{TYPICAL_REPOSITORY}' END
+        FROM generate_series(1, {2 * UNLEDGERED}) g
+    ) f
+    JOIN traust.repository r ON r.url = f.url""",
+    """INSERT INTO traust.decision (finding_id, statement_key, validity, evidence_grade, reason,
+        source_channel, actor, occurred_at)
+    SELECT id, 'sk-' || fingerprint, 'false_positive', 'B', repeat('rationale ', 20),
+        'interactive', 'human:perf@example.com',
+        now() - make_interval(mins => mod(abs(hashtext(fingerprint)), 525600))
+    FROM traust.finding""",
+    """INSERT INTO traust_ledger.layers (repository_id, merkle_signing_method)
+    SELECT id, 'keypair' FROM traust.repository""",
+    f"""INSERT INTO traust_ledger.events (layer_id, decision_id, seq, event_payload)
+    SELECT l.id, d.id, row_number() OVER (PARTITION BY l.id ORDER BY d.id) - 1,
+        convert_to(jsonb_build_object('id', d.id, 'finding_id', d.finding_id,
+            'statement_key', d.statement_key, 'validity', d.validity, 'resolution', d.resolution,
+            'evidence_grade', d.evidence_grade, 'reason', d.reason, 'actor', d.actor,
+            'source_channel', d.source_channel, 'occurred_at', d.occurred_at,
+            'created_at', d.created_at)::text, 'UTF8')
+    FROM traust.decision d
+    JOIN traust.finding f ON f.id = d.finding_id
+    JOIN traust_ledger.layers l ON l.repository_id = f.repository_id
+    WHERE substr(f.fingerprint, 4)::int <= {DECISIONS}""",
 )
 
 
@@ -90,7 +129,8 @@ def seeded_database(url: str) -> Engine:
             apply_schema(engine, contracts.database_ddl(Dialect.POSTGRES))
             apply_schema(engine, SEED)
             with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
-                conn.exec_driver_sql("VACUUM (ANALYZE) traust_ops.run_order")
+                for table in ("traust_ops.run_order", "traust.decision", "traust_ledger.events"):
+                    conn.exec_driver_sql(f"VACUUM (ANALYZE) {table}")
         except BaseException:
             engine.dispose()
             _drop(url, name)  # never leave a half-seeded database to be reused

@@ -1,6 +1,6 @@
 # traust-core
 
-The shared Python base for traust: one clear place to read and write each kind of data, so scripts stop opening their own database connections, building their own paths, writing their own JSON and running their own subprocesses. Python callers (traust, traust-engine, traust-ledger) use it in-process; other languages (the Go SDK, SCI) will reach the same services through the REST API served from here (resource/ID routes, request IDs, OpenAPI generated from the core models).
+The shared Python base for traust: one clear place to read and write each kind of data, so scripts stop opening their own database connections, building their own paths, writing their own JSON and running their own subprocesses. Python callers (traust, traust-engine) use it in-process; other languages (the Go SDK, SCI) will reach the same services through the REST API served from here (resource/ID routes, request IDs, OpenAPI generated from the core models).
 
 All modules live under `traust_core.v1` (see [Versioning](#versioning)).
 
@@ -74,7 +74,7 @@ flowchart LR
   ENG -->|"next tick: route(state, events, refusals)"| RT["Router (pure)"]
 ```
 
-traust, traust-engine and traust-ledger import core and call services in-process. The CLI exists only so an LLM can enter the Python world. Worked example: `tests/v1/example/continuous_ops/`.
+traust and traust-engine import core and call services in-process. The CLI exists only so an LLM can enter the Python world. Worked example: `tests/v1/example/continuous_ops/`.
 
 ## Two setups, one API
 
@@ -183,7 +183,7 @@ Everything here is `v1` API, reshaped in place until it is frozen. Each contract
 - SQLAlchemy Core only: no ORM mapped classes. Models never know about the database; the shared repository base gives only `add`/`get`/`update`.
 - Unknown or unmeasured values are `None`, never `0`.
 - Every table repository has behaviour tests on SQLite and Postgres; stores and providers have contract tests.
-- traust-core is the hub: other traust repos depend on it, not the reverse. The only code dependency is the traust-ledger client, inside the ledger provider adapter; traust-contracts is pinned data. HTTP only in providers (outbound) and the HTTP adapter (inbound).
+- traust-core is the hub: other traust repos depend on it, not the reverse. The only code dependency is traust-ledger's pure functions (Merkle, signing, verifying), imported only by `services/ledger.py`; traust-contracts is pinned data. HTTP only in providers (outbound) and the HTTP adapter (inbound).
 
 ## Domain services (stubs)
 

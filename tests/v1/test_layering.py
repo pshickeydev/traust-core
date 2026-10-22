@@ -23,7 +23,7 @@ THIRD_PARTY = {
     "providers": {"pydantic"},
     "repositories": {"sqlalchemy", "psycopg", "pydantic"},
     "rendering": {"pydantic"},
-    "services": {"pydantic"},
+    "services": {"pydantic", "traust_ledger"},  # one module: test_architecture
     "context": {"pydantic", "yaml", "sqlalchemy"},
 }
 
