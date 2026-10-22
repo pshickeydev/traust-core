@@ -202,6 +202,7 @@ class Context:
         assessment = AssessmentService(uow, clock=self.clock, hosts=hosts)
         intake = FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy())
         ledger = None if self.config.ledger is None else LedgerService(uow, self.config.ledger)
+        identity = self.config.identity
         return Services(
             assessment=assessment,
             portfolio=PortfolioService(
@@ -215,7 +216,13 @@ class Context:
             findings=FindingService(
                 uow,
                 intake,
-                FindingDecisions(uow, ledger, Lint({TriageArtifact: [VerdictCitations()]})),
+                FindingDecisions(
+                    uow,
+                    ledger,
+                    Lint({TriageArtifact: [VerdictCitations()]}),
+                    clock=self.clock,
+                    restatement_approvers=identity.restatement_approvers if identity else 0,
+                ),
                 FindingReview(uow, ReviewPolicy()),
                 FindingPrecedents(uow),
             ),

@@ -18,7 +18,9 @@ from traust_core.v1.models.vocabulary import (
     ActorKind,
     DispositionAssurance,
     DispositionResolution,
+    EvidenceGrade,
     FindingOrigin,
+    RestatementReason,
     Severity,
     SourceType,
     Validity,
@@ -213,6 +215,34 @@ class Decision(AppendOnly):
     ticket: str | None = None
     auto_accept_tier: bool = False
     occurred_at: datetime
+
+
+class DecisionApprover(AppendOnly):
+    """Someone other than its author who agreed to a restatement."""
+
+    decision_id: UUID
+    approver: str
+
+
+class Restatement(Model):
+    """An administrator's correction of one decision: the values it fixes and its authority."""
+
+    decision_id: UUID
+    reason: RestatementReason
+    ticket: str
+    rationale: str
+    approvers: tuple[str, ...] = ()
+    validity: Validity | None = None
+    resolution: DispositionResolution | None = None
+    evidence_grade: EvidenceGrade | None = None
+    severity: Severity | None = None
+    fixed_repository_ref_id: UUID | None = None
+
+    def changes(self) -> dict[str, object]:
+        return {f: v for f in RESTATABLE if (v := getattr(self, f)) is not None}
+
+
+RESTATABLE = ("validity", "resolution", "evidence_grade", "severity", "fixed_repository_ref_id")
 
 
 class ReviewItem(Entity):
