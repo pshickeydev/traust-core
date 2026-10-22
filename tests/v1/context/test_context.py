@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import pytest
+import sqlalchemy as sa
 
 from tests.v1.example.repository import SqlTaskUnitOfWork, metadata
 from traust_core.v1.context import Config, Context
@@ -13,11 +14,10 @@ def _write(tmp_path: Path, text: str) -> Path:
     return path
 
 
-def test_empty_file_means_files_only(tmp_path: Path) -> None:
-    config = Config.from_file(_write(tmp_path, ""))
+def test_empty_file_defaults_to_sqlite_under_home(tmp_path: Path) -> None:
+    config = Config.from_file(_write(tmp_path, f"home: {tmp_path / 'home'}\n"))
     assert config.database.url is None
-    with pytest.raises(ConfigError, match="files-only"):
-        config.database.engine_url()
+    assert config.record_store_url() == sa.make_url(f"sqlite:///{tmp_path / 'home' / 'traust.db'}")
 
 
 def test_database_password_comes_from_env(monkeypatch: pytest.MonkeyPatch) -> None:

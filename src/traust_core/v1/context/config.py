@@ -9,6 +9,7 @@ import yaml
 
 from traust_core.v1.errors import ConfigError
 from traust_core.v1.models.inventory import DEFAULT_FORGE_HOSTS
+from traust_core.v1.services.findings.rating import RatingConfig
 
 
 class _Model(pydantic.BaseModel):
@@ -31,9 +32,8 @@ class DatabaseConfig(_Model):
         return _read_env(self.password_env, "database.password_env")
 
     def engine_url(self) -> sa.URL:
-        # NEED(local): "files-only" goes away; with no url the record store is SQLite under home.
         if self.url is None:
-            raise ConfigError("database.url is not set (files-only setup)")
+            raise ConfigError("database.url is not set")
         try:
             url = sa.make_url(self.url)
         except sa.exc.ArgumentError as e:
@@ -57,11 +57,23 @@ class ProcessConfig(_Model):
 # home dir, record store (SQLite default, Postgres optional), blob store (local dir or S3),
 # identity, ledger. Pack data (catalogs, product maps) is not config; env only for secrets.
 class Config(_Model):
+    home: Path = pydantic.Field(default_factory=lambda: Path.home() / ".traust")
     database: DatabaseConfig = DatabaseConfig()
     artifacts: ArtifactsConfig = ArtifactsConfig()
     process: ProcessConfig = ProcessConfig()
+    rating: RatingConfig = RatingConfig()
     allowed_repo_hosts: tuple[str, ...] = ()
     forge_hosts: dict[str, str] = pydantic.Field(default_factory=lambda: dict(DEFAULT_FORGE_HOSTS))
+
+    @pydantic.field_validator("home")
+    @classmethod
+    def _expand_home(cls, value: Path) -> Path:
+        return value.expanduser()
+
+    def record_store_url(self) -> sa.URL:
+        if self.database.url is not None:
+            return self.database.engine_url()
+        return sa.URL.create("sqlite", database=str(self.home / "traust.db"))
 
     @classmethod
     def from_file(cls, path: Path) -> Config:
