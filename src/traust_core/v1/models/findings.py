@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
 from types import MappingProxyType
-from typing import NewType
+from typing import TYPE_CHECKING, NewType
 from uuid import UUID
 
 from traust_core.v1.errors import ForbiddenError, ValidationError
@@ -25,6 +25,9 @@ from traust_core.v1.models.vocabulary import (
     SourceType,
     Validity,
 )
+
+if TYPE_CHECKING:
+    from traust_core.v1.models.assessment import Assessment
 
 Label = NewType("Label", str)
 CweId = NewType("CweId", str)
@@ -80,6 +83,19 @@ class RecordDecision(Model):
     fixed_repository_ref_id: UUID | None = None
     artifact_id: UUID | None = None
     occurred_at: datetime | None = None
+
+
+# NEED(assessment-kind): contracts names the assessment kinds; validation and verification are
+# the ones evidence precedence reads (every other kind is static, as triage reports were).
+_REPORT = {
+    "validation": SourceType.VALIDATION_REPORT,
+    "verification": SourceType.VERIFICATION_REPORT,
+}
+
+
+def report_sources(assessments: Iterable[Assessment]) -> dict[UUID, SourceType]:
+    """Each assessor's report kind, which tells execution proof from static review."""
+    return {a.id: _REPORT[a.kind] for a in assessments if a.id and a.kind in _REPORT}
 
 
 class ReviewCase(Model): ...
@@ -160,6 +176,9 @@ class Finding(Entity):
     title: str
 
 
+# A report's claims can't change after the fact: occurrence and location rows are append-only and
+# the report's artifact pins its bytes by digest. This replaced the claim hashes track-findings
+# pinned on audit JSON (baseline_claims.py). Not covered: finding.title and finding_cwe are mutable.
 class Occurrence(AppendOnly):
     """A finding as one assessment reported it."""
 
@@ -366,6 +385,7 @@ class Disposition(Model):
     fp_overridden: bool = False
     fp_reassertion_blocked: bool = False
     awaiting_signoff: bool = False
+    severity: Severity | None = None
     last_decision_at: datetime | None = None
 
     @classmethod
@@ -422,6 +442,7 @@ class Disposition(Model):
         if resolved:
             tier = min(s.resolution_tier for s in resolved)
             resolution = [s for s in resolved if s.resolution_tier == tier][-1].decision.resolution
+        rated = [s.decision.severity for s in said if s.decision.severity]
         return cls(
             finding_id=finding_id,
             validity=validity,
@@ -431,6 +452,7 @@ class Disposition(Model):
             fp_overridden=overridden,
             fp_reassertion_blocked=blocked,
             awaiting_signoff=awaiting,
+            severity=rated[-1] if rated else None,
             last_decision_at=said[-1].at if said else None,
         )
 

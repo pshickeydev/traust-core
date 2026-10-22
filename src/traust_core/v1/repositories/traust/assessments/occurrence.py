@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Collection
 from typing import Protocol
 from uuid import UUID
 
@@ -34,6 +35,7 @@ class OccurrenceRepository(RecordRepository[Occurrence], Protocol):
     def find(self, finding_id: UUID, assessment_id: UUID) -> Occurrence | None: ...
     def list_for_assessment(self, assessment_id: UUID) -> list[Occurrence]: ...
     def list_for_finding(self, finding_id: UUID) -> list[Occurrence]: ...
+    def list_for_findings(self, finding_ids: Collection[UUID]) -> list[Occurrence]: ...
 
 
 class SqlOccurrenceRepository(SqlAppendOnlyRepository[Occurrence]):
@@ -53,3 +55,8 @@ class SqlOccurrenceRepository(SqlAppendOnlyRepository[Occurrence]):
 
     def list_for_finding(self, finding_id: UUID) -> list[Occurrence]:
         return self._many(f"list for finding {finding_id}", self.table.c.finding_id == finding_id)
+
+    def list_for_findings(self, finding_ids: Collection[UUID]) -> list[Occurrence]:
+        return self._many(
+            f"list for {len(finding_ids)} findings", self.table.c.finding_id.in_(finding_ids)
+        )
