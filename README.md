@@ -9,6 +9,7 @@ All modules live under `traust_core.v1` (see [Versioning](#versioning)).
 | **Contracts** | `contracts` | the pinned traust-contracts dependency, read as data: `validate(name, doc)` (exact JSON Schema gate), `schema()`, `enum_values()`, `normalize_enum(name, value)` (registry read view), `database_ddl(dialect)` (every namespace, bootstrap order) | skills remembering to run `reporting validate` |
 | **Errors** | `errors` | the exception hierarchy every layer raises (`ValidationError`, `NotFoundError`, …) | ad hoc exceptions |
 | **Models** | `models` | one model per contract table, grouped by section — `inventory`, `dependencies`, `assessment`, `findings`, `operations`, `ledger` (fields = columns) — next to that section's service types; `base` (`Model` strict, `Dto` tolerant, `Entity` with a database-generated UUIDv4 id, `AppendOnly` for tables that are never updated), `values` (`HttpsRepoUrl`, `GitSha`, `CveId`), `integrity` | dicts passed between scripts |
+| **Validation rules** | `models.validation` | `ValidationScope.permits(action, target, as_of=…)`, `ValidationPlan.requires_approval()`, `ValidationAttempt.soundness()` — pure scope, approval and refutation rules | duplicated harness scope and soundness rules |
 | **Artifacts** | `models.artifacts` | the `ArtifactDocument` base + `SchemaView` (fields from the installed schema, `doc.findings[0].verdict`, unknown names raise) and the named documents (`TriageArtifact`, `SecurityAuditArtifact`, …, `Verdict`, `Severity`) | `json.load` + `.get("key")` |
 | **Artifact publishing** | `services.artifact_publishing` | `ctx.artifact_publisher(specs).publish(name, subject, raw, run_id)` (LLM) or `.publish_artifact(artifact, subject, run_id)` (code): exact gate → files (always) → an `artifact` row (when `database.url` is set) | writing `analysis-results` files by hand |
 | **Analysis results** | `repositories.objects.analysis_results` | `ctx.analysis_results().read(TriageArtifact, subject)` / `.read_all(TriageArtifact, tree)`; raw `put/get/find(subject, kind)`; today's naming convention in one place | `json.load` + `"-security-audit.json"` path building |
@@ -20,6 +21,31 @@ All modules live under `traust_core.v1` (see [Versioning](#versioning)).
 | **Jobs** | `models.operations`, `services.operations` | `Materializer.materialize(AssetRequest) -> JobResult` (succeeded · degraded · refused · failed): the seam traust-engine calls; `Router` for continuous-ops `route()` | each CLI inventing its own exit codes |
 | **Providers** | `providers` | the outside world: `base` (`Provider`, `Readiness`, `Provenance`, registry), `tools`, `sources`, `feeds` (+ `validate_payload`), `http` (`HttpFetcher` + `RetryPolicy`, the outbound HTTP path), `process` (`ProcessRunner`, the only subprocess path), `clock` | ad hoc `subprocess`/`git`/fetch code, 22 private `run` wrappers |
 | **Config + Context** | `context` | one `traust.yaml`; `Context` builds everything | `os.environ`, scattered config files |
+
+## Validation rules
+
+`ValidationAction(kind, verb)` describes a scope operation; `ValidationTarget` supplies its
+context, namespace, resource, name, image, artifact ID or URL. `ValidationActionKind` covers
+Kubernetes, container, WASM, browser, credential and inventory operations; it is distinct
+from the contracts-owned execution-adapter vocabulary on `ValidationPlan.adapter`.
+
+`ValidationScope.permits(action, target, as_of=date)` evaluates expiry, off-limits rules,
+control-plane locks and positive grants. The caller supplies the date from `Clock` and
+resolves WASM artifacts to UUIDs before evaluating scope. Binding `modes` retain their
+constituent modes; credential and inventory grants require `explicit`. Cluster
+`explicit_namespaces` contain only explicit engagement grants, never inline or inferred ones.
+Browser verbs come from the first target whose origin matches the concrete URL.
+
+`ValidationPlan.requires_approval()` is true for `interactive`, false for `auto` and
+`dry-run`. It answers the human-review requirement, not permission to execute.
+
+`ValidationAttempt.soundness()` returns `SoundnessResult(verdict, flag)` without changing
+the attempt. `ValidationProbe` projects only the needed observations: verdict, verb,
+transcript, positive-control outcomes and differential discrimination. The caller supplies
+deployment-failure observations and the required `controls_required` / `differential_required`
+inputs (legacy report thresholds: 0.177.0 / 0.178.0). Producer-stamped flags are preserved;
+unsound refutations become `inconclusive`. At finding level, one sound refuting probe can
+sustain a refutation unless a deployment, control or differential gate invalidates it.
 
 ## Layers
 
