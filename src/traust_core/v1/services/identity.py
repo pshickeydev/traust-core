@@ -14,6 +14,14 @@ log = logging.getLogger(__name__)
 ADMIN_ROLES = frozenset({Role.ADMIN, Role.RESTATE})
 
 
+class LoginConfig(Model):
+    """Where people log in from the CLI (device code) and service accounts get tokens."""
+
+    issuer: str
+    client_id: str
+    scope: str = "openid"
+
+
 class IdentityConfig(Model):
     """The `identity:` config section: whose tokens are accepted, the directory, the admins."""
 
@@ -25,6 +33,7 @@ class IdentityConfig(Model):
     directory_timeout_seconds: float = 60.0
     admins: tuple[str, ...] = ()
     restatement_approvers: int = 0  # independent approvers a restatement must name
+    login: LoginConfig | None = None
 
 
 class IdentityService:

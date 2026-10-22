@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from enum import StrEnum
 
 import pydantic
@@ -63,3 +64,19 @@ class DirectoryStatus(Model):
     @property
     def active(self) -> bool:
         return self.status == "active"
+
+
+class TokenGrant(Model):
+    """What an identity provider handed back: the bearer token and how to renew it."""
+
+    access_token: pydantic.SecretStr
+    refresh_token: pydantic.SecretStr | None = None
+    expires_at: datetime | None = None
+
+
+class Login(Model):
+    """A stored login: which issuer and client it came from, and the grant to present."""
+
+    issuer: str
+    client_id: str
+    grant: TokenGrant

@@ -22,7 +22,13 @@ from traust_core.v1.providers.base import ProviderRegistry
 from traust_core.v1.providers.clock import Clock, SystemClock
 from traust_core.v1.providers.feeds import FeedProvider
 from traust_core.v1.providers.http import HttpFetcher, RetryPolicy
-from traust_core.v1.providers.identity import CommandDirectory, TokenIdentityProvider
+from traust_core.v1.providers.identity import (
+    CommandDirectory,
+    CredentialStore,
+    LocalIssuer,
+    OidcLogin,
+    TokenIdentityProvider,
+)
 from traust_core.v1.providers.process import ProcessRunner
 from traust_core.v1.providers.sources import SourceProvider
 from traust_core.v1.providers.tools import ToolProvider
@@ -154,8 +160,23 @@ class Context:
 
     @property
     def local_jwks(self) -> Path:
-        """The public keys of this machine's `local` token issuer."""
-        return self.config.home / "local-jwks.json"
+        return self.local_issuer.jwks
+
+    @cached_property
+    def local_issuer(self) -> LocalIssuer:
+        return LocalIssuer(self.config.home, self.clock)
+
+    @cached_property
+    def credentials(self) -> CredentialStore:
+        return CredentialStore(self.config.home)
+
+    @cached_property
+    def login(self) -> OidcLogin | None:
+        """Getting a token from the deployment's identity provider (`identity.login`)."""
+        cfg = self.config.identity.login if self.config.identity else None
+        if cfg is None:
+            return None
+        return OidcLogin(cfg.issuer, cfg.client_id, self.http, self.clock, scope=cfg.scope)
 
     def register_feeds(self, registry: Path) -> None:
         """Register a provider for each single-file feed in the feeds registry YAML."""
