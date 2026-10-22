@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta
 from uuid import UUID
 
@@ -31,6 +31,7 @@ from traust_core.v1.models.inventory import (
 )
 from traust_core.v1.models.observation import (
     Designation,
+    DesignationRecord,
     ForgeFacts,
     ObservationTarget,
     ObservedRepoState,
@@ -39,9 +40,6 @@ from traust_core.v1.models.values import GitSha, HttpsRepoUrl
 from traust_core.v1.models.vocabulary import RefKind, Severity
 from traust_core.v1.providers.clock import Clock, SystemClock
 from traust_core.v1.providers.sources import SourceProvider
-from traust_core.v1.repositories.designations import DesignationRepository
-from traust_core.v1.repositories.observation import ObservationStore
-from traust_core.v1.repositories.traust.findings import OpenCounts
 from traust_core.v1.repositories.traust.inventory import InventoryUnitOfWork
 from traust_core.v1.services.assessment import AssessmentService, parse_audit_date
 from traust_core.v1.services.findings.service import FindingService
@@ -87,13 +85,15 @@ class PortfolioService:
         uow: InventoryUnitOfWork,
         policy: PortfolioPolicy,
         *,
-        store: ObservationStore,
         assessment: AssessmentService | None = None,
         sources: SourceProvider | None = None,
         clock: Clock | None = None,
         hosts: Mapping[str, str] | None = None,
     ) -> None:
-        self._uow, self._policy, self._store = uow, policy, store
+        self._uow, self._policy = uow, policy
+        # NEED(model): forge facts live for one observation session. Data model Appendix E
+        # fetches them live at routing time; redesign D1 (c) reads a stored repo_state. Decide.
+        self._facts: dict[UUID, ForgeFacts] = {}
         self._assessment, self._sources = assessment, sources
         self._clock = clock or SystemClock()
         self._hosts = dict(hosts or DEFAULT_FORGE_HOSTS)
@@ -124,11 +124,13 @@ class PortfolioService:
             breaker=breaker,
             quota_deferred=quota_deferred,
         )
-        self._store.save(facts)
+        previous = self._facts.get(facts.repository_id)
+        if previous is None or previous.observed_at <= facts.observed_at:
+            self._facts[facts.repository_id] = facts  # never move time backwards
         return facts
 
     def forge_facts(self, repository_id: UUID) -> ForgeFacts | None:
-        return self._store.find(repository_id)
+        return self._facts.get(repository_id)
 
     def register_product(self, slug: ProductSlug, name: str) -> Product:
         raise NotImplementedError("stub: replaces registry/products.py, inventory.py")
@@ -204,18 +206,17 @@ class RepoStateQuery:
         portfolio: PortfolioService,
         assessments: AssessmentService,
         findings: FindingService,
-        counts: OpenCounts,
         policy: PortfolioPolicy,
         *,
-        designations: DesignationRepository | None = None,
+        designations: Sequence[DesignationRecord] = (),
         clock: Clock | None = None,
         hosts: Mapping[str, str] | None = None,
     ) -> None:
         self._portfolio = portfolio
         self._assessments = assessments
         self._findings = findings
-        self._counts, self._policy = counts, policy
-        self._designations = designations
+        self._policy = policy
+        self._designations = tuple(designations)
         self._clock = clock or SystemClock()
         self._hosts = dict(hosts or DEFAULT_FORGE_HOSTS)
 
@@ -235,7 +236,7 @@ class RepoStateQuery:
             target.has_audit,
         ):
             raise NotFoundError(f"audit baseline changed for {target.repo_url}; observe it again")
-        live = self._counts.open_count(target.repository_id, (Severity.CRITICAL, Severity.HIGH))
+        live = self._findings.open_count(target.repository_id, (Severity.CRITICAL, Severity.HIGH))
         now = self._clock.now()
         fresh = self._assessments.freshness(
             baseline=target, changed_lines=facts.changed_lines, as_of=now
@@ -245,7 +246,7 @@ class RepoStateQuery:
             designation = next(
                 (
                     row.designation
-                    for row in self._designations.entries()
+                    for row in self._designations
                     if target.repo_url
                     and (
                         target.repo_url == row.match

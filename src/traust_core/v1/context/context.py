@@ -10,6 +10,7 @@ from typing import Any, TypeVar
 from sqlalchemy.engine import Engine
 
 from traust_core.v1.context.config import Config
+from traust_core.v1.context.designations import load_designations
 from traust_core.v1.context.observation import command_source
 from traust_core.v1.models.artifacts import ARTIFACT_FOR_KIND
 from traust_core.v1.providers.base import ProviderRegistry
@@ -25,9 +26,7 @@ from traust_core.v1.repositories import (
     create_database_engine,
 )
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
-from traust_core.v1.repositories.designations import FileDesignationRepository
 from traust_core.v1.repositories.objects.analysis_results import AnalysisResultsRepository
-from traust_core.v1.repositories.observation import InMemoryObservationStore
 from traust_core.v1.repositories.sql import Dialect
 from traust_core.v1.repositories.tables import TableFactory
 from traust_core.v1.services.artifact_publishing import (
@@ -36,6 +35,16 @@ from traust_core.v1.services.artifact_publishing import (
     SqlArtifactIndex,
 )
 from traust_core.v1.services.assessment import AssessmentService
+from traust_core.v1.services.findings import (
+    FindingDecisions,
+    FindingIntake,
+    FindingPrecedents,
+    FindingReview,
+    FindingService,
+    IdentityPolicy,
+    ReviewPolicy,
+    TaxonomyPolicy,
+)
 from traust_core.v1.services.operations import Materializer
 from traust_core.v1.services.portfolio import (
     PortfolioPolicy,
@@ -53,11 +62,10 @@ class Services: ...
 
 @dataclass(frozen=True)
 class _Observation:
-    """What the observation door yields: the write path, the composite read, the store."""
+    """What the observation door yields: the write path and the composite read."""
 
     service: PortfolioService
     query: RepoStateQuery
-    store: InMemoryObservationStore
 
 
 class Context:
@@ -136,33 +144,34 @@ class Context:
         """Observe repositories: forge facts in, derived routing state out.
 
         Reads inventory, assessments and open counts from the contract tables
-        over one session unit of work; the observation store is in memory until
-        contracts lands repository_observation (NEED marker in
-        repositories/observation.py).
+        over one session unit of work; forge facts live for the session (NEED marker
+        in services/portfolio.py).
         """
-        store = InMemoryObservationStore()
         policy = PortfolioPolicy()
         with SqlTraustUnitOfWork(self.database) as uow:
             assessment = AssessmentService(uow, clock=self.clock, hosts=self.config.forge_hosts)
             service = PortfolioService(
                 uow,
                 policy,
-                store=store,
                 assessment=assessment,
                 sources=command_source(self.config.forge_hosts, clock=self.clock),
                 clock=self.clock,
                 hosts=self.config.forge_hosts,
             )
+            findings = FindingService(
+                uow,
+                FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy()),
+                FindingDecisions(uow, None),
+                FindingReview(uow, ReviewPolicy()),
+                FindingPrecedents(uow),
+            )
             query = RepoStateQuery(
                 service,
                 assessment,
-                None,  # findings service: open counts come from the finding_status view
-                uow.open_counts,
+                findings,
                 policy,
-                designations=(
-                    FileDesignationRepository(designations) if designations is not None else None
-                ),
+                designations=load_designations(designations) if designations is not None else (),
                 clock=self.clock,
                 hosts=self.config.forge_hosts,
             )
-            yield _Observation(service=service, query=query, store=store)
+            yield _Observation(service=service, query=query)

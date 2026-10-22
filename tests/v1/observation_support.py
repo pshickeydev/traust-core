@@ -11,7 +11,6 @@ from traust_core.v1.models.vocabulary import Severity
 from traust_core.v1.providers.base import Acquisition, Result
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.sources import ChangedFile, Comparison, Quota, RepoInfo, SourceError
-from traust_core.v1.repositories.observation import InMemoryObservationStore
 from traust_core.v1.services.assessment import AssessmentService
 from traust_core.v1.services.portfolio import PortfolioPolicy, PortfolioService, RepoStateQuery
 
@@ -85,7 +84,7 @@ class FixedBaselineAssessment(AssessmentService):
         return self.target
 
 
-def observer(case=None, *, store=None, **changes):
+def observer(case=None, **changes):
     case = case or REFERENCE["cases"][0]
     data = {**case["repo"], **changes}
     live = data.pop("live_crit_high", 0)
@@ -101,11 +100,9 @@ def observer(case=None, *, store=None, **changes):
     counts = FixedOpenCounts()
     counts.counts[target.repository_id] = live
     sources = FakeSource(case["info"], case["compare"])
-    store = store if store is not None else InMemoryObservationStore()
     service = PortfolioService(
-        None,  # contract uow unused: observation writes go to the store
+        None,  # contract uow unused: forge facts live in the service for the session
         PortfolioPolicy(),
-        store=store,
         assessment=assessment,
         sources=sources,
         clock=clock,
@@ -116,14 +113,13 @@ def observer(case=None, *, store=None, **changes):
         RepoStateQuery(
             service,
             assessment,
-            None,  # findings service: open counts come from the counts port
-            counts,
+            counts,  # stands in for FindingService.open_count
             PortfolioPolicy(),
             clock=clock,
             hosts=HOSTS,
         ),
     )
-    return harness, store, assessment, counts, sources
+    return harness, service, assessment, counts, sources
 
 
 class _Harness:

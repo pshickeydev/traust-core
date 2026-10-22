@@ -38,17 +38,17 @@ def test_recorded_legacy_observation_parity(case):
 
 
 def test_state_recomputes_findings_and_age_without_contacting_forge():
-    service, store, _assessment, findings, source = observer(live_crit_high=5)
+    service, portfolio, _assessment, findings, source = observer(live_crit_high=5)
     service.record_forge_facts(repository_id=RID)
     before = service.observed(repository_id=RID)
-    stored = dict(store.rows)
+    stored = portfolio.forge_facts(RID)
     calls = list(source.calls)
     findings.counts.clear()
     service._clock = service.query._clock = FixedClock(NOW + timedelta(days=3))
     after = service.observed(repository_id=RID)
     assert before.risk_tier == "P0" and after.risk_tier == "P2"
     assert after.audit_age_days == before.audit_age_days + 3
-    assert store.rows == stored
+    assert portfolio.forge_facts(RID) == stored
     assert source.calls == calls
 
 
