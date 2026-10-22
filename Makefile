@@ -10,7 +10,7 @@ export TRAUST_TEST_DATABASE_URL
 
 PYTHON ?= python3
 
-.PHONY: help setup sync hooks lint lint-fix test test-integration test-repositories coverage coverage-html coverage-all db-up db-down
+.PHONY: help setup sync hooks lint lint-fix test test-integration test-repositories coverage coverage-html coverage-all perf db-up db-down
 
 help:
 	@echo "Targets ($(notdir $(CURDIR))):"
@@ -23,6 +23,7 @@ help:
 	@echo "  make coverage         — unit tests with coverage (term), fails under 80%"
 	@echo "  make coverage-html    — unit tests with coverage (term + htmlcov/)"
 	@echo "  make coverage-all     — unit + integration with coverage (needs make db-up)"
+	@echo "  make perf             — query plans at production volume on Postgres (make db-up first)"
 	@echo "  make db-up / db-down  — shared Postgres container ($(DB_CONTAINER)), same as contracts and ledger"
 
 setup: sync hooks
@@ -57,6 +58,10 @@ coverage:
 
 coverage-html:
 	uv run pytest tests/ --cov=traust_core --cov-report=term-missing --cov-report=html -q -m "not integration"
+
+perf:
+	uv run --extra postgres pytest perf/ -q
+	@echo "Plans for the PR: .perf/report.md"
 
 coverage-all:
 	uv run --extra postgres pytest tests/ --cov=traust_core --cov-report=term-missing --cov-report=html -q

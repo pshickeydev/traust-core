@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from datetime import timedelta
+from uuid import uuid4
 
 import pytest
 from sqlalchemy.engine import Engine
 
 from tests.v1.repositories.tables.conftest import T0, Seed, apart
+from traust_core.v1.errors import NotFoundError
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 
 LEASE = timedelta(minutes=5)
@@ -35,12 +37,25 @@ def test_claim_records_the_lease(seed: Seed) -> None:
     assert claimed.updated_at >= order.updated_at
 
 
+def test_claim_stamps_when_work_started(seed: Seed) -> None:
+    seed.run_order()
+    claimed = seed.uow.run_orders.claim("worker-1", T0, LEASE)
+    assert claimed is not None and claimed.started_at == T0
+
+
+def test_get_for_update_reads_the_order_and_refuses_unknown_ids(seed: Seed) -> None:
+    order = seed.run_order(asset="feeds_cache", lane=None)
+    assert seed.uow.run_orders.get_for_update(order.id) == order
+    with pytest.raises(NotFoundError):
+        seed.uow.run_orders.get_for_update(uuid4())
+
+
 def test_expired_leases_return_to_the_queue(seed: Seed) -> None:
     orders = seed.uow.run_orders
     expired, live = seed.run_order(priority=1), seed.run_order(priority=2)
     orders.claim("w1", T0, LEASE)
     orders.claim("w2", T0 + LEASE, LEASE)
-    assert orders.release_expired(T0 + LEASE + timedelta(seconds=1)) == 1
+    assert orders.requeue_expired(T0 + LEASE + timedelta(seconds=1)) == 1
     released = orders.get(expired.id)
     assert (released.state, released.lease_holder, released.lease_expires_at) == (
         "queued",

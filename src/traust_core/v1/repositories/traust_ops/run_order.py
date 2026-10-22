@@ -6,7 +6,8 @@ from uuid import UUID
 
 import sqlalchemy as sa
 
-from traust_core.v1.models.operations import RunOrder
+from traust_core.v1.errors import NotFoundError
+from traust_core.v1.models.operations import OrderState, RunOrder
 from traust_core.v1.repositories.tables import (
     TRAUST_OPS,
     MutableRecordRepository,
@@ -26,7 +27,8 @@ RUN_ORDER = TableSpec(
         uuid_column("artifact_id", nullable=True),
         text_column("rule", nullable=True),
         text_column("event_source", nullable=True),
-        text_column("lane"),
+        text_column("asset"),
+        text_column("lane", nullable=True),
         text_column("state"),
         sa.Column("priority", sa.Integer, nullable=False),
         text_column("reason", nullable=True),
@@ -38,19 +40,19 @@ RUN_ORDER = TableSpec(
     ),
 )
 
-# run_order.state values the queue mechanics depend on (contracts enum, to add).
-QUEUED = "queued"
-LEASED = "leased"
-
 
 class RunOrderRepository(MutableRecordRepository[RunOrder], Protocol):
     def claim(self, worker: str, now: datetime, lease_for: timedelta) -> RunOrder | None:
         """Lease the next queued order (priority, then age); None when the queue is empty."""
         ...
 
-    def release_expired(self, now: datetime) -> int: ...
+    def get_for_update(self, order_id: UUID) -> RunOrder:
+        """Read and row-lock an order until the transaction ends."""
+        ...
+
+    def requeue_expired(self, now: datetime) -> int: ...
     def list_for_batch(self, run_batch_id: UUID) -> list[RunOrder]: ...
-    def list_for_repository(self, repository_id: UUID, state: str) -> list[RunOrder]: ...
+    def list_for_repository(self, repository_id: UUID, state: OrderState) -> list[RunOrder]: ...
 
 
 class SqlRunOrderRepository(SqlMutableRepository[RunOrder]):
@@ -62,7 +64,7 @@ class SqlRunOrderRepository(SqlMutableRepository[RunOrder]):
         # SKIP LOCKED on Postgres; SQLite serialises writers and drops FOR UPDATE.
         next_id = (
             sa.select(c.id)
-            .where(c.state == QUEUED)
+            .where(c.state == OrderState.QUEUED)
             .order_by(c.priority, c.created_at, c.id)
             .limit(1)
             .with_for_update(skip_locked=True)
@@ -70,29 +72,41 @@ class SqlRunOrderRepository(SqlMutableRepository[RunOrder]):
         )
         stmt = (
             sa.update(self.table)
-            .where(c.id == next_id, c.state == QUEUED)
-            .values(state=LEASED, lease_holder=worker, lease_expires_at=now + lease_for)
+            .where(c.id == next_id, c.state == OrderState.QUEUED)
+            .values(
+                state=OrderState.LEASED,
+                lease_holder=worker,
+                lease_expires_at=now + lease_for,
+                started_at=now,
+            )
             .returning(c.id)
         )
         claimed = self._execute(f"claim for {worker}", stmt).scalar_one_or_none()
         return None if claimed is None else self.get(claimed)
 
-    def release_expired(self, now: datetime) -> int:
-        """Return expired leases to the queue; the count released."""
+    def get_for_update(self, order_id: UUID) -> RunOrder:
+        stmt = self._select().where(self.table.c.id == order_id).with_for_update()
+        row = self._execute(f"lock {order_id}", stmt).mappings().one_or_none()
+        if row is None:
+            raise NotFoundError(f"run_order {order_id}")
+        return self._to_record(row)
+
+    def requeue_expired(self, now: datetime) -> int:
+        """Return expired leases to the queue; the count requeued."""
         c = self.table.c
         stmt = (
             sa.update(self.table)
-            .where(c.state == LEASED, c.lease_expires_at < now)
-            .values(state=QUEUED, lease_holder=None, lease_expires_at=None)
+            .where(c.state == OrderState.LEASED, c.lease_expires_at < now)
+            .values(state=OrderState.QUEUED, lease_holder=None, lease_expires_at=None)
         )
-        return self._execute(f"release expired at {now}", stmt).rowcount
+        return self._execute(f"requeue expired at {now}", stmt).rowcount
 
     def list_for_batch(self, run_batch_id: UUID) -> list[RunOrder]:
         return self._many(
             f"list for batch {run_batch_id}", self.table.c.run_batch_id == run_batch_id
         )
 
-    def list_for_repository(self, repository_id: UUID, state: str) -> list[RunOrder]:
+    def list_for_repository(self, repository_id: UUID, state: OrderState) -> list[RunOrder]:
         c = self.table.c
         return self._many(
             f"list {state} for {repository_id}",
