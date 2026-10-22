@@ -15,9 +15,10 @@ from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.operations import OrderRequest
 from traust_core.v1.models.vocabulary import ActorKind
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
+from traust_core.v1.services.identity import IdentityConfig
 from traust_core.v1.services.ledger import LedgerConfig
 
-OPERATOR = Principal(id=uuid4(), kind=ActorKind("human"), display="operator")
+OPERATOR = Principal(identity="operator@example.com", kind=ActorKind("human"), display="operator")
 
 
 def _write(tmp_path: Path, text: str) -> Path:
@@ -141,3 +142,44 @@ def test_a_configured_ledger_proves_a_decision(configured: Context) -> None:
     assert receipt.checkpoint.layer.merkle_size == 1
     assert receipt.checkpoint.layer.id is not None
     assert ledger.verify(receipt.checkpoint.layer.id).passed
+
+
+def test_no_identity_section_verifies_nobody() -> None:
+    assert Context(Config()).services().identity is None
+
+
+def test_an_identity_section_wires_the_trusted_issuers_and_local_keys(tmp_path: Path) -> None:
+    path = tmp_path / "traust.yaml"
+    path.write_text(
+        f"home: {tmp_path}\n"
+        "identity:\n"
+        "  issuers:\n"
+        "    - issuer: https://idp.example\n"
+        "      jwks_url: https://idp.example/jwks\n"
+        "      audience: traust\n"
+        "  trust_local: true\n"
+        "  admins: [alice@example.com]\n"
+    )
+    context = Context.from_file(path)
+    identity = context.services().identity
+    assert identity is not None and identity is context.identity
+    assert identity._provider.check().detail == "https://idp.example, local"
+    assert identity._provider._local_jwks == tmp_path / "local-jwks.json"
+    assert identity._directory is None
+
+
+def test_a_directory_program_that_does_not_exist_fails_at_wiring(tmp_path: Path) -> None:
+    config = Config(identity=IdentityConfig(directory_command=("/no/such/validate",)))
+    with pytest.raises(ConfigError, match="program not found"):
+        _ = Context(config).identity
+    script = tmp_path / "validate"
+    script.write_text("")
+    wired = Context(Config(identity=IdentityConfig(directory_command=(str(script),)))).identity
+    assert wired is not None and wired._directory is not None
+
+
+def test_a_typo_in_the_identity_section_is_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "traust.yaml"
+    path.write_text("identity:\n  issuer: https://idp.example\n")
+    with pytest.raises(ConfigError):
+        Context.from_file(path)

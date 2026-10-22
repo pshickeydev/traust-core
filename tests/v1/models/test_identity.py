@@ -12,7 +12,7 @@ def principal(
     kind: str = "human", verified: bool = True, roles: tuple[Role, ...] = ()
 ) -> Principal:
     return Principal(
-        id=uuid4(),
+        identity=f"{uuid4()}@example.com",
         kind=ActorKind(kind),
         display="someone",
         verified_by=IdentitySource.OIDC if verified else None,
