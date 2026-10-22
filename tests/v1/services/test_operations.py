@@ -18,7 +18,8 @@ from sqlalchemy.engine import Engine
 from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import T0, Seed
 from traust_core.v1.errors import ConfigError, ConflictError, NotFoundError
-from traust_core.v1.models.common import Principal, TimeWindow
+from traust_core.v1.models.common import TimeWindow
+from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.operations import (
     Budget,
     BudgetStatus,

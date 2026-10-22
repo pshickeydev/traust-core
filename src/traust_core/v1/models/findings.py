@@ -11,7 +11,8 @@ from uuid import UUID
 
 from traust_core.v1.errors import ForbiddenError, ValidationError
 from traust_core.v1.models.base import AppendOnly, Entity, Model
-from traust_core.v1.models.common import CodeSpan, Principal
+from traust_core.v1.models.common import CodeSpan
+from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.vocabulary import (
     ActorKind,
     DispositionAssurance,

@@ -9,8 +9,8 @@ from uuid import UUID, uuid4
 import pytest
 
 from traust_core.v1.errors import ForbiddenError, ValidationError
-from traust_core.v1.models.common import IdentitySource, Principal
 from traust_core.v1.models.findings import Decision, Disposition
+from traust_core.v1.models.identity import IdentitySource, Principal
 from traust_core.v1.models.vocabulary import ActorKind, SourceType
 
 T0 = datetime(2026, 10, 1, tzinfo=UTC)
