@@ -17,7 +17,7 @@ from traust_core.v1.context.designations import load_designations
 from traust_core.v1.context.feeds import load_file_feeds
 from traust_core.v1.context.observation import command_source
 from traust_core.v1.errors import ConfigError
-from traust_core.v1.models.artifacts import ARTIFACT_FOR_KIND
+from traust_core.v1.models.artifacts import ARTIFACT_FOR_KIND, TriageArtifact
 from traust_core.v1.providers.base import ProviderRegistry
 from traust_core.v1.providers.clock import Clock, SystemClock
 from traust_core.v1.providers.feeds import FeedProvider
@@ -54,8 +54,10 @@ from traust_core.v1.services.findings import (
     ReviewPolicy,
     TaxonomyPolicy,
 )
+from traust_core.v1.services.findings.citations import VerdictCitations
 from traust_core.v1.services.identity import IdentityService
 from traust_core.v1.services.ledger import LedgerService
+from traust_core.v1.services.lint import Lint
 from traust_core.v1.services.operations import Materializer, OpsService
 from traust_core.v1.services.portfolio import (
     PortfolioPolicy,
@@ -213,7 +215,7 @@ class Context:
             findings=FindingService(
                 uow,
                 intake,
-                FindingDecisions(uow, ledger),
+                FindingDecisions(uow, ledger, Lint({TriageArtifact: [VerdictCitations()]})),
                 FindingReview(uow, ReviewPolicy()),
                 FindingPrecedents(uow),
             ),

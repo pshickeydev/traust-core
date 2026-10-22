@@ -10,6 +10,7 @@ from typing import NewType
 from uuid import UUID
 
 from traust_core.v1.errors import ForbiddenError, ValidationError
+from traust_core.v1.models import candidate_formats
 from traust_core.v1.models.base import AppendOnly, Entity, Model
 from traust_core.v1.models.common import CodeSpan
 from traust_core.v1.models.identity import Principal
@@ -84,19 +85,51 @@ class RiskRating(Model): ...
 
 
 class FindingCandidate(Model):
+    """A reported finding before intake; severity and confidence are None when not reported."""
+
     label: Label
     repository_id: UUID
     title: str
+    description: str = ""
+    rule: str | None = None
     cwes: tuple[CweId, ...] = ()
     category: Category | None = None
     locations: tuple[CodeSpan, ...] = ()
-    reported_severity: Severity
-    confidence: Confidence
+    reported_severity: Severity | None = None
+    confidence: Confidence | None = None
     origin: FindingOrigin
 
     @classmethod
-    def parse_many(cls, raw: bytes, format: CandidateFormat) -> list[FindingCandidate]:
-        raise NotImplementedError("stub: replaces triage/normalize_input.py")
+    def parse_many(
+        cls, raw: bytes, format: CandidateFormat, repository_id: UUID, origin: FindingOrigin
+    ) -> list[FindingCandidate]:
+        """Third-party scanner output as candidates; labels are made unique within the document."""
+        parse = {
+            CandidateFormat.SARIF: candidate_formats.sarif,
+            CandidateFormat.DEPENDABOT: candidate_formats.dependabot,
+            CandidateFormat.GOVULNCHECK: candidate_formats.govulncheck,
+        }[format]
+        seen: dict[str, int] = {}
+        out = []
+        for i, f in enumerate(parse(raw)):
+            base = str(f["label"] or f"{format.value}-{i + 1}")
+            seen[base] = seen.get(base, 0) + 1
+            out.append(
+                cls(
+                    label=Label(base if seen[base] == 1 else f"{base}#{seen[base]}"),
+                    repository_id=repository_id,
+                    title=f["title"],
+                    description=f["description"],
+                    rule=f["rule"],
+                    category=Category(f["category"]) if f["category"] else None,
+                    cwes=tuple(CweId(c) for c in f["cwes"]),
+                    locations=(CodeSpan(path=f["path"], line=f["line"]),) if f["path"] else (),
+                    reported_severity=Severity(f["severity"]) if f["severity"] else None,
+                    confidence=Confidence(f["confidence"]) if f["confidence"] is not None else None,
+                    origin=origin,
+                )
+            )
+        return out
 
 
 class Finding(Entity):
