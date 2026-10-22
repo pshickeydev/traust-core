@@ -30,6 +30,7 @@ REPOSITORY_REF = TableSpec(
 
 
 class RepositoryRefRepository(MutableRecordRepository[RepositoryRef], Protocol):
+    def get_or_add(self, record: RepositoryRef) -> RepositoryRef: ...
     def find(self, repository_id: UUID, name: str | None, sha: str) -> RepositoryRef | None:
         """A named ref by (repository, name, sha); name None = the bare commit."""
         ...
@@ -42,6 +43,15 @@ class RepositoryRefRepository(MutableRecordRepository[RepositoryRef], Protocol):
 class SqlRepositoryRefRepository(SqlMutableRepository[RepositoryRef]):
     spec = REPOSITORY_REF
     record = RepositoryRef
+
+    def get_or_add(self, record: RepositoryRef) -> RepositoryRef:
+        named = record.name is not None
+        return self._get_or_add(
+            record,
+            ("repository_id", "name", "sha") if named else ("repository_id", "sha"),
+            lambda: self.find(record.repository_id, record.name, record.sha),
+            index_where=self.table.c.name.is_not(None) if named else self.table.c.name.is_(None),
+        )
 
     def find(self, repository_id: UUID, name: str | None, sha: str) -> RepositoryRef | None:
         c = self.table.c

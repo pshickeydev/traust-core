@@ -27,12 +27,20 @@ REPOSITORY = TableSpec(
 
 
 class RepositoryRepository(MutableRecordRepository[Repository], Protocol):
+    def get_or_add(self, record: Repository) -> Repository: ...
     def find_by_url(self, url: str) -> Repository | None: ...
 
 
 class SqlRepositoryRepository(SqlMutableRepository[Repository]):
     spec = REPOSITORY
     record = Repository
+
+    def get_or_add(self, record: Repository) -> Repository:
+        return self._get_or_add(
+            record,
+            ("url",),
+            lambda: self.find_by_url(record.url),
+        )
 
     def find_by_url(self, url: str) -> Repository | None:
         return self._one(f"find {url}", self.table.c.url == url)

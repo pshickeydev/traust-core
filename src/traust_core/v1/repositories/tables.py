@@ -17,9 +17,10 @@ from typing import Any, ClassVar, Generic, Protocol, TypeVar
 from uuid import UUID
 
 import sqlalchemy as sa
+from sqlalchemy.dialects import postgresql, sqlite
 from sqlalchemy.engine import Connection
 
-from traust_core.v1.errors import NotFoundError
+from traust_core.v1.errors import NotFoundError, RepositoryError
 from traust_core.v1.models.base import AppendOnly, Entity, Model
 from traust_core.v1.repositories.sql import (
     Dialect,
@@ -127,6 +128,32 @@ class SqlTableRepository(SqlRepository, Generic[R]):
     def add(self, record: R) -> R:
         saved = self._insert_record(f"add {self.spec.name}", self.table, self._values(record))
         return record.model_copy(update=saved)
+
+    def _get_or_add(
+        self,
+        record: R,
+        keys: Sequence[str],
+        find: Callable[[], R | None],
+        *,
+        index_where: sa.ColumnElement[bool] | None = None,
+    ) -> R:
+        insert = (
+            postgresql.insert if self._connection.dialect.name == "postgresql" else sqlite.insert
+        )
+        stmt = (
+            insert(self.table)
+            .values(self._values(record))
+            .on_conflict_do_nothing(index_elements=list(keys), index_where=index_where)
+            .returning(*self.table.c)
+        )
+        row = self._execute(f"get or add {self.spec.name}", stmt).mappings().first()
+        if row is not None:
+            return self._to_record(row)
+        # A separate statement sees the competing insert after it commits on Postgres.
+        existing = find()
+        if existing is None:
+            raise RepositoryError(f"{self.spec.name}: conflicting row disappeared")
+        return existing
 
     def get(self, record_id: UUID) -> R:
         found = self._one(f"get {record_id}", self.table.c.id == record_id)

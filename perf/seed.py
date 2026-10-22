@@ -32,6 +32,11 @@ DECISIONS = 250_000
 HOT_REPOSITORY = "https://forge.example/org/r1"
 TYPICAL_REPOSITORY = "https://forge.example/org/r2"
 UNLEDGERED = 50
+PRODUCTS = 1_000
+TEAMS = 1_000
+REVISIONS_PER_REPOSITORY = 12
+RELEASES_PER_PRODUCT = 12
+OWNERSHIP_PERIODS = 10
 
 ROUTED = ("full-audit", "diff-scan", "diff-scan-quarterly", "threat-model-review", "deps-lane")
 UNROUTED = ("feeds_cache", "repo_state", "dashboards")
@@ -112,6 +117,32 @@ SEED = (
     FROM generate_series(1, {SPEND_EVENTS}) s(g)
     JOIN (SELECT row_number() OVER (ORDER BY id) AS n, id, lane FROM traust_ops.run_order) o
         ON o.n = 1 + mod(s.g, {RUN_ORDERS})""",
+    f"""INSERT INTO traust.product (slug, name)
+    SELECT 'product-' || g, 'Product ' || g FROM generate_series(1, {PRODUCTS}) g""",
+    f"""INSERT INTO traust.release (product_id, version)
+    SELECT p.id, 'v' || g FROM traust.product p
+    CROSS JOIN generate_series(1, {RELEASES_PER_PRODUCT}) g""",
+    f"""INSERT INTO traust.repository_ref (repository_id, name, kind, sha)
+    SELECT r.id, CASE WHEN named THEN 'main' END, CASE WHEN named THEN 'branch' END,
+        lpad(g::text, 40, '0')
+    FROM traust.repository r CROSS JOIN generate_series(1, {REVISIONS_PER_REPOSITORY}) g
+    CROSS JOIN (VALUES (true), (false)) variant(named)""",
+    f"""INSERT INTO traust.component (release_id, repository_ref_id)
+    SELECT release.id, ref.id
+    FROM (SELECT id, row_number() OVER (ORDER BY id) n FROM traust.repository_ref
+        WHERE name IS NOT NULL) ref
+    JOIN (SELECT id, row_number() OVER (ORDER BY id) n FROM traust.release) release
+        ON release.n = 1 + mod(ref.n - 1, {PRODUCTS * RELEASES_PER_PRODUCT})""",
+    f"""INSERT INTO traust.team (name)
+    SELECT 'team-' || g FROM generate_series(1, {TEAMS}) g""",
+    f"""INSERT INTO traust.ownership (repository_id, team_id, valid_from, valid_to)
+    SELECT r.id, t.id, timestamptz '2020-01-01' + g * interval '1 year',
+        CASE WHEN g < {OWNERSHIP_PERIODS - 1}
+            THEN timestamptz '2020-01-01' + (g + 1) * interval '1 year' END
+    FROM (SELECT id, row_number() OVER (ORDER BY id) n FROM traust.repository) r
+    JOIN (SELECT id, row_number() OVER (ORDER BY id) n FROM traust.team) t
+        ON t.n = 1 + mod(r.n - 1, {TEAMS})
+    CROSS JOIN generate_series(0, {OWNERSHIP_PERIODS - 1}) g""",
 )
 
 
@@ -147,6 +178,13 @@ def seeded_database(url: str) -> Engine:
                     "traust_ops.spend_event",
                     "traust.decision",
                     "traust_ledger.events",
+                    "traust.repository",
+                    "traust.product",
+                    "traust.release",
+                    "traust.repository_ref",
+                    "traust.component",
+                    "traust.team",
+                    "traust.ownership",
                 ):
                     conn.exec_driver_sql(f"VACUUM (ANALYZE) {table}")
         except BaseException:

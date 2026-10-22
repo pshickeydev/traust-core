@@ -27,6 +27,7 @@ from traust_core.v1.models.inventory import (
     RepoState,
     RiskTier,
     SyncReport,
+    Team,
     VersionLabel,
 )
 from traust_core.v1.models.observation import (
@@ -36,7 +37,13 @@ from traust_core.v1.models.observation import (
     ObservationTarget,
     ObservedRepoState,
 )
-from traust_core.v1.models.values import GitSha, HttpsRepoUrl
+from traust_core.v1.models.values import (
+    GitSha,
+    HttpsRepoUrl,
+    require_aware_datetime,
+    require_nonblank,
+    require_uuid,
+)
 from traust_core.v1.models.vocabulary import RefKind, Severity
 from traust_core.v1.providers.clock import Clock, SystemClock
 from traust_core.v1.providers.sources import SourceProvider
@@ -133,27 +140,82 @@ class PortfolioService:
         return self._facts.get(repository_id)
 
     def register_product(self, slug: ProductSlug, name: str) -> Product:
-        raise NotImplementedError("stub: replaces registry/products.py, inventory.py")
+        require_nonblank(slug, "product.slug")
+        require_nonblank(name, "product.name")
+        with self._uow as uow:
+            product = uow.products.get_or_add(Product(slug=slug, name=name))
+            uow.commit()
+            return product
 
     def register_repository(self, url: HttpsRepoUrl, public: bool) -> Repository:
-        raise NotImplementedError("stub: replaces corpus_intake.py, add-inputs")
+        if not isinstance(url, HttpsRepoUrl):
+            raise ValidationError("repository.url must be an HttpsRepoUrl")
+        if not isinstance(public, bool):
+            raise ValidationError("repository.public must be a boolean")
+        require_nonblank(url.host, "repository.url.host")
+        require_nonblank(url.path, "repository.url.path")
+        try:
+            url = HttpsRepoUrl.parse(str(url), (url.host,))
+        except (TypeError, ValueError) as exc:
+            raise ValidationError("repository.url is invalid") from exc
+        with self._uow as uow:
+            repository = uow.repositories.get_or_add(Repository(url=str(url), public=public))
+            uow.commit()
+            return repository
 
     def register_ref(
         self, repository_id: UUID, sha: GitSha, name: RefName | None, kind: RefKind | None
     ) -> RepositoryRef:
-        raise NotImplementedError("stub: replaces product_repo (product, repo, ref) rows")
+        require_uuid(repository_id, "repository_ref.repository_id")
+        if not isinstance(sha, GitSha):
+            raise ValidationError("repository_ref.sha must be a GitSha")
+        require_nonblank(sha.value, "repository_ref.sha")
+        GitSha.parse(sha.value)
+        if (name is None) != (kind is None):
+            raise ValidationError("repository ref name and kind must both be set or both be absent")
+        if name is not None:
+            require_nonblank(name, "repository_ref.name")
+            if not isinstance(kind, RefKind):
+                raise ValidationError("repository_ref.kind must be a RefKind")
+        with self._uow as uow:
+            ref = uow.repository_refs.get_or_add(
+                RepositoryRef(repository_id=repository_id, sha=str(sha), name=name, kind=kind)
+            )
+            uow.commit()
+            return ref
 
     def record_release(self, product_id: UUID, version: VersionLabel) -> Release:
-        raise NotImplementedError("stub: replaces product_repo_version, build_release_events")
+        require_uuid(product_id, "release.product_id")
+        require_nonblank(version, "release.version")
+        with self._uow as uow:
+            release = uow.releases.get_or_add(Release(product_id=product_id, version=version))
+            uow.commit()
+            return release
 
     def add_component(self, release_id: UUID, repository_ref_id: UUID) -> Component:
-        raise NotImplementedError("stub: replaces product_repo upserts")
+        require_uuid(release_id, "component.release_id")
+        require_uuid(repository_ref_id, "component.repository_ref_id")
+        with self._uow as uow:
+            component = uow.components.get_or_add(
+                Component(release_id=release_id, repository_ref_id=repository_ref_id)
+            )
+            uow.commit()
+            return component
 
     def release_changes(self, release_id: UUID, previous_id: UUID) -> ReleaseChange:
         raise NotImplementedError("stub: replaces build_release_events.diff_container")
 
     def assign_owner(self, repository_id: UUID, team: str, at: datetime) -> Ownership:
-        raise NotImplementedError("stub: replaces repo_owner, subject_ownership")
+        require_uuid(repository_id, "ownership.repository_id")
+        require_nonblank(team, "team.name")
+        require_aware_datetime(at, "ownership.valid_from")
+        with self._uow as uow:
+            owner = uow.teams.get_or_add(Team(name=team))
+            ownership = uow.ownerships.get_or_add(
+                Ownership(repository_id=repository_id, team_id=owner.id, valid_from=at)
+            )
+            uow.commit()
+            return ownership
 
     def exposure_class(self, repository_id: UUID, liveness: Liveness) -> ExposureClass:
         raise NotImplementedError("stub: replaces build_rescan_worklist.exposure_class")

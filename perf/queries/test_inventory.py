@@ -1,0 +1,95 @@
+from __future__ import annotations
+
+import pytest
+import sqlalchemy as sa
+
+from perf.harness import Profile
+from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
+
+CASES = [
+    ("products", "product_slug_key"),
+    ("repositories", "repository_url_key"),
+    ("releases", "release_product_id_version_key"),
+    ("components", "component_release_id_repository_ref_id_key"),
+    ("teams", "team_name_key"),
+    ("repository_refs", "uq_ref_named"),
+    ("repository_refs", "uq_ref_bare"),
+    ("ownerships", "uq_ownership_open"),
+]
+
+
+@pytest.mark.parametrize("table,index", CASES)
+@pytest.mark.parametrize("existing", [False, True], ids=["insert", "repeat"])
+def test_registration_uses_the_natural_key_without_scanning(
+    engine: sa.Engine,
+    explained: Profile,
+    table: str,
+    index: str,
+    existing: bool,
+) -> None:
+    with SqlTraustUnitOfWork(engine) as unit:
+        repo = getattr(unit, table)
+        query = sa.select(repo.table).limit(1)
+        if table == "repository_refs":
+            query = query.where(
+                repo.table.c.name.is_(None)
+                if index == "uq_ref_bare"
+                else repo.table.c.name.is_not(None)
+            )
+        if table == "ownerships":
+            query = query.where(repo.table.c.valid_to.is_(None))
+        record = repo.record.model_validate(unit.connection.execute(query).mappings().one())
+        if not existing:
+            match table:
+                case "products":
+                    change = {"slug": "perf-new-product"}
+                case "repositories":
+                    change = {"url": "https://forge.example/perf/new"}
+                case "releases":
+                    change = {"version": "perf-new-version"}
+                case "teams":
+                    change = {"name": "perf-new-team"}
+                case "repository_refs":
+                    change = {"sha": "f" * 40}
+                case "components":
+                    releases = unit.releases.table
+                    change = {
+                        "release_id": unit.connection.scalar(
+                            sa.select(releases.c.id)
+                            .where(releases.c.id != record.release_id)
+                            .limit(1)
+                        )
+                    }
+                case "ownerships":
+                    teams = unit.teams.table
+                    change = {
+                        "team_id": unit.connection.scalar(
+                            sa.select(teams.c.id).where(teams.c.id != record.team_id).limit(1)
+                        )
+                    }
+            record = record.model_copy(update=change)
+    statements = explained(lambda uow: getattr(uow, table).get_or_add(record))
+    assert len(statements) == (2 if existing else 1)
+    for position, statement in enumerate(statements):
+        indexes = {index}
+        if table == "components" and position == 1:
+            indexes.add("idx_component_repository_ref")
+        assert any(statement.uses_index(candidate) for candidate in indexes), statement.plan
+        assert not statement.seq_scans(), statement.plan
+        assert statement.execution_ms < 25, statement.plan
+
+
+def test_current_ownership_uses_the_partial_unique_index(
+    engine: sa.Engine, explained: Profile
+) -> None:
+    with SqlTraustUnitOfWork(engine) as unit:
+        table = unit.ownerships.table
+        row = unit.connection.execute(
+            sa.select(table.c.repository_id, table.c.team_id)
+            .where(table.c.valid_to.is_(None))
+            .limit(1)
+        ).one()
+    (statement,) = explained(lambda uow: uow.ownerships.find_current(*row))
+    assert statement.uses_index("uq_ownership_open"), statement.plan
+    assert not statement.seq_scans(), statement.plan
+    assert statement.execution_ms < 5, statement.plan
