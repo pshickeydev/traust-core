@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from collections import defaultdict
 from collections.abc import Sequence
 from pathlib import Path
 from uuid import UUID
@@ -14,10 +15,14 @@ from traust_core.v1.models.findings import (
     Decision,
     DecisionApprover,
     Disposition,
+    FindingContext,
+    Location,
     RecordDecision,
     Restatement,
     StatementKey,
+    SubjectRef,
     TriageInput,
+    TriageItem,
 )
 from traust_core.v1.models.identity import Principal, Role
 from traust_core.v1.models.integrity import canonical_json, sha256_hex
@@ -173,7 +178,36 @@ class FindingDecisions:
         return approvers
 
     def prepare(self, assessment_id: UUID) -> TriageInput:
-        raise NotImplementedError("stub: replaces the triage skill's query_index / precedent CLIs")
+        """Everything a triage of one assessment judges: its findings, as reported, and where."""
+        with self._uow as uow:
+            assessment = uow.assessments.get(assessment_id)
+            ref = uow.repository_refs.get(assessment.repository_ref_id)
+            repository = uow.repositories.get(ref.repository_id)
+            occurrences = uow.occurrences.list_for_assessment(assessment_id)
+            findings = {
+                f.id: f for f in uow.findings.list_by_ids({o.finding_id for o in occurrences})
+            }
+            where: dict[UUID, list[Location]] = defaultdict(list)
+            for loc in uow.locations.list_for_occurrences([o.id for o in occurrences]):
+                where[loc.occurrence_id].append(loc)
+        return TriageInput(
+            subject=SubjectRef(
+                repository_id=repository.id,
+                repository_url=repository.url,
+                repository_ref_id=ref.id,
+                sha=ref.sha,
+                assessment_id=assessment_id,
+            ),
+            findings=FindingContext(),
+            prepared_at=self._clock.now(),
+            assessor=assessment.assessor,
+            items=tuple(
+                TriageItem(
+                    finding=findings[o.finding_id], occurrence=o, locations=tuple(where[o.id])
+                )
+                for o in occurrences
+            ),
+        )
 
     def check(self, doc: TriageArtifact, checkout: Path) -> LintReport:
         """Lint the triage against the target checkout: after the votes, before `record`."""

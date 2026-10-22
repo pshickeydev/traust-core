@@ -76,3 +76,15 @@ def test_locations_ordered_by_path_then_line(seed: Seed) -> None:
     a3 = seed.location(occurrence, path="a.go", line_start=3, line_end=3)
     whole = seed.location(occurrence, path="c.go", line_start=None, line_end=None)
     assert seed.uow.locations.list_for_occurrence(occurrence.id) == [a3, a20, b, whole]
+
+
+def test_locations_of_many_occurrences_in_one_read(seed: Seed) -> None:
+    o1, o2, other = seed.occurrence(), seed.occurrence(), seed.occurrence()
+    b1 = seed.location(o1, path="b.go")
+    a1 = seed.location(o1, path="a.go")
+    a2 = seed.location(o2, path="a.go")
+    seed.location(other)
+    found = seed.uow.locations.list_for_occurrences([o1.id, o2.id])
+    assert same_rows(found, [a1, b1, a2])
+    assert [loc.path for loc in found if loc.occurrence_id == o1.id] == ["a.go", "b.go"]
+    assert seed.uow.locations.list_for_occurrences([]) == []

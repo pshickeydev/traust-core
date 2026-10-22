@@ -467,7 +467,14 @@ class FindingView(Model):
     sla_due: datetime | None = None
 
 
-class SubjectRef(Model): ...
+class SubjectRef(Model):
+    """What a skill works on: a commit of a repository, and the assessment when there is one."""
+
+    repository_id: UUID
+    repository_url: str
+    repository_ref_id: UUID
+    sha: str
+    assessment_id: UUID | None = None
 
 
 class FindingContext(Model):
@@ -481,7 +488,17 @@ class SkillInput(Model):
     prepared_at: datetime
 
 
-class TriageInput(SkillInput): ...
+class TriageItem(Model):
+    """One reported finding to judge: the finding, how this assessment reported it, and where."""
+
+    finding: Finding
+    occurrence: Occurrence
+    locations: tuple[Location, ...] = ()
+
+
+class TriageInput(SkillInput):
+    assessor: str
+    items: tuple[TriageItem, ...]
 
 
 class FindingSeriesPoint(Model):
