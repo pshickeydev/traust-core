@@ -1,0 +1,3 @@
+no
+vf-rbac-tried:
+vf-rbac-probe: verb=delete res=secrets

@@ -1,0 +1,3 @@
+no
+vf-rbac-tried: system:serviceaccount:tenant-a:app system:serviceaccount:tenant-a:worker
+vf-rbac-probe: verb=delete res=secrets
