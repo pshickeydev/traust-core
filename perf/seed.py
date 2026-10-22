@@ -22,6 +22,8 @@ REPOSITORIES = 10_000
 RUN_BATCHES = 52
 RUN_ORDERS = 2_000_000
 OPEN_ORDERS = 20_000
+# ~1.5 model calls per order over the same year; 1 in 10 claims no order (unattributed).
+SPEND_EVENTS = 3_000_000
 
 # A year of decisions (Appendix D: ~250k), each proved by one ledger event in its repository's
 # layer. Every 25th lands on HOT_REPOSITORY, a monorepo-sized layer of 10k events; the rest
@@ -99,6 +101,17 @@ SEED = (
     JOIN traust.finding f ON f.id = d.finding_id
     JOIN traust_ledger.layers l ON l.repository_id = f.repository_id
     WHERE substr(f.fingerprint, 4)::int <= {DECISIONS}""",
+    f"""INSERT INTO traust_ops.spend_event (run_order_id, lane, provider, model, skill, tokens_in,
+        tokens_out, cost_usd, occurred_at)
+    SELECT CASE WHEN mod(s.g, 10) <> 0 THEN o.id END,
+        CASE WHEN mod(s.g, 10) <> 0 THEN o.lane END, 'anthropic',
+        (ARRAY['opus', 'sonnet', 'haiku'])[1 + mod(s.g, 3)],
+        (ARRAY['secure-code-audit', 'triage', NULL])[1 + mod(s.g, 3)],
+        1000 + mod(s.g, 50000), 100 + mod(s.g, 5000), round(mod(s.g, 2000) / 100.0, 2),
+        now() - make_interval(secs => s.g * 10)
+    FROM generate_series(1, {SPEND_EVENTS}) s(g)
+    JOIN (SELECT row_number() OVER (ORDER BY id) AS n, id, lane FROM traust_ops.run_order) o
+        ON o.n = 1 + mod(s.g, {RUN_ORDERS})""",
 )
 
 
@@ -129,7 +142,12 @@ def seeded_database(url: str) -> Engine:
             apply_schema(engine, contracts.database_ddl(Dialect.POSTGRES))
             apply_schema(engine, SEED)
             with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
-                for table in ("traust_ops.run_order", "traust.decision", "traust_ledger.events"):
+                for table in (
+                    "traust_ops.run_order",
+                    "traust_ops.spend_event",
+                    "traust.decision",
+                    "traust_ledger.events",
+                ):
                     conn.exec_driver_sql(f"VACUUM (ANALYZE) {table}")
         except BaseException:
             engine.dispose()

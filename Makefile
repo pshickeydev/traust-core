@@ -71,7 +71,7 @@ db-up:
 	@if podman container exists $(DB_CONTAINER) 2>/dev/null; then \
 		echo "$(DB_CONTAINER) already running"; \
 	else \
-		podman run --name $(DB_CONTAINER) --rm -d \
+		podman run --name $(DB_CONTAINER) --rm -d --shm-size=256m \
 			-e POSTGRES_USER=$(DB_USER) \
 			-e POSTGRES_PASSWORD=$(DB_PASSWORD) \
 			-e POSTGRES_DB=$(DB_NAME) \

@@ -7,7 +7,7 @@ resolution-markers = [
 ]
 
 [manifest]
-overrides = [{ name = "traust-contracts", git = "https://github.com/traust-security/traust-contracts.git?rev=46f5c038153a780d9417fa7839de215595f7fe26" }]
+overrides = [{ name = "traust-contracts", git = "https://github.com/traust-security/traust-contracts.git?rev=7e06d1d25f2df846dbd2e69a935a870bbccbf441" }]
 
 [[package]]
 name = "annotated-types"
@@ -1131,7 +1131,7 @@ wheels = [
 [[package]]
 name = "traust-contracts"
 version = "0.0.0"
-source = { git = "https://github.com/traust-security/traust-contracts.git?rev=46f5c038153a780d9417fa7839de215595f7fe26#46f5c038153a780d9417fa7839de215595f7fe26" }
+source = { git = "https://github.com/traust-security/traust-contracts.git?rev=7e06d1d25f2df846dbd2e69a935a870bbccbf441#7e06d1d25f2df846dbd2e69a935a870bbccbf441" }
 dependencies = [
     { name = "jsonschema", extra = ["format-nongpl"] },
     { name = "pydantic" },
@@ -1172,7 +1172,7 @@ requires-dist = [
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "referencing", specifier = ">=0.30" },
     { name = "sqlalchemy", specifier = ">=2.0" },
-    { name = "traust-contracts", git = "https://github.com/traust-security/traust-contracts.git?rev=46f5c038153a780d9417fa7839de215595f7fe26" },
+    { name = "traust-contracts", git = "https://github.com/traust-security/traust-contracts.git?rev=7e06d1d25f2df846dbd2e69a935a870bbccbf441" },
     { name = "traust-ledger", git = "https://github.com/traust-security/traust-ledger.git?rev=d1b589a50f57c77852eeead7b8ae78e2701ac90f" },
 ]
 provides-extras = ["postgres"]

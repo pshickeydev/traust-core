@@ -7,12 +7,13 @@ from decimal import Decimal
 from typing import Protocol, TypeVar
 from uuid import UUID
 
-from traust_core.v1.errors import ConflictError
+from traust_core.v1.errors import ConfigError, ConflictError
 from traust_core.v1.models.common import Page, PageRequest, Principal, TimeBucket, TimeWindow
 from traust_core.v1.models.operations import (
     AssetName,
     AssetRequest,
     Budget,
+    BudgetStatus,
     BudgetVerdict,
     JobResult,
     LaneName,
@@ -160,24 +161,66 @@ def _require(order: RunOrder, state: OrderState, worker: WorkerId | None = None)
 
 
 class SpendService:
-    def __init__(self, uow: OpsUnitOfWork, budgets: Sequence[Budget]) -> None:
+    def __init__(self, uow: OpsUnitOfWork, clock: Clock, budgets: Sequence[Budget]) -> None:
         self._uow = uow
-        self._budgets = budgets
+        self._clock = clock
+        self._budgets = {b.lane: b for b in budgets}
+        if len(self._budgets) != len(budgets):
+            raise ConfigError(f"more than one budget per lane: {[b.lane for b in budgets]}")
 
-    def record(self, event: SpendEvent) -> None:
-        raise NotImplementedError("stub: replaces metrics/collect_spend.append_rows")
+    def record(self, event: SpendEvent) -> SpendEvent:
+        # NEED(model-registry): check provider and model against ModelCatalog once it lands.
+        with self._uow as uow:
+            order = None if event.run_order_id is None else uow.run_orders.get(event.run_order_id)
+            saved = uow.spend_events.add(event.model_copy(update={"lane": order and order.lane}))
+            uow.commit()
+        log.info(
+            "spend %s recorded: %s/%s $%s", saved.id, saved.provider, saved.model, saved.cost_usd
+        )
+        return saved
 
     def collect(self, source: SpendSource, window: TimeWindow) -> int:
         raise NotImplementedError("stub: replaces metrics/collect_spend.py")
 
     def attribute(self, window: TimeWindow) -> SpendAttribution:
-        raise NotImplementedError("stub: replaces metrics/attribute_spend.py")
+        """Spend tied to an order vs spend no order claims; the two always sum to the total."""
+        return SpendAttribution(
+            window=window,
+            attributed_usd=self._total(SpendFilter(window=window, attributed=True)),
+            unattributed_usd=self._total(SpendFilter(window=window, attributed=False)),
+        )
 
-    def check_budget(self, lane: LaneName, estimate: Decimal) -> BudgetVerdict:
-        raise NotImplementedError("stub: replaces cli/budget_shadow.py")
+    def check_budget(self, lane: LaneName, estimate: Decimal | None) -> BudgetVerdict:
+        """Judge month-to-date lane spend plus `estimate` (None = unknown cost); never withholds."""
+        spent = self._total(SpendFilter(window=TimeWindow.month_of(self._clock.now()), lane=lane))
+        budget = self._budgets.get(lane)
+        verdict = (
+            budget.verdict(spent, estimate)
+            if budget is not None
+            else BudgetVerdict(
+                lane=lane, status=BudgetStatus.NO_BUDGET, spent_usd=spent, estimate_usd=estimate
+            )
+        )
+        log.log(
+            logging.WARNING if verdict.status is BudgetStatus.OVER else logging.INFO,
+            "budget %s for lane %s (%s): spent $%s + estimate %s of %s",
+            verdict.status,
+            lane,
+            verdict.enforcement,
+            spent,
+            estimate,
+            verdict.budget_usd,
+        )
+        return verdict
 
     def summary(self, filter: SpendFilter, group_by: SpendDimension) -> list[SpendRollup]:
-        raise NotImplementedError("stub: replaces metrics/spend.py, financial-tracking")
+        with self._uow as uow:
+            return uow.spend_events.sum_by(filter, group_by)
+
+    def _total(self, filter: SpendFilter) -> Decimal:
+        with self._uow as uow:
+            rollups = uow.spend_events.sum_by(filter)
+        return rollups[0].cost_usd if rollups else Decimal(0)
 
 
 class FreshnessQuery:

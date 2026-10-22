@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta, timezone
+from decimal import Decimal
 from uuid import uuid4
 
 import pytest
@@ -10,6 +11,8 @@ from sqlalchemy.engine import Engine
 
 from tests.v1.repositories.tables.conftest import T0, Seed, apart
 from traust_core.v1.errors import NotFoundError
+from traust_core.v1.models.common import TimeWindow
+from traust_core.v1.models.operations import LaneName, SpendDimension, SpendFilter, SpendRollup
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 
 LEASE = timedelta(minutes=5)
@@ -90,6 +93,86 @@ def test_spend_by_order_and_half_open_window(seed: Seed) -> None:
     seed.spend_event(occurred_at=T0 + timedelta(days=1))  # end is exclusive
     assert spend.list_for_order(order.id) == [start]
     assert spend.list_between(T0, T0 + timedelta(days=1)) == [start, inside]
+
+
+OCTOBER = TimeWindow.month_of(T0)
+
+
+def rollup(key: str | None, events: int, usd: str) -> SpendRollup:
+    return SpendRollup(
+        key=key,
+        events=events,
+        tokens_in=100 * events,
+        tokens_out=20 * events,
+        cost_usd=Decimal(usd),
+    )
+
+
+def test_spend_sums_by_lane_with_unrouted_and_unattributed_as_no_lane(seed: Seed) -> None:
+    audit, diff = seed.run_order(lane="full-audit"), seed.run_order(lane="diff-scan")
+    unrouted = seed.run_order(asset="feeds_cache")
+    seed.spend_event(run_order_id=audit.id, lane="full-audit", cost_usd=Decimal("1.10"))
+    seed.spend_event(run_order_id=audit.id, lane="full-audit", cost_usd=Decimal("2.20"))
+    seed.spend_event(run_order_id=diff.id, lane="diff-scan", cost_usd=Decimal("0.30"))
+    seed.spend_event(run_order_id=unrouted.id, cost_usd=Decimal("0.40"))
+    seed.spend_event(cost_usd=Decimal("0.50"))
+    assert seed.uow.spend_events.sum_by(SpendFilter(window=OCTOBER), SpendDimension.LANE) == [
+        rollup("diff-scan", 1, "0.30"),
+        rollup("full-audit", 2, "3.30"),
+        rollup(None, 2, "0.90"),
+    ]
+
+
+def test_spend_sums_by_utc_month_model_and_skill(seed: Seed) -> None:
+    spend = seed.uow.spend_events
+    year = TimeWindow(start=datetime(2026, 1, 1, tzinfo=UTC), end=datetime(2027, 1, 1, tzinfo=UTC))
+    late_sept = datetime(2026, 10, 1, 1, tzinfo=timezone(timedelta(hours=3)))  # 22:00 UTC, Sept
+    seed.spend_event(occurred_at=late_sept, model="opus", skill="triage")
+    seed.spend_event(occurred_at=T0, model="opus")
+    seed.spend_event(occurred_at=T0, model="haiku", skill="triage")
+    assert spend.sum_by(SpendFilter(window=year), SpendDimension.MONTH) == [
+        rollup("2026-09", 1, "0.25"),
+        rollup("2026-10", 2, "0.50"),
+    ]
+    assert spend.sum_by(SpendFilter(window=year), SpendDimension.MODEL) == [
+        rollup("haiku", 1, "0.25"),
+        rollup("opus", 2, "0.50"),
+    ]
+    assert spend.sum_by(SpendFilter(window=year), SpendDimension.SKILL) == [
+        rollup("triage", 2, "0.50"),
+        rollup(None, 1, "0.25"),
+    ]
+
+
+def test_spend_total_filters_by_window_lane_and_attribution(seed: Seed) -> None:
+    spend = seed.uow.spend_events
+    audit, diff = seed.run_order(lane="full-audit"), seed.run_order(lane="diff-scan")
+    seed.spend_event(run_order_id=audit.id, lane="full-audit", cost_usd=Decimal("1.00"))
+    seed.spend_event(
+        run_order_id=audit.id, lane="full-audit", occurred_at=OCTOBER.end, cost_usd=Decimal("9.00")
+    )
+    seed.spend_event(run_order_id=diff.id, lane="diff-scan", cost_usd=Decimal("0.10"))
+    seed.spend_event(cost_usd=Decimal("0.01"))
+    lane = LaneName("full-audit")
+    assert spend.sum_by(SpendFilter(window=OCTOBER)) == [rollup(None, 3, "1.11")]
+    assert spend.sum_by(SpendFilter(window=OCTOBER, lane=lane)) == [rollup(None, 1, "1.00")]
+    assert spend.sum_by(SpendFilter(window=OCTOBER, attributed=False)) == [rollup(None, 1, "0.01")]
+    assert spend.sum_by(SpendFilter(window=OCTOBER, attributed=True)) == [rollup(None, 2, "1.10")]
+
+
+def test_spend_sums_are_empty_without_spend(seed: Seed) -> None:
+    spend = seed.uow.spend_events
+    seed.spend_event(occurred_at=OCTOBER.end)
+    assert spend.sum_by(SpendFilter(window=OCTOBER)) == []
+    assert spend.sum_by(SpendFilter(window=OCTOBER), SpendDimension.LANE) == []
+    assert spend.sum_by(SpendFilter(window=OCTOBER, lane=LaneName("full-audit"))) == []
+
+
+def test_spend_sums_keep_decimal_cents(seed: Seed) -> None:
+    for _ in range(10):
+        seed.spend_event(cost_usd=Decimal("0.10"))
+    (total,) = seed.uow.spend_events.sum_by(SpendFilter(window=OCTOBER))
+    assert total.cost_usd == Decimal("1.00")
 
 
 def test_latest_feed_snapshot_by_retrieval_time(seed: Seed) -> None:

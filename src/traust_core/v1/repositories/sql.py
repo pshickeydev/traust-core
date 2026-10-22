@@ -120,6 +120,25 @@ def _sqlite_now(element: Any, compiler: Any, **kw: Any) -> str:
     return "strftime('%Y-%m-%dT%H:%M:%fZ','now')"
 
 
+class UtcMonth(sa.FunctionElement[str]):
+    """YYYY-MM of a timestamp column, in UTC, on either dialect."""
+
+    type = sa.Text()
+    name = "utc_month"
+    inherit_cache = True
+
+
+@compiles(UtcMonth, "postgresql")
+def _postgres_month(element: Any, compiler: Any, **kw: Any) -> str:
+    return f"to_char({compiler.process(element.clauses, **kw)} AT TIME ZONE 'UTC', 'YYYY-MM')"
+
+
+@compiles(UtcMonth, "sqlite")
+def _sqlite_month(element: Any, compiler: Any, **kw: Any) -> str:
+    # Contracts' TEXT timestamps are already UTC ISO-8601.
+    return f"substr({compiler.process(element.clauses, **kw)}, 1, 7)"
+
+
 def record_columns() -> tuple[sa.Column[UUID], sa.Column[datetime], sa.Column[datetime]]:
     """Mutable base columns: UUIDv4 id; the touch trigger keeps updated_at."""
     return (
