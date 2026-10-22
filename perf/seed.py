@@ -93,6 +93,9 @@ SEED = (
         'interactive', 'human:perf@example.com',
         now() - make_interval(mins => mod(abs(hashtext(fingerprint)), 525600))
     FROM traust.finding""",
+    """INSERT INTO traust.decision_approver (decision_id, approver)
+    SELECT id, 'human:approver@example.com' FROM traust.decision
+    WHERE mod(abs(hashtext(statement_key)), 100) = 0""",
     """INSERT INTO traust_ledger.layers (repository_id, merkle_signing_method)
     SELECT id, 'keypair' FROM traust.repository""",
     f"""INSERT INTO traust_ledger.events (layer_id, decision_id, seq, event_payload)
@@ -177,6 +180,7 @@ def seeded_database(url: str) -> Engine:
                     "traust_ops.run_order",
                     "traust_ops.spend_event",
                     "traust.decision",
+                    "traust.decision_approver",
                     "traust_ledger.events",
                     "traust.repository",
                     "traust.product",

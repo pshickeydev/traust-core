@@ -24,6 +24,7 @@ class IdentityConfig(Model):
     directory_command: tuple[str, ...] = ()
     directory_timeout_seconds: float = 60.0
     admins: tuple[str, ...] = ()
+    restatement_approvers: int = 0  # independent approvers a restatement must name
 
 
 class IdentityService:
