@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
+from pathlib import Path
 from typing import Any
 from uuid import UUID
 
-from traust_ledger._internal.integrity import (
+from traust_ledger.integrity import (
+    LEAF_FORMAT_CURRENT,
     Severity,
     SigningConfig,
     canonical_event_bytes,
@@ -14,9 +16,9 @@ from traust_ledger._internal.integrity import (
     verify_merkle_integrity,
     verify_merkle_signature,
 )
-from traust_ledger._internal.integrity.merkle import LEAF_FORMAT_CURRENT
 
 from traust_core.v1.errors import NotFoundError, ServiceError, ValidationError
+from traust_core.v1.models.base import Model
 from traust_core.v1.models.findings import Decision
 from traust_core.v1.models.ledger import (
     AppendReceipt,
@@ -38,6 +40,14 @@ _MERKLE = (
 )
 
 
+class LedgerConfig(Model):
+    """The `ledger:` config section. Keypair (cosign) signing; no key means layers stay unsigned."""
+
+    key_path: Path | None = None
+    public_key_path: Path | None = None
+    required: bool = False
+
+
 class LedgerService:
     """Proof that decisions weren't changed: traust-ledger computes, these tables store.
 
@@ -45,18 +55,14 @@ class LedgerService:
     work to append in the decision's transaction.
     """
 
-    def __init__(
-        self,
-        uow: LedgerUnitOfWork,
-        signing: SigningConfig,
-        *,
-        public_key_path: str | None = None,
-        signing_required: bool = False,
-    ) -> None:
+    def __init__(self, uow: LedgerUnitOfWork, config: LedgerConfig) -> None:
         self._uow = uow
-        self._signing = signing
-        self._public_key_path = public_key_path
-        self._signing_required = signing_required
+        key = None if config.key_path is None else str(config.key_path)
+        self._signing = SigningConfig(method="keypair", key_path=key)
+        self._public_key_path = (
+            None if config.public_key_path is None else str(config.public_key_path)
+        )
+        self._signing_required = config.required
 
     def append_decision(self, decision: Decision, repository_id: UUID) -> AppendReceipt:
         """Append the decision's event to the repository layer, then restamp and sign it."""
@@ -98,7 +104,9 @@ class LedgerService:
             document = self._document(self._uow.layers.get(layer_id))
         issues = [
             *verify_merkle_integrity(document),
-            *verify_merkle_signature(document, self._public_key_path),
+            *verify_merkle_signature(
+                document, self._public_key_path, required=self._signing_required
+            ),
         ]
         return VerifyResult(
             layer_id=layer_id,

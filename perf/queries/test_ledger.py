@@ -5,7 +5,6 @@ from __future__ import annotations
 from uuid import UUID
 
 import pytest
-from traust_ledger._internal.integrity import SigningConfig
 
 from perf.conftest import Clocked
 from perf.harness import Explained, Profile
@@ -13,9 +12,8 @@ from perf.seed import DECISIONS, HOT_REPOSITORY, TYPICAL_REPOSITORY, UNLEDGERED
 from traust_core.v1.models.findings import Decision
 from traust_core.v1.models.ledger import Event, Layer
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
-from traust_core.v1.services.ledger import LedgerService
+from traust_core.v1.services.ledger import LedgerConfig, LedgerService
 
-UNSIGNED = SigningConfig(method="keypair")
 LAYERS = {
     "hot (10k events)": (HOT_REPOSITORY, 1),
     "typical (~24)": (TYPICAL_REPOSITORY, 1 + UNLEDGERED),
@@ -35,7 +33,7 @@ def unledgered(uow: SqlTraustUnitOfWork, url: str, n: int) -> tuple[Decision, UU
 
 def append(uow: SqlTraustUnitOfWork, url: str, n: int) -> None:
     decision, repo_id = unledgered(uow, url, n)
-    LedgerService(uow, UNSIGNED).append_decision(decision, repo_id)
+    LedgerService(uow, LedgerConfig()).append_decision(decision, repo_id)
 
 
 def append_without_restamp(uow: SqlTraustUnitOfWork, url: str, n: int) -> None:
@@ -75,7 +73,7 @@ def test_verify_reads_one_layer_by_index(explained: Profile) -> None:
     def verify(uow: SqlTraustUnitOfWork) -> None:
         layer = uow.layers.find_for_update(_repo(uow, HOT_REPOSITORY))
         assert isinstance(layer, Layer) and layer.id is not None
-        LedgerService(uow, UNSIGNED).verify(layer.id)
+        LedgerService(uow, LedgerConfig()).verify(layer.id)
 
     *_, events = explained(verify)
     fast(events, "events_layer_id_seq_key", 50)

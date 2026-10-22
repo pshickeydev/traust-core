@@ -51,6 +51,7 @@ from traust_core.v1.services.findings import (
     ReviewPolicy,
     TaxonomyPolicy,
 )
+from traust_core.v1.services.ledger import LedgerService
 from traust_core.v1.services.operations import Materializer, OpsService
 from traust_core.v1.services.portfolio import (
     PortfolioPolicy,
@@ -70,6 +71,7 @@ class Services:
     findings: FindingService
     exposure: ExposureService
     ops: OpsService
+    ledger: LedgerService | None
 
 
 @dataclass(frozen=True)
@@ -164,6 +166,7 @@ class Context:
         hosts = self.config.forge_hosts
         assessment = AssessmentService(uow, clock=self.clock, hosts=hosts)
         intake = FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy())
+        ledger = None if self.config.ledger is None else LedgerService(uow, self.config.ledger)
         return Services(
             assessment=assessment,
             portfolio=PortfolioService(
@@ -177,12 +180,13 @@ class Context:
             findings=FindingService(
                 uow,
                 intake,
-                FindingDecisions(uow, None),
+                FindingDecisions(uow, ledger),
                 FindingReview(uow, ReviewPolicy()),
                 FindingPrecedents(uow),
             ),
             exposure=ExposureService(uow, intake, feeds=self.feeds, objects=self.object_store),
             ops=OpsService(uow, self.clock),
+            ledger=ledger,
         )
 
     def analysis_results(self) -> AnalysisResultsRepository:
