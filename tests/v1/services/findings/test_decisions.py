@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy.engine import Engine
@@ -13,7 +14,7 @@ from sqlalchemy.engine import Engine
 from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import Seed
 from traust_core.v1.errors import ConflictError, ForbiddenError, NotFoundError, ValidationError
-from traust_core.v1.models.findings import Decision, Disposition, Restatement
+from traust_core.v1.models.findings import Decision, Disposition, RecordDecision, Restatement
 from traust_core.v1.models.identity import IdentitySource, Principal, Role
 from traust_core.v1.models.vocabulary import ActorKind
 from traust_core.v1.providers.clock import FixedClock
@@ -188,3 +189,106 @@ def test_the_statement_key_is_the_judged_columns(engine: Engine) -> None:
     assert decisions.statement_key(same) == decisions.statement_key(wrong.model_copy())
     moved = wrong.model_copy(update={"severity": "low"})
     assert decisions.statement_key(moved) != decisions.statement_key(wrong)
+
+
+# decide: a person's direct statement
+ALICE = ADMIN.model_copy(update={"identity": "alice@example.com", "roles": frozenset()})
+BOB = ADMIN.model_copy(update={"identity": "bob@example.com", "roles": frozenset()})
+UNVERIFIED = ALICE.model_copy(update={"verified_by": None})
+
+
+def finding_id(engine: Engine) -> UUID:
+    with SqlTraustUnitOfWork(engine) as uow:
+        made = Seed(uow).finding()
+        uow.commit()
+    assert made.id is not None
+    return made.id
+
+
+def say(finding: UUID, **kw: Any) -> RecordDecision:
+    return RecordDecision(
+        finding_id=finding, **{"validity": "confirmed", "rationale": "reproduced it", **kw}
+    )
+
+
+def test_a_statement_is_recorded_as_its_authors_decision(engine: Engine) -> None:
+    finding = finding_id(engine)
+    made = service(engine, ledger=True).decide(say(finding, source_channel="jira"), ALICE)
+    assert (made.actor, made.validity, made.source_channel, made.occurred_at) == (
+        "human:alice@example.com",
+        "confirmed",
+        "jira",
+        NOW,
+    )
+    assert made.statement_key == service(engine).statement_key(made)
+    with SqlTraustUnitOfWork(engine) as uow:
+        assert uow.events.find_by_decision(made.id) is not None
+
+
+def test_a_retried_statement_is_the_same_decision(engine: Engine) -> None:
+    finding = finding_id(engine)
+    first = service(engine, ledger=True).decide(say(finding, occurred_at=NOW), ALICE)
+    again = service(engine, ledger=True).decide(say(finding, occurred_at=NOW), ALICE)
+    changed = service(engine).decide(say(finding, occurred_at=NOW, severity="low"), ALICE)
+    assert again == first
+    assert history(engine, first) == [first, changed]
+
+
+@pytest.mark.parametrize(
+    ("who", "change", "error"),
+    [
+        (ALICE, {"rationale": "short"}, ValidationError),
+        (ALICE, {"occurred_at": NOW + timedelta(days=2)}, ValidationError),
+        (ALICE.model_copy(update={"kind": ActorKind.MACHINE}), {}, ForbiddenError),
+        (
+            ALICE.model_copy(update={"verified_by": None}),
+            {"validity": "false_positive"},
+            ForbiddenError,
+        ),
+    ],
+    ids=["short rationale", "dated ahead", "a machine", "unverified false positive"],
+)
+def test_the_statement_gates_refuse_and_write_nothing(
+    engine: Engine, who: Principal, change: dict[str, Any], error: type[Exception]
+) -> None:
+    finding = finding_id(engine)
+    with pytest.raises(error):
+        service(engine).decide(say(finding, **change), who)
+    with SqlTraustUnitOfWork(engine) as uow:
+        assert uow.decisions.list_for_finding(finding) == []
+
+
+def test_after_a_validation_proves_it_the_same_person_cannot_reassert_alone(engine: Engine) -> None:
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        finding = seed.finding()
+        proof = seed.assessment(kind="validation")
+        seed.decision(finding, actor=None, assessment_id=proof.id, validity="confirmed")
+        uow.commit()
+    assert finding.id is not None
+    first = say(finding.id, validity="false_positive")
+    assert service(engine).decide(first, ALICE).validity == "false_positive"
+    again = say(finding.id, validity="false_positive", reason="reasserted")
+    with pytest.raises(ForbiddenError, match="second verified human"):
+        service(engine).decide(again, ALICE)
+    assert service(engine).decide(again, BOB).actor == "human:bob@example.com"
+    assert service(engine).decide(first, ALICE).actor == "human:alice@example.com"
+
+
+def test_a_statement_judges_a_commit_of_the_findings_repository(engine: Engine) -> None:
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        finding = seed.finding()
+        own = seed.repository_ref(uow.repositories.get(finding.repository_id), name="dev")
+        other = seed.repository_ref(seed.repository())
+        uow.commit()
+    assert finding.id is not None
+    made = service(engine).decide(say(finding.id, repository_ref_id=own.id), ALICE)
+    assert made.repository_ref_id == own.id
+    with pytest.raises(ValidationError, match="not in finding"):
+        service(engine).decide(say(finding.id, repository_ref_id=other.id), ALICE)
+
+
+def test_a_statement_on_a_missing_finding_is_not_found(engine: Engine) -> None:
+    with pytest.raises(NotFoundError):
+        service(engine).decide(say(uuid4()), ALICE)

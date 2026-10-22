@@ -65,7 +65,21 @@ class IdentityMove(Model): ...
 class IntakeResult(Model): ...
 
 
-class RecordDecision(Model): ...
+class RecordDecision(Model):
+    """A person's direct statement on a finding (a countersign, a re-rating): what they judged."""
+
+    finding_id: UUID
+    rationale: str
+    validity: Validity | None = None
+    resolution: DispositionResolution | None = None
+    evidence_grade: EvidenceGrade | None = None
+    severity: Severity | None = None
+    reason: str | None = None
+    source_channel: SourceType | None = None
+    repository_ref_id: UUID | None = None
+    fixed_repository_ref_id: UUID | None = None
+    artifact_id: UUID | None = None
+    occurred_at: datetime | None = None
 
 
 class ReviewCase(Model): ...

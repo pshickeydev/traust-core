@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from pathlib import Path
 from uuid import UUID
 
@@ -20,7 +21,7 @@ from traust_core.v1.models.findings import (
 )
 from traust_core.v1.models.identity import Principal, Role
 from traust_core.v1.models.integrity import canonical_json, sha256_hex
-from traust_core.v1.models.vocabulary import ActorKind
+from traust_core.v1.models.vocabulary import ActorKind, SourceType
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.sources import WorkspaceFiles
 from traust_core.v1.repositories.contract import TraustUnitOfWork
@@ -28,6 +29,13 @@ from traust_core.v1.services.ledger import LedgerService
 from traust_core.v1.services.lint import Lint, LintContext, LintReport
 
 log = logging.getLogger(__name__)
+
+# NEED(assessment-kind): contracts names the assessment kinds; validation and verification are
+# the ones evidence precedence reads (every other kind is static, as triage reports were).
+_REPORT = {
+    "validation": SourceType.VALIDATION_REPORT,
+    "verification": SourceType.VERIFICATION_REPORT,
+}
 
 _JUDGED = (
     "finding_id",
@@ -62,8 +70,44 @@ class FindingDecisions:
         self._clock = clock
         self._restatement_approvers = restatement_approvers
 
-    def decide(self, command: RecordDecision) -> Disposition:
-        raise NotImplementedError("stub: replaces emit_*_ledger_events.py, ledger event_handler")
+    def decide(self, command: RecordDecision, principal: Principal) -> Decision:
+        """A person's statement, if they may make it; a retried statement is the same decision."""
+        with self._uow as uow:
+            finding = uow.findings.get(command.finding_id)
+            if command.repository_ref_id is not None:
+                judged = uow.repository_refs.get(command.repository_ref_id)
+                if judged.repository_id != finding.repository_id:
+                    raise ValidationError(
+                        f"commit {judged.id} is not in finding {finding.id}'s repository"
+                    )
+            now = self._clock.now()
+            draft = Decision(
+                **command.model_dump(exclude={"occurred_at"}),
+                actor=principal.ref,
+                occurred_at=command.occurred_at or now,
+                statement_key="pending",
+            )
+            draft = draft.model_copy(update={"statement_key": self.statement_key(draft)})
+            same = uow.decisions.find_by_statement(finding.id, draft.statement_key)
+            if same is not None:
+                return same
+            history = uow.decisions.list_for_finding(finding.id)
+            Disposition.admit(history, draft, principal, now, self._sources(history))
+            saved = uow.decisions.add(draft)
+            if self._ledger is not None:
+                self._ledger.append_decision(saved, finding.repository_id)
+            uow.commit()
+        log.info("decision %s on finding %s by %s", saved.id, finding.id, principal.ref)
+        return saved
+
+    def _sources(self, history: Sequence[Decision]) -> dict[UUID, SourceType]:
+        """Each assessor's report kind, which tells execution proof from static review."""
+        ids = {d.assessment_id for d in history if d.assessment_id}
+        return {
+            a.id: _REPORT[a.kind]
+            for a in self._uow.assessments.list_by_ids(ids)
+            if a.id and a.kind in _REPORT
+        }
 
     def statement_key(self, decision: Decision) -> StatementKey:
         """The hash of every judged column: a retried statement is the same decision."""
