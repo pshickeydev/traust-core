@@ -4,7 +4,7 @@ traust-contracts is a pinned dependency. Read its data only through `traust_core
 
 Bump the pin:
 
-1. Change the `rev` for `traust-contracts` under `[tool.uv.sources]` in `pyproject.toml`.
+1. Change the commit in the `traust-contracts @ git+…@<sha>` line of `[project] dependencies` in `pyproject.toml` (a direct reference, so traust and traust-engine get the same pin through core; the ledger pin works the same way).
 2. `uv sync`, then `make test`; fix any artifact type or repository the tests flag.
 
 Write (exact):

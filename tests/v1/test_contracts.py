@@ -1,3 +1,4 @@
+import re
 import tomllib
 from pathlib import Path
 
@@ -12,9 +13,11 @@ from traust_core.v1.repositories import create_database_engine
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def test_contracts_dependency_is_pinned_to_a_commit() -> None:
-    source = tomllib.loads((ROOT / "pyproject.toml").read_text())["tool"]["uv"]["sources"]
-    assert len(source["traust-contracts"]["rev"]) == 40
+@pytest.mark.parametrize("name", ["traust-contracts", "traust-ledger"])
+def test_contracts_dependency_is_pinned_to_a_commit(name: str) -> None:
+    deps = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]["dependencies"]
+    pin = next(d for d in deps if d.startswith(f"{name} @ git+"))
+    assert re.fullmatch(r"[0-9a-f]{40}", pin.rsplit("@", 1)[1])
 
 
 def test_schema_gate_is_exact_and_reports_paths() -> None:
