@@ -7,8 +7,10 @@ from functools import cached_property
 from pathlib import Path
 from typing import Any, TypeVar
 
+import sqlalchemy as sa
 from sqlalchemy.engine import Engine
 
+from traust_core.v1 import contracts
 from traust_core.v1.context.config import Config
 from traust_core.v1.context.designations import load_designations
 from traust_core.v1.context.observation import command_source
@@ -23,6 +25,7 @@ from traust_core.v1.repositories import (
     LocalObjectStore,
     ObjectStore,
     UnitOfWork,
+    apply_schema,
     create_database_engine,
 )
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
@@ -45,7 +48,7 @@ from traust_core.v1.services.findings import (
     ReviewPolicy,
     TaxonomyPolicy,
 )
-from traust_core.v1.services.operations import Materializer
+from traust_core.v1.services.operations import Materializer, OpsService
 from traust_core.v1.services.portfolio import (
     PortfolioPolicy,
     PortfolioService,
@@ -57,7 +60,12 @@ U = TypeVar("U", bound=UnitOfWork)
 
 # NEED(direction): the REST API is a thin adapter over Services, and the SDK becomes a
 # framework (prepare -> run skill -> record) on top of that REST API, not thin wrappers.
-class Services: ...
+@dataclass(frozen=True)
+class Services:
+    assessment: AssessmentService
+    portfolio: PortfolioService
+    findings: FindingService
+    ops: OpsService
 
 
 @dataclass(frozen=True)
@@ -105,7 +113,13 @@ class Context:
 
     @cached_property
     def database(self) -> Engine:
-        return create_database_engine(self.config.database.engine_url())
+        local = self.config.database.url is None
+        if local:
+            self.config.home.mkdir(parents=True, exist_ok=True)
+        engine = create_database_engine(self.config.record_store_url())
+        if local and not sa.inspect(engine).get_table_names():
+            apply_schema(engine, contracts.database_ddl(Dialect.of(engine)))
+        return engine
 
     @cached_property
     def dialect(self) -> Dialect:
@@ -130,7 +144,30 @@ class Context:
         )
 
     def services(self) -> Services:
-        raise NotImplementedError("stub: composition root; wires every API service")
+        return self._wire(SqlTraustUnitOfWork(self.database), PortfolioPolicy())
+
+    def _wire(self, uow: SqlTraustUnitOfWork, policy: PortfolioPolicy) -> Services:
+        hosts = self.config.forge_hosts
+        assessment = AssessmentService(uow, clock=self.clock, hosts=hosts)
+        return Services(
+            assessment=assessment,
+            portfolio=PortfolioService(
+                uow,
+                policy,
+                assessment=assessment,
+                sources=command_source(hosts, clock=self.clock),
+                clock=self.clock,
+                hosts=hosts,
+            ),
+            findings=FindingService(
+                uow,
+                FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy()),
+                FindingDecisions(uow, None),
+                FindingReview(uow, ReviewPolicy()),
+                FindingPrecedents(uow),
+            ),
+            ops=OpsService(uow, self.clock),
+        )
 
     def analysis_results(self) -> AnalysisResultsRepository:
         return AnalysisResultsRepository(self.object_store, ARTIFACT_FOR_KIND)
@@ -149,29 +186,14 @@ class Context:
         """
         policy = PortfolioPolicy()
         with SqlTraustUnitOfWork(self.database) as uow:
-            assessment = AssessmentService(uow, clock=self.clock, hosts=self.config.forge_hosts)
-            service = PortfolioService(
-                uow,
-                policy,
-                assessment=assessment,
-                sources=command_source(self.config.forge_hosts, clock=self.clock),
-                clock=self.clock,
-                hosts=self.config.forge_hosts,
-            )
-            findings = FindingService(
-                uow,
-                FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy()),
-                FindingDecisions(uow, None),
-                FindingReview(uow, ReviewPolicy()),
-                FindingPrecedents(uow),
-            )
+            services = self._wire(uow, policy)
             query = RepoStateQuery(
-                service,
-                assessment,
-                findings,
+                services.portfolio,
+                services.assessment,
+                services.findings,
                 policy,
                 designations=load_designations(designations) if designations is not None else (),
                 clock=self.clock,
                 hosts=self.config.forge_hosts,
             )
-            yield _Observation(service=service, query=query)
+            yield _Observation(service=services.portfolio, query=query)

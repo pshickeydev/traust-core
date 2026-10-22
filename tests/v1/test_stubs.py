@@ -88,5 +88,5 @@ def test_stub_signature_is_fully_typed(stub: tuple[str, Any]) -> None:
 
 def test_every_domain_has_stubs() -> None:
     roles = {owner.split(".")[2] for owner, _ in STUBS}
-    assert {"models", "services", "context"} <= roles
+    assert {"models", "services"} <= roles
     assert "repositories" not in roles  # one real repository per contract table, no stubs

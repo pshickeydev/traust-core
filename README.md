@@ -83,7 +83,7 @@ traust, traust-engine and traust-ledger import core and call services in-process
 | Config | `artifacts.path` only | + `database.url` (Postgres), object store |
 | `ArtifactPublisher.publish` | validate → files | validate → files → `artifact` row |
 
-The database schema is created from the traust-contracts DDL by whoever provisions the database (`apply_schema(engine, contracts.database_ddl(dialect))`); traust-core reads and writes rows. Contracts owns and tests the schema; core tests repository behaviour.
+With no `database.url`, `Context` keeps the record store in SQLite at `<home>/traust.db` (`home` defaults to `~/.traust`) and creates the schema from the traust-contracts DDL on first use. A configured `database.url` is never touched: whoever provisions it creates the schema (`apply_schema(engine, contracts.database_ddl(dialect))`). `ctx.services()` builds every service over one shared unit of work. Contracts owns and tests the schema; core tests repository behaviour.
 
 ## Usage
 
