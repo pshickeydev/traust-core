@@ -29,6 +29,8 @@ OWNERSHIP = TableSpec(
 
 
 class OwnershipRepository(MutableRecordRepository[Ownership], Protocol):
+    def get_or_add(self, record: Ownership) -> Ownership: ...
+    def find_current(self, repository_id: UUID, team_id: UUID) -> Ownership | None: ...
     def current(self, repository_id: UUID) -> list[Ownership]: ...
     def as_of(self, repository_id: UUID, at: datetime) -> list[Ownership]: ...
     def list_for_team(self, team_id: UUID) -> list[Ownership]: ...
@@ -37,6 +39,23 @@ class OwnershipRepository(MutableRecordRepository[Ownership], Protocol):
 class SqlOwnershipRepository(SqlMutableRepository[Ownership]):
     spec = OWNERSHIP
     record = Ownership
+
+    def get_or_add(self, record: Ownership) -> Ownership:
+        return self._get_or_add(
+            record,
+            ("repository_id", "team_id"),
+            lambda: self.find_current(record.repository_id, record.team_id),
+            index_where=self.table.c.valid_to.is_(None),
+        )
+
+    def find_current(self, repository_id: UUID, team_id: UUID) -> Ownership | None:
+        c = self.table.c
+        return self._one(
+            f"current for {repository_id}/{team_id}",
+            c.repository_id == repository_id,
+            c.team_id == team_id,
+            c.valid_to.is_(None),
+        )
 
     def current(self, repository_id: UUID) -> list[Ownership]:
         c = self.table.c

@@ -3,7 +3,9 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
+from datetime import datetime
 from urllib.parse import urlsplit
+from uuid import UUID
 
 from traust_core.v1.errors import ValidationError
 
@@ -12,6 +14,21 @@ from traust_core.v1.errors import ValidationError
 _SHA = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 _CVE = re.compile(r"CVE-\d{4}-\d{4,}")
 _PATH_SEGMENT = re.compile(r"[A-Za-z0-9._-]+")
+
+
+def require_nonblank(value: str, field: str) -> None:
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError(f"{field} must be nonblank text")
+
+
+def require_uuid(value: UUID, field: str) -> None:
+    if not isinstance(value, UUID):
+        raise ValidationError(f"{field} must be a UUID")
+
+
+def require_aware_datetime(value: datetime, field: str) -> None:
+    if not isinstance(value, datetime) or value.utcoffset() is None:
+        raise ValidationError(f"{field} must be a timezone-aware datetime")
 
 
 @dataclass(frozen=True, slots=True)

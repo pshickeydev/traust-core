@@ -15,12 +15,20 @@ PRODUCT = TableSpec(TRAUST, "product", lambda: (text_column("slug"), text_column
 
 
 class ProductRepository(MutableRecordRepository[Product], Protocol):
+    def get_or_add(self, record: Product) -> Product: ...
     def find_by_slug(self, slug: str) -> Product | None: ...
 
 
 class SqlProductRepository(SqlMutableRepository[Product]):
     spec = PRODUCT
     record = Product
+
+    def get_or_add(self, record: Product) -> Product:
+        return self._get_or_add(
+            record,
+            ("slug",),
+            lambda: self.find_by_slug(record.slug),
+        )
 
     def find_by_slug(self, slug: str) -> Product | None:
         return self._one(f"find {slug}", self.table.c.slug == slug)

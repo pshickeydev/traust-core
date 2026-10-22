@@ -18,6 +18,7 @@ COMPONENT = TableSpec(
 
 
 class ComponentRepository(MutableRecordRepository[Component], Protocol):
+    def get_or_add(self, record: Component) -> Component: ...
     def find(self, release_id: UUID, repository_ref_id: UUID) -> Component | None: ...
     def list_for_release(self, release_id: UUID) -> list[Component]: ...
     def list_for_ref(self, repository_ref_id: UUID) -> list[Component]: ...
@@ -26,6 +27,13 @@ class ComponentRepository(MutableRecordRepository[Component], Protocol):
 class SqlComponentRepository(SqlMutableRepository[Component]):
     spec = COMPONENT
     record = Component
+
+    def get_or_add(self, record: Component) -> Component:
+        return self._get_or_add(
+            record,
+            ("release_id", "repository_ref_id"),
+            lambda: self.find(record.release_id, record.repository_ref_id),
+        )
 
     def find(self, release_id: UUID, repository_ref_id: UUID) -> Component | None:
         c = self.table.c

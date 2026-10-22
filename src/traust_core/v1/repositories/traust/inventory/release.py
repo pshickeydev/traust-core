@@ -17,6 +17,7 @@ RELEASE = TableSpec(TRAUST, "release", lambda: (uuid_column("product_id"), text_
 
 
 class ReleaseRepository(MutableRecordRepository[Release], Protocol):
+    def get_or_add(self, record: Release) -> Release: ...
     def find(self, product_id: UUID, version: str) -> Release | None: ...
     def list_for_product(self, product_id: UUID) -> list[Release]: ...
 
@@ -24,6 +25,13 @@ class ReleaseRepository(MutableRecordRepository[Release], Protocol):
 class SqlReleaseRepository(SqlMutableRepository[Release]):
     spec = RELEASE
     record = Release
+
+    def get_or_add(self, record: Release) -> Release:
+        return self._get_or_add(
+            record,
+            ("product_id", "version"),
+            lambda: self.find(record.product_id, record.version),
+        )
 
     def find(self, product_id: UUID, version: str) -> Release | None:
         c = self.table.c
