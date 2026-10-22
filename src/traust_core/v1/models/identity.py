@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from enum import StrEnum
-from uuid import UUID
+
+import pydantic
 
 from traust_core.v1.models.base import Model
 from traust_core.v1.models.vocabulary import ActorKind
@@ -21,7 +22,7 @@ class IdentitySource(StrEnum):
 
 
 class Principal(Model):
-    id: UUID
+    identity: str
     kind: ActorKind
     display: str
     verified_by: IdentitySource | None = None
@@ -29,8 +30,8 @@ class Principal(Model):
 
     @property
     def ref(self) -> str:
-        """The principal id rows store (`requested_by`, `actor`): `<kind>:<id>`."""
-        return f"{self.kind}:{self.id}"
+        """What rows store as the actor (`requested_by`, `actor`): `<kind>:<verified identity>`."""
+        return f"{self.kind}:{self.identity}"
 
     def is_verified_human(self) -> bool:
         """A person whose identity a trusted source proved (verified_by is set only then)."""
@@ -40,8 +41,25 @@ class Principal(Model):
         return self.is_verified_human() and role in self.roles
 
 
-# Shapes land with caller identity.
-class Credential(Model): ...
+LOCAL_ISSUER = "local"
 
 
-class DirectoryStatus(Model): ...
+class TrustedIssuer(Model):
+    """An OIDC issuer whose tokens the deployment accepts; audience pins tokens to traust."""
+
+    issuer: str
+    jwks_url: str
+    audience: str | None = None
+
+
+class Credential(Model):
+    token: pydantic.SecretStr
+
+
+class DirectoryStatus(Model):
+    identity: str
+    status: str
+
+    @property
+    def active(self) -> bool:
+        return self.status == "active"

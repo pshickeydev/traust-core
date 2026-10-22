@@ -21,7 +21,7 @@ FP, CONFIRMED = "false_positive", "confirmed"
 
 def person(verified: bool = True, kind: str = "human") -> Principal:
     return Principal(
-        id=uuid4(),
+        identity=f"{uuid4()}@example.com",
         kind=ActorKind(kind),
         display="p",
         verified_by=IdentitySource.OIDC if verified else None,
