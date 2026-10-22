@@ -37,7 +37,7 @@ jobs:
         with:
           enable-cache: true
           python-version: ${{ matrix.python-version }}
-      - uses: sigstore/cosign-installer@v4   # cosign 3: the ledger signs layer roots with a keypair
+      - uses: sigstore/cosign-installer@v4.1.2   # cosign 3: the ledger signs layer roots with a keypair
       - run: uv sync --frozen
       - run: make coverage   # same tests as make test, fails under 80% (pyproject fail_under)
 
@@ -66,7 +66,7 @@ jobs:
         with:
           enable-cache: true
           python-version: "3.12"
-      - uses: sigstore/cosign-installer@v4
+      - uses: sigstore/cosign-installer@v4.1.2
       - run: uv sync --frozen --extra postgres
       - run: make test-integration
 
