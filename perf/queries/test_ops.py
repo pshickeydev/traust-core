@@ -6,7 +6,8 @@ from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 from perf.harness import Explained, Profile
-from traust_core.v1.models.operations import OrderState
+from traust_core.v1.models.common import TimeWindow
+from traust_core.v1.models.operations import LaneName, OrderState, SpendDimension, SpendFilter
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 
 NOW = datetime.now(UTC)
@@ -59,3 +60,29 @@ def _any_batch(uow: SqlTraustUnitOfWork) -> UUID:
     batch = uow.run_batches.find("drain_tranche", "2026-W01")
     assert batch is not None and batch.id is not None
     return batch.id
+
+
+MONTH = TimeWindow.month_of(NOW)
+
+
+def test_month_to_date_spend_reads_the_window_by_index(explained: Profile) -> None:
+    (total,) = explained(lambda uow: uow.spend_events.sum_by(SpendFilter(window=MONTH)))
+    fast(total, "idx_ops_spend_event_occurred", 200)
+
+
+def test_a_lanes_month_to_date_spend_reads_its_lane_by_index(explained: Profile) -> None:
+    lane = SpendFilter(window=MONTH, lane=LaneName("full-audit"))
+    (total,) = explained(lambda uow: uow.spend_events.sum_by(lane))
+    fast(total, "idx_ops_spend_event_lane_occurred", 100)
+
+
+def test_spend_by_lane_and_by_month(explained: Profile) -> None:
+    (by_lane,) = explained(
+        lambda uow: uow.spend_events.sum_by(SpendFilter(window=MONTH), SpendDimension.LANE)
+    )
+    fast(by_lane, "idx_ops_spend_event_occurred", 500)
+    year = TimeWindow(start=NOW - timedelta(days=365), end=NOW)
+    (by_month,) = explained(
+        lambda uow: uow.spend_events.sum_by(SpendFilter(window=year), SpendDimension.MONTH)
+    )
+    assert by_month.execution_ms < 2000, by_month.plan

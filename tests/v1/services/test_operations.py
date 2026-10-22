@@ -1,11 +1,13 @@
-"""OpsService order lifecycle on SQLite and Postgres: submit, claim, heartbeat, complete,
-approve, requeue."""
+"""OpsService order lifecycle (submit, claim, heartbeat, complete, approve, requeue) and
+SpendService rollups and budget verdicts, on SQLite and Postgres."""
 
 from __future__ import annotations
 
+import logging
 import threading
 from collections.abc import Iterator
 from datetime import timedelta
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -15,20 +17,26 @@ from sqlalchemy.engine import Engine
 
 from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import T0, Seed
-from traust_core.v1.errors import ConflictError, NotFoundError
-from traust_core.v1.models.common import Principal
+from traust_core.v1.errors import ConfigError, ConflictError, NotFoundError
+from traust_core.v1.models.common import Principal, TimeWindow
 from traust_core.v1.models.operations import (
+    Budget,
+    BudgetStatus,
     JobResult,
+    LaneName,
     OrderRequest,
     OrderState,
     Outcome,
     RunOrder,
+    SpendDimension,
+    SpendEvent,
+    SpendFilter,
     WorkerId,
 )
-from traust_core.v1.models.vocabulary import ActorKind
+from traust_core.v1.models.vocabulary import ActorKind, BudgetEnforcement
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
-from traust_core.v1.services.operations import OpsService
+from traust_core.v1.services.operations import OpsService, SpendService
 
 LEASE = timedelta(minutes=5)
 W1, W2 = WorkerId("w1"), WorkerId("w2")
@@ -230,3 +238,136 @@ def test_ten_concurrent_claimers_never_lease_the_same_order(engine: Engine) -> N
     claimed = [o.id for o in got if o is not None]
     assert sorted(map(str, claimed)) == sorted(map(str, orders))
     assert got.count(None) == 3
+
+
+AUDIT = LaneName("full-audit")
+OCTOBER = TimeWindow.month_of(T0)
+
+
+def spend(engine: Engine, *budgets: Budget, at: timedelta = timedelta()) -> SpendService:
+    return SpendService(SqlTraustUnitOfWork(engine), FixedClock(T0 + at), budgets)
+
+
+def audit_budget(enforcement: str, monthly: str = "10") -> Budget:
+    return Budget(
+        lane=AUDIT, monthly_usd=Decimal(monthly), enforcement=BudgetEnforcement(enforcement)
+    )
+
+
+def spent(engine: Engine, usd: str, lane: str | None = AUDIT, **kw: Any) -> SpendEvent:
+    order = seeded(engine, lane=lane) if lane else None
+    values = {"provider": "anthropic", "model": "claude", "tokens_in": 100, "tokens_out": 20}
+    event = SpendEvent(
+        **{**values, "occurred_at": T0, **kw},
+        run_order_id=order.id if order else None,
+        cost_usd=Decimal(usd),
+    )
+    return spend(engine).record(event)
+
+
+def test_record_saves_spend_with_database_identity(engine: Engine) -> None:
+    saved = spent(engine, "1.25")
+    assert saved.id is not None and saved.created_at is not None
+    with SqlTraustUnitOfWork(engine) as uow:
+        assert uow.spend_events.get(saved.id) == saved
+
+
+def test_record_stamps_the_orders_lane(engine: Engine) -> None:
+    assert (spent(engine, "1.00").lane, spent(engine, "1.00", lane=None).lane) == (AUDIT, None)
+    order = seeded(engine, lane="diff-scan")
+    claimed = SpendEvent(
+        run_order_id=order.id,
+        lane="full-audit",
+        provider="anthropic",
+        model="claude",
+        tokens_in=1,
+        tokens_out=1,
+        cost_usd=Decimal("0.01"),
+        occurred_at=T0,
+    )
+    assert spend(engine).record(claimed).lane == "diff-scan"
+
+
+def test_summary_rolls_up_by_lane(engine: Engine) -> None:
+    spent(engine, "2.00")
+    spent(engine, "0.50", lane="diff-scan")
+    spent(engine, "0.25", lane=None)
+    rollups = spend(engine).summary(SpendFilter(window=OCTOBER), SpendDimension.LANE)
+    assert [(r.key, r.cost_usd) for r in rollups] == [
+        ("diff-scan", Decimal("0.50")),
+        ("full-audit", Decimal("2.00")),
+        (None, Decimal("0.25")),
+    ]
+
+
+def test_attribution_splits_spend_without_losing_any(engine: Engine) -> None:
+    spent(engine, "3.00")
+    spent(engine, "0.75", lane=None)
+    spent(engine, "9.00", occurred_at=OCTOBER.end)
+    split = spend(engine).attribute(OCTOBER)
+    assert (split.attributed_usd, split.unattributed_usd) == (Decimal("3.00"), Decimal("0.75"))
+    (total,) = spend(engine).summary(SpendFilter(window=OCTOBER), SpendDimension.MONTH)
+    assert split.total_usd == total.cost_usd
+
+
+def test_attribution_of_an_empty_window_is_zero_measured_spend(engine: Engine) -> None:
+    split = spend(engine).attribute(OCTOBER)
+    assert (split.attributed_usd, split.unattributed_usd) == (Decimal(0), Decimal(0))
+
+
+@pytest.mark.parametrize(
+    ("estimate", "status"),
+    [("1.99", BudgetStatus.WITHIN), ("2.01", BudgetStatus.OVER)],
+)
+def test_check_budget_judges_month_to_date_lane_spend(
+    engine: Engine, estimate: str, status: BudgetStatus
+) -> None:
+    spent(engine, "8.00")
+    spent(engine, "50.00", lane="diff-scan")
+    spent(engine, "50.00", lane=None)
+    spent(engine, "50.00", occurred_at=OCTOBER.start - timedelta(microseconds=1000))
+    verdict = spend(engine, audit_budget("advisory")).check_budget(AUDIT, Decimal(estimate))
+    assert (verdict.status, verdict.spent_usd, verdict.budget_usd) == (
+        status,
+        Decimal("8.00"),
+        Decimal("10"),
+    )
+
+
+def test_check_budget_uses_the_clocks_month(engine: Engine) -> None:
+    spent(engine, "8.00")
+    november = OCTOBER.end - T0
+    verdict = spend(engine, audit_budget("advisory"), at=november).check_budget(AUDIT, Decimal(5))
+    assert (verdict.status, verdict.spent_usd) == (BudgetStatus.WITHIN, Decimal(0))
+
+
+@pytest.mark.parametrize("enforcement", ["none", "observe"])
+def test_check_budget_never_binds_outside_enforcement(engine: Engine, enforcement: str) -> None:
+    spent(engine, "50.00")
+    verdict = spend(engine, audit_budget(enforcement)).check_budget(AUDIT, Decimal(1))
+    assert (verdict.status, verdict.binding) == (BudgetStatus.OVER, False)
+
+
+def test_check_budget_without_a_budget_reports_spend_and_never_binds(engine: Engine) -> None:
+    spent(engine, "50.00")
+    verdict = spend(engine).check_budget(AUDIT, None)
+    assert (verdict.status, verdict.spent_usd, verdict.enforcement, verdict.binding) == (
+        BudgetStatus.NO_BUDGET,
+        Decimal("50.00"),
+        None,
+        False,
+    )
+
+
+def test_check_budget_logs_an_overrun_as_a_warning(
+    engine: Engine, caplog: pytest.LogCaptureFixture
+) -> None:
+    spent(engine, "50.00")
+    with caplog.at_level(logging.INFO, logger="traust_core.v1.services.operations"):
+        spend(engine, audit_budget("observe")).check_budget(AUDIT, Decimal(1))
+    assert [r.levelno for r in caplog.records if "budget" in r.message] == [logging.WARNING]
+
+
+def test_two_budgets_for_one_lane_are_refused(engine: Engine) -> None:
+    with pytest.raises(ConfigError):
+        spend(engine, audit_budget("observe"), audit_budget("advisory", "20"))

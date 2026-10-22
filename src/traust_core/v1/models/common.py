@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Generic, NewType, TypeVar
 from uuid import UUID
@@ -36,6 +36,17 @@ class TimeBucket(StrEnum):
 class TimeWindow(Model):
     start: datetime
     end: datetime
+
+    @classmethod
+    def month_of(cls, at: datetime) -> TimeWindow:
+        """The UTC calendar month containing `at`, end exclusive."""
+        start = at.astimezone(UTC).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        end = (
+            start.replace(year=start.year + 1, month=1)
+            if start.month == 12
+            else start.replace(month=start.month + 1)
+        )
+        return cls(start=start, end=end)
 
 
 class ArtifactRef(Model):

@@ -10,6 +10,7 @@ from uuid import UUID
 from pydantic import Field
 
 from traust_core.v1.models.base import AppendOnly, Dto, Entity, Model
+from traust_core.v1.models.common import TimeWindow
 from traust_core.v1.models.vocabulary import BudgetEnforcement
 
 AssetName = NewType("AssetName", str)
@@ -112,19 +113,64 @@ class ThroughputPoint(Model): ...
 class SpendSource(Model): ...
 
 
-class SpendAttribution(Model): ...
+class SpendDimension(StrEnum):
+    MONTH = "month"
+    LANE = "lane"
+    PROVIDER = "provider"
+    MODEL = "model"
+    SKILL = "skill"
 
 
-class BudgetVerdict(Model): ...
+class SpendFilter(Model):
+    window: TimeWindow
+    lane: LaneName | None = None
+    attributed: bool | None = None
 
 
-class SpendFilter(Model): ...
+class SpendRollup(Model):
+    """Spend summed over one group; key is None for spend without that dimension (no lane)."""
+
+    key: str | None = None
+    events: int
+    tokens_in: int
+    tokens_out: int
+    cost_usd: Decimal
 
 
-class SpendDimension(Model): ...
+class SpendAttribution(Model):
+    window: TimeWindow
+    attributed_usd: Decimal
+    unattributed_usd: Decimal
+
+    @property
+    def total_usd(self) -> Decimal:
+        return self.attributed_usd + self.unattributed_usd
 
 
-class SpendRollup(Model): ...
+class BudgetStatus(StrEnum):
+    WITHIN = "within"
+    OVER = "over"
+    NO_BUDGET = "no_budget"
+
+
+class BudgetVerdict(Model):
+    """One lane's month-to-date spend plus an estimate, judged against its budget."""
+
+    lane: LaneName
+    status: BudgetStatus
+    enforcement: BudgetEnforcement | None = None
+    spent_usd: Decimal
+    estimate_usd: Decimal | None
+    budget_usd: Decimal | None = None
+
+    @property
+    def binding(self) -> bool:
+        """Admission may withhold: over, enforcing, and the cost is known."""
+        return (
+            self.status is BudgetStatus.OVER
+            and self.enforcement in (BudgetEnforcement.ADVISORY, BudgetEnforcement.ENFORCED)
+            and self.estimate_usd is not None
+        )
 
 
 class StaleItem(Model): ...
@@ -162,6 +208,7 @@ class SpendEvent(AppendOnly):
     provider: str
     model: str
     skill: str | None = None
+    lane: str | None = None
     tokens_in: int
     tokens_out: int
     cost_usd: Decimal
@@ -187,5 +234,14 @@ class Budget(Model):
     monthly_usd: Decimal
     enforcement: BudgetEnforcement
 
-    def verdict(self, spent: Decimal, estimate: Decimal) -> BudgetVerdict:
-        raise NotImplementedError("stub: replaces budget_shadow.shadow_verdict")
+    def verdict(self, spent: Decimal, estimate: Decimal | None) -> BudgetVerdict:
+        # Unknown cost is judged on measured spend alone, and `binding` stays false.
+        projected = spent if estimate is None else spent + estimate
+        return BudgetVerdict(
+            lane=self.lane,
+            status=BudgetStatus.OVER if projected > self.monthly_usd else BudgetStatus.WITHIN,
+            enforcement=self.enforcement,
+            spent_usd=spent,
+            estimate_usd=estimate,
+            budget_usd=self.monthly_usd,
+        )
