@@ -13,11 +13,13 @@ from sqlalchemy.engine import Engine
 from traust_core.v1 import contracts
 from traust_core.v1.context.config import Config
 from traust_core.v1.context.designations import load_designations
+from traust_core.v1.context.feeds import load_file_feeds
 from traust_core.v1.context.observation import command_source
 from traust_core.v1.models.artifacts import ARTIFACT_FOR_KIND
 from traust_core.v1.providers.base import ProviderRegistry
 from traust_core.v1.providers.clock import Clock, SystemClock
 from traust_core.v1.providers.feeds import FeedProvider
+from traust_core.v1.providers.http import HttpFetcher, RetryPolicy
 from traust_core.v1.providers.process import ProcessRunner
 from traust_core.v1.providers.sources import SourceProvider
 from traust_core.v1.providers.tools import ToolProvider
@@ -38,6 +40,7 @@ from traust_core.v1.services.artifact_publishing import (
     SqlArtifactIndex,
 )
 from traust_core.v1.services.assessment import AssessmentService
+from traust_core.v1.services.exposure import ExposureService
 from traust_core.v1.services.findings import (
     FindingDecisions,
     FindingIntake,
@@ -65,6 +68,7 @@ class Services:
     assessment: AssessmentService
     portfolio: PortfolioService
     findings: FindingService
+    exposure: ExposureService
     ops: OpsService
 
 
@@ -91,7 +95,7 @@ class Context:
         self._process = process
         self.tools: ProviderRegistry[ToolProvider[Any]] = ProviderRegistry("tool")
         self.sources: ProviderRegistry[SourceProvider] = ProviderRegistry("source")
-        self.feeds: ProviderRegistry[FeedProvider[Any]] = ProviderRegistry("feed")
+        self.feeds: ProviderRegistry[FeedProvider] = ProviderRegistry("feed")
         self.assets: ProviderRegistry[Materializer] = ProviderRegistry("asset")
 
     @classmethod
@@ -110,6 +114,16 @@ class Context:
         return ProcessRunner(
             cfg.allowed_binaries, keep_env=cfg.keep_env, timeout_seconds=cfg.timeout_seconds
         )
+
+    @cached_property
+    def http(self) -> HttpFetcher:
+        policy = RetryPolicy(**self.config.http.model_dump())
+        return HttpFetcher("traust-core", policy, clock=self.clock)
+
+    def register_feeds(self, registry: Path) -> None:
+        """Register a provider for each single-file feed in the feeds registry YAML."""
+        for feed in load_file_feeds(registry, http=self.http, clock=self.clock):
+            self.feeds.register(feed.name, lambda feed=feed: feed)
 
     @cached_property
     def database(self) -> Engine:
@@ -149,6 +163,7 @@ class Context:
     def _wire(self, uow: SqlTraustUnitOfWork, policy: PortfolioPolicy) -> Services:
         hosts = self.config.forge_hosts
         assessment = AssessmentService(uow, clock=self.clock, hosts=hosts)
+        intake = FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy())
         return Services(
             assessment=assessment,
             portfolio=PortfolioService(
@@ -161,11 +176,12 @@ class Context:
             ),
             findings=FindingService(
                 uow,
-                FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy()),
+                intake,
                 FindingDecisions(uow, None),
                 FindingReview(uow, ReviewPolicy()),
                 FindingPrecedents(uow),
             ),
+            exposure=ExposureService(uow, intake, feeds=self.feeds, objects=self.object_store),
             ops=OpsService(uow, self.clock),
         )
 

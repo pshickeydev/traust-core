@@ -25,18 +25,59 @@ from traust_core.v1.models.dependencies import (
     Version,
     VexStatus,
 )
-from traust_core.v1.providers.feeds import FeedStatus
+from traust_core.v1.models.integrity import sha256_hex
+from traust_core.v1.models.operations import FeedSnapshot
+from traust_core.v1.providers.base import ProviderRegistry
+from traust_core.v1.providers.feeds import FeedProvider, FeedStatus, validate_payload
 from traust_core.v1.repositories.contract import TraustUnitOfWork
+from traust_core.v1.repositories.objects import ObjectKey, ObjectStore
+from traust_core.v1.services.artifact_publishing import record_artifact
 from traust_core.v1.services.findings.intake import FindingIntake
+
+FEED_ARTIFACT_KIND = "feed"
 
 
 class ExposureService:
-    def __init__(self, uow: TraustUnitOfWork, intake: FindingIntake) -> None:
+    def __init__(
+        self,
+        uow: TraustUnitOfWork,
+        intake: FindingIntake,
+        *,
+        feeds: ProviderRegistry[FeedProvider],
+        objects: ObjectStore,
+    ) -> None:
         self._uow = uow
         self._intake = intake
+        self._feeds = feeds
+        self._objects = objects
 
-    def refresh_feed(self, feed: FeedName) -> FeedStatus:
-        raise NotImplementedError("stub: replaces fetch_feeds.py, registry/feeds.py")
+    def refresh_feed(self, feed: FeedName, run_order_id: UUID | None = None) -> FeedStatus:
+        """Fetch, validate and snapshot one feed; a failed fetch raises and writes nothing."""
+        provider = self._feeds.get(feed)
+        result = provider.fetch()
+        validate_payload(result.data, provider.filename)
+        key = ObjectKey.parse(f"feeds/{feed}/{sha256_hex(result.data)}/{provider.filename}")
+        ref = self._objects.put(key, result.data)
+        with self._uow as uow:
+            artifact = record_artifact(uow, ref, FEED_ARTIFACT_KIND)
+            latest = uow.feed_snapshots.latest(feed)
+            retried = (
+                latest is not None
+                and latest.artifact_id == artifact.id
+                and latest.run_order_id == run_order_id
+            )
+            if not retried:
+                assert artifact.id is not None
+                uow.feed_snapshots.add(
+                    FeedSnapshot(
+                        run_order_id=run_order_id,
+                        artifact_id=artifact.id,
+                        feed=feed,
+                        retrieved_at=result.acquisition.acquired_at,
+                    )
+                )
+            uow.commit()
+        return self.feed_status(feed)
 
     def ingest_sbom(self, artifact_id: UUID) -> Sbom:
         """CycloneDX / SPDX from standard tools; deduplicated by normalized package-list digest."""
@@ -100,4 +141,8 @@ class ExposureService:
         raise NotImplementedError("stub: replaces fetch_feeds.vex_product_status")
 
     def feed_status(self, feed: FeedName) -> FeedStatus:
-        raise NotImplementedError("stub: replaces registry/feeds.feed_status")
+        max_age = self._feeds.get(feed).max_age
+        with self._uow as uow:
+            latest = uow.feed_snapshots.latest(feed)
+        fetched_at = latest.retrieved_at if latest is not None else None
+        return FeedStatus(name=feed, fetched_at=fetched_at, max_age=max_age)

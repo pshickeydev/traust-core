@@ -51,6 +51,7 @@ def test_services_share_one_unit_of_work() -> None:
             services.findings._uow,
             services.findings.intake._uow,
             services.findings.decisions._uow,
+            services.exposure._uow,
             services.ops._uow,
         )
     }

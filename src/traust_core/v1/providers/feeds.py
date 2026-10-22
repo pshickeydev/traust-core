@@ -5,14 +5,14 @@ import json
 import zlib
 from datetime import datetime, timedelta
 from pathlib import PurePosixPath
-from typing import Protocol, TypeVar
+from typing import Protocol
 
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.base import Dto
 from traust_core.v1.models.dependencies import Advisory, Package, Version
-from traust_core.v1.providers.base import Readiness, Result
-
-Rec = TypeVar("Rec", covariant=True)
+from traust_core.v1.providers.base import Acquisition, Readiness, Result
+from traust_core.v1.providers.clock import Clock
+from traust_core.v1.providers.http import HttpFetcher
 
 
 class FeedStatus(Dto):
@@ -25,16 +25,47 @@ class FeedStatus(Dto):
         return self.fetched_at is None or now - self.fetched_at > self.max_age
 
 
-class FeedProvider(Protocol[Rec]):
+class FeedProvider(Protocol):
+    """Fetches one feed's bytes; snapshots and staleness belong to feed_snapshot."""
+
     name: str
+    filename: str
+    max_age: timedelta
 
     def check(self) -> Readiness: ...
 
-    def refresh(self) -> FeedStatus: ...
+    def fetch(self) -> Result[bytes]: ...
 
-    def status(self) -> FeedStatus: ...
 
-    def read(self) -> Result[Rec]: ...
+class HttpFileFeed:
+    """A feed published as one file at a URL (EPSS, KEV)."""
+
+    def __init__(
+        self,
+        name: str,
+        url: str,
+        filename: str,
+        max_age: timedelta,
+        *,
+        http: HttpFetcher,
+        clock: Clock,
+    ) -> None:
+        self.name = name
+        self.url = url
+        self.filename = filename
+        self.max_age = max_age
+        self._http = http
+        self._clock = clock
+
+    def check(self) -> Readiness:
+        return Readiness(ready=True)
+
+    def fetch(self) -> Result[bytes]:
+        data = self._http.get(self.url)
+        acquisition = Acquisition(
+            provider=self.name, acquired_at=self._clock.now(), source=self.url
+        )
+        return Result(data, acquisition)
 
 
 class AdvisoryLookup(Protocol):

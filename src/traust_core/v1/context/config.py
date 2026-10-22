@@ -51,6 +51,16 @@ class ProcessConfig(_Model):
     timeout_seconds: float = 600.0
 
 
+class HttpConfig(_Model):
+    """Retry policy for outbound provider HTTP (RetryPolicy fields)."""
+
+    max_attempts: int = 4
+    timeout_seconds: float = 120.0
+    backoff_base_seconds: float = 1.0
+    max_wait_seconds: float = 60.0
+    jitter_seconds: float = 0.5
+
+
 # NEED(logging): one logging setup from Config — per-logger levels, JSON or text, stderr + rolling
 # file, and a correlation ID set at every entry point and carried on every line (AGENTS.md).
 # NEED(config): too busy and too clunky today. Target: one shape, one home, few keys —
@@ -61,6 +71,7 @@ class Config(_Model):
     database: DatabaseConfig = DatabaseConfig()
     artifacts: ArtifactsConfig = ArtifactsConfig()
     process: ProcessConfig = ProcessConfig()
+    http: HttpConfig = HttpConfig()
     rating: RatingConfig = RatingConfig()
     allowed_repo_hosts: tuple[str, ...] = ()
     forge_hosts: dict[str, str] = pydantic.Field(default_factory=lambda: dict(DEFAULT_FORGE_HOSTS))
