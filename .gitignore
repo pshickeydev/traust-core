@@ -10,3 +10,4 @@ dist/
 htmlcov/
 .coverage
 .coverage.*
+.perf/
