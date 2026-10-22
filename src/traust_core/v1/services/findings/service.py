@@ -49,7 +49,8 @@ class FindingService:
         raise NotImplementedError("stub: replaces vuln-scan/resolve_baseline.py, baseline_claims")
 
     def open_count(self, repository_id: UUID, severities: Sequence[Severity]) -> int:
-        raise NotImplementedError("stub: replaces traust#58 live_crit_high")
+        with self._uow as uow:
+            return uow.open_counts.open_count(repository_id, severities)
 
     def summary(self, filter: FindingFilter, group_by: FindingDimension) -> list[FindingRollup]:
         raise NotImplementedError("stub: replaces findings_summary, pattern_exposure, dashboards")

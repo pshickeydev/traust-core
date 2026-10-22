@@ -1,11 +1,13 @@
-# Tier 1: runs on every PR and on main. Red blocks merge (XWING-2207 AC#2).
-# Mirrors the Makefile so CI and local behave identically.
+# Tier 1: runs on every PR, in the merge queue, and on main and development after
+# each merge, so two PRs green on their own bases can't land red together.
+# Red blocks merge (XWING-2207 AC#2). Mirrors the Makefile so CI and local behave identically.
 name: CI
 
 on:
   pull_request:
+  merge_group:
   push:
-    branches: [main]
+    branches: [main, development]
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
