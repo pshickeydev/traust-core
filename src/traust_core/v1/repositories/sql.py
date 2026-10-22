@@ -153,7 +153,7 @@ def apply_schema(engine: Engine, statements: Iterable[str]) -> None:
 
 class SqlUnitOfWork:
     """Re-entrant: collaborating services share one instance; the outermost `with`
-    owns the connection and the rollback.
+    owns the connection, the commit and the rollback.
     """
 
     def __init__(self, engine: Engine) -> None:
@@ -196,7 +196,8 @@ class SqlUnitOfWork:
             self._connection = None
 
     def commit(self) -> None:
-        self.connection.commit()
+        if self._depth == 1:
+            self.connection.commit()
 
     def rollback(self) -> None:
         self.connection.rollback()

@@ -49,7 +49,7 @@ Python 3.11+ library. The platform API lives in `traust_core.v1`. Overview: [REA
 - `models/base.py`: `Model` (strict, internal), `Dto` (tolerant, boundary data), `Entity` (`id`, `created_at`, `updated_at` — `None` until the database saves it), `AppendOnly` (`id`, `created_at` — rows are never updated)
 - Tests mirror `src`: `tests/v1/<role>/test_<subject>.py`
 - Pack policy (routing rules, cadences, lanes, skills, CLIs) stays in traust
-- traust-core is the hub: every other traust repo depends on it, it depends on none of them. One exception: the traust-ledger client, imported only inside the ledger provider adapter (behind `LedgerClient`). traust-contracts is data, read through `traust_core.v1.contracts`
+- traust-core is the hub: every other traust repo depends on it, it depends on none of them. One exception: traust-ledger, a library of pure ledger functions (canonical bytes, Merkle, signing, verifying), imported only by `services/ledger.py`; traust-ledger never imports core. traust-contracts is data, read through `traust_core.v1.contracts`
 - HTTP is in scope, in two places only: outbound calls live inside providers (forge, feeds, advisory APIs), and the inbound REST API
 - **REST API:** a real service in front of the core services, with **no domain logic of its own** (rules live in the services, so the in-process path behaves the same). It must follow:
   - resources addressed by ID: `/findings/{finding_id}`, `/findings/{finding_id}/decisions`, `/orders/{order_id}/lease`; plural nouns, verbs only as HTTP methods

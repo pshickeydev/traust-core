@@ -283,3 +283,21 @@ def test_unit_of_work_is_reentrant(engine) -> None:
 
     with pytest.raises(RepositoryError):
         _ = first.connection
+
+
+def test_only_the_outermost_commit_commits(uow: RecordUnitOfWork) -> None:
+    with uow as outer:
+        with uow as inner:  # a collaborating service commits its part
+            saved = inner.records.add(Record(name="joined", status="open"))
+            inner.commit()
+        outer.rollback()  # the owner abandons the whole transaction
+    assert saved.id is not None
+    with uow as u, pytest.raises(NotFoundError):
+        u.records.get(saved.id)
+
+    with uow as outer:
+        with uow as inner:
+            saved = inner.records.add(Record(name="joined", status="open"))
+        outer.commit()
+    with uow as u:
+        assert u.records.get(saved.id) == saved

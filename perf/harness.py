@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from statistics import median
+from time import perf_counter
 from typing import Any
 
 import sqlalchemy as sa
@@ -68,3 +70,16 @@ def profile(engine: Engine, call: Callable[[SqlTraustUnitOfWork], object]) -> li
             call(uow)
         savepoint.rollback()
         return [explain(uow.connection, sql, params) for sql, params in issued]
+
+
+def timed(engine: Engine, call: Callable[[SqlTraustUnitOfWork], object], runs: int = 20) -> float:
+    """Median wall-clock ms of `call` (SQL and Python), each run rolled back."""
+    took = []
+    with SqlTraustUnitOfWork(engine) as uow:
+        for _ in range(runs):
+            savepoint = uow.connection.begin_nested()
+            start = perf_counter()
+            call(uow)
+            took.append((perf_counter() - start) * 1000)
+            savepoint.rollback()
+    return median(took)
