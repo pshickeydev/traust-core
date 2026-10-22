@@ -117,3 +117,10 @@ def test_resolving_a_review_item(seed: Seed) -> None:
     assert item_finding.id == item.finding_id
     assert u.review_items.pending(limit=10) == []
     assert u.review_items.get(item.id) == resolved
+
+
+def test_findings_by_ids(seed: Seed) -> None:
+    f1, f2 = seed.finding(), seed.finding()
+    seed.finding()
+    assert same_rows(seed.uow.findings.list_by_ids({f1.id, f2.id}), [f1, f2])
+    assert seed.uow.findings.list_by_ids([]) == []

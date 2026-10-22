@@ -37,6 +37,9 @@ TEAMS = 1_000
 REVISIONS_PER_REPOSITORY = 12
 RELEASES_PER_PRODUCT = 12
 OWNERSHIP_PERIODS = 10
+# A year of scans (Appendix D: ~250k occurrences): every seeded finding reported once, ten per
+# assessment; half the locations name a line range, the other half a whole file.
+FINDINGS_PER_ASSESSMENT = 10
 
 ROUTED = ("full-audit", "diff-scan", "diff-scan-quarterly", "threat-model-review", "deps-lane")
 UNROUTED = ("feeds_cache", "repo_state", "dashboards")
@@ -146,6 +149,21 @@ SEED = (
     JOIN (SELECT id, row_number() OVER (ORDER BY id) n FROM traust.team) t
         ON t.n = 1 + mod(r.n - 1, {TEAMS})
     CROSS JOIN generate_series(0, {OWNERSHIP_PERIODS - 1}) g""",
+    f"""INSERT INTO traust.assessment (repository_ref_id, kind, status, assessor, assessor_version,
+        occurred_at)
+    SELECT ref.id, 'vuln-scan', 'complete', 'vuln-scan', '1', now() - make_interval(hours => g)
+    FROM generate_series(1, {DECISIONS // FINDINGS_PER_ASSESSMENT}) g
+    JOIN (SELECT id, row_number() OVER (ORDER BY id) n FROM traust.repository_ref) ref
+        ON ref.n = g""",
+    f"""INSERT INTO traust.occurrence (finding_id, assessment_id, severity, rule)
+    SELECT f.id, a.id, 'high', 'rule-' || mod(f.n, 50)
+    FROM (SELECT id, row_number() OVER (ORDER BY id) n FROM traust.finding) f
+    JOIN (SELECT id, row_number() OVER (ORDER BY id) n FROM traust.assessment) a
+        ON a.n = 1 + (f.n - 1) / {FINDINGS_PER_ASSESSMENT}""",
+    """INSERT INTO traust.location (occurrence_id, path, line_start, line_end)
+    SELECT o.id, 'pkg/file' || g || '.go', CASE WHEN g = 1 THEN 10 END, CASE WHEN g = 1 THEN 12 END
+    FROM traust.occurrence o CROSS JOIN generate_series(1, 2) g
+    WHERE g = 1 OR mod(abs(hashtext(o.id::text)), 2) = 0""",
 )
 
 
@@ -189,6 +207,10 @@ def seeded_database(url: str) -> Engine:
                     "traust.component",
                     "traust.team",
                     "traust.ownership",
+                    "traust.finding",
+                    "traust.assessment",
+                    "traust.occurrence",
+                    "traust.location",
                 ):
                     conn.exec_driver_sql(f"VACUUM (ANALYZE) {table}")
         except BaseException:
