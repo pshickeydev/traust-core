@@ -8,12 +8,14 @@ import pytest
 import sqlalchemy as sa
 
 from tests.v1.conftest import SQL_BACKENDS, contract_db
+from tests.v1.repositories.tables.conftest import Seed
 from traust_core.v1.context import Config, Context
 from traust_core.v1.errors import ConfigError
 from traust_core.v1.models.common import Principal
 from traust_core.v1.models.operations import OrderRequest
 from traust_core.v1.models.vocabulary import ActorKind
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
+from traust_core.v1.services.ledger import LedgerConfig
 
 OPERATOR = Principal(id=uuid4(), kind=ActorKind("human"), display="operator")
 
@@ -95,3 +97,47 @@ def test_a_configured_database_is_never_bootstrapped(tmp_path: Path) -> None:
     ctx = Context(Config(home=tmp_path / "home", database={"url": url}))  # type: ignore[arg-type]
     assert sa.inspect(ctx.database).get_table_names() == []
     assert not (tmp_path / "home").exists()
+
+
+def test_no_ledger_section_leaves_the_ledger_off() -> None:
+    services = Context(Config()).services()
+    assert services.ledger is None
+    assert services.findings.decisions._ledger is None
+
+
+def test_a_ledger_section_wires_one_ledger_into_decisions(tmp_path: Path) -> None:
+    config = Config.from_file(
+        _write(
+            tmp_path,
+            f"home: {tmp_path / 'home'}\n"
+            f"ledger:\n  key_path: {tmp_path / 'cosign.key'}\n"
+            f"  public_key_path: {tmp_path / 'cosign.pub'}\n  required: true\n",
+        )
+    )
+    services = Context(config).services()
+    assert services.ledger is not None
+    assert services.findings.decisions._ledger is services.ledger
+    assert services.ledger._uow is services.findings._uow
+    assert services.ledger._signing.key_path == str(tmp_path / "cosign.key")
+    assert services.ledger._signing_required
+
+
+def test_a_typo_in_the_ledger_section_is_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError):
+        Config.from_file(_write(tmp_path, "ledger:\n  key_pth: /keys/cosign.key\n"))
+
+
+def test_a_configured_ledger_proves_a_decision(configured: Context) -> None:
+    config = configured.config.model_copy(update={"ledger": LedgerConfig()})
+    ctx = Context(config)
+    with SqlTraustUnitOfWork(ctx.database) as uow:
+        seed = Seed(uow)
+        repo, decision = seed.repository(), seed.decision()
+        uow.commit()
+    assert repo.id is not None
+    ledger = ctx.services().ledger
+    assert ledger is not None
+    receipt = ledger.append_decision(decision, repo.id)
+    assert receipt.checkpoint.layer.merkle_size == 1
+    assert receipt.checkpoint.layer.id is not None
+    assert ledger.verify(receipt.checkpoint.layer.id).passed

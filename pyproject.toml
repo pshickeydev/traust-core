@@ -28,15 +28,9 @@ dev = [
     "ruff>=0.6",
 ]
 
-[tool.uv]
-# traust-ledger pins its own traust-contracts; core's pin (the DDL core bootstraps) wins.
-override-dependencies = [
-    "traust-contracts @ git+https://github.com/traust-security/traust-contracts.git@7e06d1d25f2df846dbd2e69a935a870bbccbf441",
-]
-
 [tool.uv.sources]
 traust-contracts = { git = "https://github.com/traust-security/traust-contracts.git", rev = "7e06d1d25f2df846dbd2e69a935a870bbccbf441" }
-traust-ledger = { git = "https://github.com/traust-security/traust-ledger.git", rev = "d1b589a50f57c77852eeead7b8ae78e2701ac90f" }
+traust-ledger = { git = "https://github.com/traust-security/traust-ledger.git", rev = "7f34ff61ddd6f1b868c85cae6c5a466d3d6c6bb4" }
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/traust_core"]

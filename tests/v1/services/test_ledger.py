@@ -12,7 +12,6 @@ from uuid import UUID, uuid4
 import pytest
 import sqlalchemy as sa
 from sqlalchemy.engine import Engine
-from traust_ledger._internal.integrity import SigningConfig
 
 from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import Seed
@@ -20,9 +19,7 @@ from traust_core.v1.errors import ConflictError, NotFoundError, ServiceError, Va
 from traust_core.v1.models.findings import Decision
 from traust_core.v1.models.ledger import Event, Signing
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
-from traust_core.v1.services.ledger import LedgerService
-
-UNSIGNED = SigningConfig(method="keypair")
+from traust_core.v1.services.ledger import LedgerConfig, LedgerService
 
 
 @pytest.fixture(params=SQL_BACKENDS)
@@ -44,10 +41,8 @@ def keys(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[str, str]:
     return f"{prefix}.key", f"{prefix}.pub"
 
 
-def ledger(
-    uow: SqlTraustUnitOfWork, signing: SigningConfig = UNSIGNED, **kw: object
-) -> LedgerService:
-    return LedgerService(uow, signing, **kw)  # type: ignore[arg-type]
+def ledger(uow: SqlTraustUnitOfWork, **config: object) -> LedgerService:
+    return LedgerService(uow, LedgerConfig.model_validate(config))
 
 
 def decisions(engine: Engine, n: int) -> tuple[UUID, list[Decision]]:
@@ -208,6 +203,14 @@ def test_verify_detects_an_edited_root(engine: Engine) -> None:
     assert any("merkle_root mismatch" in e for e in service.verify(layer.id).errors)
 
 
+def test_an_unsigned_layer_fails_verify_when_signing_is_required(engine: Engine) -> None:
+    repo_id, (decision,) = decisions(engine, 1)
+    layer = ledger(SqlTraustUnitOfWork(engine)).append_decision(decision, repo_id).checkpoint.layer
+    assert layer.id is not None
+    result = ledger(SqlTraustUnitOfWork(engine), required=True).verify(layer.id)
+    assert any("absent" in e for e in result.errors)
+
+
 def test_verify_an_unknown_layer_raises(engine: Engine) -> None:
     with pytest.raises(NotFoundError):
         ledger(SqlTraustUnitOfWork(engine)).verify(uuid4())
@@ -218,7 +221,7 @@ def test_a_signed_root_verifies_with_the_public_key(engine: Engine, keys: tuple[
     repo_id, made = decisions(engine, 2)
     service = ledger(
         SqlTraustUnitOfWork(engine),
-        SigningConfig(method="keypair", key_path=private),
+        key_path=private,
         public_key_path=public,
     )
     checkpoint = [service.append_decision(d, repo_id) for d in made][-1].checkpoint
@@ -240,7 +243,7 @@ def test_a_signed_layer_without_the_public_key_does_not_pass(
     engine: Engine, keys: tuple[str, str]
 ) -> None:
     repo_id, (decision,) = decisions(engine, 1)
-    signer = ledger(SqlTraustUnitOfWork(engine), SigningConfig(method="keypair", key_path=keys[0]))
+    signer = ledger(SqlTraustUnitOfWork(engine), key_path=keys[0])
     layer = signer.append_decision(decision, repo_id).checkpoint.layer
     assert layer.id is not None
     result = signer.verify(layer.id)
@@ -252,7 +255,7 @@ def test_an_unsigned_append_drops_the_stale_signature(
     engine: Engine, keys: tuple[str, str]
 ) -> None:
     repo_id, (first, second) = decisions(engine, 2)
-    signed = ledger(SqlTraustUnitOfWork(engine), SigningConfig(method="keypair", key_path=keys[0]))
+    signed = ledger(SqlTraustUnitOfWork(engine), key_path=keys[0])
     signed.append_decision(first, repo_id)
     checkpoint = ledger(SqlTraustUnitOfWork(engine)).append_decision(second, repo_id).checkpoint
     assert checkpoint.signing is Signing.UNCONFIGURED
@@ -264,9 +267,7 @@ def test_required_signing_without_a_key_rolls_the_append_back(engine: Engine) ->
     repo_id, (decision,) = decisions(engine, 1)
     assert decision.id is not None
     with pytest.raises(ServiceError, match="not signed"):
-        ledger(SqlTraustUnitOfWork(engine), signing_required=True).append_decision(
-            decision, repo_id
-        )
+        ledger(SqlTraustUnitOfWork(engine), required=True).append_decision(decision, repo_id)
     with SqlTraustUnitOfWork(engine) as uow:
         assert uow.events.find_by_decision(decision.id) is None
         assert uow.layers.find_for_update(repo_id) is None
@@ -278,7 +279,7 @@ def test_checkpoint_signs_an_existing_layer(engine: Engine, keys: tuple[str, str
     unsigned = ledger(SqlTraustUnitOfWork(engine)).append_decision(decision, repo_id)
     signer = ledger(
         SqlTraustUnitOfWork(engine),
-        SigningConfig(method="keypair", key_path=private),
+        key_path=private,
         public_key_path=public,
     )
     checkpoint = signer.checkpoint(repo_id)

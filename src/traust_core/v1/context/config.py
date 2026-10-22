@@ -10,6 +10,7 @@ import yaml
 from traust_core.v1.errors import ConfigError
 from traust_core.v1.models.inventory import DEFAULT_FORGE_HOSTS
 from traust_core.v1.services.findings.rating import RatingConfig
+from traust_core.v1.services.ledger import LedgerConfig
 
 
 class _Model(pydantic.BaseModel):
@@ -65,7 +66,7 @@ class HttpConfig(_Model):
 # file, and a correlation ID set at every entry point and carried on every line (AGENTS.md).
 # NEED(config): too busy and too clunky today. Target: one shape, one home, few keys —
 # home dir, record store (SQLite default, Postgres optional), blob store (local dir or S3),
-# identity, ledger. Pack data (catalogs, product maps) is not config; env only for secrets.
+# identity. Pack data (catalogs, product maps) is not config; env only for secrets.
 class Config(_Model):
     home: Path = pydantic.Field(default_factory=lambda: Path.home() / ".traust")
     database: DatabaseConfig = DatabaseConfig()
@@ -73,6 +74,7 @@ class Config(_Model):
     process: ProcessConfig = ProcessConfig()
     http: HttpConfig = HttpConfig()
     rating: RatingConfig = RatingConfig()
+    ledger: LedgerConfig | None = None  # absent: no proof chain; decisions are still recorded
     allowed_repo_hosts: tuple[str, ...] = ()
     forge_hosts: dict[str, str] = pydantic.Field(default_factory=lambda: dict(DEFAULT_FORGE_HOSTS))
 
