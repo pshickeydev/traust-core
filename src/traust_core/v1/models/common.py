@@ -58,6 +58,11 @@ class Principal(Model):
     verified_by: IdentitySource | None = None
     roles: frozenset[Role] = frozenset()
 
+    @property
+    def ref(self) -> str:
+        """The principal id rows store (`requested_by`, `actor`): `<kind>:<id>`."""
+        return f"{self.kind}:{self.id}"
+
     def is_verified_human(self) -> bool:
         raise NotImplementedError(
             "stub: replaces ledger is_actor_verified / require_verified_human"

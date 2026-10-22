@@ -369,7 +369,7 @@ class Seed:
         return self._add("run_batch", self.new_run_batch(**kw))
 
     def new_run_order(self, **kw: Any) -> RunOrder:
-        values = {"lane": "audit", "state": "queued", "priority": 5, "requested_by": "user:me"}
+        values = {"asset": "audit", "state": "queued", "priority": 5, "requested_by": "user:me"}
         return RunOrder(**{**values, **kw})
 
     def run_order(self, **kw: Any) -> RunOrder:
