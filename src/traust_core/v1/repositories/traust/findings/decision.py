@@ -4,6 +4,8 @@ from datetime import datetime
 from typing import Protocol
 from uuid import UUID
 
+import sqlalchemy as sa
+
 from traust_core.v1.models.findings import Decision
 from traust_core.v1.repositories.tables import (
     TRAUST,
@@ -33,6 +35,9 @@ DECISION = TableSpec(
         text_column("severity", nullable=True),
         text_column("source_channel", nullable=True),
         text_column("actor", nullable=True),
+        text_column("rationale", nullable=True),
+        text_column("ticket", nullable=True),
+        sa.Column("auto_accept_tier", sa.Boolean, nullable=False),
         timestamp_column("occurred_at"),
     ),
     append_only=True,
