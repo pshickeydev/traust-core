@@ -11,8 +11,11 @@ from enum import StrEnum
 from typing import NewType
 from uuid import UUID
 
-from traust_core.v1.models.assessment import Freshness
+from pydantic import AwareDatetime, field_serializer
+
 from traust_core.v1.models.base import Entity, Model
+from traust_core.v1.models.values import HttpsRepoUrl
+from traust_core.v1.models.vocabulary import ComparisonStatus
 
 ProductSlug = NewType("ProductSlug", str)
 RefName = NewType("RefName", str)
@@ -106,20 +109,28 @@ class ReleaseChange(Model): ...
 class CrownJewelTier(Model): ...
 
 
-class Liveness(Model):
-    """Forge facts fetched live at routing time - never stored."""
-
-    archived: bool
-    public: bool
-    pushed_at: datetime | None = None
-    observed_at: datetime
-
-
 class RepoState(Model):
+    """The routing state derived from one repository's latest forge observation."""
+
     repository_id: UUID
-    exposure: ExposureClass
+    repo: HttpsRepoUrl | None
+    status: ComparisonStatus
     risk_tier: RiskTier
-    crown_jewel: CrownJewelTier | None = None
-    freshness: Freshness | None = None
+    exposure: ExposureClass
     open_critical_high: int
-    liveness: Liveness | None = None
+    crown_jewel: CrownJewelTier | None = None
+    audit_age_days: int | None
+    changed_lines: int | None
+    churn_ratio: float | None
+    sensitive_changed: bool | None
+    sensitive_lines: int | None
+    deps_only: bool | None
+    ahead_by: int | None
+    compare_truncated: bool | None
+    push_changed: bool | None
+    observed_at: AwareDatetime
+    error: str | None = None
+
+    @field_serializer("repo", when_used="json")
+    def serialize_repo(self, repo: HttpsRepoUrl | None) -> str | None:
+        return str(repo) if repo else None

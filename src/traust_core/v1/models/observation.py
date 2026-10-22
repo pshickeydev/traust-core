@@ -1,4 +1,4 @@
-"""Repository observation: forge measurements and the state derived from them.
+"""Repository observation: forge measurements and what they are measured against.
 
 Keyed by repository_id, matching the inventory tables.
 """
@@ -11,7 +11,6 @@ from uuid import UUID
 from pydantic import AwareDatetime, field_serializer
 
 from traust_core.v1.models.base import Model
-from traust_core.v1.models.inventory import ExposureClass, RiskTier
 from traust_core.v1.models.values import HttpsRepoUrl
 from traust_core.v1.models.vocabulary import ComparisonStatus
 
@@ -78,28 +77,3 @@ class ChangeMetrics(Model):
 class DesignationRecord(Model):
     match: str
     designation: Designation
-
-
-class ObservedRepoState(Model):
-    """The routing state derived from one repository's latest observation."""
-
-    repository_id: UUID
-    repo: HttpsRepoUrl | None
-    status: ComparisonStatus
-    risk_tier: RiskTier
-    exposure: ExposureClass
-    audit_age_days: int | None
-    changed_lines: int | None
-    churn_ratio: float | None
-    sensitive_changed: bool | None
-    sensitive_lines: int | None
-    deps_only: bool | None
-    ahead_by: int | None
-    compare_truncated: bool | None
-    push_changed: bool | None
-    observed_at: AwareDatetime
-    error: str | None = None
-
-    @field_serializer("repo", when_used="json")
-    def serialize_repo(self, repo: HttpsRepoUrl | None) -> str | None:
-        return str(repo) if repo else None

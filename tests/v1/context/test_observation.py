@@ -57,6 +57,6 @@ def test_observation_door_reads_the_contract_tables(tmp_path):
     with context.repository_observation() as obs:
         facts = obs.service.record_forge_facts(repository_id=repo.id, network=False)
         assert facts.repository_id == repo.id
-        state = obs.query.observed(repository_id=repo.id)
+        state = obs.query.repo_state(repository_id=repo.id)
         assert state.repository_id == repo.id
         assert obs.service.forge_facts(repo.id).repository_id == repo.id

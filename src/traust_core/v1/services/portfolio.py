@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from datetime import datetime, timedelta
+from datetime import date, datetime
 from uuid import UUID
 
 from traust_core.v1.errors import ConfigError, NotFoundError, ValidationError
@@ -12,7 +12,6 @@ from traust_core.v1.models.inventory import (
     ComponentFilter,
     ExposureClass,
     ForgeHost,
-    Liveness,
     OrgName,
     Ownership,
     OwnershipSource,
@@ -35,7 +34,6 @@ from traust_core.v1.models.observation import (
     DesignationRecord,
     ForgeFacts,
     ObservationTarget,
-    ObservedRepoState,
 )
 from traust_core.v1.models.values import (
     GitSha,
@@ -77,6 +75,10 @@ class PortfolioPolicy:
                 ExposureClass.PUBLIC_EXTERNAL if public_upstream else ExposureClass.PRIVATE_EXTERNAL
             )
         return ExposureClass.PUBLIC_INTERNAL if public_upstream else ExposureClass.PRIVATE_INTERNAL
+
+    def is_dormant(self, pushed: date | None, today: date) -> bool:
+        """No push for longer than `dormant_days`; an unknown push date is not dormant."""
+        return pushed is not None and (today - pushed).days > self.dormant_days
 
     def risk_tier(self, open_critical_high: int, archived: bool, dormant: bool) -> RiskTier:
         if open_critical_high >= self.p0_min_live:
@@ -217,15 +219,6 @@ class PortfolioService:
             uow.commit()
             return ownership
 
-    def exposure_class(self, repository_id: UUID, liveness: Liveness) -> ExposureClass:
-        raise NotImplementedError("stub: replaces build_rescan_worklist.exposure_class")
-
-    def is_dormant(self, liveness: Liveness, now: datetime, after: timedelta) -> bool:
-        raise NotImplementedError("stub: replaces check_repo_liveness.classify")
-
-    def risk_tier(self, repository_id: UUID, open_critical_high: int, now: datetime) -> RiskTier:
-        raise NotImplementedError("stub: replaces build_rescan_worklist.risk_tier")
-
     def get_repository(self, repository_id: UUID) -> Repository:
         raise NotImplementedError("stub: portfolio read")
 
@@ -249,9 +242,6 @@ class PortfolioSync:
     def __init__(self, portfolio: PortfolioService, sources: SourceProvider) -> None:
         self._portfolio = portfolio
         self._sources = sources
-
-    def liveness(self, repository_id: UUID) -> Liveness:
-        raise NotImplementedError("stub: replaces check_repo_liveness.gh_repo_info")
 
     def import_org(self, org: OrgName, host: ForgeHost) -> SyncReport:
         raise NotImplementedError("stub: replaces corpus_intake.py org import")
@@ -282,9 +272,9 @@ class RepoStateQuery:
         self._clock = clock or SystemClock()
         self._hosts = dict(hosts or DEFAULT_FORGE_HOSTS)
 
-    def observed(
+    def repo_state(
         self, *, repository_id: UUID | None = None, repo_url: str | None = None
-    ) -> ObservedRepoState:
+    ) -> RepoState:
         """The routing state derived from one repository's latest observation."""
         target = self._assessments.observation_target(
             repository_id=repository_id, repo_url=repo_url
@@ -319,12 +309,13 @@ class RepoStateQuery:
             )
         pushed = parse_audit_date(facts.pushed_at)
         audited = parse_audit_date(target.audit_date) if target.has_audit else None
-        dormant = bool(pushed and (now.date() - pushed).days > self._policy.dormant_days)
-        return ObservedRepoState(
+        dormant = self._policy.is_dormant(pushed, now.date())
+        return RepoState(
             repository_id=target.repository_id,
             repo=facts.repo,
             status=facts.status,
             risk_tier=self._policy.risk_tier(live, bool(facts.archived), dormant),
+            open_critical_high=live,
             exposure=self._policy.exposure_class(
                 designation,
                 (facts.visibility or "").lower() == "public",
@@ -342,9 +333,6 @@ class RepoStateQuery:
             observed_at=facts.observed_at,
             error=facts.error,
         )
-
-    def repo_state(self, repository_id: UUID) -> RepoState:
-        raise NotImplementedError("stub: replaces traust#58 observe_repo")
 
     def list(self, filter: RepositoryFilter, page: PageRequest) -> Page[RepoState]:
         raise NotImplementedError("stub: replaces build_rescan_worklist, build_crown_jewel_tiers")

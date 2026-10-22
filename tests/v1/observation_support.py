@@ -135,5 +135,5 @@ class _Harness:
     def record_forge_facts(self, **kwargs):
         return self._service.record_forge_facts(**kwargs)
 
-    def observed(self, **kwargs):
-        return self.query.observed(**kwargs)
+    def repo_state(self, **kwargs):
+        return self.query.repo_state(**kwargs)
