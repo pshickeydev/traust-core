@@ -224,7 +224,7 @@ class SpendService:
 
 
 class FreshnessQuery:
-    def __init__(self, providers: ProviderCatalog, feeds: Sequence[FeedProvider[object]]) -> None:
+    def __init__(self, providers: ProviderCatalog, feeds: Sequence[FeedProvider]) -> None:
         self._providers = providers
         self._feeds = feeds
 

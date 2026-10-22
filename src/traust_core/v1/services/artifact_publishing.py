@@ -77,6 +77,13 @@ class ArtifactIndex(Protocol):
     ) -> UUID: ...
 
 
+def record_artifact(uow: AssessmentsUnitOfWork, ref: ObjectRef, kind: str) -> Artifact:
+    """The imported artifact row for stored bytes; same bytes, same row. Caller commits."""
+    return uow.artifacts.find(None, ref.sha256) or uow.artifacts.add(
+        Artifact(digest=ref.sha256, kind=kind, uri=str(ref.key))
+    )
+
+
 class SqlArtifactIndex:
     """Records each published document as an artifact row; same bytes, same row."""
 
@@ -87,9 +94,7 @@ class SqlArtifactIndex:
         self, artifact: ArtifactDocument, subject: Subject, ref: ObjectRef, run_id: str
     ) -> UUID:
         with self._uow() as u:
-            row = u.artifacts.find(None, ref.sha256) or u.artifacts.add(
-                Artifact(digest=ref.sha256, kind=artifact.schema, uri=str(ref.key))
-            )
+            row = record_artifact(u, ref, artifact.schema)
             u.commit()
         assert row.id is not None
         return row.id
