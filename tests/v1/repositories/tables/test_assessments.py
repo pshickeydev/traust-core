@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import timedelta
 from decimal import Decimal
+from uuid import uuid4
 
 from tests.v1.repositories.tables.conftest import T0, Seed, same_rows
 
@@ -32,6 +33,15 @@ def test_assessments_produced_by_a_run_order(seed: Seed) -> None:
     produced = seed.assessment(run_order_id=order.id)
     seed.assessment()
     assert seed.uow.assessments.list_for_run_order(order.id) == [produced]
+
+
+def test_assessments_by_ids_in_one_read(seed: Seed) -> None:
+    ref = seed.repository_ref()
+    first, second, _ = (seed.assessment(ref) for _ in range(3))
+    assert same_rows(
+        seed.uow.assessments.list_by_ids({first.id, second.id, uuid4()}), [first, second]
+    )
+    assert seed.uow.assessments.list_by_ids(set()) == []
 
 
 def test_artifacts_of_an_assessment_and_imported_ones(seed: Seed) -> None:

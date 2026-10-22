@@ -8,7 +8,7 @@ from uuid import UUID
 from perf.harness import Explained, Profile
 from perf.queries.test_ledger import fast
 from perf.seed import DECISIONS, REPOSITORIES
-from traust_core.v1.models.findings import Restatement
+from traust_core.v1.models.findings import RecordDecision, Restatement
 from traust_core.v1.models.identity import IdentitySource, Principal, Role
 from traust_core.v1.models.vocabulary import ActorKind
 from traust_core.v1.providers.clock import FixedClock
@@ -63,3 +63,19 @@ def test_restate_reads_the_decision_and_its_history_by_index(explained: Profile)
 def test_approvers_of_a_decision_read_by_index(explained: Profile) -> None:
     *_, approvers = explained(lambda uow: uow.decision_approvers.list_for_decision(_decision(uow)))
     fast(approvers, "decision_approver_decision_id_approver_key", 1)
+
+
+def decide(uow: SqlTraustUnitOfWork) -> None:
+    decision = uow.decisions.get(_decision(uow))
+    decisions = FindingDecisions(uow, None, Lint({}), clock=FixedClock(datetime.now(UTC)))
+    statement = RecordDecision(
+        finding_id=decision.finding_id, validity="confirmed", rationale="reproduced it"
+    )
+    decisions.decide(statement, ADMIN)
+
+
+def test_decide_reads_the_finding_its_statement_and_history_by_index(explained: Profile) -> None:
+    *_, finding, statement, history = reads(explained(decide))
+    fast(finding, "finding_pkey", 1)
+    fast(statement, "idx_decision_finding_occurred", 1)
+    fast(history, "idx_decision_finding_occurred", 5)
