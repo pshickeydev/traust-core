@@ -23,6 +23,7 @@ from traust_core.v1.models.findings import (
     SubjectRef,
     TriageInput,
     TriageItem,
+    report_sources,
 )
 from traust_core.v1.models.identity import Principal, Role
 from traust_core.v1.models.integrity import canonical_json, sha256_hex
@@ -35,12 +36,6 @@ from traust_core.v1.services.lint import Lint, LintContext, LintReport
 
 log = logging.getLogger(__name__)
 
-# NEED(assessment-kind): contracts names the assessment kinds; validation and verification are
-# the ones evidence precedence reads (every other kind is static, as triage reports were).
-_REPORT = {
-    "validation": SourceType.VALIDATION_REPORT,
-    "verification": SourceType.VERIFICATION_REPORT,
-}
 
 _JUDGED = (
     "finding_id",
@@ -106,13 +101,8 @@ class FindingDecisions:
         return saved
 
     def _sources(self, history: Sequence[Decision]) -> dict[UUID, SourceType]:
-        """Each assessor's report kind, which tells execution proof from static review."""
         ids = {d.assessment_id for d in history if d.assessment_id}
-        return {
-            a.id: _REPORT[a.kind]
-            for a in self._uow.assessments.list_by_ids(ids)
-            if a.id and a.kind in _REPORT
-        }
+        return report_sources(self._uow.assessments.list_by_ids(ids))
 
     def statement_key(self, decision: Decision) -> StatementKey:
         """The hash of every judged column: a retried statement is the same decision."""

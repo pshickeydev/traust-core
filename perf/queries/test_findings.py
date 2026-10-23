@@ -1,19 +1,31 @@
-"""3b · Restatement at a year's volume: an administrator corrects one decision."""
+"""3b · Findings at a year's volume: restate and decide one decision; a repository's baseline."""
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import UTC, datetime
 from uuid import UUID
 
 from perf.harness import Explained, Profile
 from perf.queries.test_ledger import fast
-from perf.seed import DECISIONS, REPOSITORIES
+from perf.seed import DECISIONS, HOT_REPOSITORY, REPOSITORIES, TYPICAL_REPOSITORY
 from traust_core.v1.models.findings import RecordDecision, Restatement
 from traust_core.v1.models.identity import IdentitySource, Principal, Role
 from traust_core.v1.models.vocabulary import ActorKind
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
+from traust_core.v1.services.findings import (
+    FindingIntake,
+    FindingPrecedents,
+    FindingReview,
+    FindingService,
+    IdentityPolicy,
+    RatingPolicy,
+    ReviewPolicy,
+    TaxonomyPolicy,
+)
 from traust_core.v1.services.findings.decisions import FindingDecisions
+from traust_core.v1.services.findings.rating import RatingConfig
 from traust_core.v1.services.lint import Lint
 
 ADMIN = Principal(
@@ -79,3 +91,35 @@ def test_decide_reads_the_finding_its_statement_and_history_by_index(explained: 
     fast(finding, "finding_pkey", 1)
     fast(statement, "idx_decision_finding_occurred", 1)
     fast(history, "idx_decision_finding_occurred", 5)
+
+
+def baseline(url: str) -> Callable[[SqlTraustUnitOfWork], None]:
+    def run(uow: SqlTraustUnitOfWork) -> None:
+        repo = uow.repositories.find_by_url(url)
+        assert repo is not None and repo.id is not None
+        findings = FindingService(
+            uow,
+            FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy()),
+            FindingDecisions(uow, None, Lint({}), clock=FixedClock(datetime.now(UTC))),
+            FindingReview(uow, ReviewPolicy()),
+            FindingPrecedents(uow),
+            RatingPolicy(RatingConfig()),
+        )
+        assert findings.baseline(repo.id, datetime.now(UTC))
+
+    return run
+
+
+def test_baseline_of_a_typical_repository_reads_by_index(explained: Profile) -> None:
+    *_, listed, decisions, occurrences, assessments = explained(baseline(TYPICAL_REPOSITORY))
+    fast(listed, "finding_repository_id_fingerprint_algo_fingerprint_key", 5)
+    fast(decisions, "decision_finding_id_statement_key_key", 5)
+    fast(occurrences, "occurrence_finding_id_assessment_id_key", 5)
+    fast(assessments, "assessment_pkey", 5)
+
+
+def test_baseline_of_the_hot_repository_stays_fast(explained: Profile) -> None:
+    # 10k findings, 4% of each table: Postgres rightly scans rather than probe 10k ids.
+    *_, listed, decisions, occurrences, assessments = explained(baseline(HOT_REPOSITORY))
+    assert listed.uses_index("finding_repository_id_fingerprint_algo_fingerprint_key")
+    assert all(e.execution_ms < 100 for e in (listed, decisions, occurrences, assessments))

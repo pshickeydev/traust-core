@@ -57,6 +57,7 @@ from traust_core.v1.services.findings import (
     FindingReview,
     FindingService,
     IdentityPolicy,
+    RatingPolicy,
     ReviewPolicy,
     TaxonomyPolicy,
 )
@@ -246,6 +247,7 @@ class Context:
                 ),
                 FindingReview(uow, ReviewPolicy()),
                 FindingPrecedents(uow),
+                RatingPolicy(self.config.rating),
             ),
             exposure=ExposureService(uow, intake, feeds=self.feeds, objects=self.object_store),
             ops=OpsService(uow, self.clock),
