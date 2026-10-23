@@ -220,10 +220,12 @@ class PortfolioService:
             return ownership
 
     def get_repository(self, repository_id: UUID) -> Repository:
-        raise NotImplementedError("stub: portfolio read")
+        with self._uow as uow:
+            return uow.repositories.get(repository_id)
 
     def find_repository(self, url: HttpsRepoUrl) -> Repository | None:
-        raise NotImplementedError("stub: replaces canon_repo / normalize_repo lookups")
+        with self._uow as uow:
+            return uow.repositories.find_by_url(str(url))
 
     def list_repositories(self, filter: RepositoryFilter, page: PageRequest) -> Page[Repository]:
         raise NotImplementedError("stub: replaces build_org_index.py, repo-graph")
