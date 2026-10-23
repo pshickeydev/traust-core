@@ -15,7 +15,7 @@ from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.operations import OrderRequest
 from traust_core.v1.models.vocabulary import ActorKind
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
-from traust_core.v1.services.identity import IdentityConfig
+from traust_core.v1.services.identity import IdentityConfig, LoginConfig
 from traust_core.v1.services.ledger import LedgerConfig
 
 OPERATOR = Principal(identity="operator@example.com", kind=ActorKind("human"), display="operator")
@@ -183,3 +183,14 @@ def test_a_typo_in_the_identity_section_is_rejected(tmp_path: Path) -> None:
     path.write_text("identity:\n  issuer: https://idp.example\n")
     with pytest.raises(ConfigError):
         Context.from_file(path)
+
+
+def test_login_is_wired_only_when_configured(tmp_path: Path) -> None:
+    assert Context(Config(home=tmp_path)).login is None
+    login = LoginConfig(issuer="https://idp.example", client_id="traust-cli")
+    context = Context(Config(home=tmp_path, identity=IdentityConfig(login=login)))
+    assert context.login is not None
+    assert (context.login.issuer, context.login.client_id) == ("https://idp.example", "traust-cli")
+    assert context.local_jwks == tmp_path / "local-jwks.json"
+    context.credentials.clear()
+    assert context.credentials.load() is None
