@@ -62,6 +62,7 @@ from traust_core.v1.services.findings import (
     TaxonomyPolicy,
 )
 from traust_core.v1.services.findings.citations import VerdictCitations
+from traust_core.v1.services.findings.restatement import RestatementPolicy
 from traust_core.v1.services.identity import IdentityService
 from traust_core.v1.services.ledger import LedgerService
 from traust_core.v1.services.lint import Lint
@@ -248,7 +249,9 @@ class Context:
                     clock=self.clock,
                     objects=self.object_store,
                     review=review,
-                    restatement_approvers=identity.restatement_approvers if identity else 0,
+                    restatement=RestatementPolicy(
+                        identity.restatement_approvers if identity else 0
+                    ),
                 ),
                 FindingReview(uow, review),
                 precedents,

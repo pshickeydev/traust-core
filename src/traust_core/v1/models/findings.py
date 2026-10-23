@@ -9,11 +9,12 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, NewType
 from uuid import UUID
 
-from traust_core.v1.errors import ForbiddenError, ValidationError
+from traust_core.v1.errors import ConflictError, ForbiddenError, ValidationError
 from traust_core.v1.models import candidate_formats
 from traust_core.v1.models.base import AppendOnly, Entity, Model
 from traust_core.v1.models.common import CodeSpan
 from traust_core.v1.models.identity import Principal
+from traust_core.v1.models.integrity import canonical_json, sha256_hex
 from traust_core.v1.models.vocabulary import (
     ActorKind,
     DispositionAssurance,
@@ -290,8 +291,91 @@ class Restatement(Model):
     def changes(self) -> dict[str, object]:
         return {f: v for f in RESTATABLE if (v := getattr(self, f)) is not None}
 
+    def independent_approvers(self, author: Principal) -> frozenset[str]:
+        """The approvers it names, normalised, without its author."""
+        named = {a.strip().lower() for a in self.approvers if a.strip()}
+        return frozenset(named - {author.identity.lower()})
+
+    def correct(
+        self,
+        restated: Decision,
+        history: Sequence[Decision],
+        author: Principal,
+        at: datetime,
+        commit: UUID | None,
+    ) -> Decision:
+        """The correcting decision, if this is an attributed, real correction of the latest record.
+
+        It copies the restated statement with the changes applied: the fold drops the original.
+        """
+        if not self.ticket.strip():
+            raise ValidationError("a restatement names its authority: a ticket")
+        if len(self.rationale) < RATIONALE_MIN_LENGTH:
+            raise ValidationError(f"a rationale of at least {RATIONALE_MIN_LENGTH} characters")
+        if any(d.restates_id == restated.id for d in history):
+            raise ConflictError(
+                f"decision {restated.id} was already restated: restate the correction"
+            )
+        changes = self.changes()
+        if not changes:
+            raise ValidationError("a restatement corrects at least one of " + ", ".join(RESTATABLE))
+        by_id = {d.id: d for d in history}
+        earlier, step = [], restated
+        while step.restates_id is not None and (step := by_id.get(step.restates_id)) is not None:
+            earlier.append(step)
+        for field, value in changes.items():
+            current = getattr(restated, field)
+            if current is None:
+                raise ValidationError(
+                    f"nothing to restate: {field} has no value yet; record it instead"
+                )
+            if value == current:
+                raise ValidationError(
+                    f"the restatement changes nothing: {field} is already {value}"
+                )
+            if value in {getattr(d, field) for d in earlier} - {current}:
+                raise ValidationError(
+                    f"{field} {value} was already corrected away from; record why anew"
+                )
+        draft = restated.model_copy(
+            update={
+                **changes,
+                "id": None,
+                "created_at": None,
+                "assessment_id": None,
+                "repository_ref_id": commit,
+                "restates_id": restated.id,
+                "auto_accept_tier": False,
+                "actor": author.ref,
+                "reason": self.reason,
+                "ticket": self.ticket.strip(),
+                "rationale": self.rationale,
+                "occurred_at": at,
+            }
+        )
+        return draft.model_copy(update={"statement_key": statement_key(draft)})
+
 
 RESTATABLE = ("validity", "resolution", "evidence_grade", "severity", "fixed_repository_ref_id")
+_JUDGED = (
+    "finding_id",
+    "assessment_id",
+    "actor",
+    "repository_ref_id",
+    "restates_id",
+    "validity",
+    "resolution",
+    "evidence_grade",
+    "reason",
+    "severity",
+    "fixed_repository_ref_id",
+)
+
+
+def statement_key(decision: Decision) -> StatementKey:
+    """The hash of every judged column: a retried statement is the same decision."""
+    judged = {k: str(v) for k in _JUDGED if (v := getattr(decision, k)) is not None}
+    return StatementKey(sha256_hex(canonical_json(judged)))
 
 
 class ReviewItem(Entity):

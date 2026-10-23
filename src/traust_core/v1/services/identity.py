@@ -31,7 +31,7 @@ class IdentityConfig(Model):
     trust_local: bool = False
     directory_command: tuple[str, ...] = ()
     directory_timeout_seconds: float = 60.0
-    admins: tuple[str, ...] = ()
+    admins: tuple[str, ...] = ()  # people or service accounts; restating stays human-only
     restatement_approvers: int = 0  # independent approvers a restatement must name
     login: LoginConfig | None = None
 
@@ -55,6 +55,6 @@ class IdentityService:
             if not status.active:
                 log.warning("directory refused %s: %s", principal.identity, status.status)
                 raise AuthenticationError(f"{principal.identity}: directory says {status.status}")
-        if principal.is_verified_human() and principal.identity in self._admins:
+        if principal.verified_by is not None and principal.identity.lower() in self._admins:
             return principal.model_copy(update={"roles": principal.roles | ADMIN_ROLES})
         return principal

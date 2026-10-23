@@ -8,6 +8,7 @@ from uuid import UUID
 
 from traust_ledger.integrity import (
     LEAF_FORMAT_CURRENT,
+    IntegrityFinding,
     Severity,
     SigningConfig,
     canonical_event_bytes,
@@ -17,7 +18,13 @@ from traust_ledger.integrity import (
     verify_merkle_signature,
 )
 
-from traust_core.v1.errors import ForbiddenError, NotFoundError, ServiceError, ValidationError
+from traust_core.v1.errors import (
+    ForbiddenError,
+    IntegrityError,
+    NotFoundError,
+    ServiceError,
+    ValidationError,
+)
 from traust_core.v1.models.base import Model
 from traust_core.v1.models.common import Cursor, Page, PageRequest
 from traust_core.v1.models.findings import Decision
@@ -47,6 +54,9 @@ class LedgerConfig(Model):
 
     key_path: Path | None = None
     public_key_path: Path | None = None
+    previous_public_key_path: Path | None = (
+        None  # during a key rotation: old signatures still verify
+    )
     required: bool = False
 
 
@@ -61,9 +71,8 @@ class LedgerService:
         self._uow = uow
         key = None if config.key_path is None else str(config.key_path)
         self._signing = SigningConfig(method="keypair", key_path=key)
-        self._public_key_path = (
-            None if config.public_key_path is None else str(config.public_key_path)
-        )
+        keys = (config.public_key_path, config.previous_public_key_path)
+        self._public_keys = tuple(str(k) for k in keys if k is not None)
         self._signing_required = config.required
 
     def append_decision(self, decision: Decision, repository_id: UUID) -> AppendReceipt:
@@ -120,7 +129,15 @@ class LedgerService:
             layer = self._uow.layers.find_for_update(repository_id)
             if layer is None:
                 raise NotFoundError(f"ledger layer for repository {repository_id}")
-            checkpoint = self._finalize(layer)
+            document = self._document(layer)
+            issues = self._issues(document, required=False)  # a missing signature is what it adds
+            problems = [i.message for i in issues if i.severity is Severity.ERROR]
+            if problems:
+                raise IntegrityError(
+                    f"ledger layer {layer.id} does not verify, so it won't be re-signed: "
+                    + "; ".join(problems)
+                )
+            checkpoint = self._finalize(layer, document)
             self._uow.commit()
         return checkpoint
 
@@ -128,20 +145,25 @@ class LedgerService:
         """Recompute the layer's root from its stored events and check the signature."""
         with self._uow:
             document = self._document(self._uow.layers.get(layer_id))
-        issues = [
-            *verify_merkle_integrity(document),
-            *verify_merkle_signature(
-                document, self._public_key_path, required=self._signing_required
-            ),
-        ]
+        issues = self._issues(document, required=self._signing_required)
         return VerifyResult(
             layer_id=layer_id,
             errors=tuple(i.message for i in issues if i.severity is Severity.ERROR),
             warnings=tuple(i.message for i in issues if i.severity is not Severity.ERROR),
         )
 
-    def _finalize(self, layer: Layer) -> Checkpoint:
-        document = self._document(layer)
+    def _issues(self, document: dict[str, Any], *, required: bool) -> list[IntegrityFinding]:
+        """Root against events, then the signature against any configured public key."""
+        integrity = verify_merkle_integrity(document)
+        tries = [
+            verify_merkle_signature(document, key, required=required)
+            for key in self._public_keys or (None,)
+        ]
+        passing = next((t for t in tries if all(i.severity is not Severity.ERROR for i in t)), None)
+        return [*integrity, *(tries[0] if passing is None else passing)]
+
+    def _finalize(self, layer: Layer, document: dict[str, Any] | None = None) -> Checkpoint:
+        document = document or self._document(layer)
         dropped = stamp_merkle_metadata(document)
         attempt = sign_if_configured(document, self._signing)
         if dropped and attempt.status != Signing.SIGNED:

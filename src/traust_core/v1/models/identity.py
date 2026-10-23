@@ -39,7 +39,8 @@ class Principal(Model):
         return self.kind == ActorKind.HUMAN and self.verified_by is not None
 
     def has_role(self, role: Role) -> bool:
-        return self.is_verified_human() and role in self.roles
+        """A verified principal, person or service account, holding the role."""
+        return self.verified_by is not None and role in self.roles
 
 
 LOCAL_ISSUER = "local"

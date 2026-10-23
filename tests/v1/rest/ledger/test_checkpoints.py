@@ -6,7 +6,7 @@ from uuid import uuid4
 from fastapi.testclient import TestClient
 
 from tests.v1.rest.conftest import bearer
-from tests.v1.rest.ledger.conftest import Ledgered, deployment
+from tests.v1.rest.ledger.conftest import Ledgered, deployment, tamper
 from traust_core.v1.context import Config, Context
 from traust_core.v1.rest.app import create_app
 
@@ -59,3 +59,11 @@ def test_a_deployment_without_a_ledger_has_no_ledger_resources(tmp_path: Path) -
         response = client.get(f"/v1/ledger/layers/{uuid4()}", headers=bearer(context))
     assert response.status_code == 404
     assert "keeps no ledger" in response.json()["detail"]
+
+
+def test_a_layer_that_does_not_verify_is_not_re_signed(ledgered: Ledgered) -> None:
+    tamper(ledgered.context, ledgered.layer_id)
+    response = ledgered.client.post(checkpoint_url(ledgered), headers=ledgered.admin)
+    assert response.status_code == 409
+    assert response.headers["content-type"] == "application/problem+json"
+    assert "won't be re-signed" in response.json()["detail"]
