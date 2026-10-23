@@ -30,8 +30,10 @@ from traust_core.v1.models.integrity import canonical_json, sha256_hex
 from traust_core.v1.models.vocabulary import ActorKind, SourceType
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.sources import WorkspaceFiles
+from traust_core.v1.rendering import MarkdownRenderer
 from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.services.findings.precedents import FindingPrecedents
+from traust_core.v1.services.insight import TriageView
 from traust_core.v1.services.ledger import LedgerService
 from traust_core.v1.services.lint import Lint, LintContext, LintReport
 
@@ -213,6 +215,10 @@ class FindingDecisions:
     def check(self, doc: TriageArtifact, checkout: Path) -> LintReport:
         """Lint the triage against the target checkout: after the votes, before `record`."""
         return self._lint.run(doc, LintContext(files=WorkspaceFiles(checkout)))
+
+    def render(self, doc: TriageArtifact) -> bytes:
+        """The triage as Markdown: a projection of the document, never a second source."""
+        return MarkdownRenderer().render(TriageView().report(doc))
 
     def record(self, doc: TriageArtifact, provenance: Provenance) -> list[Decision]:
         """A triage is an assessment (kind triage) and one decision per verdict, one transaction."""
