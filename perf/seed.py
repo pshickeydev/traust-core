@@ -38,7 +38,7 @@ REVISIONS_PER_REPOSITORY = 12
 RELEASES_PER_PRODUCT = 12
 OWNERSHIP_PERIODS = 10
 # A year of scans (Appendix D: ~250k occurrences): every seeded finding reported once, ten per
-# assessment; half the locations name a line range, the other half a whole file.
+# assessment; half the locations name a line range (with its enclosing function), half a file.
 FINDINGS_PER_ASSESSMENT = 10
 
 ROUTED = ("full-audit", "diff-scan", "diff-scan-quarterly", "threat-model-review", "deps-lane")
@@ -160,8 +160,15 @@ SEED = (
     FROM (SELECT id, row_number() OVER (ORDER BY id) n FROM traust.finding) f
     JOIN (SELECT id, row_number() OVER (ORDER BY id) n FROM traust.assessment) a
         ON a.n = 1 + (f.n - 1) / {FINDINGS_PER_ASSESSMENT}""",
-    """INSERT INTO traust.location (occurrence_id, path, line_start, line_end)
-    SELECT o.id, 'pkg/file' || g || '.go', CASE WHEN g = 1 THEN 10 END, CASE WHEN g = 1 THEN 12 END
+    """INSERT INTO traust.cwe (identifier, abstraction)
+    SELECT 'CWE-' || g, 'base' FROM generate_series(1, 1000) g""",
+    """INSERT INTO traust.finding_cwe (finding_id, cwe_id)
+    SELECT f.id, c.id
+    FROM (SELECT id, 1 + mod(row_number() OVER (ORDER BY id), 1000) n FROM traust.finding) f
+    JOIN (SELECT id, row_number() OVER (ORDER BY id) n FROM traust.cwe) c ON c.n = f.n""",
+    """INSERT INTO traust.location (occurrence_id, path, line_start, line_end, symbol)
+    SELECT o.id, 'pkg/file' || g || '.go', CASE WHEN g = 1 THEN 10 END, CASE WHEN g = 1 THEN 12 END,
+        CASE WHEN g = 1 THEN 'fn' || mod(abs(hashtext(o.id::text)), 50000) END
     FROM traust.occurrence o CROSS JOIN generate_series(1, 2) g
     WHERE g = 1 OR mod(abs(hashtext(o.id::text)), 2) = 0""",
 )
@@ -211,6 +218,7 @@ def seeded_database(url: str) -> Engine:
                     "traust.assessment",
                     "traust.occurrence",
                     "traust.location",
+                    "traust.finding_cwe",
                 ):
                     conn.exec_driver_sql(f"VACUUM (ANALYZE) {table}")
         except BaseException:

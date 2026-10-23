@@ -225,6 +225,7 @@ class Context:
         intake = FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy())
         ledger = None if self.config.ledger is None else LedgerService(uow, self.config.ledger)
         identity = self.config.identity
+        precedents = FindingPrecedents(uow)
         return Services(
             assessment=assessment,
             portfolio=PortfolioService(
@@ -242,11 +243,12 @@ class Context:
                     uow,
                     ledger,
                     Lint({TriageArtifact: [VerdictCitations()]}),
+                    precedents,
                     clock=self.clock,
                     restatement_approvers=identity.restatement_approvers if identity else 0,
                 ),
                 FindingReview(uow, ReviewPolicy()),
-                FindingPrecedents(uow),
+                precedents,
                 RatingPolicy(self.config.rating),
             ),
             exposure=ExposureService(uow, intake, feeds=self.feeds, objects=self.object_store),

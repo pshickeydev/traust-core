@@ -51,7 +51,9 @@ def _decision(uow: SqlTraustUnitOfWork) -> UUID:
 
 
 def restate(uow: SqlTraustUnitOfWork) -> None:
-    decisions = FindingDecisions(uow, None, Lint({}), clock=FixedClock(datetime.now(UTC)))
+    decisions = FindingDecisions(
+        uow, None, Lint({}), FindingPrecedents(uow), clock=FixedClock(datetime.now(UTC))
+    )
     restatement = Restatement(
         decision_id=_decision(uow),
         validity="confirmed",
@@ -79,7 +81,9 @@ def test_approvers_of_a_decision_read_by_index(explained: Profile) -> None:
 
 def decide(uow: SqlTraustUnitOfWork) -> None:
     decision = uow.decisions.get(_decision(uow))
-    decisions = FindingDecisions(uow, None, Lint({}), clock=FixedClock(datetime.now(UTC)))
+    decisions = FindingDecisions(
+        uow, None, Lint({}), FindingPrecedents(uow), clock=FixedClock(datetime.now(UTC))
+    )
     statement = RecordDecision(
         finding_id=decision.finding_id, validity="confirmed", rationale="reproduced it"
     )
@@ -97,12 +101,14 @@ def baseline(url: str) -> Callable[[SqlTraustUnitOfWork], None]:
     def run(uow: SqlTraustUnitOfWork) -> None:
         repo = uow.repositories.find_by_url(url)
         assert repo is not None and repo.id is not None
+        precedents = FindingPrecedents(uow)
+        clock = FixedClock(datetime.now(UTC))
         findings = FindingService(
             uow,
             FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy()),
-            FindingDecisions(uow, None, Lint({}), clock=FixedClock(datetime.now(UTC))),
+            FindingDecisions(uow, None, Lint({}), precedents, clock=clock),
             FindingReview(uow, ReviewPolicy()),
-            FindingPrecedents(uow),
+            precedents,
             RatingPolicy(RatingConfig()),
         )
         assert findings.baseline(repo.id, datetime.now(UTC))

@@ -31,10 +31,13 @@ from traust_core.v1.models.vocabulary import ActorKind, SourceType
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.sources import WorkspaceFiles
 from traust_core.v1.repositories.contract import TraustUnitOfWork
+from traust_core.v1.services.findings.precedents import FindingPrecedents
 from traust_core.v1.services.ledger import LedgerService
 from traust_core.v1.services.lint import Lint, LintContext, LintReport
 
 log = logging.getLogger(__name__)
+
+PRECEDENTS_PER_FINDING = 3
 
 
 _JUDGED = (
@@ -60,6 +63,7 @@ class FindingDecisions:
         uow: TraustUnitOfWork,
         ledger: LedgerService | None,
         lint: Lint,
+        precedents: FindingPrecedents,
         *,
         clock: Clock,
         restatement_approvers: int = 0,
@@ -67,6 +71,7 @@ class FindingDecisions:
         self._uow = uow
         self._ledger = ledger
         self._lint = lint
+        self._precedents = precedents
         self._clock = clock
         self._restatement_approvers = restatement_approvers
 
@@ -168,7 +173,7 @@ class FindingDecisions:
         return approvers
 
     def prepare(self, assessment_id: UUID) -> TriageInput:
-        """Everything a triage of one assessment judges: its findings, as reported, and where."""
+        """What a triage of one assessment judges: its findings as reported, where, precedents."""
         with self._uow as uow:
             assessment = uow.assessments.get(assessment_id)
             ref = uow.repository_refs.get(assessment.repository_ref_id)
@@ -180,6 +185,9 @@ class FindingDecisions:
             where: dict[UUID, list[Location]] = defaultdict(list)
             for loc in uow.locations.list_for_occurrences([o.id for o in occurrences]):
                 where[loc.occurrence_id].append(loc)
+            precedents = self._precedents.for_findings(
+                {o.finding_id: where[o.id] for o in occurrences}, PRECEDENTS_PER_FINDING
+            )
         return TriageInput(
             subject=SubjectRef(
                 repository_id=repository.id,
@@ -193,7 +201,10 @@ class FindingDecisions:
             assessor=assessment.assessor,
             items=tuple(
                 TriageItem(
-                    finding=findings[o.finding_id], occurrence=o, locations=tuple(where[o.id])
+                    finding=findings[o.finding_id],
+                    occurrence=o,
+                    locations=tuple(where[o.id]),
+                    precedents=tuple(precedents.get(o.finding_id, ())),
                 )
                 for o in occurrences
             ),
