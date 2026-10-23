@@ -19,11 +19,19 @@ dependencies = [
     "traust-ledger @ git+https://github.com/traust-security/traust-ledger.git@7f34ff61ddd6f1b868c85cae6c5a466d3d6c6bb4",
 ]
 
+[project.scripts]
+traust-server = "traust_core.v1.rest.server:main"
+
 [project.optional-dependencies]
 postgres = ["psycopg[binary]>=3.1"]
+# The HTTP REST adapter (traust_core.v1.rest); nothing else in core imports these.
+rest = ["fastapi>=0.115", "uvicorn>=0.30"]
 
 [dependency-groups]
 dev = [
+    "fastapi>=0.115",
+    "httpx2",
+    "uvicorn>=0.30",
     "pytest>=8.0",
     "pytest-cov>=6.0",
     "ruff>=0.6",
