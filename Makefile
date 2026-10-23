@@ -17,7 +17,7 @@ help:
 	@echo "  make setup            — uv sync + install git hooks (run once per clone)"
 	@echo "  make lint             — ruff check + format --check"
 	@echo "  make lint-fix         — ruff --fix + format"
-	@echo "  make test             — unit tests (no integration)"
+	@echo "  make test             — unit tests, no integration (parallel via pytest-xdist)"
 	@echo "  make test-integration — integration tests against Postgres (make db-up first)"
 	@echo "  make test-repositories — repository layer on SQLite and Postgres (make db-up first)"
 	@echo "  make coverage         — unit tests with coverage (term), fails under 80%"
@@ -47,13 +47,13 @@ lint-fix:
 	uv run ruff format .
 
 test:
-	uv run pytest tests/ -q -m "not integration"
+	uv run pytest tests/ -q -n auto -m "not integration"
 
 test-integration:
-	uv run --extra postgres pytest tests/ -q -m integration
+	uv run --extra postgres pytest tests/ -q -n auto -m integration
 
 test-repositories:
-	uv run --extra postgres pytest tests/v1/repositories/tables -q -m "integration or not integration"
+	uv run --extra postgres pytest tests/v1/repositories/tables -q -n auto -m "integration or not integration"
 
 coverage:
 	uv run pytest tests/ --cov=traust_core --cov-report=term-missing -q -m "not integration"
