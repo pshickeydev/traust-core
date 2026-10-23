@@ -15,6 +15,7 @@ ORDER = [
     "rendering",
     "services",
     "context",
+    "rest",
 ]
 THIRD_PARTY = {
     "errors": set(),
@@ -25,6 +26,7 @@ THIRD_PARTY = {
     "rendering": {"pydantic"},
     "services": {"pydantic", "traust_ledger"},  # one module: test_architecture
     "context": {"pydantic", "yaml", "sqlalchemy"},
+    "rest": {"pydantic", "fastapi", "starlette", "uvicorn"},  # the [rest] extra; nothing else
 }
 
 

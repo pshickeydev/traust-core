@@ -10,7 +10,7 @@ export TRAUST_TEST_DATABASE_URL
 
 PYTHON ?= python3
 
-.PHONY: help setup sync hooks lint lint-fix test test-integration test-repositories coverage coverage-html coverage-all perf db-up db-down
+.PHONY: help setup sync hooks lint lint-fix test test-integration test-repositories coverage coverage-html coverage-all perf api-check serve db-up db-down
 
 help:
 	@echo "Targets ($(notdir $(CURDIR))):"
@@ -24,6 +24,8 @@ help:
 	@echo "  make coverage-html    — unit tests with coverage (term + htmlcov/)"
 	@echo "  make coverage-all     — unit + integration with coverage (needs make db-up)"
 	@echo "  make perf             — query plans at production volume on Postgres (make db-up first)"
+	@echo "  make api-check        — build the REST API's OpenAPI document (.openapi/openapi.json)"
+	@echo "  make serve            — traust-server on 127.0.0.1:8080 (CONFIG=path for a config file)"
 	@echo "  make db-up / db-down  — shared Postgres container ($(DB_CONTAINER)), same as contracts and ledger"
 
 setup: sync hooks
@@ -89,4 +91,11 @@ db-up:
 
 db-down:
 	@podman stop $(DB_CONTAINER) 2>/dev/null || true
+
+api-check:
+	@mkdir -p .openapi
+	uv run python -c "import json, tempfile; from pathlib import Path; from traust_core.v1.context import Config, Context; from traust_core.v1.rest.app import create_app; spec = create_app(Context(Config(home=Path(tempfile.mkdtemp())))).openapi(); assert spec['paths'], 'no routes'; Path('.openapi/openapi.json').write_text(json.dumps(spec, indent=2)); print(f\"{len(spec['paths'])} paths -> .openapi/openapi.json\")"
+
+serve:
+	uv run traust-server $(if $(CONFIG),--config $(CONFIG))
 
