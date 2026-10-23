@@ -77,7 +77,11 @@ class PrecedentReason(Model):
 class IdentityMove(Model): ...
 
 
-class IntakeResult(Model): ...
+class IntakeResult(Model):
+    """Each candidate's finding by its report label, and the findings this intake created."""
+
+    findings: Mapping[Label, UUID]
+    created: tuple[UUID, ...] = ()
 
 
 class RecordDecision(Model):

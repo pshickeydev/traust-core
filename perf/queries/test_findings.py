@@ -129,3 +129,23 @@ def test_baseline_of_the_hot_repository_stays_fast(explained: Profile) -> None:
     *_, listed, decisions, occurrences, assessments = explained(baseline(HOT_REPOSITORY))
     assert listed.uses_index("finding_repository_id_fingerprint_algo_fingerprint_key")
     assert all(e.execution_ms < 100 for e in (listed, decisions, occurrences, assessments))
+
+
+def test_intake_looks_up_each_natural_key_by_index(explained: Profile) -> None:
+    # Inserts can't be replayed against generated ids; intake's lookups are what grow.
+    def lookups(uow: SqlTraustUnitOfWork) -> None:
+        decision = uow.decisions.get(_decision(uow))
+        finding = uow.findings.get(decision.finding_id)
+        (seen,) = uow.occurrences.list_for_finding(decision.finding_id)
+        uow.findings.find_by_fingerprint(finding.repository_id, "v3", "0" * 64)
+        uow.occurrences.find(decision.finding_id, seen.assessment_id)
+        uow.cwes.find_by_identifier("CWE-89")
+        uow.finding_cwes.list_for_finding(decision.finding_id)
+        uow.finding_labels.list_for_finding(decision.finding_id)
+
+    *_, fingerprint, occurrence, cwe, linked, labelled = explained(lookups)
+    fast(fingerprint, "finding_repository_id_fingerprint_algo_fingerprint_key", 1)
+    fast(occurrence, "occurrence_finding_id_assessment_id_key", 1)
+    fast(cwe, "cwe_identifier_key", 1)
+    fast(linked, "finding_cwe_finding_id_cwe_id_key", 1)
+    fast(labelled, "finding_label_finding_id_taxonomy_label_key", 1)
