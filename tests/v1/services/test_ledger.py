@@ -15,9 +15,18 @@ from sqlalchemy.engine import Engine
 
 from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import Seed
-from traust_core.v1.errors import ConflictError, NotFoundError, ServiceError, ValidationError
+from traust_core.v1.errors import (
+    ConflictError,
+    ForbiddenError,
+    NotFoundError,
+    ServiceError,
+    ValidationError,
+)
+from traust_core.v1.models.common import Cursor, PageRequest
 from traust_core.v1.models.findings import Decision
+from traust_core.v1.models.identity import IdentitySource, Principal, Role
 from traust_core.v1.models.ledger import Event, Signing
+from traust_core.v1.models.vocabulary import ActorKind
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services.ledger import LedgerConfig, LedgerService
 
@@ -39,6 +48,15 @@ def keys(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[str, str]:
         capture_output=True,
     )
     return f"{prefix}.key", f"{prefix}.pub"
+
+
+ADMIN = Principal(
+    identity="admin@example.com",
+    kind=ActorKind.HUMAN,
+    display="admin",
+    verified_by=IdentitySource.OIDC,
+    roles=frozenset({Role.ADMIN}),
+)
 
 
 def ledger(uow: SqlTraustUnitOfWork, **config: object) -> LedgerService:
@@ -282,7 +300,7 @@ def test_checkpoint_signs_an_existing_layer(engine: Engine, keys: tuple[str, str
         key_path=private,
         public_key_path=public,
     )
-    checkpoint = signer.checkpoint(repo_id)
+    checkpoint = signer.checkpoint(repo_id, ADMIN)
     assert checkpoint.signing is Signing.SIGNED
     assert checkpoint.layer.merkle_root == unsigned.checkpoint.layer.merkle_root
     assert checkpoint.layer.id is not None
@@ -291,4 +309,74 @@ def test_checkpoint_signs_an_existing_layer(engine: Engine, keys: tuple[str, str
 
 def test_checkpoint_without_a_layer_raises(engine: Engine) -> None:
     with pytest.raises(NotFoundError):
-        ledger(SqlTraustUnitOfWork(engine)).checkpoint(uuid4())
+        ledger(SqlTraustUnitOfWork(engine)).checkpoint(uuid4(), ADMIN)
+
+
+def appended(engine: Engine, n: int) -> tuple[UUID, UUID]:
+    """n decisions appended to one repository's layer: (repository_id, layer_id)."""
+    repo_id, made = decisions(engine, n)
+    with SqlTraustUnitOfWork(engine) as uow:
+        service = ledger(uow)
+        receipts = [service.append_decision(d, repo_id) for d in made]
+        uow.commit()
+    layer_id = receipts[-1].checkpoint.layer.id if receipts else None
+    assert layer_id is not None
+    return repo_id, layer_id
+
+
+def test_a_repositorys_layers_and_one_layer_read_back(engine: Engine) -> None:
+    repo_id, layer_id = appended(engine, 2)
+    service = ledger(SqlTraustUnitOfWork(engine))
+    (layer,) = service.layers(repo_id)
+    assert layer.id == layer_id and layer.merkle_size == 2
+    assert service.layer(layer_id) == layer
+    assert service.layers(uuid4()) == []
+    with pytest.raises(NotFoundError):
+        service.layer(uuid4())
+
+
+@pytest.mark.parametrize(
+    ("limit", "pages"),
+    [(10, [[0, 1, 2]]), (2, [[0, 1], [2]]), (3, [[0, 1, 2]]), (1, [[0], [1], [2]])],
+)
+def test_events_page_by_seq(engine: Engine, limit: int, pages: list[list[int]]) -> None:
+    _, layer_id = appended(engine, 3)
+    service, seen, cursor = ledger(SqlTraustUnitOfWork(engine)), [], None
+    while True:
+        page = service.events(layer_id, PageRequest(limit=limit, cursor=cursor))
+        seen.append([e.seq for e in page.items])
+        if page.next is None:
+            break
+        cursor = page.next
+    assert seen == pages
+
+
+def test_events_of_an_unknown_layer_or_with_a_bad_cursor_are_refused(engine: Engine) -> None:
+    _, layer_id = appended(engine, 1)
+    service = ledger(SqlTraustUnitOfWork(engine))
+    with pytest.raises(NotFoundError):
+        service.events(uuid4(), PageRequest())
+    with pytest.raises(ValidationError):
+        service.events(layer_id, PageRequest(cursor=Cursor("seven")))
+    assert service.events(layer_id, PageRequest(cursor=Cursor("0"))).items == ()
+
+
+@pytest.mark.parametrize(
+    "who",
+    [
+        ADMIN.model_copy(update={"roles": frozenset()}),
+        ADMIN.model_copy(update={"verified_by": None}),
+        ADMIN.model_copy(update={"kind": ActorKind.MACHINE}),
+    ],
+    ids=["no admin role", "unverified", "a machine"],
+)
+def test_a_checkpoint_is_an_admins(engine: Engine, who: Principal) -> None:
+    repo_id, _ = appended(engine, 1)
+    with pytest.raises(ForbiddenError):
+        ledger(SqlTraustUnitOfWork(engine)).checkpoint(repo_id, who)
+
+
+def test_verification_reports_whether_it_passed(engine: Engine) -> None:
+    _, layer_id = appended(engine, 2)
+    result = ledger(SqlTraustUnitOfWork(engine)).verify(layer_id)
+    assert result.passed and result.model_dump()["passed"] is True

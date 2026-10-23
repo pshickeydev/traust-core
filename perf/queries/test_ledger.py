@@ -91,3 +91,17 @@ def _repo(uow: SqlTraustUnitOfWork, url: str) -> UUID:
     repo = uow.repositories.find_by_url(url)
     assert repo is not None and repo.id is not None
     return repo.id
+
+
+def _layer_id(uow: SqlTraustUnitOfWork, url: str) -> UUID:
+    layer = uow.layers.find_for_update(_repo(uow, url))
+    assert layer is not None and layer.id is not None
+    return layer.id
+
+
+@pytest.mark.parametrize("after", [None, 9_000], ids=["first page", "a late page"])
+def test_an_events_page_reads_by_index_in_seq_order(explained: Profile, after: int | None) -> None:
+    *_, page = explained(
+        lambda uow: uow.events.page_for_layer(_layer_id(uow, HOT_REPOSITORY), after, 101)
+    )
+    fast(page, "events_layer_id_seq_key", 5)
