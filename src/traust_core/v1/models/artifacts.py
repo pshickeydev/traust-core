@@ -222,7 +222,9 @@ class PrivProfileArtifact(
 class AdapterResultArtifact(ArtifactDocument, name="adapter-result", schema="adapter-result"): ...
 
 
-class RepoStateArtifact(ArtifactDocument, name="repo-state", schema="repo-state"): ...
+class RepoStateArtifact(
+    ArtifactDocument, name="repo-state", schema="repo-state", kind=ResultKind.REPO_STATE
+): ...
 
 
 class IsolationReviewArtifact(
@@ -279,6 +281,7 @@ AssessmentArtifact = (
     | ThreatModelArtifact
     | PrivProfileArtifact
     | IsolationReviewArtifact
+    | RepoStateArtifact
 )
 PqcArtifact = PqcFactsArtifact | PqcReadinessArtifact | PqcDecisionTreeArtifact
 
@@ -292,5 +295,6 @@ ANALYSIS_ARTIFACTS: tuple[type[ArtifactDocument], ...] = (
     VerificationArtifact,
     CloudConfigAuditArtifact,
     PrivProfileArtifact,
+    RepoStateArtifact,
 )
 ARTIFACT_FOR_KIND = {a.kind: a for a in ANALYSIS_ARTIFACTS if a.kind is not None}

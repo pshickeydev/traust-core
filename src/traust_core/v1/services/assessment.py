@@ -4,10 +4,11 @@ from collections.abc import Mapping, Sequence
 from datetime import date, datetime, time
 from uuid import UUID
 
-from traust_core.v1.errors import NotFoundError, ValidationError
+from traust_core.v1.errors import IntegrityError, NotFoundError, ValidationError
 from traust_core.v1.models.artifacts import AssessmentArtifact
 from traust_core.v1.models.assessment import (
     ASSESSMENT_COMPLETED,
+    Artifact,
     Assessment,
     AssessmentFilter,
     AssessmentKind,
@@ -21,7 +22,8 @@ from traust_core.v1.models.assessment import (
     ToolName,
     ToolRun,
 )
-from traust_core.v1.models.common import Page, PageRequest, Provenance
+from traust_core.v1.models.common import Cursor, Page, PageRequest, Provenance
+from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.models.inventory import DEFAULT_FORGE_HOSTS
 from traust_core.v1.models.observation import ObservationTarget
 from traust_core.v1.providers.clock import Clock, SystemClock
@@ -54,18 +56,77 @@ class AssessmentService:
         )
 
     def record(
-        self, doc: AssessmentArtifact, repository_ref_id: UUID, provenance: Provenance
+        self,
+        doc: AssessmentArtifact,
+        repository_ref_id: UUID,
+        kind: AssessmentKind,
+        assessor: str,
+        assessor_version: str,
+        provenance: Provenance,
     ) -> Assessment:
-        raise NotImplementedError("stub: replaces corpus/store_ingest.py, threat_model.py")
+        """`doc` identifies the published artifact's contract; its schema doesn't name a
+        producer consistently enough to recover `kind`/`assessor` from it, so the caller
+        (which already published `doc` and knows what produced it) supplies them. The
+        artifact reference is verified against `doc`'s own bytes: a caller can't link
+        evidence to an assessment that doesn't match what it claims to record."""
+        if provenance.artifact is None:
+            raise ValidationError("record requires a published artifact reference")
+        digest = sha256_hex(doc.payload)
+        with self._uow as uow:
+            published = uow.artifacts.get(provenance.artifact.id)
+            if published.digest != digest:
+                raise IntegrityError(
+                    f"artifact {provenance.artifact.id}: doc digest {digest} "
+                    f"!= published {published.digest}"
+                )
+            assessment = uow.assessments.add(
+                Assessment(
+                    repository_ref_id=repository_ref_id,
+                    kind=kind,
+                    status=ASSESSMENT_COMPLETED,
+                    assessor=assessor,
+                    assessor_version=assessor_version,
+                    occurred_at=provenance.occurred_at,
+                )
+            )
+            assert assessment.id is not None
+            uow.artifacts.add(
+                Artifact(
+                    assessment_id=assessment.id,
+                    digest=published.digest,
+                    kind=published.kind,
+                    uri=published.uri,
+                )
+            )
+            uow.commit()
+        return assessment
 
     def get(self, assessment_id: UUID) -> Assessment:
-        raise NotImplementedError("stub: assessment read")
+        with self._uow as uow:
+            return uow.assessments.get(assessment_id)
 
     def latest(self, repository_ref_id: UUID, kind: AssessmentKind) -> Assessment | None:
-        raise NotImplementedError("stub: replaces corpus/resolver latest report")
+        with self._uow as uow:
+            return uow.assessments.latest(repository_ref_id, kind)
 
     def list(self, filter: AssessmentFilter, page: PageRequest) -> Page[Assessment]:
-        raise NotImplementedError("stub: replaces corpus/resolver.walk_reports")
+        if page.limit <= 0:
+            raise ValidationError("page limit must be positive")
+        after = _decode_cursor(page.cursor)
+        with self._uow as uow:
+            rows = uow.assessments.search(
+                repository_ref_id=filter.repository_ref_id,
+                kind=filter.kind,
+                status=filter.status,
+                limit=page.limit + 1,
+                after=after,
+            )
+        items = rows[: page.limit]
+        next_cursor = None
+        if len(rows) > page.limit:
+            last = items[-1]
+            next_cursor = Cursor(f"{last.occurred_at.isoformat()}|{last.id}")
+        return Page(items=tuple(items), next=next_cursor)
 
     def population(self, as_of: datetime, filter: AssessmentFilter) -> Population:
         raise NotImplementedError("stub: replaces census/build_census.py, corpus/resolver")
@@ -151,3 +212,10 @@ def parse_audit_date(value: str | None) -> date | None:
         return date.fromisoformat(value.strip()[:10])
     except ValueError:
         return None
+
+
+def _decode_cursor(cursor: Cursor | None) -> tuple[datetime, UUID] | None:
+    if cursor is None:
+        return None
+    raw_at, _, raw_id = cursor.partition("|")
+    return datetime.fromisoformat(raw_at), UUID(raw_id)
