@@ -59,7 +59,19 @@ class FindingDimension(StrEnum):
 class WeaknessLabels(Model): ...
 
 
-class PrecedentReason(Model): ...
+class PrecedentStrength(StrEnum):
+    """What a precedent may save: a person's verdict earns fewer votes; a machine's annotates."""
+
+    HUMAN = "human_countersigned"
+    MACHINE = "machine_refuted_sound"
+
+
+class PrecedentReason(Model):
+    """Why a prior verdict applies: the same function in the same (vendor-normalized) file."""
+
+    strength: PrecedentStrength
+    path: str
+    symbol: str
 
 
 class IdentityMove(Model): ...
@@ -516,6 +528,7 @@ class TriageItem(Model):
     finding: Finding
     occurrence: Occurrence
     locations: tuple[Location, ...] = ()
+    precedents: tuple[Precedent, ...] = ()
 
 
 class TriageInput(SkillInput):

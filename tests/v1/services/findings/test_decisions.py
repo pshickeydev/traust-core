@@ -20,6 +20,7 @@ from traust_core.v1.models.vocabulary import ActorKind
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services.findings.decisions import FindingDecisions
+from traust_core.v1.services.findings.precedents import FindingPrecedents
 from traust_core.v1.services.ledger import LedgerConfig, LedgerService
 from traust_core.v1.services.lint import Lint
 
@@ -48,7 +49,12 @@ def service(engine: Engine, approvers: int = 0, ledger: bool = False) -> Finding
     uow = SqlTraustUnitOfWork(engine)
     chain = LedgerService(uow, LedgerConfig()) if ledger else None
     return FindingDecisions(
-        uow, chain, Lint({}), clock=FixedClock(NOW), restatement_approvers=approvers
+        uow,
+        chain,
+        Lint({}),
+        FindingPrecedents(uow),
+        clock=FixedClock(NOW),
+        restatement_approvers=approvers,
     )
 
 

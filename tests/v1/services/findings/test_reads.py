@@ -59,12 +59,13 @@ def engine(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[Engine]:
 
 def service(engine: Engine) -> FindingService:
     uow = SqlTraustUnitOfWork(engine)
+    precedents = FindingPrecedents(uow)
     return FindingService(
         uow,
         FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy()),
-        FindingDecisions(uow, None, Lint({}), clock=FixedClock(NOW)),
+        FindingDecisions(uow, None, Lint({}), precedents, clock=FixedClock(NOW)),
         FindingReview(uow, ReviewPolicy()),
-        FindingPrecedents(uow),
+        precedents,
         RatingPolicy(RatingConfig()),
     )
 

@@ -88,3 +88,14 @@ def test_locations_of_many_occurrences_in_one_read(seed: Seed) -> None:
     assert same_rows(found, [a1, b1, a2])
     assert [loc.path for loc in found if loc.occurrence_id == o1.id] == ["a.go", "b.go"]
     assert seed.uow.locations.list_for_occurrences([]) == []
+
+
+def test_occurrences_by_ids_and_locations_by_symbol(seed: Seed) -> None:
+    o1, o2 = seed.occurrence(), seed.occurrence()
+    seed.occurrence()
+    assert same_rows(seed.uow.occurrences.list_by_ids([o1.id, o2.id]), [o1, o2])
+    parse = seed.location(o1, path="a.go", symbol="Parse")
+    render = seed.location(o2, path="a.go", symbol="Render")
+    seed.location(o2, path="b.go", symbol=None)
+    assert same_rows(seed.uow.locations.list_with_symbols({"Parse", "Render"}), [parse, render])
+    assert seed.uow.locations.list_with_symbols([]) == []
