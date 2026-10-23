@@ -3,6 +3,8 @@ from __future__ import annotations
 from enum import StrEnum
 from uuid import UUID
 
+from pydantic import computed_field
+
 from traust_core.v1.models.base import AppendOnly, Entity, Model
 
 
@@ -54,6 +56,7 @@ class VerifyResult(Model):
     errors: tuple[str, ...] = ()
     warnings: tuple[str, ...] = ()
 
+    @computed_field  # type: ignore[prop-decorator]
     @property
     def passed(self) -> bool:
         return not self.errors and not self.warnings

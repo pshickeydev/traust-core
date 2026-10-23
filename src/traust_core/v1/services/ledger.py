@@ -17,9 +17,11 @@ from traust_ledger.integrity import (
     verify_merkle_signature,
 )
 
-from traust_core.v1.errors import NotFoundError, ServiceError, ValidationError
+from traust_core.v1.errors import ForbiddenError, NotFoundError, ServiceError, ValidationError
 from traust_core.v1.models.base import Model
+from traust_core.v1.models.common import Cursor, Page, PageRequest
 from traust_core.v1.models.findings import Decision
+from traust_core.v1.models.identity import Principal, Role
 from traust_core.v1.models.ledger import (
     AppendReceipt,
     Checkpoint,
@@ -88,8 +90,32 @@ class LedgerService:
             self._uow.commit()
         return AppendReceipt(event=event, checkpoint=checkpoint)
 
-    def checkpoint(self, repository_id: UUID) -> Checkpoint:
+    def layers(self, repository_id: UUID) -> list[Layer]:
+        """A repository's layers: the repository's own, then one per line."""
+        with self._uow:
+            return self._uow.layers.list_for_repository(repository_id)
+
+    def layer(self, layer_id: UUID) -> Layer:
+        with self._uow:
+            return self._uow.layers.get(layer_id)
+
+    def events(self, layer_id: UUID, page: PageRequest) -> Page[Event]:
+        """A layer's events in `seq` order; the cursor is the last `seq` returned."""
+        after = None
+        if page.cursor is not None:
+            if not page.cursor.isdigit():
+                raise ValidationError(f"ledger events: cursor {page.cursor!r} is not a seq")
+            after = int(page.cursor)
+        with self._uow:
+            self._uow.layers.get(layer_id)
+            found = self._uow.events.page_for_layer(layer_id, after, page.limit + 1)
+        items, more = found[: page.limit], len(found) > page.limit
+        return Page(items=tuple(items), next=Cursor(str(items[-1].seq)) if more else None)
+
+    def checkpoint(self, repository_id: UUID, principal: Principal) -> Checkpoint:
         """Restamp and sign the repository layer, e.g. once a signing key is configured."""
+        if not principal.has_role(Role.ADMIN):
+            raise ForbiddenError(f"{principal.ref}: a ledger checkpoint is an admin's")
         with self._uow:
             layer = self._uow.layers.find_for_update(repository_id)
             if layer is None:
