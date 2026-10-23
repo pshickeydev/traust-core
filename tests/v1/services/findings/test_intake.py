@@ -16,6 +16,7 @@ from tests.v1.repositories.tables.conftest import Seed
 from traust_core.v1.errors import NotFoundError, ValidationError
 from traust_core.v1.models.common import CodeSpan, RepoPath
 from traust_core.v1.models.findings import CweId, FindingCandidate, Label
+from traust_core.v1.models.integrity import FingerprintInput
 from traust_core.v1.models.inventory import Repository, RepositoryRef
 from traust_core.v1.models.vocabulary import FindingOrigin, Severity
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
@@ -221,3 +222,30 @@ def test_an_invalid_candidate_rolls_back_the_whole_report(
 def test_an_unknown_assessment_is_not_found(engine: Engine, target: Target) -> None:
     with pytest.raises(NotFoundError):
         intake(engine).accept(uuid4(), [candidate(target)])
+
+
+def test_match_finds_an_accepted_report_entry_by_fingerprint(
+    engine: Engine, target: Target
+) -> None:
+    accepted = intake(engine).accept(audit(engine, target), [candidate(target)])
+    entry = {
+        "id": "OPERATOR-abcdef0-001",
+        "cwes": ["CWE-89"],
+        "locations": [{"path": "controllers/db.go"}, {"path": "./controllers/reconcile.go"}],
+    }
+    reported = FingerprintInput.from_report(entry, target.repository.url)
+    found = intake(engine).match(target.repository.id, reported)  # type: ignore[arg-type]
+    assert found == accepted.findings[Label("OPERATOR-abcdef0-001")]
+
+
+def test_match_of_an_entry_never_accepted_is_none(engine: Engine, target: Target) -> None:
+    reported = FingerprintInput.from_report(
+        {"cwes": ["CWE-79"], "locations": [{"path": "web/view.go"}]}, target.repository.url
+    )
+    assert intake(engine).match(target.repository.id, reported) is None  # type: ignore[arg-type]
+
+
+def test_match_refuses_an_entry_without_a_location(engine: Engine, target: Target) -> None:
+    reported = FingerprintInput.from_report({"cwes": ["CWE-79"]}, target.repository.url)
+    with pytest.raises(ValidationError, match="no usable location"):
+        intake(engine).match(target.repository.id, reported)  # type: ignore[arg-type]

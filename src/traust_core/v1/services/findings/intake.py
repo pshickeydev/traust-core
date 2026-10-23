@@ -48,6 +48,13 @@ class FindingIntake:
             created=tuple(dict.fromkeys(f for f, new in taken.values() if new)),
         )
 
+    def match(self, repository_id: UUID, reported: FingerprintInput) -> UUID | None:
+        """The recorded finding a report entry is, by fingerprint; None if it was never accepted."""
+        with self._uow as uow:
+            fp = self._identity.match_key(reported, strict=True)
+            found = uow.findings.find_by_fingerprint(repository_id, fp.algo, fp.value)
+        return None if found is None else found.id
+
     def _take(
         self,
         uow: TraustUnitOfWork,
