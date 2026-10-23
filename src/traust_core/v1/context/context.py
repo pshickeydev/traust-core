@@ -226,6 +226,7 @@ class Context:
         ledger = None if self.config.ledger is None else LedgerService(uow, self.config.ledger)
         identity = self.config.identity
         precedents = FindingPrecedents(uow)
+        review = ReviewPolicy(self.config.valve_salt())
         return Services(
             assessment=assessment,
             portfolio=PortfolioService(
@@ -245,9 +246,11 @@ class Context:
                     Lint({TriageArtifact: [VerdictCitations()]}),
                     precedents,
                     clock=self.clock,
+                    objects=self.object_store,
+                    review=review,
                     restatement_approvers=identity.restatement_approvers if identity else 0,
                 ),
-                FindingReview(uow, ReviewPolicy()),
+                FindingReview(uow, review),
                 precedents,
                 RatingPolicy(self.config.rating),
             ),

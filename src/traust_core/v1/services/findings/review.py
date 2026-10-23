@@ -1,25 +1,65 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
+from collections.abc import Mapping
 from uuid import UUID
 
+from traust_core.v1.models.base import Model
 from traust_core.v1.models.common import Page, PageRequest
 from traust_core.v1.models.findings import (
     Decision,
-    Disposition,
     ReviewCase,
     ReviewFilter,
     ReviewItem,
 )
-from traust_core.v1.models.vocabulary import ReviewReason, TenancyProfile
+from traust_core.v1.models.vocabulary import ReviewReason, Validity
 from traust_core.v1.repositories.contract import TraustUnitOfWork
 
 
+class ReviewConfig(Model):
+    valve_salt_env: str | None = None  # env var holding the audit-valve salt (a secret)
+
+
 class ReviewPolicy:
-    def needs_signoff(
-        self, decision: Decision, disposition: Disposition, profile: TenancyProfile
-    ) -> ReviewReason | None:
-        raise NotImplementedError(
-            "stub: replaces emit_triage is_auto_accept, track-findings countersign rule"
+    """Who must look before a machine verdict stands."""
+
+    AUDIT_ONE_IN = 10
+    _CLAIMED_LOW = frozenset({"low", "informational"})
+
+    def __init__(self, valve_salt: str | None = None) -> None:
+        self._salt = valve_salt
+
+    def auto_accepts(
+        self,
+        votes: Mapping[str, int],
+        confidence: float | None,
+        claimed: str | None,
+        lint_clean: bool,
+    ) -> bool:
+        """A machine FP may stand without countersign: at least two concurring FP votes and no
+        dissent, a clean citation lint, confidence of 8 or more, a low / informational claim."""
+        return (
+            lint_clean
+            and not votes.get("true_positive")
+            and not votes.get("hardening")
+            and votes.get("false_positive", 0) >= 2
+            and (confidence or 0) >= 8
+            and (claimed or "").strip().lower() in self._CLAIMED_LOW
+        )
+
+    def needs_signoff(self, decision: Decision) -> ReviewReason | None:
+        """A salted 1-in-10 sample of auto-accepted FPs goes to a person; with no salt, all of them
+        (an auto-accept tier without an audit valve isn't one)."""
+        if decision.validity != Validity.FALSE_POSITIVE or not decision.auto_accept_tier:
+            return None
+        if self._salt is None:
+            return ReviewReason.FP_AUDIT_VALVE
+        digest = hmac.new(self._salt.encode(), decision.statement_key.encode(), hashlib.sha256)
+        return (
+            ReviewReason.FP_AUDIT_VALVE
+            if int(digest.hexdigest(), 16) % self.AUDIT_ONE_IN == 0
+            else None
         )
 
 
