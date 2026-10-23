@@ -18,9 +18,11 @@ from traust_core.v1.models.findings import Decision, Disposition, RecordDecision
 from traust_core.v1.models.identity import IdentitySource, Principal, Role
 from traust_core.v1.models.vocabulary import ActorKind
 from traust_core.v1.providers.clock import FixedClock
+from traust_core.v1.repositories import InMemoryObjectStore
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services.findings.decisions import FindingDecisions
 from traust_core.v1.services.findings.precedents import FindingPrecedents
+from traust_core.v1.services.findings.review import ReviewPolicy
 from traust_core.v1.services.ledger import LedgerConfig, LedgerService
 from traust_core.v1.services.lint import Lint
 
@@ -54,6 +56,8 @@ def service(engine: Engine, approvers: int = 0, ledger: bool = False) -> Finding
         Lint({}),
         FindingPrecedents(uow),
         clock=FixedClock(NOW),
+        objects=InMemoryObjectStore(),
+        review=ReviewPolicy(),
         restatement_approvers=approvers,
     )
 

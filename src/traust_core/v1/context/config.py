@@ -10,6 +10,7 @@ import yaml
 from traust_core.v1.errors import ConfigError
 from traust_core.v1.models.inventory import DEFAULT_FORGE_HOSTS
 from traust_core.v1.services.findings.rating import RatingConfig
+from traust_core.v1.services.findings.review import ReviewConfig
 from traust_core.v1.services.identity import IdentityConfig
 from traust_core.v1.services.ledger import LedgerConfig
 
@@ -75,6 +76,7 @@ class Config(_Model):
     process: ProcessConfig = ProcessConfig()
     http: HttpConfig = HttpConfig()
     rating: RatingConfig = RatingConfig()
+    review: ReviewConfig = ReviewConfig()
     ledger: LedgerConfig | None = None  # absent: no proof chain; decisions are still recorded
     identity: IdentityConfig | None = None  # absent: no caller can be verified
     allowed_repo_hosts: tuple[str, ...] = ()
@@ -84,6 +86,9 @@ class Config(_Model):
     @classmethod
     def _expand_home(cls, value: Path) -> Path:
         return value.expanduser()
+
+    def valve_salt(self) -> str | None:
+        return _read_env(self.review.valve_salt_env, "review.valve_salt_env")
 
     def record_store_url(self) -> sa.URL:
         if self.database.url is not None:

@@ -26,6 +26,7 @@ from traust_core.v1.models.vocabulary import (
     SourceType,
 )
 from traust_core.v1.providers.clock import FixedClock
+from traust_core.v1.repositories import InMemoryObjectStore
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services.findings import (
     FindingDecisions,
@@ -63,7 +64,15 @@ def service(engine: Engine) -> FindingService:
     return FindingService(
         uow,
         FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy()),
-        FindingDecisions(uow, None, Lint({}), precedents, clock=FixedClock(NOW)),
+        FindingDecisions(
+            uow,
+            None,
+            Lint({}),
+            precedents,
+            clock=FixedClock(NOW),
+            objects=InMemoryObjectStore(),
+            review=ReviewPolicy(),
+        ),
         FindingReview(uow, ReviewPolicy()),
         precedents,
         RatingPolicy(RatingConfig()),

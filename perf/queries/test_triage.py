@@ -10,8 +10,10 @@ from perf.harness import Profile
 from perf.queries.test_findings import reads
 from perf.queries.test_ledger import fast
 from traust_core.v1.providers.clock import FixedClock
+from traust_core.v1.repositories import InMemoryObjectStore
 from traust_core.v1.services.findings.decisions import FindingDecisions
 from traust_core.v1.services.findings.precedents import FindingPrecedents
+from traust_core.v1.services.findings.review import ReviewPolicy
 from traust_core.v1.services.lint import Lint
 
 
@@ -21,7 +23,13 @@ def test_prepare_reads_each_table_once_by_index(engine: Engine, explained: Profi
     clock = FixedClock(datetime.now(UTC))
     statements = explained(
         lambda uow: FindingDecisions(
-            uow, None, Lint({}), FindingPrecedents(uow), clock=clock
+            uow,
+            None,
+            Lint({}),
+            FindingPrecedents(uow),
+            clock=clock,
+            objects=InMemoryObjectStore(),
+            review=ReviewPolicy(),
         ).prepare(scan)
     )
     assessment, ref, repository, occurrences, findings, locations, *precedents = reads(statements)

@@ -13,6 +13,7 @@ from traust_core.v1.models.findings import RecordDecision, Restatement
 from traust_core.v1.models.identity import IdentitySource, Principal, Role
 from traust_core.v1.models.vocabulary import ActorKind
 from traust_core.v1.providers.clock import FixedClock
+from traust_core.v1.repositories import InMemoryObjectStore
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services.findings import (
     FindingIntake,
@@ -52,7 +53,13 @@ def _decision(uow: SqlTraustUnitOfWork) -> UUID:
 
 def restate(uow: SqlTraustUnitOfWork) -> None:
     decisions = FindingDecisions(
-        uow, None, Lint({}), FindingPrecedents(uow), clock=FixedClock(datetime.now(UTC))
+        uow,
+        None,
+        Lint({}),
+        FindingPrecedents(uow),
+        clock=FixedClock(datetime.now(UTC)),
+        objects=InMemoryObjectStore(),
+        review=ReviewPolicy(),
     )
     restatement = Restatement(
         decision_id=_decision(uow),
@@ -82,7 +89,13 @@ def test_approvers_of_a_decision_read_by_index(explained: Profile) -> None:
 def decide(uow: SqlTraustUnitOfWork) -> None:
     decision = uow.decisions.get(_decision(uow))
     decisions = FindingDecisions(
-        uow, None, Lint({}), FindingPrecedents(uow), clock=FixedClock(datetime.now(UTC))
+        uow,
+        None,
+        Lint({}),
+        FindingPrecedents(uow),
+        clock=FixedClock(datetime.now(UTC)),
+        objects=InMemoryObjectStore(),
+        review=ReviewPolicy(),
     )
     statement = RecordDecision(
         finding_id=decision.finding_id, validity="confirmed", rationale="reproduced it"
@@ -106,7 +119,15 @@ def baseline(url: str) -> Callable[[SqlTraustUnitOfWork], None]:
         findings = FindingService(
             uow,
             FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy()),
-            FindingDecisions(uow, None, Lint({}), precedents, clock=clock),
+            FindingDecisions(
+                uow,
+                None,
+                Lint({}),
+                precedents,
+                clock=clock,
+                objects=InMemoryObjectStore(),
+                review=ReviewPolicy(),
+            ),
             FindingReview(uow, ReviewPolicy()),
             precedents,
             RatingPolicy(RatingConfig()),
