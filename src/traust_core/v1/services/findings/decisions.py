@@ -7,13 +7,11 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
-from traust_core.v1.errors import ConflictError, ForbiddenError, ValidationError
+from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.artifacts import TriageArtifact
 from traust_core.v1.models.assessment import Artifact, Assessment
 from traust_core.v1.models.common import Provenance
 from traust_core.v1.models.findings import (
-    RATIONALE_MIN_LENGTH,
-    RESTATABLE,
     Decision,
     DecisionApprover,
     Disposition,
@@ -28,9 +26,10 @@ from traust_core.v1.models.findings import (
     TriageInput,
     TriageItem,
     report_sources,
+    statement_key,
 )
-from traust_core.v1.models.identity import Principal, Role
-from traust_core.v1.models.integrity import canonical_json, sha256_hex
+from traust_core.v1.models.identity import Principal
+from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.models.vocabulary import ActorKind, ReviewReason, SourceType, Validity
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.sources import WorkspaceFiles
@@ -38,6 +37,7 @@ from traust_core.v1.rendering import MarkdownRenderer
 from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.repositories.objects import ObjectKey, ObjectStore
 from traust_core.v1.services.findings.precedents import FindingPrecedents
+from traust_core.v1.services.findings.restatement import RestatementPolicy
 from traust_core.v1.services.findings.review import ReviewPolicy
 from traust_core.v1.services.insight import TriageView
 from traust_core.v1.services.ledger import LedgerService
@@ -58,21 +58,6 @@ _RATIONALE_CAP = 500
 PRECEDENTS_PER_FINDING = 3
 
 
-_JUDGED = (
-    "finding_id",
-    "assessment_id",
-    "actor",
-    "repository_ref_id",
-    "restates_id",
-    "validity",
-    "resolution",
-    "evidence_grade",
-    "reason",
-    "severity",
-    "fixed_repository_ref_id",
-)
-
-
 class FindingDecisions:
     """Decisions are the only writes to a finding's state; every read is a view over them."""
 
@@ -86,7 +71,7 @@ class FindingDecisions:
         clock: Clock,
         objects: ObjectStore,
         review: ReviewPolicy,
-        restatement_approvers: int = 0,
+        restatement: RestatementPolicy | None = None,
     ) -> None:
         self._uow = uow
         self._ledger = ledger
@@ -95,7 +80,7 @@ class FindingDecisions:
         self._clock = clock
         self._objects = objects
         self._review = review
-        self._restatement_approvers = restatement_approvers
+        self._restatement = restatement or RestatementPolicy()
 
     def decide(self, command: RecordDecision, principal: Principal) -> Decision:
         """A person's statement, if they may make it; a retried statement is the same decision."""
@@ -132,39 +117,21 @@ class FindingDecisions:
         return report_sources(self._uow.assessments.list_by_ids(ids))
 
     def statement_key(self, decision: Decision) -> StatementKey:
-        """The hash of every judged column: a retried statement is the same decision."""
-        judged = {k: str(v) for k in _JUDGED if (v := getattr(decision, k)) is not None}
-        return StatementKey(sha256_hex(canonical_json(judged)))
+        return statement_key(decision)
 
     def restate(self, restatement: Restatement, principal: Principal) -> Decision:
         """An administrator's correction: a new decision that replaces the one it restates."""
-        approvers = self._authorize(restatement, principal)
+        approvers = self._restatement.authorize(restatement, principal)
         with self._uow as uow:
             restated = uow.decisions.get(restatement.decision_id)
-            history = uow.decisions.list_for_finding(restated.finding_id)
-            _check_correction(restatement, restated, history)
             commit = restated.repository_ref_id
             if restated.assessment_id is not None:
                 commit = uow.assessments.get(restated.assessment_id).repository_ref_id
-            draft = restated.model_copy(
-                update={
-                    **restatement.changes(),
-                    "id": None,
-                    "created_at": None,
-                    "assessment_id": None,
-                    "repository_ref_id": commit,
-                    "restates_id": restated.id,
-                    "auto_accept_tier": False,
-                    "actor": principal.ref,
-                    "reason": restatement.reason,
-                    "ticket": restatement.ticket.strip(),
-                    "rationale": restatement.rationale,
-                    "occurred_at": self._clock.now(),
-                }
+            history = uow.decisions.list_for_finding(restated.finding_id)
+            correction = restatement.correct(
+                restated, history, principal, self._clock.now(), commit
             )
-            saved = uow.decisions.add(
-                draft.model_copy(update={"statement_key": self.statement_key(draft)})
-            )
+            saved = uow.decisions.add(correction)
             for approver in sorted(approvers):
                 ref = f"{ActorKind.HUMAN}:{approver}"
                 uow.decision_approvers.add(DecisionApprover(decision_id=saved.id, approver=ref))
@@ -174,25 +141,6 @@ class FindingDecisions:
             uow.commit()
         log.info("decision %s restated as %s by %s", restated.id, saved.id, principal.ref)
         return saved
-
-    def _authorize(self, restatement: Restatement, principal: Principal) -> set[str]:
-        """Who may restate, and on whose authority (traust-ledger's restatement gates)."""
-        if not principal.is_verified_human():
-            raise ForbiddenError(f"{principal.ref}: a restatement is a verified human's correction")
-        if not principal.has_role(Role.RESTATE):
-            raise ForbiddenError(f"{principal.ref}: restating needs the restate role")
-        if not restatement.ticket.strip():
-            raise ValidationError("a restatement names its authority: a ticket")
-        if len(restatement.rationale) < RATIONALE_MIN_LENGTH:
-            raise ValidationError(f"a rationale of at least {RATIONALE_MIN_LENGTH} characters")
-        approvers = {a.strip().lower() for a in restatement.approvers if a.strip()}
-        approvers.discard(principal.identity)
-        if len(approvers) < self._restatement_approvers:
-            raise ForbiddenError(
-                f"a restatement needs {self._restatement_approvers} approvers besides its author;"
-                f" it names {len(approvers)}"
-            )
-        return approvers
 
     def prepare(self, assessment_id: UUID) -> TriageInput:
         """What a triage of one assessment judges: its findings as reported, where, precedents."""
@@ -373,33 +321,6 @@ class FindingDecisions:
         if self._ledger is not None:
             self._ledger.append_decision(saved, finding.repository_id)
         return saved
-
-
-def _check_correction(
-    restatement: Restatement, restated: Decision, history: list[Decision]
-) -> None:
-    """The change is real, replaces a value, restates the latest record and restores nothing."""
-    if any(d.restates_id == restated.id for d in history):
-        raise ConflictError(f"decision {restated.id} was already restated: restate the correction")
-    changes = restatement.changes()
-    if not changes:
-        raise ValidationError("a restatement corrects at least one of " + ", ".join(RESTATABLE))
-    by_id = {d.id: d for d in history}
-    earlier, step = [], restated
-    while step.restates_id is not None and (step := by_id.get(step.restates_id)) is not None:
-        earlier.append(step)
-    for field, value in changes.items():
-        current = getattr(restated, field)
-        if current is None:
-            raise ValidationError(
-                f"nothing to restate: {field} has no value yet; record it instead"
-            )
-        if value == current:
-            raise ValidationError(f"the restatement changes nothing: {field} is already {value}")
-        if value in {getattr(d, field) for d in earlier} - {current}:
-            raise ValidationError(
-                f"{field} {value} was already corrected away from; record why anew"
-            )
 
 
 def _rationale(verdict: Any, validity: Validity) -> str:

@@ -18,6 +18,7 @@ from tests.v1.repositories.tables.conftest import Seed
 from traust_core.v1.errors import (
     ConflictError,
     ForbiddenError,
+    IntegrityError,
     NotFoundError,
     ServiceError,
     ValidationError,
@@ -366,9 +367,9 @@ def test_events_of_an_unknown_layer_or_with_a_bad_cursor_are_refused(engine: Eng
     [
         ADMIN.model_copy(update={"roles": frozenset()}),
         ADMIN.model_copy(update={"verified_by": None}),
-        ADMIN.model_copy(update={"kind": ActorKind.MACHINE}),
+        ADMIN.model_copy(update={"kind": ActorKind.MACHINE, "roles": frozenset()}),
     ],
-    ids=["no admin role", "unverified", "a machine"],
+    ids=["no admin role", "unverified", "a machine without the role"],
 )
 def test_a_checkpoint_is_an_admins(engine: Engine, who: Principal) -> None:
     repo_id, _ = appended(engine, 1)
@@ -380,3 +381,83 @@ def test_verification_reports_whether_it_passed(engine: Engine) -> None:
     _, layer_id = appended(engine, 2)
     result = ledger(SqlTraustUnitOfWork(engine)).verify(layer_id)
     assert result.passed and result.model_dump()["passed"] is True
+
+
+def test_a_service_account_admin_checkpoints(engine: Engine) -> None:
+    repo_id, _ = appended(engine, 1)
+    rotation = ADMIN.model_copy(update={"identity": "key-rotation", "kind": ActorKind.MACHINE})
+    assert ledger(SqlTraustUnitOfWork(engine)).checkpoint(repo_id, rotation).layer.merkle_size == 1
+
+
+def keypair(tmp_path: Path, name: str) -> tuple[str, str]:
+    """Another throwaway cosign keypair (the `keys` fixture sets the empty password)."""
+    prefix = tmp_path / name
+    subprocess.run(
+        ["cosign", "generate-key-pair", "--output-key-prefix", str(prefix)],
+        check=True,
+        capture_output=True,
+    )
+    return f"{prefix}.key", f"{prefix}.pub"
+
+
+def test_checkpoint_refuses_to_sign_over_tampered_events(engine: Engine) -> None:
+    repo_id, layer_id = appended(engine, 3)
+    tamper(
+        engine,
+        lambda events, _: sa.update(events).where(events.c.seq == 1).values(event_payload=b"{}"),
+    )
+    service = ledger(SqlTraustUnitOfWork(engine))
+    before = service.layer(layer_id)
+    with pytest.raises(IntegrityError, match="merkle_root mismatch"):
+        service.checkpoint(repo_id, ADMIN)
+    assert service.layer(layer_id) == before
+
+
+def test_checkpoint_refuses_a_signature_that_does_not_verify(
+    engine: Engine, keys: tuple[str, str]
+) -> None:
+    private, public = keys
+    repo_id, (decision,) = decisions(engine, 1)
+    signer = ledger(SqlTraustUnitOfWork(engine), key_path=private, public_key_path=public)
+    layer_id = signer.append_decision(decision, repo_id).checkpoint.layer.id
+    assert layer_id is not None
+    tamper(engine, lambda _, layers: sa.update(layers).values(merkle_root_signature="AAAA"))
+    with pytest.raises(IntegrityError, match="won't be re-signed"):
+        signer.checkpoint(repo_id, ADMIN)
+    assert signer.layer(layer_id).merkle_root_signature == "AAAA"
+
+
+def test_a_key_rotation_re_signs_with_the_new_key(
+    engine: Engine, keys: tuple[str, str], tmp_path: Path
+) -> None:
+    old_private, old_public = keys
+    new_private, new_public = keypair(tmp_path, "rotated")
+    repo_id, (decision,) = decisions(engine, 1)
+    old = ledger(SqlTraustUnitOfWork(engine), key_path=old_private, public_key_path=old_public)
+    layer_id = old.append_decision(decision, repo_id).checkpoint.layer.id
+    assert layer_id is not None
+    new_only = ledger(SqlTraustUnitOfWork(engine), key_path=new_private, public_key_path=new_public)
+    with pytest.raises(IntegrityError):
+        new_only.checkpoint(repo_id, ADMIN)  # the old signature verifies against no configured key
+    rotating = ledger(
+        SqlTraustUnitOfWork(engine),
+        key_path=new_private,
+        public_key_path=new_public,
+        previous_public_key_path=old_public,
+    )
+    assert rotating.verify(layer_id).passed
+    assert rotating.checkpoint(repo_id, ADMIN).signing is Signing.SIGNED
+    assert new_only.verify(layer_id).passed
+
+
+def test_checkpoint_signs_an_unsigned_layer_even_when_signing_is_required(
+    engine: Engine, keys: tuple[str, str]
+) -> None:
+    private, public = keys
+    repo_id, _ = appended(engine, 2)
+    strict = ledger(
+        SqlTraustUnitOfWork(engine), key_path=private, public_key_path=public, required=True
+    )
+    checkpoint = strict.checkpoint(repo_id, ADMIN)
+    assert checkpoint.signing is Signing.SIGNED
+    assert checkpoint.layer.id is not None and strict.verify(checkpoint.layer.id).passed
