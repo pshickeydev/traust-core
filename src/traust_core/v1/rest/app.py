@@ -11,8 +11,8 @@ from fastapi.exceptions import RequestValidationError
 
 from traust_core.v1.context import Context
 from traust_core.v1.errors import TraustError
-from traust_core.v1.rest.problems import problem
-from traust_core.v1.rest.routes import ROUTERS
+from traust_core.v1.rest.common.problems import problem
+from traust_core.v1.rest.domains import DOMAINS
 
 access = logging.getLogger("traust_core.rest.access")
 
@@ -32,11 +32,11 @@ def request_id(request: Request) -> str:
 
 
 def create_app(context: Context) -> FastAPI:
-    """The REST API over `context`'s services; every route is in `routes.ROUTERS`."""
+    """The REST API over `context`'s services; each package in `DOMAINS` brings its router."""
     app = FastAPI(title="traust-core", version="v1")
     app.state.context = context
-    for router in ROUTERS:
-        app.include_router(router)
+    for domain in DOMAINS:
+        app.include_router(domain.router)
 
     @app.middleware("http")
     async def correlate(
