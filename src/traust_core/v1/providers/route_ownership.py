@@ -18,10 +18,13 @@ PATH_PARAM_RX = re.compile(
 PRIVILEGED_RX = re.compile(r"(?i)(admin|operator|superuser|staff)")
 _QUOTED_RX = re.compile(r"'([^'\"]*)'|\"([^'\"]*)\"")
 _ALTERNATIVE_RX = re.compile(r"(?i)(\bor\b|\|\||_or_|#\w|principal|authentication\.)")
+# owner-, tenant- or membership-shaped fields; broad on purpose, since a miss reads as ownerless
 OWNER_FIELD_RX = re.compile(
-    r"(?i)^_?(owner|user|tenant|team|org|organi[sz]ation|account|customer|member|workspace|"
-    r"author|created_?by)(_?id)?$"
+    r"(?i)^_?(owner\w*|owned_?by\w*|users?|user_?id|tenant\w*|team\w*|org|orgs?_?id|"
+    r"organi[sz]ation\w*|account\w*|customer\w*|member\w*|workspace\w*|author\w*|"
+    r"creator\w*|created_?by\w*|project\w*|group\w*|company\w*|client\w*|realm\w*)$"
 )
+_CONSTANT_ROLE = re.compile(r"\b(?:[A-Z]\w*\.)?[A-Z][A-Z0-9_]{2,}\b")
 MUTATING = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 JUDGED = frozenset({RouteOwnership.CALLER_BLIND, RouteOwnership.UNCHECKED})
 
@@ -54,13 +57,17 @@ def path_params(pattern: str) -> tuple[str, ...]:
 
 
 def privileged_only(guard: str) -> bool:
-    """A guard naming a privileged role with no ordinary role or other way in."""
-    if not PRIVILEGED_RX.search(guard) or _ALTERNATIVE_RX.search(guard):
+    """A guard naming only privileged roles, quoted or as constants, with no other way in."""
+    if not PRIVILEGED_RX.search(guard) or _ALTERNATIVE_RX.search(guard) or "…" in guard:
         return False
     if guard.count("'") % 2 or guard.count('"') % 2:
         return False  # a label cut short may have lost a role
-    quoted = (a or b for a, b in _QUOTED_RX.findall(guard))
+    name, _, args = guard.partition("(")
+    quoted = [a or b for a, b in _QUOTED_RX.findall(args)]
     roles = [r for q in quoted for r in re.split(r"[,\s]+", q) if r]
+    roles += _CONSTANT_ROLE.findall(_QUOTED_RX.sub(" ", args))
+    if not roles:
+        return not args and bool(PRIVILEGED_RX.search(name))
     return all(PRIVILEGED_RX.search(r) for r in roles)
 
 

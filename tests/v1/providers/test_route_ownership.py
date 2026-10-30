@@ -378,7 +378,7 @@ def test_a_guard_beside_an_unguard_marker_is_not_authentication() -> None:
         (['@PreAuthorize("isAuthenticated()")'], RouteOwnership.CALLER_BLIND),
     ],
 )
-def test_a_deploy_time_config_counts_only_the_routes_own_guards(
+def test_the_enumerators_effective_guards_decide_authentication(
     guards: list[str], expected: RouteOwnership
 ) -> None:
     row = _row(
@@ -392,7 +392,7 @@ def test_a_deploy_time_config_counts_only_the_routes_own_guards(
         ["spring-security:authenticated"],
         ["spring-security:conditional-config", "spring-security:permitAll"],
     )
-    row.own(HandlerFacts(lookups=(Lookup(at(3), record_type="Item"),)), FIELDS, deploy_time=True)
+    row.own(HandlerFacts(lookups=(Lookup(at(3), record_type="Item"),)), FIELDS, guards=row.guards)
     assert row.ownership is expected
 
 
