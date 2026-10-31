@@ -446,6 +446,18 @@ PROBE = (
     "    Card c = cards.findById(id).orElseThrow();\n"
     "    if (!c.ownerEmail.equals(me.getName()) == false) throw new IllegalStateException();\n"
     "    return c;\n  }\n"
+    '  @GetMapping("/inline-as/{id}") Card inlineAs(@PathVariable Long id, @RequestParam String as, Principal me) {\n'
+    "    return cards.findByIdAndOwnerEmail(id, as != null ? as : me.getName()).orElseThrow();\n  }\n"
+    '  @GetMapping("/finder/{id}") Card viaFinder(@PathVariable Long id, Principal me) {\n'
+    "    return load(id, me, cards::findByIdAndOwnerEmail);\n  }\n"
+    "  Card load(Long id, Principal me, java.util.function.BiFunction<Long, String, Card> finder) {\n"
+    "    Card c = finder.apply(id, me.getName());\n"
+    "    return c;\n  }\n"
+    '  @GetMapping("/finder-request/{id}") Card viaFinderRequest(@PathVariable Long id, @RequestParam String who) {\n'
+    "    return loadFor(id, who, cards::findByIdAndOwnerEmail);\n  }\n"
+    "  Card loadFor(Long id, String who, java.util.function.BiFunction<Long, String, Card> finder) {\n"
+    "    Card c = finder.apply(id, who);\n"
+    "    return c;\n  }\n"
     '  @DeleteMapping("/reassigned/{id}") void reassigned(@PathVariable Long id, Principal me, Long other) {\n'
     "    cards.findByIdAndOwnerEmail(id, me.getName()).orElseThrow();\n"
     "    id = other;\n"
@@ -502,6 +514,13 @@ def probe(tmp_path_factory: pytest.TempPathFactory) -> dict:
         ("GET", "/p/roles/{id}", "caller-blind"),  # Roles.USER admits ordinary users
         ("GET", "/p/doubled/{id}", "unchecked"),  # `!owner == false` denies the owner
         ("DELETE", "/p/reassigned/{id}", "unchecked"),  # the id changed after the check
+        ("GET", "/p/inline-as/{id}", "unchecked"),  # a mixed value inline isn't the caller
+        (
+            "GET",
+            "/p/finder/{id}",
+            "scoped",
+        ),  # a load handed a caller value: trusted (owner decision)
+        ("GET", "/p/finder-request/{id}", "caller-blind"),  # handed request data, not the caller
     ],
 )
 def test_protection_that_doesnt_hold_stays_judged(

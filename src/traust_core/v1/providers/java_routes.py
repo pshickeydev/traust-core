@@ -953,6 +953,7 @@ class _Ownership:
             return node is not None and any(is_caller(n) for n in walk(node))
 
         scan = _Walk(self, src, t, body, ids, callers, depth, local_types, is_caller, calls_caller)
+        scan.in_scope = params | set(local_types)
         scan.verify(covered or set(), body.start_byte)
         for stmt in body.named_children:
             scan.statement(stmt)
@@ -1125,6 +1126,7 @@ class _Walk:
         self.o, self.src, self.t, self.body = owner, src, t, body
         self.ids, self.callers, self.depth, self.local_types = ids, callers, depth, local_types
         self.is_caller, self.calls_caller = is_caller, calls_caller
+        self.in_scope: set[str] = set()  # parameters and locals: request data unless a caller
         self.lookups: list[Lookup] = []
         self.lookup_ids: list[set[str]] = []
         self.starts: list[int] = []
@@ -1306,7 +1308,10 @@ class _Walk:
         elif targets := self.o._callees(src, self.t, call, self.local_types):
             # one hop, and a second only into an authorization-shaped helper (`checkXxxId`)
             if self.depth >= 2 or (self.depth == 1 and not _AUTHORIZE_NAME.match(name)):
-                self.handoffs.append((self.o._span(src, call), used, call.start_byte))
+                # past the depth limit; a check- or validation-shaped helper (`validateId`) is
+                # presumed not to act on the object, so it isn't an unseen hand-off (no credit)
+                if not _ENFORCING_NAME.match(name):
+                    self.handoffs.append((self.o._span(src, call), used, call.start_byte))
                 return
             self.hop = self.hop or self.o._span(src, call)
             handed_caller = self.calls_caller(args)
@@ -1341,9 +1346,17 @@ class _Walk:
             pass  # credited only where it refuses (a bare enforcing statement or a condition)
         elif rtext[:1].islower() and _LOOKUP_NAME.match(name):
             self.add(call, used, Lookup(self.o._span(src, call)))
-        elif not _INERT_RECEIVERS.match(rtext) and not _CONVERSION.match(name):
+        elif (
+            not _INERT_RECEIVERS.match(rtext)
+            and not _CONVERSION.match(name)
+            and not _ENFORCING_NAME.match(name)  # a validator (`validateId(id, …)`) doesn't act
+        ):
             if call.parent is not None and call.parent.type == "variable_declarator":
-                self.add(call, used, Lookup(self.o._span(src, call)))
+                # a kept load through code we can't see (`finder.apply(user.getTenantId(), id)`):
+                # handed a value taken only from the caller, it is trusted to narrow to it
+                # (owner decision 2026-10-30)
+                trusted = self.caller_value(args)
+                self.add(call, used, Lookup(self.o._span(src, call), scoped=trusted))
             else:
                 self.handoffs.append((self.o._span(src, call), used, call.start_byte))
         self.produced[(call.start_byte, call.end_byte)] = (
@@ -1357,12 +1370,21 @@ class _Walk:
         self.lookup_ids.append(used)
         self.starts.append(call.start_byte)
 
+    def caller_value(self, args: Node | None) -> bool:
+        """An argument taken only from the caller (`user.getTenantId()`, `me.getName()`), not
+        mixed with request data."""
+        return args is not None and any(
+            self.o._pure_caller(self.src, a, self.callers, self.in_scope)
+            for a in args.named_children
+            if a.type != "comment"
+        )
+
     def scoped(self, call: Node, args: Node, name: str) -> bool:
         """The query itself narrows to the caller: a caller argument to a lookup that isn't an
         Or-query, or a chained filter comparing the record with the caller."""
-        if self.calls_caller(args) and _LOOKUP_NAME.match(name) and not _OR_QUERY.search(name):
+        if self.caller_value(args) and _LOOKUP_NAME.match(name) and not _OR_QUERY.search(name):
             return True
-        if self.calls_caller(args) and name in _ENTITY_MANAGER_LOOKUPS + _QUERY_CALLS:
+        if name in _ENTITY_MANAGER_LOOKUPS + _QUERY_CALLS:
             return False
         node = call
         while node.parent is not None and node.parent.type == "method_invocation":
