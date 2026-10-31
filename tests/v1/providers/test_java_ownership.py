@@ -1,5 +1,4 @@
 """Ownership of the object a Spring or JAX-RS id route acts on, read from its handler."""
-# ruff: noqa: E501  (embedded Java fixture lines; wrapped in the follow-up PR)
 
 from __future__ import annotations
 
@@ -152,7 +151,7 @@ def _row(result: dict, method: str, pattern: str) -> dict:
     [
         ("GET", "/api/invoices/{id}", "caller-blind", True),
         ("GET", "/api/mine/{id}", "scoped", False),
-        ("GET", "/api/filtered/{id}", "scoped", False),
+        ("GET", "/api/filtered/{id}", "unchecked", True),  # a filter lambda: not an allowed shape
         ("DELETE", "/api/invoices/{id}", "checked", False),
         ("PUT", "/api/invoices/{id}", "checked", False),
         ("GET", "/api/currencies/{code}", "none", False),
@@ -164,12 +163,12 @@ def _row(result: dict, method: str, pattern: str) -> dict:
         ("DELETE", "/api/admin/invoices/{id}", "n/a", False),
         ("GET", "/api/clerk/invoices/{id}", "caller-blind", True),
         ("GET", "/api/invoices", "n/a", False),
-        ("GET", "/docs/{id}", "scoped", False),
+        ("GET", "/docs/{id}", "unchecked", True),  # a ternary returning null isn't a refusal
         ("DELETE", "/docs/{id}", "caller-blind", True),
         ("GET", "/api/owned/{id}", "scoped", False),
         ("GET", "/api/keyed/{raw}", "caller-blind", True),
         ("GET", "/api/logged/{id}", "unchecked", True),
-        ("GET", "/api/permitted/{id}", "checked", False),
+        ("GET", "/api/permitted/{id}", "unchecked", True),  # a check-shaped name proves nothing
         ("GET", "/api/self/{id}", "caller-blind", True),
         ("GET", "/docs/{id}/peek", "caller-blind", True),
         ("GET", "/docs/{id}/careless", "unchecked", True),
@@ -301,15 +300,15 @@ def ledger(tmp_path_factory: pytest.TempPathFactory) -> dict:
     [
         ("GET", "/v/logs/{id}", "unchecked"),  # the condition doesn't deny
         ("GET", "/v/unrelated/{id}", "unchecked"),  # compares nothing with the caller
-        ("GET", "/v/positive/{id}", "checked"),  # equal → returns, otherwise throws
+        ("GET", "/v/positive/{id}", "unchecked"),  # equal → returns: not an allowed shape
         ("GET", "/v/advisory/{id}", "unchecked"),  # an authorization result left unused
-        ("GET", "/v/enforced/{id}", "checked"),
+        ("GET", "/v/enforced/{id}", "unchecked"),  # a helper we can't follow, credited by name
         ("GET", "/v/mapped/{id}", "unchecked"),  # the caller added to output, not a filter
         ("DELETE", "/v/late/{id}", "unchecked"),  # the delete runs before the check
         ("GET", "/v/branch/{id}", "unchecked"),  # the scoped lookup sits in an optional branch
         ("GET", "/v/format/{id}", "caller-blind"),  # method security on another parameter
         ("GET", "/v/demo/{id}", "caller-blind"),  # names the id, compares it with a constant
-        ("GET", "/v/returned/{id}", "checked"),  # the returned object against the caller
+        ("GET", "/v/returned/{id}", "caller-blind"),  # @PostAuthorize runs after the handler
         ("GET", "/v/ledger/{id}", "caller-blind"),  # @PathVariable on the interface
         ("GET", "/v/documents/{id}", "caller-blind"),  # owner field inherited
         ("GET", "/v/memos/{id}", "caller-blind"),  # superclass outside the checkout: not ownerless
@@ -358,7 +357,8 @@ PROBE = (
     "    return c;\n  }\n"
     '  @GetMapping("/lambda/{id}") Card lambda(@PathVariable Long id, Principal me) {\n'
     "    Card c = cards.findById(id).orElseThrow();\n"
-    "    Runnable r = () -> { if (!c.ownerEmail.equals(me.getName())) throw new IllegalStateException(); };\n"
+    "    Runnable r = () -> { if (!c.ownerEmail.equals(me.getName())) throw new"
+    " IllegalStateException(); };\n"
     "    return c;\n  }\n"
     '  @GetMapping("/nested/{id}") Card nested(@PathVariable Long id, Principal me, boolean s) {\n'
     "    Card c = cards.findById(id).orElseThrow();\n"
@@ -374,7 +374,8 @@ PROBE = (
     "    c.cents = 0;\n"
     "    cards.save(c);\n"
     "    if (!c.ownerEmail.equals(me.getName())) throw new IllegalStateException();\n  }\n"
-    '  @GetMapping("/unrelated-deny/{id}") Card unrelatedDeny(@PathVariable Long id, Principal me) {\n'
+    '  @GetMapping("/unrelated-deny/{id}") Card unrelatedDeny(@PathVariable Long id, Principal me)'
+    " {\n"
     "    Card c = cards.findById(id).orElseThrow();\n"
     '    if (c.ownerEmail.equals(me.getName())) { System.out.println("owner"); }\n'
     "    if (c.cents < 0) { throw new IllegalStateException(); }\n"
@@ -392,17 +393,21 @@ PROBE = (
     '  @DeleteMapping("/ignored/{id}") void ignored(@PathVariable Long id, Principal me) {\n'
     "    Optional<Card> mine = cards.findByIdAndOwnerEmail(id, me.getName());\n"
     "    cards.deleteById(id);\n  }\n"
-    '  @DeleteMapping("/unchecked-exists/{id}") void uncheckedExists(@PathVariable Long id, Principal me) {\n'
+    '  @DeleteMapping("/unchecked-exists/{id}") void uncheckedExists(@PathVariable Long id,'
+    " Principal me) {\n"
     '    if (!cards.existsByIdAndOwnerEmail(id, me.getName())) { System.out.println("x"); }\n'
     "    cards.deleteById(id);\n  }\n"
-    '  @DeleteMapping("/enforced-exists/{id}") void enforcedExists(@PathVariable Long id, Principal me) {\n'
-    "    if (!cards.existsByIdAndOwnerEmail(id, me.getName())) { throw new IllegalStateException(); }\n"
+    '  @DeleteMapping("/enforced-exists/{id}") void enforcedExists(@PathVariable Long id,'
+    " Principal me) {\n"
+    "    if (!cards.existsByIdAndOwnerEmail(id, me.getName())) { throw new"
+    " IllegalStateException(); }\n"
     "    cards.deleteById(id);\n  }\n"
     '  @DeleteMapping("/thrown/{id}") void thrown(@PathVariable Long id, Principal me) {\n'
     "    cards.findByIdAndOwnerEmail(id, me.getName()).orElseThrow();\n"
     "    cards.deleteById(id);\n  }\n"
     '  @PreAuthorize("@access.canReadProject(#pid, authentication)")\n'
-    '  @GetMapping("/projects/{pid}/cards/{cid}") Card two(@PathVariable Long pid, @PathVariable Long cid) {\n'
+    '  @GetMapping("/projects/{pid}/cards/{cid}") Card two(@PathVariable Long pid, @PathVariable'
+    " Long cid) {\n"
     "    return cards.findById(cid).orElseThrow();\n  }\n"
     '  @PreAuthorize("@rateLimiter.allow(#id)")\n'
     '  @GetMapping("/limited/{id}") Card limited(@PathVariable Long id) {\n'
@@ -412,7 +417,8 @@ PROBE = (
     "    Card c = cards.findById(id).orElseThrow();\n"
     "    cards.deleteById(id);\n"
     "    return c;\n  }\n"
-    '  @GetMapping("/as/{id}") Card as(@PathVariable Long id, @RequestParam String as, Principal me) {\n'
+    '  @GetMapping("/as/{id}") Card as(@PathVariable Long id, @RequestParam String as, Principal'
+    " me) {\n"
     "    String owner = as != null ? as : me.getName();\n"
     "    return cards.findByIdAndOwnerEmail(id, owner).orElseThrow();\n  }\n"
     '  @GetMapping("/nonnull/{id}") Card nonnull(@PathVariable Long id, Principal me) {\n'
@@ -424,7 +430,8 @@ PROBE = (
     '  @GetMapping("/created/{id}") Card created(@PathVariable Long id, Principal me) {\n'
     "    return new LooseFinder().find(id, me.getName());\n  }\n"
     '  @GetMapping("/jpql/{id}") Object jpql(@PathVariable Long id) {\n'
-    '    return em.createQuery("from Card c where c.id = :id").setParameter("id", id).getSingleResult();\n'
+    '    return em.createQuery("from Card c where c.id = :id").setParameter("id",'
+    " id).getSingleResult();\n"
     "  }\n"
     '  @GetMapping("/jdbc/{id}") Object jdbc(@PathVariable Long id) {\n'
     '    return jdbc.queryForObject("select * from card where id = ?", Object.class, id);\n  }\n'
@@ -446,19 +453,25 @@ PROBE = (
     "    Card c = cards.findById(id).orElseThrow();\n"
     "    if (!c.ownerEmail.equals(me.getName()) == false) throw new IllegalStateException();\n"
     "    return c;\n  }\n"
-    '  @GetMapping("/inline-as/{id}") Card inlineAs(@PathVariable Long id, @RequestParam String as, Principal me) {\n'
-    "    return cards.findByIdAndOwnerEmail(id, as != null ? as : me.getName()).orElseThrow();\n  }\n"
+    '  @GetMapping("/inline-as/{id}") Card inlineAs(@PathVariable Long id, @RequestParam String'
+    " as, Principal me) {\n"
+    "    return cards.findByIdAndOwnerEmail(id, as != null ? as : me.getName()).orElseThrow();\n "
+    " }\n"
     '  @GetMapping("/finder/{id}") Card viaFinder(@PathVariable Long id, Principal me) {\n'
     "    return load(id, me, cards::findByIdAndOwnerEmail);\n  }\n"
-    "  Card load(Long id, Principal me, java.util.function.BiFunction<Long, String, Card> finder) {\n"
+    "  Card load(Long id, Principal me, java.util.function.BiFunction<Long, String, Card> finder)"
+    " {\n"
     "    Card c = finder.apply(id, me.getName());\n"
     "    return c;\n  }\n"
-    '  @GetMapping("/finder-request/{id}") Card viaFinderRequest(@PathVariable Long id, @RequestParam String who) {\n'
+    '  @GetMapping("/finder-request/{id}") Card viaFinderRequest(@PathVariable Long id,'
+    " @RequestParam String who) {\n"
     "    return loadFor(id, who, cards::findByIdAndOwnerEmail);\n  }\n"
-    "  Card loadFor(Long id, String who, java.util.function.BiFunction<Long, String, Card> finder) {\n"
+    "  Card loadFor(Long id, String who, java.util.function.BiFunction<Long, String, Card> finder)"
+    " {\n"
     "    Card c = finder.apply(id, who);\n"
     "    return c;\n  }\n"
-    '  @DeleteMapping("/reassigned/{id}") void reassigned(@PathVariable Long id, Principal me, Long other) {\n'
+    '  @DeleteMapping("/reassigned/{id}") void reassigned(@PathVariable Long id, Principal me,'
+    " Long other) {\n"
     "    cards.findByIdAndOwnerEmail(id, me.getName()).orElseThrow();\n"
     "    id = other;\n"
     "    cards.deleteById(id);\n  }\n"
@@ -529,3 +542,227 @@ def test_protection_that_doesnt_hold_stays_judged(
     row = _row(probe, method, pattern)
     assert row["ownership"] == ownership
     assert row["judgement_required"] is (ownership in ("caller-blind", "unchecked"))
+
+
+# A second independent review: shapes credited without protection, each beside a correct twin
+# that the allow-list (owner decision 2026-10-31) still credits.
+REVIEW = (
+    "package review;\n"
+    "import org.springframework.web.bind.annotation.*;\n"
+    "import java.security.Principal;\n"
+    "class Card { Long id; String ownerEmail; long cents; }\n"
+    "class Note { Long id; String username; }\n"
+    "class Patient { Long id; String ownerId; }\n"
+    "class Visit { Long id; Patient patient; }\n"
+    "class Result<T> { T value; }\n"
+    "interface CardRepository extends JpaRepository<Card, Long> {\n"
+    "  Optional<Card> findByIdAndOwnerEmail(Long id, String ownerEmail);\n}\n"
+    "class CardGuard {\n"
+    "  private CardRepository cards;\n"
+    "  void checkCard(Long id, String me) {\n"
+    "    Card c = cards.findById(id).orElseThrow();\n"
+    "    if (!c.ownerEmail.equals(me)) throw new IllegalStateException();\n  }\n"
+    "  void checkPair(Long pid, Long cid, String me) {\n"
+    "    Card c = cards.findById(cid).orElseThrow();\n"
+    "    if (!c.ownerEmail.equals(me)) throw new IllegalStateException();\n  }\n}\n"
+    "class Guards { static void verifyOwner(Long id, String me) {} }\n"
+    "class Session {\n"
+    "  String owner() {\n"
+    "    return SecurityContextHolder.getContext().getAuthentication().getName();\n  }\n}\n"
+    "class Reader {\n"
+    "  private JdbcTemplate jdbc;\n"
+    "  Result<Card> fetch(Long id) {\n"
+    '    return new Result<>(jdbc.queryForObject("select * from card where id = ?",'
+    " Card.class, id));\n"
+    "  }\n}\n"
+    '@RestController @RequestMapping("/r")\n'
+    "class Review {\n"
+    "  private CardRepository cards;\n"
+    "  private CardGuard guard;\n"
+    "  private Reader reader;\n"
+    "  private EntityManager em;\n"
+    "  private Orders orders;\n"
+    "  private String lastSeen;\n"
+    '  @GetMapping("/and/{id}") Card and(@PathVariable Long id, Principal me) {\n'
+    "    Card c = cards.findById(id).orElseThrow();\n"
+    "    if (!c.ownerEmail.equals(me.getName()) && c.cents > 0)"
+    " throw new IllegalStateException();\n"
+    "    return c;\n  }\n"
+    '  @GetMapping("/null-or/{id}") Card nullOr(@PathVariable Long id, Principal me) {\n'
+    "    Card c = cards.findById(id).orElse(null);\n"
+    "    if (c == null || !c.ownerEmail.equals(me.getName()))"
+    " throw new IllegalStateException();\n"
+    "    return c;\n  }\n"
+    '  @GetMapping("/objects/{id}") Card objects(@PathVariable Long id, Principal me) {\n'
+    "    Card c = cards.findById(id).orElseThrow();\n"
+    "    if (!Objects.equals(c.ownerEmail, me.getName()))"
+    " { throw new IllegalStateException(); }\n"
+    "    return c;\n  }\n"
+    '  @GetMapping("/getter/{id}") Card getter(@PathVariable Long id, Principal me) {\n'
+    "    Card c = cards.findById(id).orElseThrow();\n"
+    "    if (!me.getName().equals(c.getOwnerEmail())) throw new IllegalStateException();\n"
+    "    return c;\n  }\n"
+    '  @GetMapping("/forbidden/{id}") Object forbidden(@PathVariable Long id, Principal me) {\n'
+    "    Card c = cards.findById(id).orElseThrow();\n"
+    "    if (!c.ownerEmail.equals(me.getName()))"
+    " return ResponseEntity.status(FORBIDDEN).body(c);\n"
+    "    return c;\n  }\n"
+    '  @GetMapping("/later/{id}") Card later(@PathVariable Long id, Principal me) {\n'
+    "    Card c = cards.findById(id).orElseThrow();\n"
+    "    orders.touch(c);\n"
+    "    if (!c.ownerEmail.equals(me.getName())) throw new IllegalStateException();\n"
+    "    return c;\n  }\n"
+    '  @GetMapping("/checkout/{id}") Card checkout(@PathVariable Long id) {\n'
+    "    orders.checkout(id);\n"
+    "    return cards.findById(id).orElseThrow();\n  }\n"
+    '  @GetMapping("/static/{id}") Card viaStatic(@PathVariable Long id, Principal me) {\n'
+    "    Guards.verifyOwner(id, me.getName());\n"
+    "    return cards.findById(id).orElseThrow();\n  }\n"
+    '  @GetMapping("/guarded/{id}") Card guarded(@PathVariable Long id, Principal me) {\n'
+    "    guard.checkCard(id, me.getName());\n"
+    "    return cards.findById(id).orElseThrow();\n  }\n"
+    '  @GetMapping("/projects/{pid}/cards/{cid}")\n'
+    "  Card other(@PathVariable Long pid, @PathVariable Long cid, Principal me) {\n"
+    "    guard.checkCard(cid, me.getName());\n"
+    "    return cards.findById(pid).orElseThrow();\n  }\n"
+    '  @GetMapping("/pairs/{pid}/{cid}")\n'
+    "  Card pair(@PathVariable Long pid, @PathVariable Long cid, Principal me) {\n"
+    "    guard.checkPair(pid, cid, me.getName());\n"
+    "    return cards.findById(pid).orElseThrow();\n  }\n"
+    '  @GetMapping("/result/{id}") Result<Card> result(@PathVariable Long id) {\n'
+    "    return reader.fetch(id);\n  }\n"
+    '  @GetMapping("/notes/{id}") Note note(@PathVariable Long id) {\n'
+    "    return em.find(Note.class, id);\n  }\n"
+    '  @GetMapping("/visits/{id}") Visit visit(@PathVariable Long id) {\n'
+    "    return em.find(Visit.class, id);\n  }\n"
+    '  @GetMapping("/ternary/{id}") Card ternary(@PathVariable Long id, boolean f) {\n'
+    "    Long key = f ? id : 0L;\n"
+    "    return cards.findById(key).orElseThrow();\n  }\n"
+    '  @GetMapping("/formatted/{id}") Card formatted(@PathVariable Long id) {\n'
+    '    String key = "" + id;\n'
+    "    return cards.findById(Long.valueOf(key)).orElseThrow();\n  }\n"
+    '  @GetMapping("/swapped/{id}")\n'
+    "  Card swapped(@PathVariable Long id, Principal p, @RequestParam String who) {\n"
+    "    String me = p.getName();\n"
+    "    me = who;\n"
+    "    return cards.findByIdAndOwnerEmail(id, me).orElseThrow();\n  }\n"
+    '  @GetMapping("/named/{id}") Card named(@PathVariable Long id) {\n'
+    "    return cards.findByIdAndOwnerEmail(id, owner()).orElseThrow();\n  }\n"
+    "  String owner() { return lastSeen; }\n"
+    '  @PreAuthorize("@access.canRead(#id, authentication) or true")\n'
+    '  @GetMapping("/spel-or/{id}") Card spelOr(@PathVariable Long id) {\n'
+    "    return cards.findById(id).orElseThrow();\n  }\n"
+    '  @PreAuthorize("!@access.canRead(#id, authentication)")\n'
+    '  @GetMapping("/spel-not/{id}") Card spelNot(@PathVariable Long id) {\n'
+    "    return cards.findById(id).orElseThrow();\n  }\n"
+    '  @PostAuthorize("returnObject.ownerEmail == authentication.name")\n'
+    '  @GetMapping("/touched/{id}") Card touched(@PathVariable Long id) {\n'
+    "    Card c = cards.findById(id).orElseThrow();\n"
+    "    cards.save(c);\n"
+    "    return c;\n  }\n"
+    '  @PreAuthorize("hasRole(@roles.admin())")\n'
+    '  @GetMapping("/bean-role/{id}") Card beanRole(@PathVariable Long id) {\n'
+    "    return cards.findById(id).orElseThrow();\n  }\n"
+    "}\n"
+    '@RestController @RequestMapping("/admin")\n'
+    "@PreAuthorize(\"hasRole('ADMIN')\")\n"
+    "class Admin {\n"
+    "  private CardRepository cards;\n"
+    '  @GetMapping("/cards/{id}") Card card(@PathVariable Long id) {\n'
+    "    return cards.findById(id).orElseThrow();\n  }\n"
+    '  @PreAuthorize("isAuthenticated()")\n'
+    '  @GetMapping("/open/{id}") Card open(@PathVariable Long id) {\n'
+    "    return cards.findById(id).orElseThrow();\n  }\n"
+    "}\n"
+)
+
+
+@pytest.fixture(scope="module")
+def review(tmp_path_factory: pytest.TempPathFactory) -> dict:
+    root = tmp_path_factory.mktemp("review")
+    for rel, text in {
+        "pom.xml": POM,
+        "src/main/java/review/MethodSecurity.java": METHOD_SECURITY,
+        "src/main/java/review/Review.java": REVIEW,
+    }.items():
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+    return route_guards(tree_files(root)).model_dump(mode="json")
+
+
+@pytest.mark.parametrize(
+    ("method", "pattern", "ownership"),
+    [
+        ("GET", "/r/and/{id}", "unchecked"),  # `&&`: the owner passes only when cents > 0
+        ("GET", "/r/null-or/{id}", "checked"),
+        ("GET", "/r/objects/{id}", "checked"),
+        ("GET", "/r/getter/{id}", "checked"),
+        ("GET", "/r/forbidden/{id}", "unchecked"),  # returns the record in a 403 body
+        ("GET", "/r/later/{id}", "unchecked"),  # handed on before the check
+        ("GET", "/r/checkout/{id}", "caller-blind"),  # `checkout` isn't a check
+        ("GET", "/r/static/{id}", "unchecked"),  # a static helper that verifies nothing
+        ("GET", "/r/guarded/{id}", "checked"),  # a helper that refuses a foreign record
+        ("GET", "/r/projects/{pid}/cards/{cid}", "unchecked"),  # verified the other id
+        ("GET", "/r/pairs/{pid}/{cid}", "unchecked"),  # handed both ids, verified one
+        ("GET", "/r/result/{id}", "caller-blind"),  # a wrapper return type isn't ownerless
+        ("GET", "/r/notes/{id}", "caller-blind"),  # username is an owner field
+        ("GET", "/r/visits/{id}", "caller-blind"),  # owned through its patient: not ownerless
+        ("GET", "/r/ternary/{id}", "caller-blind"),  # a ternary of the id is the id
+        ("GET", "/r/formatted/{id}", "caller-blind"),  # a string built from the id is the id
+        ("GET", "/r/swapped/{id}", "unchecked"),  # the caller local was overwritten
+        ("GET", "/r/named/{id}", "caller-blind"),  # a same-named caller helper in another class
+        ("GET", "/r/spel-or/{id}", "caller-blind"),
+        ("GET", "/r/spel-not/{id}", "caller-blind"),
+        ("GET", "/r/touched/{id}", "caller-blind"),  # @PostAuthorize after a save
+        ("GET", "/r/bean-role/{id}", "caller-blind"),  # a role we can't read isn't privileged
+        ("GET", "/admin/cards/{id}", "n/a"),  # privileged only
+        ("GET", "/admin/open/{id}", "caller-blind"),  # the method's own rule overrides the class's
+    ],
+)
+def test_only_the_allowed_shapes_count_as_protection(
+    review: dict, method: str, pattern: str, ownership: str
+) -> None:
+    row = _row(review, method, pattern)
+    assert row["ownership"] == ownership
+    assert row["judgement_required"] is (ownership in ("caller-blind", "unchecked"))
+
+
+def test_under_a_deploy_time_chain_only_the_routes_own_rules_decide(tmp_path) -> None:
+    chain = (
+        '@ConditionalOnProperty(name = "app.security", havingValue = "{cond}")\n'
+        "class {name} {{\n"
+        "  @Bean SecurityFilterChain f(HttpSecurity http) throws Exception {{\n"
+        "    http.authorizeHttpRequests(a -> a.anyRequest().{rule}());\n"
+        "    return http.build();\n  }}\n}}\n"
+    )
+    files = {
+        "pom.xml": POM,
+        "src/main/java/app/MethodSecurity.java": METHOD_SECURITY,
+        "src/main/java/app/Off.java": chain.format(cond="false", name="Off", rule="permitAll"),
+        "src/main/java/app/On.java": chain.format(cond="true", name="On", rule="authenticated"),
+        "src/main/java/app/Api.java": (
+            "import org.springframework.web.bind.annotation.*;\n"
+            "import jakarta.annotation.security.PermitAll;\n"
+            "class Card { Long id; String ownerEmail; }\n"
+            "@RestController class Api {\n"
+            "  private EntityManager em;\n"
+            '  @PreAuthorize("isAuthenticated()")\n'
+            '  @GetMapping("/signed/{id}") Card signed(@PathVariable Long id) {\n'
+            "    return em.find(Card.class, id);\n  }\n"
+            '  @GetMapping("/bare/{id}") Card bare(@PathVariable Long id) {\n'
+            "    return em.find(Card.class, id);\n  }\n"
+            "  @PermitAll\n"
+            '  @GetMapping("/open/{id}") Card open(@PathVariable Long id) {\n'
+            "    return em.find(Card.class, id);\n  }\n}\n"
+        ),
+    }
+    for rel, text in files.items():
+        path = tmp_path / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+    result = route_guards(tree_files(tmp_path)).model_dump(mode="json")
+    # a candidate chain's permitAll doesn't open a route that authenticates itself
+    assert _row(result, "GET", "/signed/{id}")["ownership"] == "caller-blind"
+    assert _row(result, "GET", "/bare/{id}")["ownership"] == "n/a"
+    assert _row(result, "GET", "/open/{id}")["ownership"] == "n/a"

@@ -282,6 +282,11 @@ def test_classify(
         ("require_admin_or_owner", False),
         ("@PreAuthorize(\"hasRole('ADMIN') or #id == principal.id\")", False),
         ("requireAuth", False),
+        ("@PreAuthorize(\"hasAnyRole('ADMIN', 'OPERATOR')\")", True),
+        ("@RolesAllowed(Roles.ADMIN)", True),
+        ('@PreAuthorize("hasRole(@roles.admin())")', False),
+        ("@RolesAllowed(adminRole)", False),
+        ("@PreAuthorize(\"hasRole('ADMIN') and #id > 0\")", False),
     ],
 )
 def test_privileged_only_needs_every_way_in_to_be_privileged(guard: str, privileged: bool) -> None:

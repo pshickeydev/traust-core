@@ -20,10 +20,11 @@ _QUOTED_RX = re.compile(r"'([^'\"]*)'|\"([^'\"]*)\"")
 _ALTERNATIVE_RX = re.compile(r"(?i)(\bor\b|\|\||_or_|#\w|principal|authentication\.)")
 # owner-, tenant- or membership-shaped fields; broad on purpose, since a miss reads as ownerless
 OWNER_FIELD_RX = re.compile(
-    r"(?i)^_?(owner\w*|owned_?by\w*|users?|user_?id|tenant\w*|team\w*|org|orgs?_?id|"
+    r"(?i)^_?(owner\w*|owned_?by\w*|user\w*|uid|tenant\w*|team\w*|org|orgs?_?id|"
     r"organi[sz]ation\w*|account\w*|customer\w*|member\w*|workspace\w*|author\w*|"
     r"creator\w*|created_?by\w*|project\w*|group\w*|company\w*|client\w*|realm\w*)$"
 )
+_SPEL_ROLE_CALL = re.compile(r"has(?:Any)?(?:Role|Authority)\((.*)\)")
 _CONSTANT_ROLE = re.compile(r"\b(?:[A-Z]\w*\.)?[A-Z][A-Z0-9_]{2,}\b")
 MUTATING = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 JUDGED = frozenset({RouteOwnership.CALLER_BLIND, RouteOwnership.UNCHECKED})
@@ -63,12 +64,36 @@ def privileged_only(guard: str) -> bool:
     if guard.count("'") % 2 or guard.count('"') % 2:
         return False  # a label cut short may have lost a role
     name, _, args = guard.partition("(")
+    if name.startswith("@"):
+        roles = _annotation_roles(name, args.removesuffix(")"))
+        return bool(roles) and all(PRIVILEGED_RX.search(r) for r in roles)
     quoted = [a or b for a, b in _QUOTED_RX.findall(args)]
     roles = [r for q in quoted for r in re.split(r"[,\s]+", q) if r]
     roles += _CONSTANT_ROLE.findall(_QUOTED_RX.sub(" ", args))
     if not roles:
         return not args and bool(PRIVILEGED_RX.search(name))
     return all(PRIVILEGED_RX.search(r) for r in roles)
+
+
+def _annotation_roles(name: str, args: str) -> list[str] | None:
+    """The roles a Java security annotation names, or None when any isn't a literal or constant
+    (`hasRole(@roles.admin())`, `@RolesAllowed(adminRole)`)."""
+    if not args:
+        return [name] if PRIVILEGED_RX.search(name) else None
+    if name in ("@PreAuthorize", "@PostAuthorize"):
+        expression = re.fullmatch(r'\s*(?:value\s*=\s*)?"(.*)"\s*', args)
+        call = expression and _SPEL_ROLE_CALL.fullmatch(expression.group(1).strip())
+        return _literals(call.group(1), "'") if call else None
+    return _literals(re.sub(r"^\s*(?:value\s*=\s*)?\{?|\}?\s*$", "", args), '"')
+
+
+def _literals(text: str, quote: str) -> list[str] | None:
+    items = [i.strip() for i in text.split(",")]
+    if not all(
+        (i[:1] == i[-1:] == quote and len(i) > 1) or _CONSTANT_ROLE.fullmatch(i) for i in items
+    ):
+        return None
+    return [i.strip(quote) for i in items]
 
 
 def owner_field(record_type: str | None, fields: Mapping[str, Sequence[str]]) -> str | None:
