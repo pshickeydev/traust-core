@@ -392,7 +392,9 @@ class Threat(Model):
     techniques: tuple[AttackTechnique, ...] = ()
     isolation_dimensions: tuple[IsolationDimension, ...] = ()  # the dimensions it stresses
     boundary_ids: tuple[str, ...] = ()  # the tenant boundaries naming it
-    isolation_review_ref: str | None = None  # the first naming boundary's full review
+    isolation_review_ref: str | None = (
+        None  # the first naming boundary's isolation-review artifact id
+    )
     mitigations: tuple[ThreatMitigation, ...] = ()
     linddun: bool = False  # a privacy-overlay row
 
