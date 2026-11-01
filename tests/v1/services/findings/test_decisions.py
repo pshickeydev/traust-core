@@ -23,7 +23,7 @@ from traust_core.v1.models.findings import (
     Restatement,
 )
 from traust_core.v1.models.identity import IdentitySource, Principal, Role
-from traust_core.v1.models.vocabulary import ActorKind, Validity
+from traust_core.v1.models.vocabulary import ActorKind, ReviewReason, Validity
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.repositories import InMemoryObjectStore
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
@@ -412,3 +412,38 @@ def test_a_statement_judges_a_commit_of_the_findings_repository(engine: Engine) 
 def test_a_statement_on_a_missing_finding_is_not_found(engine: Engine) -> None:
     with pytest.raises(NotFoundError):
         service(engine).decide(say(uuid4()), ALICE)
+
+
+def test_a_resolved_review_item_does_not_mask_a_new_decisionless_outcome(
+    engine: Engine,
+) -> None:
+    """Without a decision the dedupe key is (reason, None), which older outcomes
+    share: only a PENDING item may cover a new outcome — a resolved one answered an
+    old question and must not mask the new one."""
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        finding = seed.finding()
+        seed.review_item(finding, reason="analyst_review", status="resolved")
+        item = FindingDecisions._validation_review(
+            uow, finding.id, ReviewReason.ANALYST_REVIEW, None
+        )
+        assert item.status == "pending"
+
+
+def test_a_replay_reuses_its_decisions_review_item_even_once_resolved(
+    engine: Engine,
+) -> None:
+    """A recorded decision makes (reason, decision_id) the outcome's identity: the
+    same decision is a replay, so its item is reused across statuses — stable ids,
+    no reopen (corpus #252)."""
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        finding = seed.finding()
+        decision = seed.decision(finding)
+        seed.review_item(
+            finding, reason="analyst_review", decision_id=decision.id, status="resolved"
+        )
+        item = FindingDecisions._validation_review(
+            uow, finding.id, ReviewReason.ANALYST_REVIEW, decision
+        )
+        assert item.status == "resolved"

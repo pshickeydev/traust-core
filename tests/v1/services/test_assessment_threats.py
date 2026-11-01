@@ -360,3 +360,13 @@ def test_tenant_boundaries_are_the_latest_models_section_10_as_stated(models: Mo
 def test_tenant_boundaries_need_the_publisher(uow: SqlTraustUnitOfWork) -> None:
     with pytest.raises(ConfigError, match="needs the publisher"):
         AssessmentService(uow, clock=FixedClock(NOW)).tenant_boundaries([])
+
+
+def test_boundary_dimension_spellings_normalise_on_read(models: Models) -> None:
+    """Classifier plan 03's rule at this boundary: spellings normalise on read — a
+    stored 'No'/'Partial'/'YES' folds into the closed lowercase vocabulary."""
+    repo, main, _ = models.repo()
+    stated = boundary(1, "T1", privilege="No", hygiene="Partial", encryption="YES")
+    models.record(main, 1, {**model(threat(1)), "tenant_boundaries": [stated]})
+    [b] = models.service.tenant_boundaries([repo.id])
+    assert b.dimensions == {"privilege": "no", "hygiene": "partial", "encryption": "yes"}

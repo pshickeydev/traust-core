@@ -69,6 +69,7 @@ from traust_core.v1.models.vocabulary import (
     DispositionResolution,
     EvidenceGrade,
     FindingKind,
+    ReviewItemStatus,
     ReviewReason,
     SourceType,
     ValidationVerdict,
@@ -1096,11 +1097,18 @@ class FindingDecisions:
         decision: Decision | None,
     ) -> ReviewItem:
         decision_id = decision.id if decision else None
+        # a recorded decision makes (reason, decision_id) the outcome's identity, so a
+        # replay reuses its item across statuses (stable ids, no reopen, corpus #252).
+        # Without a decision the key is (reason, None), which older outcomes share:
+        # only a PENDING item may cover then — a resolved one answered an old
+        # question and must not mask the new outcome.
         known = next(
             (
                 item
                 for item in uow.review_items.list_for_finding(finding_id)
-                if item.reason == reason and item.decision_id == decision_id
+                if item.reason == reason
+                and item.decision_id == decision_id
+                and (decision_id is not None or item.status == ReviewItemStatus.PENDING)
             ),
             None,
         )

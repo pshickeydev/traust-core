@@ -1830,7 +1830,7 @@ _HOW_TO_READ_THREATS = (
 )
 
 
-_DIMENSION_WEIGHTS = {"no": 2, "partial": 1}  # yes and na weigh nothing
+_DIMENSION_WEIGHTS = {"no": 2, "partial": 1, "yes": 0, "na": 0}  # unknown weighs as failed
 _COMPLEXITY = ("low", "medium", "high")
 _HOW_TO_READ_BOUNDARIES = (
     "Tenant-boundary rows from multi-tenant models' optional section 10, ordered weakest-first "
@@ -1880,8 +1880,10 @@ def _ranked_boundary(
     stated = boundary.dimensions.items()
     return RankedBoundary(
         boundary=boundary,
-        weakness=sum(_DIMENSION_WEIGHTS.get(v, 0) for _, v in stated),
-        failed=tuple(d for d, v in stated if v == "no"),
+        # a result outside the closed vocabulary weighs worst and names its dimension
+        # failed — an unmappable value is never read as passing
+        weakness=sum(_DIMENSION_WEIGHTS.get(v, _DIMENSION_WEIGHTS["no"]) for _, v in stated),
+        failed=tuple(d for d, v in stated if v not in _DIMENSION_WEIGHTS or v == "no"),
         partial=tuple(d for d, v in stated if v == "partial"),
         open_threats=tuple(t for t in boundary.threat_ids if (boundary.assessment_id, t) in opened),
     )

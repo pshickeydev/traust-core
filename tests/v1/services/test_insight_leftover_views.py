@@ -1038,3 +1038,23 @@ def test_review_cards_render_through_context(engine: Engine, tmp_path: Path) -> 
     assert result.failed == {}
     text = result.rendered[ViewName.REVIEW_CARD].markdown
     assert "1 needs-review item(s)" in text and "needs_review (needs_manual_test)" in text
+
+
+def test_an_out_of_vocabulary_dimension_result_is_not_read_as_passing() -> None:
+    """A dimension the model states outside the closed vocabulary — capitalised or
+    unmappable — reads weakest and names its dimension failed, never passing."""
+    threats = [threat(A, "T1", "mitigated")]
+    model = register(
+        threats,
+        boundaries=[
+            boundary(A, 1, privilege="No"),
+            boundary(A, 2, privilege="maybe"),
+            boundary(A, 3, privilege="yes"),
+        ],
+    ).build(ViewFilter())
+    ranked = model.tenant_boundaries
+    assert [r.boundary.boundary_id for r in ranked] == ["IF-1", "IF-2", "IF-3"]
+    assert [r.weakness for r in ranked] == [2, 2, 0]
+    assert ranked[0].failed == ("privilege",)
+    assert ranked[1].failed == ("privilege",)
+    assert ranked[2].failed == ()
