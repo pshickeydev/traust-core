@@ -304,6 +304,25 @@ def test_the_match_ladder(
     )
 
 
+def test_a_disjoint_cwe_near_miss_is_not_detected(bench: Bench) -> None:
+    """PATH_CWE needs a shared CWE: a reported finding that only shares the path is a
+    near miss, never detected (the declared ladder is 'CWE + path >= 0.5', corpus #201)."""
+    bench.key(target(expected={"fingerprint": None}))
+    run = bench.service.run_benchmark(
+        {
+            "bt-x-001": [
+                bench.audit(
+                    report(finding(title="resource exhaustion in the decoder", cwes=["CWE-400"]))
+                )
+            ]
+        }
+    )
+    (match,) = run.targets[0].matches
+    assert match.tier is MatchTier.REVIEW
+    card = run.scorecard()
+    assert (card.overall.detected, card.near_misses) == (0, 1)
+
+
 def test_a_reported_finding_matches_one_expectation_only(bench: Bench) -> None:
     twice = target(expected={"fingerprint": None})
     twice["expected"].append(dict(twice["expected"][0]))
