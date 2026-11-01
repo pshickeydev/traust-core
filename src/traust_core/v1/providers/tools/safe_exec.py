@@ -470,6 +470,14 @@ def _check_git_argv(argv: list[str]) -> str:
         if tok == "-C":
             i += 2
             continue
+        if tok in ("--git-dir", "--work-tree", "--namespace"):
+            # these globals always take the next token as their value — skipping
+            # only the flag (the generic dash-skip below) would make the value the
+            # "subcommand" and hide the real one from the network check
+            if i + 1 < len(argv):
+                i += 2
+                continue
+            return f"dangling git {tok}"
         if tok.startswith("-"):
             i += 1
             continue
@@ -485,7 +493,7 @@ def _check_git_argv(argv: list[str]) -> str:
 
 
 def _check_curl_argv(argv: list[str]) -> str:
-    for tok in argv[1:]:
+    for i, tok in enumerate(argv[1:], start=1):
         flag = tok.split("=", 1)[0]
         if flag in CURL_DENY_FLAGS:
             return (
@@ -495,12 +503,17 @@ def _check_curl_argv(argv: list[str]) -> str:
             )
         if tok.startswith(("-d@", "--data@")):
             return "curl -d@<file> is denied under safe_exec"
-        if flag in ("-d", "--data", "--data-binary", "--data-raw", "--data-urlencode"):
-            idx = argv.index(tok)
-            if "=" in tok:
-                val = tok.split("=", 1)[1]
-            else:
-                val = argv[idx + 1] if idx + 1 < len(argv) else ""
+        if flag in (
+            "-d",
+            "--data",
+            "--data-binary",
+            "--data-raw",
+            "--data-urlencode",
+            "--data-ascii",
+        ):
+            # inspect this occurrence's own value: argv.index(tok) would find the
+            # first repeated flag and read the wrong argument
+            val = tok.split("=", 1)[1] if "=" in tok else argv[i + 1] if i + 1 < len(argv) else ""
             if val.startswith("@"):
                 return "curl --data @<file> is denied under safe_exec"
         if tok.startswith("file://"):
