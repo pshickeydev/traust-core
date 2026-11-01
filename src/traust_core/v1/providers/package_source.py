@@ -291,7 +291,7 @@ def _extract(blob: bytes, kind: str, dest: Path) -> int:
             inner = tf.extractfile(member) if member else None
             if inner is None:
                 raise FetchRefused("gem has no data.tar.gz")
-            return _extract(inner.read(MAX_BYTES + 1), "tar", dest)
+            return _extract(_capped(inner), "tar", dest)
     dest.mkdir(parents=True, exist_ok=True)
     root = dest.resolve()
 
@@ -307,7 +307,8 @@ def _extract(blob: bytes, kind: str, dest: Path) -> int:
                     continue
                 if (t := target(info.filename)) is not None:
                     t.parent.mkdir(parents=True, exist_ok=True)
-                    t.write_bytes(z.read(info))
+                    with z.open(info) as member:
+                        t.write_bytes(_capped(member))
                     n += 1
         return n
     with tarfile.open(fileobj=io.BytesIO(blob), mode="r:*") as tf:
@@ -316,9 +317,19 @@ def _extract(blob: bytes, kind: str, dest: Path) -> int:
             f = tf.extractfile(m) if t is not None else None
             if t is not None and f is not None:
                 t.parent.mkdir(parents=True, exist_ok=True)
-                t.write_bytes(f.read())
+                t.write_bytes(_capped(f))
                 n += 1
     return n
+
+
+def _capped(f: io.BufferedIOBase) -> bytes:
+    """The size cap is on the bytes that land, not only the bytes on the wire: an
+    archive under MAX_BYTES may not decompress without bound (a small zip can
+    hold gigabytes)."""
+    data = f.read(MAX_BYTES + 1)
+    if len(data) > MAX_BYTES:
+        raise FetchRefused(f"archive member decompresses past the {MAX_BYTES}-byte cap")
+    return data
 
 
 def root_of(tree: Path) -> Path:

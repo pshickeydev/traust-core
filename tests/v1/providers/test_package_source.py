@@ -157,6 +157,20 @@ def test_an_unreadable_archive_is_refused(tmp_path: Path) -> None:
         extract(tarball({"metadata.gz": b"x"}, mode="w"), "gem", tmp_path)
 
 
+def test_extraction_refuses_a_member_that_decompresses_past_the_cap(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The module's own contract: sizes are capped, and the cap is on the bytes that
+    land, not only the bytes on the wire — a small archive may not decompress without bound."""
+    monkeypatch.setattr("traust_core.v1.providers.package_source.MAX_BYTES", 1024)
+    bomb = io.BytesIO()
+    with zipfile.ZipFile(bomb, "w") as z:
+        z.writestr("m@v1/big.bin", "\0" * 10_000)
+    assert len(bomb.getvalue()) < 1024  # well under the wire cap
+    with pytest.raises(FetchRefused, match="cap"):
+        extract(bomb.getvalue(), "zip", tmp_path / "out")
+
+
 def test_a_gem_extracts_its_data_archive(tmp_path: Path) -> None:
     blob = gem({"lib/rack/utils.rb": b"module Rack; end\n", "../escape.rb": b"x"})
     assert extract(blob, "gem", tmp_path) == 1
