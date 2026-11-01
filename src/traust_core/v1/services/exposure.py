@@ -505,7 +505,9 @@ class ExposureService:
             l1_version_in_range=in_range,
             manifest_version=in_manifest[0].version if in_manifest else None,
             manifest_scan=None
-            if not pinned
+            if not pinned or in_range is None
+            # an undecided range is unobserved, not in range — the tier never asserts
+            # a pin it could not check (classification reads IN_RANGE as likely_affected)
             else ImpactManifestScan.MODULE_PINNED_OUT_OF_RANGE
             if in_range is False
             else ImpactManifestScan.MODULE_PINNED_IN_RANGE,
