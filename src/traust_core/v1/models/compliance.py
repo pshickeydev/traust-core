@@ -1048,6 +1048,13 @@ def merge_variances(
                 f"doc-variance record {rid} exists with different content — pass update to "
                 "supersede it (silent rewrite refused)"
             )
+        elif any(
+            {k: v for k, v in r.items() if k != "id"} == {k: v for k, v in rec.items() if k != "id"}
+            for r in records
+        ):
+            # the superseding record is already in the register: recording the same
+            # corrected doc again is a no-op, not another successor per re-import
+            continue
         else:
             successor = f"{rid}-r{len(records)}"
             records[at[rid]] = {

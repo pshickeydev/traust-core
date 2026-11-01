@@ -747,8 +747,14 @@ class RemediationService:
             if assessment.kind != REMEDIATION:
                 raise NotFoundError(f"work item {work_item_id}")
             repository_id = self._inventory.get_ref(assessment.repository_ref_id).repository_id
-        (item,) = self._items(repository_id, [assessment])
-        return item
+            items = self._items(repository_id, [assessment])
+        if not items:
+            # an assessment can exist with no recorded decisions (a crash between
+            # open()'s commits) — that is not found, not an unpacking error
+            raise NotFoundError(
+                f"work item {work_item_id}: its findings were never recorded — nothing to work on"
+            )
+        return items[0]
 
     def next_pending(self, filter: WorkItemFilter) -> WorkItem | None:
         """The repository's oldest work item still a candidate, with no report yet."""

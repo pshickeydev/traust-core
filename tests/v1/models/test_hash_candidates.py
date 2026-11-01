@@ -108,3 +108,21 @@ def test_uri_artifact_resolution_does_not_rescan_artifacts_per_result() -> None:
     assert len(parsed) == 1000
     assert all(row["hashes"] for row in parsed)
     assert artifacts.passes <= 2
+
+
+def test_labels_stay_unique_when_a_raw_label_already_carries_a_hash_suffix() -> None:
+    """Labels are made unique within the document (parse_many's own contract): a raw
+    'a#2' must not collide with the generated suffix of a repeated 'a'."""
+    doc = document()
+    run = doc["runs"][0]
+    base = run["results"][0]
+    run["results"] = [dict(base, guid=g) for g in ("a#2", "a", "a")]
+    found = FindingCandidate.parse_many(
+        json.dumps(doc).encode(),
+        CandidateFormat.SARIF,
+        uuid4(),
+        repository_url=REPO,
+        sha=SHA,
+    )
+    labels = [str(f.label) for f in found]
+    assert len(labels) == len(set(labels)) == 3

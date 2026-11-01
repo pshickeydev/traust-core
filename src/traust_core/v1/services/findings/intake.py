@@ -91,9 +91,12 @@ class FindingIntake:
             candidates = tuple(self._validate(c) for c in candidates)
             catalog: dict[str, UUID] = {}
             pending: dict[UUID, dict[tuple[str, int | None], CodeSpan]] = {}
+            baselines: dict[UUID, set[tuple[str, int | None]]] = {}
             keys, kinds = self._fingerprints(repo, candidates, f"assessment {assessment_id}")
             taken = {
-                c.label: self._take(uow, assessment_id, c, fp, catalog, pending, kind=kinds.get(fp))
+                c.label: self._take(
+                    uow, assessment_id, c, fp, catalog, pending, baselines, kind=kinds.get(fp)
+                )
                 for c, fp in zip(candidates, keys, strict=True)
             }
             for occurrence_id, locations in pending.items():
@@ -257,6 +260,7 @@ class FindingIntake:
         fp: Fingerprint,
         catalog: dict[str, UUID],
         pending: dict[UUID, dict[tuple[str, int | None], CodeSpan]],
+        baselines: dict[UUID, set[tuple[str, int | None]]],
         *,
         kind: FindingKind | None,
     ) -> tuple[UUID, bool]:
@@ -289,9 +293,23 @@ class FindingIntake:
             )
             assert occurrence.id is not None
             pending[occurrence.id] = {}
-        locations = pending.get(occurrence.id, {})
+        else:
+            assert occurrence.id is not None
+            if occurrence.id not in pending:
+                # first touch this call of an occurrence recorded earlier: the locations
+                # it already stated are the baseline — a re-run adds only what is new
+                # (a new line on a stated path never feeds the fingerprint), never
+                # silently dropping it; candidates later in this same call still merge
+                baselines[occurrence.id] = {
+                    (loc.path, loc.line_start)
+                    for loc in uow.locations.list_for_occurrence(occurrence.id)
+                }
+                pending[occurrence.id] = {}
+        locations = pending[occurrence.id]
         for span in candidate.locations:
             key = (span.path, span.line)
+            if key in baselines.get(occurrence.id, ()):
+                continue
             previous = locations.get(key)
             merged = (
                 {h.algorithm: h for h in (*previous.hashes, *span.hashes)}

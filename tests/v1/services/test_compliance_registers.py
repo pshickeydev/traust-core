@@ -511,3 +511,13 @@ def test_collect_product_docs_refuses_without_official_guides(
     assert world.product.id is not None
     with pytest.raises(error, match=message):
         world.compliance(docs=docs).collect_product_docs(world.product.id)
+
+
+def test_rerecording_a_superseded_doc_variance_is_a_noop(world: World) -> None:
+    """The superseding record is already in the register: recording the same corrected
+    doc again changes nothing — no second successor per re-import."""
+    world.service.record(register_doc(variance()), provenance())
+    corrected = variance(disposition="doc_corrected")
+    updated = world.service.record(register_doc(corrected), provenance(), update=True)
+    again = world.service.record(register_doc(corrected), provenance(), update=True)
+    assert again == updated
