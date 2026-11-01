@@ -337,7 +337,13 @@ class PortfolioService:
                     if facts.visibility is None
                     else facts.visibility.lower() == "public",
                     archived=repository.archived if facts.archived is None else facts.archived,
-                    upstream_id=upstream.id if upstream else None,
+                    # fork=None means the forge did not say — keep the recorded lineage;
+                    # a reported fork repoints it, a reported non-fork clears it
+                    upstream_id=upstream.id
+                    if upstream
+                    else repository.upstream_id
+                    if facts.fork is None
+                    else None,
                 )
             )
             metadata_changed = current != repository

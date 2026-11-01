@@ -112,6 +112,17 @@ def test_a_repository_no_longer_a_fork_loses_its_upstream(observed: Observed) ->
     assert sorted("fork_of" in o for o in observed.observations()) == [False, True]
 
 
+def test_an_observation_that_does_not_report_fork_status_keeps_the_recorded_upstream(
+    observed: Observed,
+) -> None:
+    """fork=None is 'not reported', not 'not a fork' — an unknown must not delete a
+    recorded lineage, the same rule visibility and archived already follow."""
+    observed.observe(fork=True, parent="Org/Upstream")
+    upstream = observed.uow.repositories.find_by_url("https://github.com/org/upstream")
+    observed.observe(fork=None, parent=None, pushed_at="2026-10-02T00:00:00Z")
+    assert observed.row().upstream_id == upstream.id
+
+
 def test_visibility_and_archived_are_kept_on_the_repository(observed: Observed) -> None:
     observed.observe(visibility="public", archived=True)
     assert (observed.row().public, observed.row().archived) == (True, True)
