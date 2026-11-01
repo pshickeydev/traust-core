@@ -134,7 +134,9 @@ class StatementPolicy:
             ReviewReason.AMBIGUOUS_STATEMENT
             if said is None
             else ReviewReason.UNVERIFIED_IDENTITY
-            if not comment.author
+            # a named automation is not a person — the transition maps, but it still
+            # waits for one, exactly like the anonymous-changelog case
+            if not comment.author or comment.bot
             else None
         )
         return [

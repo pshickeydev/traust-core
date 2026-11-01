@@ -147,7 +147,12 @@ class SqlDecisionRepository(SqlAppendOnlyRepository[Decision]):
 
     def list_finding_ids_for_review(self) -> list[UUID]:
         c = self.table.c
-        confirmed = sa.select(c.finding_id).where(c.validity == str(Validity.CONFIRMED))
+        # any spelling validity_spellings reads as confirmed — a historical
+        # true_positive/hardening confirmation contradicts a machine refutation exactly
+        # as a canonical one does ("never silently resolved")
+        confirmed = sa.select(c.finding_id).where(
+            c.validity.in_(validity_spellings(Validity.CONFIRMED))
+        )
         machine = sa.and_(
             sa.not_(c.auto_accept_tier),
             sa.or_(c.actor.is_(None), sa.not_(c.actor.startswith(f"{ActorKind.HUMAN}:"))),

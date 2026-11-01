@@ -149,6 +149,22 @@ def test_a_jira_transition_maps_but_waits_without_its_transitioner(
     assert said(c) == [(A, TrustTier.QUEUE, validity, resolution, ReviewReason.UNVERIFIED_IDENTITY)]
 
 
+def test_a_jira_transition_by_a_named_bot_waits_for_a_person() -> None:
+    """A named automation is not a person: its transition maps but queues as unverified
+    identity, exactly like the anonymous changelog case (the class contract: a plain
+    transition 'waits for a person')."""
+    c = comment(
+        "Filed by file-security-defect for OPERATOR-abcdef0-001.",
+        source=SourceType.JIRA,
+        author=ExternalHandle("jira-automation"),
+        bot=True,
+        status="Done",
+    )
+    assert said(c) == [
+        (A, TrustTier.QUEUE, None, DispositionResolution.RESOLVED, ReviewReason.UNVERIFIED_IDENTITY)
+    ]
+
+
 def test_an_unmapped_jira_status_is_ambiguous() -> None:
     c = comment(
         "OPERATOR-abcdef0-001", source=SourceType.JIRA, author=ExternalHandle(""), status="Backlog"
