@@ -164,7 +164,7 @@ def test_extraction_refuses_a_member_that_decompresses_past_the_cap(
     land, not only the bytes on the wire — a small archive may not decompress without bound."""
     monkeypatch.setattr("traust_core.v1.providers.package_source.MAX_BYTES", 1024)
     bomb = io.BytesIO()
-    with zipfile.ZipFile(bomb, "w") as z:
+    with zipfile.ZipFile(bomb, "w", compression=zipfile.ZIP_DEFLATED) as z:
         z.writestr("m@v1/big.bin", "\0" * 10_000)
     assert len(bomb.getvalue()) < 1024  # well under the wire cap
     with pytest.raises(FetchRefused, match="cap"):
