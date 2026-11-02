@@ -10,6 +10,7 @@ import sys
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
+from typing import TYPE_CHECKING
 
 from traust_core.v1.models.code_facts import (
     CodeFactDetail,
@@ -27,10 +28,19 @@ from traust_core.v1.models.code_facts import (
 from traust_core.v1.models.common import CodeSpan, RepoPath
 from traust_core.v1.providers.base import Acquisition, Readiness, Result
 from traust_core.v1.providers.clock import Clock
-from traust_core.v1.providers.route_ownership import JUDGED, HandlerFacts, classify, rank
+from traust_core.v1.providers.route_ownership import (
+    JUDGED,
+    HandlerFacts,
+    classify,
+    path_params,
+    rank,
+)
 from traust_core.v1.providers.syntax import grammar_missing
 from traust_core.v1.providers.tools import ToolRequest
 from traust_core.v1.providers.tree import TreeFile, tree_files
+
+if TYPE_CHECKING:
+    from traust_core.v1.providers.python_ownership import PyOwnership, Target
 
 GUARD_RX = re.compile(
     r"(?i)(auth[nz]?|authenticate|authoriz|login|rbac|permission|"
@@ -981,6 +991,11 @@ FASTAPI_VERBS = ("get", "post", "put", "patch", "delete", "head", "options", "tr
 _FASTAPI_DECORATORS = {*FASTAPI_VERBS, "api_route", "websocket"}
 _DEPENDS = ("Depends", "Security")
 FAIL_OPEN = "fail-open"
+_OPTIONAL = "optional:"
+# a dependency named for the authenticated caller
+_CALLER_DEPENDENCY = re.compile(
+    r"(?i)(^|_)(current|authenticated|logged_?in|signed_?in)_?(user|account|member|principal|identity|subject)s?$"
+)
 _FASTAPI_SECURITY = re.compile(
     r"^(HTTPBearer|HTTPBasic|HTTPDigest|OAuth2\w*|APIKey(Header|Query|Cookie)|OpenIdConnect)$"
 )
@@ -1291,6 +1306,10 @@ def _middleware_rejects(fn: ast.AST) -> bool:
     return False
 
 
+def _db_session_middleware(name: str) -> bool:
+    return bool(_DB_SESSION_RX.match(re.sub(r"(?i)_?middleware$", "", name)))
+
+
 def _guard_named(name: str) -> bool:
     return bool(GUARD_RX.search(name) or _FLASK_GUARD_EXTRA.search(name))
 
@@ -1305,7 +1324,7 @@ def _middleware_guard(
         _last(name)
     ):
         return False
-    if not _guard_named(_last(name)):
+    if not _guard_named(_last(name)) or _db_session_middleware(_last(name)):
         return False
     fn = modules.function(name, rel, functions)
     return fn is None or fn.node is None or _middleware_rejects(fn.node)
@@ -1373,6 +1392,119 @@ class _FastApi:
         self.mounts: dict[_Key, list[_Mount]] = {}
         self.middleware: dict[_Key, list[str]] = {}
         self._bind()
+        self._ownership: PyOwnership | None = None
+        self._facts: dict[tuple[int, frozenset[str]], HandlerFacts] = {}
+
+    def ownership(self) -> PyOwnership:
+        """The handlers' ownership reader, built on first use over the same parsed tree."""
+        if self._ownership is None:
+            from traust_core.v1.providers.python_ownership import PyCode, PyOwnership
+
+            trees = {s.file.rel: s.tree for s in self.index.sources}
+            texts = {s.file.rel: s.file.text for s in self.index.sources}
+            code = PyCode(trees, self.modules, texts)
+            self._ownership = PyOwnership(code, self._callers, self._depends_on)
+        return self._ownership
+
+    def _param_dependencies(
+        self, fn: ast.AST, rel: str
+    ) -> list[tuple[str, ast.Call, str, ast.AST | None]]:
+        """Each parameter's `Depends(...)` (in its default or `Annotated` alias), with the file it
+        is resolved from and the parameter's annotation."""
+        args = getattr(fn, "args", None)
+        if args is None:
+            return []
+        positional = [*args.posonlyargs, *args.args]
+        defaults = [None] * (len(positional) - len(args.defaults)) + list(args.defaults)
+        pairs = [
+            *zip(positional, defaults, strict=True),
+            *zip(args.kwonlyargs, args.kw_defaults, strict=True),
+        ]
+        out = []
+        for param, default in pairs:
+            ann, where = _unquoted(param.annotation), rel
+            if isinstance(ann, ast.Name | ast.Attribute) and (
+                found := self.index.alias(_dotted(ann), rel)
+            ):
+                ann, where = found
+            if isinstance(ann, ast.Subscript) and _last(_dotted(ann.value)) == "Annotated":
+                parts = ann.slice.elts if isinstance(ann.slice, ast.Tuple) else [ann.slice]
+                out += [
+                    (param.arg, e, where, parts[0])
+                    for e in parts[1:]
+                    if isinstance(e, ast.Call) and _last(_dotted(e.func)) in _DEPENDS
+                ]
+            if isinstance(default, ast.Call) and _last(_dotted(default.func)) in _DEPENDS:
+                out.append((param.arg, default, rel, ann))
+        return out
+
+    def _callers(self, target: Target) -> tuple[set[str], set[str]]:
+        """The parameters a refusing authentication dependency fills (the caller), and the
+        `Request` ones (whose `.user` is the caller)."""
+        callers = set()
+        for name, call, where, ann in self._param_dependencies(target.fn, target.rel):
+            dependency = call.args[0] if call.args else _kwarg(call, "dependency")
+            optional = isinstance(dependency, ast.Call) and any(
+                isinstance(k.value, ast.Constant) and k.value.value is False
+                for k in dependency.keywords
+                if k.arg in ("required", "auto_error")
+            )
+            guards, unguards = self._classify([(self._dependency(call, ann), where)])
+            if guards and not unguards and not optional:
+                callers.add(name)
+        args = target.fn.args
+        requests = {
+            a.arg
+            for a in (*args.posonlyargs, *args.args, *args.kwonlyargs)
+            if _last(_dotted(_unquoted(a.annotation))) in ("Request", "HTTPConnection")
+        }
+        return callers, requests
+
+    def _depends_on(self, target: Target) -> list[Target]:
+        """The checkout functions `target`'s parameters depend on, each resolved exactly."""
+        code = self.ownership().code
+        found = []
+        for _, call, where, ann in self._param_dependencies(target.fn, target.rel):
+            dependency = call.args[0] if call.args else _kwarg(call, "dependency")
+            fns = code.functions(where, dependency if dependency is not None else ann, None)
+            if fns and len(fns) == 1:
+                found.append(fns[0])
+        return found
+
+    def _route_dependencies(self, call: ast.Call, rel: str) -> tuple[list[Target], CodeSpan | None]:
+        """The route's `dependencies=[…]` functions; and the first that is an instance of a
+        checkout class whose module reads `request.path_params` (the id reaches a check we
+        don't follow)."""
+        code = self.ownership().code
+        node = _kwarg(call, "dependencies")
+        calls = node.elts if isinstance(node, ast.List | ast.Tuple) else []
+        found, opaque = [], None
+        for c in calls:
+            if not (isinstance(c, ast.Call) and _last(_dotted(c.func)) in _DEPENDS and c.args):
+                continue
+            dependency = c.args[0]
+            if isinstance(dependency, ast.Call) and (
+                where := code.class_module(rel, dependency.func)
+            ):
+                if opaque is None and "path_params" in code.text(where):
+                    opaque = CodeSpan(path=RepoPath(rel), line=c.lineno)
+                continue
+            fns = code.functions(rel, dependency, None)
+            if fns and len(fns) == 1:
+                found.append(fns[0])
+        return found, opaque
+
+    def _ownership_facts(self, call: ast.Call, fn: ast.AST, rel: str, pattern: str) -> HandlerFacts:
+        ids = frozenset(path_params(pattern))
+        key = (id(fn), ids)
+        if key not in self._facts:
+            from traust_core.v1.providers.python_ownership import Target
+
+            own = self.ownership()
+            handler = Target(self.index.paths.get(id(fn), rel), fn)  # type: ignore[arg-type]
+            deps, opaque = self._route_dependencies(call, rel)
+            self._facts[key] = own.handler(handler, set(ids), deps, opaque)
+        return self._facts[key]
 
     def _ctors(self) -> set[str]:
         """FastAPI and APIRouter, and the tree's subclasses of either."""
@@ -1400,7 +1532,10 @@ class _FastApi:
                     for t in targets
                     if isinstance(t, ast.Name | ast.Attribute)
                 ]
-                if _FASTAPI_SECURITY.match(ctor):
+                if _FASTAPI_SECURITY.match(ctor) or (
+                    GUARD_RX.search(ctor) and not NON_ENFORCING_RX.search(ctor)
+                ):
+                    # a security scheme, or an instance of a guard class (`Authenticator(…)`)
                     self.security.update(names)
                     auto_error = _kwarg(node.value, "auto_error")
                     if isinstance(auto_error, ast.Constant) and auto_error.value is False:
@@ -1425,7 +1560,7 @@ class _FastApi:
 
     def _middleware_fn(self, fn: ast.AST, recv: str, rel: str, enclosing: ast.AST | None) -> None:
         name = getattr(fn, "name", "")
-        if _guard_named(name) and _middleware_rejects(fn):
+        if _guard_named(name) and not _db_session_middleware(name) and _middleware_rejects(fn):
             for key in self.bindings.of(recv, rel, enclosing):
                 self.middleware.setdefault(key, []).append(f"middleware:{name}")
 
@@ -1468,6 +1603,13 @@ class _FastApi:
     def _dependency(self, call: ast.Call, annotation: ast.AST | None) -> str:
         target = call.args[0] if call.args else _kwarg(call, "dependency")
         name = _dotted(target if target is not None else annotation)
+        if isinstance(target, ast.Call) and any(
+            k.arg in ("required", "auto_error")
+            and isinstance(k.value, ast.Constant)
+            and k.value.value is False
+            for k in target.keywords
+        ):
+            return f"{_OPTIONAL}{name}"  # `get_user(required=False)` lets a missing caller in
         if _last(_dotted(call.func)) == "Security":
             scopes = _str_list(_kwarg(call, "scopes"))
             return f"Security:{name}" + (f"[{','.join(scopes)}]" if scopes else "")
@@ -1512,6 +1654,10 @@ class _FastApi:
         guards: list[str] = []
         unguards: list[str] = []
         for name, rel in names:
+            if name.startswith(_OPTIONAL):
+                guards.append(name.removeprefix(_OPTIONAL))
+                unguards.append(f"{FAIL_OPEN}:{name.removeprefix(_OPTIONAL)}")
+                continue
             bare = name.removeprefix("Security:").split("[")[0]
             if UNGUARD_RX.search(bare):
                 unguards.append(name)
@@ -1528,8 +1674,12 @@ class _FastApi:
                 fn = self.index.callee(bare, rel) if bare else None
                 if fn is not None and fn.node is not None:
                     g, u = self._classify(self._params(fn.node, fn.path), depth + 1, seen | {bare})
-                    if _raises(fn.node):  # it refuses the missing credential itself
+                    raises = _raises(fn.node)
+                    if raises:
+                        # it refuses the missing credential itself
                         u = [x for x in u if not x.startswith(f"{FAIL_OPEN}:")]
+                    if not g and raises and _CALLER_DEPENDENCY.search(_last(bare)):
+                        guards.append(bare)  # `get_current_user(request)` refusing no user
                     guards += [f"{bare}>{x}" for x in g]
                     unguards += [f"{bare}>{x}" for x in u]
         return _unique(guards), sorted(set(unguards))
@@ -1604,6 +1754,9 @@ class _FastApi:
             )
             if fn is not None:
                 self.index.locate(row, fn)
+                if isinstance(fn, ast.FunctionDef | ast.AsyncFunctionDef):
+                    facts = self._ownership_facts(call, fn, rel, row.pattern)
+                    row.own(facts, self.ownership().code.fields)
             rows.append(_mark(row, key[1], dynamic, rel))
         return rows
 
