@@ -625,6 +625,40 @@ def test_fastapi_fail_open_schemes_are_judged_unless_a_dependency_raises(tmp_pat
     assert _route(result, "fastapi", "DELETE", "/posts/{id}")["unguard_markers"] == []
 
 
+def test_fastapi_nested_helper_raise_enforces_only_when_called(tmp_path):
+    _write(
+        tmp_path,
+        "svc/main.py",
+        "from fastapi import Depends, FastAPI, HTTPException\n"
+        "from fastapi.security import HTTPBearer\n\n"
+        "app = FastAPI()\n"
+        "optional_bearer = HTTPBearer(auto_error=False)\n\n"
+        "def enforced_user(creds=Depends(optional_bearer)):\n"
+        "    def reject():\n"
+        "        raise HTTPException(401)\n"
+        "    if creds is None:\n"
+        "        reject()\n"
+        "    return lookup(creds)\n\n"
+        "def lazy_user(creds=Depends(optional_bearer)):\n"
+        "    def reject():\n"
+        "        raise HTTPException(401)\n"
+        "    return lookup(creds) if creds else None\n\n"
+        "@app.get('/a')\n"
+        "def a(user=Depends(enforced_user)):\n    ...\n\n"
+        "@app.get('/b')\n"
+        "def b(user=Depends(lazy_user)):\n    ...\n",
+    )
+    result = _enum(tmp_path)
+    # enforced_user calls its helper: the scheme's fail-open is enforced there
+    a = _route(result, "fastapi", "GET", "/a")
+    assert a["guards"] == ["enforced_user>optional_bearer"]
+    assert a["unguard_markers"] == [] and not a["judgement_required"]
+    # lazy_user never calls its helper: the fail-open marker stands
+    b = _route(result, "fastapi", "GET", "/b")
+    assert b["unguard_markers"] == ["lazy_user>fail-open:optional_bearer"]
+    assert b["judgement_required"]
+
+
 def test_fastapi_route_dependencies_and_bare_sibling(tmp_path):
     _write(
         tmp_path,
@@ -910,6 +944,32 @@ def test_fastapi_middleware_guards_only_when_it_can_refuse(tmp_path):
     )
     row = _route(_enum(tmp_path), "fastapi", "GET", "/data")
     assert row["scope_guards"] == ["middleware:check_api_key"]
+
+
+def test_fastapi_middleware_shared_response_name_still_rejects(tmp_path):
+    _write(
+        tmp_path,
+        "svc/app.py",
+        "from fastapi import FastAPI\n\n"
+        "app = FastAPI()\n\n"
+        "@app.middleware('http')\n"
+        "async def auth_gate(request, call_next):\n"
+        "    if request.headers.get('x-api-key') == KEY:\n"
+        "        response = await call_next(request)\n"
+        "    else:\n"
+        "        response = Response(status_code=401)\n"
+        "    return response\n\n"
+        "@app.middleware('http')\n"
+        "async def auth_flow(request, call_next):\n"
+        "    response = await call_next(request)\n"
+        "    response.headers['x-tag'] = 'a'\n"
+        "    return response\n\n"
+        "@app.get('/data')\n"
+        "def data(): ...\n",
+    )
+    row = _route(_enum(tmp_path), "fastapi", "GET", "/data")
+    # the rejected branch reuses the pass-through name: the middleware still refuses
+    assert row["scope_guards"] == ["middleware:auth_gate"]
 
 
 def test_fastapi_public_dependency_forces_judgement(tmp_path):

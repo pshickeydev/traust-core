@@ -442,9 +442,31 @@ def _method_decorators(node: ast.AST) -> tuple[list[str], dict[str, list[str]]]:
 
 
 def _raises(fn: ast.AST) -> bool:
-    """The function itself raises — a raise inside a nested (uncalled) helper is not
-    the dependency's behavior."""
-    return any(isinstance(n, ast.Raise) for n in _own_nodes(fn))
+    """The function itself raises — a raise inside a nested helper is its behavior only
+    when the function can reach that helper through calls (directly, or through a helper
+    the call reaches)."""
+    own = list(_own_nodes(fn))
+    if any(isinstance(n, ast.Raise) for n in own):
+        return True
+    nested = {n.name: n for n in own if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef)}
+    if not nested:
+        return False
+
+    def called(scope: list[ast.AST]) -> set[str]:
+        return {
+            n.func.id for n in scope if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+        }
+
+    # helpers reachable from the function, including through sibling helpers it calls
+    reachable = called(own)
+    changed = True
+    while changed:
+        changed = False
+        for name in sorted(reachable):
+            if name in nested and (deeper := called(list(_own_nodes(nested[name]))) - reachable):
+                reachable |= deeper
+                changed = True
+    return any(name in nested and _raises(nested[name]) for name in reachable)
 
 
 def _own_nodes(fn: ast.AST):
@@ -1236,16 +1258,26 @@ def _middleware_rejects(fn: ast.AST) -> bool:
     args = getattr(fn, "args", None)
     params = [a.arg for a in args.args] if args else []
     onward = params[1] if len(params) > 1 else None
-    # variables assigned from the onward call: returning one of those IS passing on
+    # a returned name passes the request on only when every assignment to it (in this
+    # scope — nested scopes keep their own bindings) stores the onward call's response:
+    # a branch assigning a rejection response to that same name can be the returned value
     passed_through: set[str] = set()
-    for n in ast.walk(fn):
-        if isinstance(n, ast.Assign) and isinstance(n.value, ast.Await):
-            inner = n.value.value
-            if isinstance(inner, ast.Call) and _dotted(inner.func) == onward:
-                for target in n.targets:
-                    if isinstance(target, ast.Name):
-                        passed_through.add(target.id)
-    for n in ast.walk(fn):
+    reassigned: set[str] = set()
+    for n in _own_nodes(fn):
+        if not isinstance(n, ast.Assign):
+            continue
+        names = [t.id for t in n.targets if isinstance(t, ast.Name)]
+        onward_call = (
+            isinstance(n.value, ast.Await)
+            and isinstance(n.value.value, ast.Call)
+            and _dotted(n.value.value.func) == onward
+        )
+        if onward_call:
+            passed_through.update(names)
+        else:
+            reassigned.update(names)
+    passed_through -= reassigned
+    for n in _own_nodes(fn):
         if isinstance(n, ast.Raise):
             return True
         if isinstance(n, ast.Return) and n.value is not None:
