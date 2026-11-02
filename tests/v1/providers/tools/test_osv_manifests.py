@@ -340,6 +340,25 @@ def test_setup_py_install_requires() -> None:
     )
 
 
+SETUP_PY_WITH_EXTRAS = """\
+from setuptools import setup
+
+setup(
+    name="my-tool",
+    install_requires=["requests[security]>=2.20", "PyYAML"],
+    extras_require={"test": ["pytest>=7", "coverage"]},
+)
+"""
+
+
+def test_setup_py_extras_require_is_not_runtime() -> None:
+    # only the install_requires list is read: a later extras_require holds optional packages,
+    # and the extras bracket inside a requirement does not end the list
+    declared, deps = M.parse_setup_py(SETUP_PY_WITH_EXTRAS)
+    assert declared == "my-tool"
+    assert _deps((declared, deps)) == sorted([("requests", ">=2.20", False), ("pyyaml", "", False)])
+
+
 def test_constraints_delegates_to_requirements() -> None:
     assert M.parse_constraints_txt(CONSTRAINTS) == M.parse_requirements_txt(CONSTRAINTS)
     assert _deps(M.parse_constraints_txt(CONSTRAINTS)) == sorted(
@@ -895,17 +914,20 @@ require (
 )
 
 require sigs.k8s.io/yaml v1.4.0
+require example.com/dep v1.0.0 // not indirect
 """
 
 
 def test_gomod_module_requires_and_indirect() -> None:
     module, requires = M.parse_gomod(GOMOD)
     assert module == "github.com/org/repo-a"
-    assert len(requires) == 4
+    assert len(requires) == 5
     as_dict = {p: (v, ind) for p, v, ind in requires}
     assert as_dict["github.com/org/lib-b"] == ("v1.2.3", False)
     assert as_dict["k8s.io/client-go"] == ("v0.29.1", True)
     assert as_dict["sigs.k8s.io/yaml"] == ("v1.4.0", False)
+    # go's marker is the comment `// indirect` itself, not any comment naming it
+    assert as_dict["example.com/dep"] == ("v1.0.0", False)
 
 
 def test_gomod_of_non_go_text_is_empty() -> None:

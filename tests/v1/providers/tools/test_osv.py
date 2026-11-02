@@ -450,7 +450,7 @@ require example.com/app/v3 v3.6.0 // the module itself, via a tool
 
 replace (
 \texample.com/app/api/v3 => ./api // built from the checkout
-\tgithub.com/old/lib => github.com/fork/lib v1.2.5
+\tgithub.com/old/lib => github.com/fork/lib v1.2.5//security backport
 )
 
 replace github.com/pinned/only v1.0.0 => ../only
@@ -461,8 +461,22 @@ replace github.com/pinned/only/other v9.9.9 => github.com/never/used v1.0.0
 def test_gomod_replaces() -> None:
     r = osv.gomod_replaces(GOMOD_WITH_REPLACES)
     assert r[("example.com/app/api/v3", None)] == ("./api", None)
+    # a comment glued to the version token is still a comment
     assert r[("github.com/old/lib", None)] == ("github.com/fork/lib", "v1.2.5")
     assert r[("github.com/pinned/only", "v1.0.0")] == ("../only", None)
+
+
+def test_gomod_replaces_keeps_vcs_urls_and_glued_comments() -> None:
+    r = osv.gomod_replaces(
+        """module example.com/x
+
+replace example.com/private => https://github.com/org/private.git v1.4.0
+replace example.com/adjacent v1.0.0 => example.com/new v2.0.0//pinned fork
+"""
+    )
+    # the // of a VCS URL is not a comment; a // glued to a version is
+    assert r[("example.com/private", None)] == ("https://github.com/org/private.git", "v1.4.0")
+    assert r[("example.com/adjacent", "v1.0.0")] == ("example.com/new", "v2.0.0")
 
 
 def test_go_requires_replaced_locally_are_not_looked_up(tmp_path: Path) -> None:
