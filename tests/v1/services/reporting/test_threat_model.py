@@ -382,6 +382,12 @@ def test_isolation_review_ref_is_an_artifact_id() -> None:
         "0f0e1d2c-3b4a-4968-87a9-8c7d6e5f4a3b",
     )
     assert errors_of(model) == []
+    # a UUID is a UUID in any case: upper-case hexadecimal is still the artifact's id
+    upper = VALID_ISOLATION.replace(
+        "analysis-results/isolation/example-mt-service/",
+        "0F0E1D2C-3B4A-4968-87A9-8C7D6E5F4A3B",
+    )
+    assert errors_of(upper) == []
 
 
 def test_a_section_10_without_a_table_fails() -> None:

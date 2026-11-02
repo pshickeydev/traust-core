@@ -122,7 +122,9 @@ DIMENSION_RESULT_ENUM = {"yes", "partial", "no", "na"}
 BOUNDARY_ID = re.compile(r"^IF-\d+$")
 #: the isolation review the boundary's dimensions came from — the artifact row's id,
 #: not a path: the store owns artifacts, and a file path is not an id
-ISOLATION_REVIEW_REF = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+ISOLATION_REVIEW_REF = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE
+)
 ASSETS_COLUMNS = ["asset", "description", "sensitivity"]
 ASSETS_OPTIONAL_COLUMNS = ["regulatory_scope", "example_records"]
 ENTRY_COLUMNS = ["entry_point", "description", "trust_boundary", "reachable_assets"]

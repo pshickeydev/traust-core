@@ -470,7 +470,7 @@ def _check_git_argv(argv: list[str]) -> str:
         if tok == "-C":
             i += 2
             continue
-        if tok in ("--git-dir", "--work-tree", "--namespace"):
+        if tok in ("--git-dir", "--work-tree", "--namespace", "--attr-source", "--shallow-file"):
             # these globals always take the next token as their value — skipping
             # only the flag (the generic dash-skip below) would make the value the
             # "subcommand" and hide the real one from the network check
@@ -510,11 +510,14 @@ def _check_curl_argv(argv: list[str]) -> str:
             "--data-raw",
             "--data-urlencode",
             "--data-ascii",
+            "--json",
         ):
             # inspect this occurrence's own value: argv.index(tok) would find the
             # first repeated flag and read the wrong argument
             val = tok.split("=", 1)[1] if "=" in tok else argv[i + 1] if i + 1 < len(argv) else ""
-            if val.startswith("@"):
+            # --data-urlencode also reads a file in its `name@file` form: any `@`
+            # before the first `=` names a file curl uploads
+            if val.startswith("@") or (flag == "--data-urlencode" and "@" in val.split("=", 1)[0]):
                 return "curl --data @<file> is denied under safe_exec"
         if tok.startswith("file://"):
             return "curl file:// scheme is denied under safe_exec"

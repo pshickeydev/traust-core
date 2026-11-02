@@ -123,6 +123,20 @@ def test_an_observation_that_does_not_report_fork_status_keeps_the_recorded_upst
     assert observed.row().upstream_id == upstream.id
 
 
+def test_forge_facts_reads_the_fork_lineage_the_inventory_kept(observed: Observed) -> None:
+    """The document omits fork_of both for an explicit non-fork and for an unreported
+    status, so it cannot say "unknown": the readback answers from the inventory's lineage,
+    which an unreported status keeps — not as an explicit non-fork."""
+    observed.observe(fork=True, parent="Org/Upstream")
+    observed.observe(fork=None, parent=None, pushed_at="2026-10-02T00:00:00Z")
+    facts = observed.service.forge_facts(observed.repository.id)
+    assert (facts.fork, facts.parent) == (True, "org/upstream")
+
+    observed.observe(fork=False, parent=None, pushed_at="2026-10-03T00:00:00Z")
+    gone = observed.service.forge_facts(observed.repository.id)
+    assert (gone.fork, gone.parent) == (False, None)
+
+
 def test_visibility_and_archived_are_kept_on_the_repository(observed: Observed) -> None:
     observed.observe(visibility="public", archived=True)
     assert (observed.row().public, observed.row().archived) == (True, True)

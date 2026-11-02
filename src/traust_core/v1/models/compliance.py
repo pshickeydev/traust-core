@@ -1021,6 +1021,13 @@ class DocVariance(Model):
         )
 
 
+def _is_successor(record_id: str, rid: str) -> bool:
+    """Successors of `rid` are named `{rid}-r<n>` (below). Only a successor of the same record
+    proves a correction already landed: the same content on an unrelated record may not swallow
+    a requested supersession."""
+    return re.fullmatch(rf"{re.escape(rid)}-r\d+", record_id) is not None
+
+
 def merge_variances(
     prior: Mapping[str, JsonValue] | None,
     incoming: Mapping[str, JsonValue],
@@ -1049,7 +1056,9 @@ def merge_variances(
                 "supersede it (silent rewrite refused)"
             )
         elif any(
-            {k: v for k, v in r.items() if k != "id"} == {k: v for k, v in rec.items() if k != "id"}
+            _is_successor(str(r["id"]), rid)
+            and {k: v for k, v in r.items() if k != "id"}
+            == {k: v for k, v in rec.items() if k != "id"}
             for r in records
         ):
             # the superseding record is already in the register: recording the same

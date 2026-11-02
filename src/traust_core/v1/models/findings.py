@@ -377,7 +377,6 @@ class FindingCandidate(Model):
             if format == CandidateFormat.SARIF
             else parse[format](raw)
         )
-        seen: dict[str, int] = {}
         taken: set[str] = set()
         out = []
         for i, f in enumerate(fields):
@@ -391,7 +390,6 @@ class FindingCandidate(Model):
                     n += 1
                 label = f"{base}#{n}"
             taken.add(label)
-            seen[base] = seen.get(base, 0) + 1
             out.append(
                 cls(
                     label=Label(label),

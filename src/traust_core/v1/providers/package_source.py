@@ -11,6 +11,7 @@ from __future__ import annotations
 import io
 import json
 import re
+import shutil
 import tarfile
 import urllib.parse
 import zipfile
@@ -275,7 +276,8 @@ def go_escape(path: str) -> str:
 
 def extract(blob: bytes, kind: str, dest: Path) -> int:
     """Regular files only, each kept inside `dest`; links and escapes are skipped. A `.gem` is a
-    tar holding the gem's files as `data.tar.gz`; that inner archive is what is extracted."""
+    tar holding the gem's files as `data.tar.gz`; that inner archive is what is extracted. A
+    retry starts over: `dest` holds only the last archive's tree, never a mix."""
     try:
         return _extract(blob, kind, dest)
     except (tarfile.TarError, zipfile.BadZipFile, EOFError, OSError) as e:
@@ -291,15 +293,17 @@ def _extract(blob: bytes, kind: str, dest: Path) -> int:
             inner = tf.extractfile(member) if member else None
             if inner is None:
                 raise FetchRefused("gem has no data.tar.gz")
-            return _extract(_capped(inner), "tar", dest)
+            return _extract(_capped(inner, MAX_BYTES), "tar", dest)
     dest.mkdir(parents=True, exist_ok=True)
+    for child in dest.iterdir():  # a retry starts over: files a refused archive left
+        shutil.rmtree(child) if child.is_dir() else child.unlink()  # behind must not taint it
     root = dest.resolve()
 
     def target(name: str) -> Path | None:
         p = (dest / name).resolve()
         return p if p.is_relative_to(root) and p != root else None
 
-    n = 0
+    n = written = 0
     if kind == "zip":
         with zipfile.ZipFile(io.BytesIO(blob)) as z:
             for info in z.infolist():
@@ -308,7 +312,9 @@ def _extract(blob: bytes, kind: str, dest: Path) -> int:
                 if (t := target(info.filename)) is not None:
                     t.parent.mkdir(parents=True, exist_ok=True)
                     with z.open(info) as member:
-                        t.write_bytes(_capped(member))
+                        data = _capped(member, MAX_BYTES - written)
+                    t.write_bytes(data)
+                    written += len(data)
                     n += 1
         return n
     with tarfile.open(fileobj=io.BytesIO(blob), mode="r:*") as tf:
@@ -317,18 +323,20 @@ def _extract(blob: bytes, kind: str, dest: Path) -> int:
             f = tf.extractfile(m) if t is not None else None
             if t is not None and f is not None:
                 t.parent.mkdir(parents=True, exist_ok=True)
-                t.write_bytes(_capped(f))
+                data = _capped(f, MAX_BYTES - written)
+                t.write_bytes(data)
+                written += len(data)
                 n += 1
     return n
 
 
-def _capped(f: io.BufferedIOBase) -> bytes:
-    """The size cap is on the bytes that land, not only the bytes on the wire: an
-    archive under MAX_BYTES may not decompress without bound (a small zip can
-    hold gigabytes)."""
-    data = f.read(MAX_BYTES + 1)
-    if len(data) > MAX_BYTES:
-        raise FetchRefused(f"archive member decompresses past the {MAX_BYTES}-byte cap")
+def _capped(f: io.BufferedIOBase, budget: int) -> bytes:
+    """The size cap is on the bytes that land, not only the bytes on the wire: an archive under
+    MAX_BYTES may not decompress without bound (a small zip can hold gigabytes), and the members
+    that land may not add up past the cap either — `budget` is what remains of it."""
+    data = f.read(budget + 1)
+    if len(data) > budget:
+        raise FetchRefused(f"archive decompresses past the {MAX_BYTES}-byte cap")
     return data
 
 

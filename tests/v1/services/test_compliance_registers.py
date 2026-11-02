@@ -409,6 +409,22 @@ def test_a_changed_record_supersedes_only_with_update(world: World) -> None:
     ]
 
 
+def test_a_correction_matching_an_unrelated_record_still_supersedes(world: World) -> None:
+    """Only a successor of the same record makes a re-import a no-op: the same content on
+    an unrelated record may not swallow a requested supersession."""
+    world.service.record(
+        register_doc(variance(claim="stale claim"), variance("dv-fips")), provenance()
+    )
+    # the corrected dv-tls content is identical to dv-fips's — an unrelated record
+    updated = world.service.record(register_doc(variance()), provenance(), update=True)
+    assert [(v.record, v.disposition) for v in updated] == [
+        ("dv-tls", "superseded"),
+        ("dv-fips", "open"),
+        ("dv-tls-r2", "open"),  # the successor is named for the register's length
+    ]
+    assert world.service.record(register_doc(variance()), provenance(), update=True) == updated
+
+
 @pytest.mark.parametrize(
     ("doc", "error", "message"),
     [
