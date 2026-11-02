@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import tempfile
@@ -70,9 +71,12 @@ class LocalObjectStore:
             Path(tmp).replace(path)
         except OSError as e:
             # a failed write must not leave the dot-prefixed temp file behind —
-            # list() would surface it as a phantom object
+            # list() would surface it as a phantom object. Cleanup cannot be
+            # allowed to mask the original failure: the RepositoryError below
+            # carries it as cause, so a failing unlink is only swallowed.
             if tmp:
-                Path(tmp).unlink(missing_ok=True)
+                with contextlib.suppress(OSError):
+                    Path(tmp).unlink(missing_ok=True)
             raise RepositoryError(f"LocalObjectStore: put {key} failed") from e
         return ObjectRef(key, sha256_hex(data), len(data))
 

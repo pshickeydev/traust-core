@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from traust_core.v1.errors import IntegrityError, NotFoundError, ValidationError
+from traust_core.v1.errors import IntegrityError, NotFoundError, RepositoryError, ValidationError
 from traust_core.v1.repositories import (
     InMemoryObjectStore,
     LocalObjectStore,
@@ -55,6 +55,21 @@ def test_bad_keys_are_rejected(raw: str) -> None:
 def test_local_store_leaves_no_temp_files(tmp_path: Path) -> None:
     LocalObjectStore(tmp_path).put(KEY, b"x")
     assert [p.name for p in (tmp_path / "reports/org/repo").iterdir()] == ["scan.json"]
+
+
+def test_local_store_failed_put_with_failing_cleanup_raises_repository_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # a write failure after temp-file creation, where cleanup fails too:
+    # the original OSError must still surface as the RepositoryError's cause
+    def refused(self: Path, *args: object, **kw: object) -> None:
+        raise OSError("refused")
+
+    monkeypatch.setattr(Path, "replace", refused)
+    monkeypatch.setattr(Path, "unlink", refused)
+    with pytest.raises(RepositoryError) as raised:
+        LocalObjectStore(tmp_path).put(KEY, b"x")
+    assert isinstance(raised.value.__cause__, OSError)
 
 
 def test_dot_named_repos_are_valid_keys() -> None:
