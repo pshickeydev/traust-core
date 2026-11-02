@@ -6,6 +6,7 @@ The caller builds the boto3 client, so endpoint and credentials stay deployment 
 from __future__ import annotations
 
 from collections.abc import Iterable, Iterator
+from contextlib import closing
 from typing import Literal, Protocol, TypedDict
 
 from traust_core.v1.errors import ConfigError, NotFoundError, RepositoryError, ValidationError
@@ -117,10 +118,13 @@ class S3ObjectStore:
 
     def _read(self, key: ObjectKey) -> bytes:
         try:
-            return self._client.get_object(Bucket=self._bucket, Key=self._name(key))["Body"].read()
+            with closing(
+                self._client.get_object(Bucket=self._bucket, Key=self._name(key))["Body"]
+            ) as body:
+                return body.read()
         except ClientError as e:
             if self._is_missing(e, key):
-                raise NotFoundError(f"artifact {key}") from None
+                raise NotFoundError(f"artifact {key}") from e
             raise RepositoryError(f"S3ObjectStore: read {key} failed") from e
         except BotoCoreError as e:
             raise RepositoryError(f"S3ObjectStore: read {key} failed") from e

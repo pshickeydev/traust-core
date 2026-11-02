@@ -25,7 +25,7 @@ def client() -> Iterator[BaseClient]:
         yield c
 
 
-def test_prefix_scopes_keys_and_list_hides_it(client) -> None:
+def test_prefix_scopes_keys_and_list_hides_it(client: BaseClient) -> None:
     store = S3ObjectStore("traust", client=client, prefix="/deploy-a/")
     ref = store.put(KEY, b"x")
     assert client.head_object(Bucket="traust", Key=f"deploy-a/{KEY}")
@@ -34,7 +34,7 @@ def test_prefix_scopes_keys_and_list_hides_it(client) -> None:
     assert list(S3ObjectStore("traust", client=client, prefix="deploy-b").list()) == []
 
 
-def test_bytes_changed_behind_the_store_fail_the_digest(client) -> None:
+def test_bytes_changed_behind_the_store_fail_the_digest(client: BaseClient) -> None:
     store = S3ObjectStore("traust", client=client)
     ref = store.put(KEY, b"original")
     client.put_object(Bucket="traust", Key=str(KEY), Body=b"tampered")
@@ -43,7 +43,7 @@ def test_bytes_changed_behind_the_store_fail_the_digest(client) -> None:
     assert store.stat(KEY).sha256 != ref.sha256
 
 
-def test_list_matches_whole_segments_and_skips_foreign_keys(client) -> None:
+def test_list_matches_whole_segments_and_skips_foreign_keys(client: BaseClient) -> None:
     store = S3ObjectStore("traust", client=client)
     store.put(ObjectKey.parse("a/x.json"), b"1")
     store.put(ObjectKey.parse("ab/y.json"), b"2")
@@ -52,7 +52,7 @@ def test_list_matches_whole_segments_and_skips_foreign_keys(client) -> None:
     assert [str(k) for k in store.list("a/")] == ["a/x.json"]
 
 
-def test_list_follows_pages(client) -> None:
+def test_list_follows_pages(client: BaseClient) -> None:
     store = S3ObjectStore("traust", client=client)
     for i in range(1005):
         client.put_object(Bucket="traust", Key=f"many/{i:04}.json", Body=b"")
@@ -151,6 +151,35 @@ def test_list_yields_before_reading_every_page() -> None:
     assert str(next(listing)) == "a/x.json"
     with pytest.raises(RepositoryError):
         next(listing)
+
+
+def test_read_closes_body_after_success_and_failure() -> None:
+    client = MagicMock()
+    body = MagicMock()
+    client.get_object.return_value = {"Body": body}
+    body.read.return_value = b"stored"
+    store = S3ObjectStore("traust", client=client)
+
+    assert store.stat(KEY).size == len(b"stored")
+    body.close.assert_called_once_with()
+
+    error = ClientError({"Error": {"Code": "InternalError"}}, "GetObject")
+    body.read.side_effect = error
+    with pytest.raises(RepositoryError) as raised:
+        store.stat(KEY)
+    assert raised.value.__cause__ is error
+    assert body.close.call_count == 2
+
+
+def test_missing_object_preserves_s3_error_cause() -> None:
+    client = MagicMock()
+    error = ClientError({"Error": {"Code": "NoSuchKey"}}, "GetObject")
+    client.get_object.side_effect = error
+    store = S3ObjectStore("traust", client=client)
+
+    with pytest.raises(NotFoundError) as raised:
+        store.stat(KEY)
+    assert raised.value.__cause__ is error
 
 
 def test_other_client_errors_are_repository_errors() -> None:
