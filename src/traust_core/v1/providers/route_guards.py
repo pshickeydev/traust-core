@@ -40,7 +40,7 @@ from traust_core.v1.providers.tools import ToolRequest
 from traust_core.v1.providers.tree import TreeFile, tree_files
 
 if TYPE_CHECKING:
-    from traust_core.v1.providers.python_ownership import PyOwnership, Target
+    from traust_core.v1.providers.python_ownership import Opaque, PyOwnership, Target
 
 GUARD_RX = re.compile(
     r"(?i)(auth[nz]?|authenticate|authoriz|login|rbac|permission|"
@@ -994,7 +994,9 @@ FAIL_OPEN = "fail-open"
 _OPTIONAL = "optional:"
 # a dependency named for the authenticated caller
 _CALLER_DEPENDENCY = re.compile(
-    r"(?i)(^|_)(current|authenticated|logged_?in|signed_?in)_?(user|account|member|principal|identity|subject)s?$"
+    r"(?i)(^|_)(current|authenticated|logged_?in|signed_?in)(_[a-z]+)*_?"
+    r"(user|account|member|principal|identity|subject|superuser|admin)s?"
+    r"(_(authorizer|dependency|dep))?$"
 )
 _FASTAPI_SECURITY = re.compile(
     r"^(HTTPBearer|HTTPBasic|HTTPDigest|OAuth2\w*|APIKey(Header|Query|Cookie)|OpenIdConnect)$"
@@ -1306,6 +1308,26 @@ def _middleware_rejects(fn: ast.AST) -> bool:
     return False
 
 
+def _depends_calls(node: ast.AST | None, rel: str) -> list[tuple[str, ast.AST]]:
+    """The `Depends(…)` calls of a `dependencies=[…]` argument, with the file they are in."""
+    calls = node.elts if isinstance(node, ast.List | ast.Tuple) else []
+    return [
+        (rel, c) for c in calls if isinstance(c, ast.Call) and _last(_dotted(c.func)) in _DEPENDS
+    ]
+
+
+def _lets_missing_in(call: ast.Call) -> bool:
+    """`Authenticator(required=False)`, `HTTPBearer(auto_error=False)`, `optional=True`."""
+    return any(
+        isinstance(k.value, ast.Constant)
+        and (
+            (k.arg in ("required", "auto_error") and k.value.value is False)
+            or (k.arg == "optional" and k.value.value is True)
+        )
+        for k in call.keywords
+    )
+
+
 def _db_session_middleware(name: str) -> bool:
     return bool(_DB_SESSION_RX.match(re.sub(r"(?i)_?middleware$", "", name)))
 
@@ -1336,6 +1358,7 @@ class _Mount:
     prefix: str
     guards: list[str]
     unguards: list[str]
+    calls: list[tuple[str, ast.AST]] = field(default_factory=list)  # its `Depends(…)` nodes
 
 
 @dataclass
@@ -1343,6 +1366,7 @@ class _Receiver:
     prefix: str = ""
     guards: list[str] = field(default_factory=list)
     unguards: list[str] = field(default_factory=list)
+    calls: list[tuple[str, ast.AST]] = field(default_factory=list)
 
 
 @dataclass
@@ -1350,6 +1374,7 @@ class _Scope:
     prefix: str
     guards: list[str]
     unguards: list[str]
+    calls: list[tuple[str, ast.AST]] = field(default_factory=list)
 
 
 def _chains(
@@ -1361,7 +1386,9 @@ def _chains(
 ) -> list[_Scope]:
     """Every way a receiver's routes are reached: each mount's prefix and the guards it adds."""
     recv = receivers[key]
-    own = _Scope(recv.prefix, [*recv.guards, *middleware.get(key, [])], list(recv.unguards))
+    own = _Scope(
+        recv.prefix, [*recv.guards, *middleware.get(key, [])], list(recv.unguards), recv.calls
+    )
     parents = [m for m in mounts.get(key, []) if m.parent not in seen and m.parent in receivers]
     if not parents:
         return [own]
@@ -1373,6 +1400,7 @@ def _chains(
                     up.prefix + m.prefix + own.prefix,
                     _unique([*up.guards, *m.guards, *own.guards]),
                     sorted({*up.unguards, *m.unguards, *own.unguards}),
+                    [*up.calls, *m.calls, *own.calls],
                 )
             )
     return out[:_MAX_MOUNTS]
@@ -1386,6 +1414,8 @@ class _FastApi:
         self.index, self.consts = index, consts
         self.modules, self.functions = index.modules, index.functions
         self.security: set[str] = set()
+        self.guard_instances: set[_Key] = set()
+        self.fail_open_instances: set[_Key] = set()
         self.fail_open: set[str] = set()  # schemes built with auto_error=False: a missing
         # credential yields None, not a 401
         self.receivers: dict[_Key, _Receiver] = {}
@@ -1443,14 +1473,20 @@ class _FastApi:
         `Request` ones (whose `.user` is the caller)."""
         callers = set()
         for name, call, where, ann in self._param_dependencies(target.fn, target.rel):
-            dependency = call.args[0] if call.args else _kwarg(call, "dependency")
-            optional = isinstance(dependency, ast.Call) and any(
-                isinstance(k.value, ast.Constant) and k.value.value is False
-                for k in dependency.keywords
-                if k.arg in ("required", "auto_error")
+            dependency = self._dependency(call, ann)
+            guards, unguards = self._classify([(dependency, where)])
+            bare = dependency.removeprefix("Security:").split("[")[0]
+            # the authentication dependency itself, not one that merely depends on it
+            # (`requested_owner(owner = Query(…), user = Depends(get_current_user))`)
+            itself = (
+                dependency.startswith("Security:")
+                or _FASTAPI_SECURITY.match(_last(bare))
+                or _last(bare) in self.security
+                or self.modules.key(bare, where, self.guard_instances) is not None
+                or bool(_CALLER_DEPENDENCY.search(_last(bare)))
+                or bool(GUARD_RX.search(_last(bare)) and not _DB_SESSION_RX.match(_last(bare)))
             )
-            guards, unguards = self._classify([(self._dependency(call, ann), where)])
-            if guards and not unguards and not optional:
+            if guards and not unguards and itself and not dependency.startswith(_OPTIONAL):
                 callers.add(name)
         args = target.fn.args
         requests = {
@@ -1460,49 +1496,46 @@ class _FastApi:
         }
         return callers, requests
 
-    def _depends_on(self, target: Target) -> list[Target]:
-        """The checkout functions `target`'s parameters depend on, each resolved exactly."""
-        code = self.ownership().code
-        found = []
-        for _, call, where, ann in self._param_dependencies(target.fn, target.rel):
-            dependency = call.args[0] if call.args else _kwarg(call, "dependency")
-            fns = code.functions(where, dependency if dependency is not None else ann, None)
-            if fns and len(fns) == 1:
-                found.append(fns[0])
-        return found
+    def _depends_on(self, target: Target) -> tuple[list[Target], list[Opaque]]:
+        """What `target`'s parameters depend on: the checkout functions, each resolved exactly,
+        and the checkout code we can't follow (a class, an instance, an ambiguous name)."""
+        return self._resolve_dependencies(
+            [
+                (where, call, ann)
+                for _, call, where, ann in self._param_dependencies(target.fn, target.rel)
+            ]
+        )
 
-    def _route_dependencies(self, call: ast.Call, rel: str) -> tuple[list[Target], CodeSpan | None]:
-        """The route's `dependencies=[…]` functions; and the first that is an instance of a
-        checkout class whose module reads `request.path_params` (the id reaches a check we
-        don't follow)."""
+    def _resolve_dependencies(
+        self, calls: list[tuple[str, ast.AST, ast.AST | None]]
+    ) -> tuple[list[Target], list[Opaque]]:
         code = self.ownership().code
-        node = _kwarg(call, "dependencies")
-        calls = node.elts if isinstance(node, ast.List | ast.Tuple) else []
-        found, opaque = [], None
-        for c in calls:
-            if not (isinstance(c, ast.Call) and _last(_dotted(c.func)) in _DEPENDS and c.args):
+        found: list[Target] = []
+        opaque: list[Opaque] = []
+        for where, call, ann in calls:
+            if not isinstance(call, ast.Call):
                 continue
-            dependency = c.args[0]
-            if isinstance(dependency, ast.Call) and (
-                where := code.class_module(rel, dependency.func)
-            ):
-                if opaque is None and "path_params" in code.text(where):
-                    opaque = CodeSpan(path=RepoPath(rel), line=c.lineno)
-                continue
-            fns = code.functions(rel, dependency, None)
-            if fns and len(fns) == 1:
-                found.append(fns[0])
+            dependency = call.args[0] if call.args else _kwarg(call, "dependency")
+            resolved = code.dependency(where, dependency if dependency is not None else ann)
+            if isinstance(resolved, list):
+                found += resolved
+            elif resolved is not None:
+                opaque.append(resolved)
         return found, opaque
 
-    def _ownership_facts(self, call: ast.Call, fn: ast.AST, rel: str, pattern: str) -> HandlerFacts:
+    def _ownership_facts(
+        self, call: ast.Call, fn: ast.AST, rel: str, pattern: str, scope: _Scope
+    ) -> HandlerFacts:
+        """Per route: its handler with the route's and its routers' own dependencies."""
         ids = frozenset(path_params(pattern))
-        key = (id(fn), ids)
+        calls = [*_depends_calls(_kwarg(call, "dependencies"), rel), *scope.calls]
+        key = (id(fn), ids, id(call), tuple(id(c) for _, c in calls))
         if key not in self._facts:
             from traust_core.v1.providers.python_ownership import Target
 
             own = self.ownership()
             handler = Target(self.index.paths.get(id(fn), rel), fn)  # type: ignore[arg-type]
-            deps, opaque = self._route_dependencies(call, rel)
+            deps, opaque = self._resolve_dependencies([(where, c, None) for where, c in calls])
             self._facts[key] = own.handler(handler, set(ids), deps, opaque)
         return self._facts[key]
 
@@ -1521,6 +1554,7 @@ class _FastApi:
 
     def _bind(self) -> None:
         ctors = self._ctors()
+        module_level = {id(s) for src in self.index.sources for s in src.tree.body}
         for rel, assigns in self.index.assigns.items():
             for node in assigns:
                 if not isinstance(node.value, ast.Call):
@@ -1532,20 +1566,29 @@ class _FastApi:
                     for t in targets
                     if isinstance(t, ast.Name | ast.Attribute)
                 ]
-                if _FASTAPI_SECURITY.match(ctor) or (
-                    GUARD_RX.search(ctor) and not NON_ENFORCING_RX.search(ctor)
-                ):
-                    # a security scheme, or an instance of a guard class (`Authenticator(…)`)
+                if _FASTAPI_SECURITY.match(ctor):
                     self.security.update(names)
                     auto_error = _kwarg(node.value, "auto_error")
                     if isinstance(auto_error, ast.Constant) and auto_error.value is False:
                         self.fail_open.update(names)
+                elif (
+                    id(node) in module_level
+                    and (ctor in self.index.classes or ctor in self.functions)
+                    and GUARD_RX.search(ctor)
+                    and not NON_ENFORCING_RX.search(ctor)
+                ):
+                    # a module-level guard built by a checkout class or factory (`Authenticator(…)`)
+                    keys = {(rel, n) for n in names}
+                    self.guard_instances |= keys
+                    if _lets_missing_in(node.value):
+                        self.fail_open_instances |= keys
                 if ctor not in ctors:
                     continue
                 guards, unguards = self._dependencies(_kwarg(node.value, "dependencies"), rel)
                 prefix = _const_str(_kwarg(node.value, "prefix")) or ""
                 for name in names:
-                    self.receivers[(rel, name)] = _Receiver(prefix, guards, unguards)
+                    calls = _depends_calls(_kwarg(node.value, "dependencies"), rel)
+                    self.receivers[(rel, name)] = _Receiver(prefix, guards, unguards, calls)
         bound = set(self.receivers)
         self.bindings = _Bindings(self.index, lambda expr, rel: self.modules.key(expr, rel, bound))
         for rel, calls in self.index.calls.items():
@@ -1597,18 +1640,19 @@ class _FastApi:
         for child in children:
             for parent in parents:
                 self.mounts.setdefault(child, []).append(
-                    _Mount(parent, _const_str(prefix_node) or "", guards, unguards)
+                    _Mount(
+                        parent,
+                        _const_str(prefix_node) or "",
+                        guards,
+                        unguards,
+                        _depends_calls(_kwarg(node, "dependencies"), rel),
+                    )
                 )
 
     def _dependency(self, call: ast.Call, annotation: ast.AST | None) -> str:
         target = call.args[0] if call.args else _kwarg(call, "dependency")
         name = _dotted(target if target is not None else annotation)
-        if isinstance(target, ast.Call) and any(
-            k.arg in ("required", "auto_error")
-            and isinstance(k.value, ast.Constant)
-            and k.value.value is False
-            for k in target.keywords
-        ):
+        if isinstance(target, ast.Call) and _lets_missing_in(target):
             return f"{_OPTIONAL}{name}"  # `get_user(required=False)` lets a missing caller in
         if _last(_dotted(call.func)) == "Security":
             scopes = _str_list(_kwarg(call, "scopes"))
@@ -1666,9 +1710,12 @@ class _FastApi:
                 or (GUARD_RX.search(bare) and not _DB_SESSION_RX.match(_last(bare)))
                 or _FASTAPI_SECURITY.match(_last(bare))
                 or _last(bare) in self.security
+                or self.modules.key(bare, rel, self.guard_instances) is not None
             ):
                 guards.append(name)
-                if _last(bare) in self.fail_open:
+                if _last(bare) in self.fail_open or (
+                    self.modules.key(bare, rel, self.fail_open_instances) is not None
+                ):
                     unguards.append(f"{FAIL_OPEN}:{name}")
             elif depth < _DEPTH and bare not in seen:
                 fn = self.index.callee(bare, rel) if bare else None
@@ -1755,7 +1802,7 @@ class _FastApi:
             if fn is not None:
                 self.index.locate(row, fn)
                 if isinstance(fn, ast.FunctionDef | ast.AsyncFunctionDef):
-                    facts = self._ownership_facts(call, fn, rel, row.pattern)
+                    facts = self._ownership_facts(call, fn, rel, row.pattern, scope)
                     row.own(facts, self.ownership().code.fields)
             rows.append(_mark(row, key[1], dynamic, rel))
         return rows

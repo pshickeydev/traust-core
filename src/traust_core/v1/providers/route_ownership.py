@@ -74,6 +74,7 @@ class HandlerFacts:
     hop: CodeSpan | None = None
     handoff: CodeSpan | None = None
     takes_id: bool = False  # a path id reaches the handler, whatever the pattern shows
+    ignores_id: bool = False  # the path ids reach only code that does nothing with them
 
 
 def path_params(pattern: str) -> tuple[str, ...]:
@@ -145,6 +146,8 @@ def classify(
     if not path_params(pattern):
         # an unresolved pattern (`Routes.CARD_BY_ID`) may still carry the id
         return (RouteOwnership.UNKNOWN if facts.takes_id else RouteOwnership.NOT_APPLICABLE), None
+    if facts.ignores_id and not facts.lookups and not facts.handoff:
+        return RouteOwnership.NOT_APPLICABLE, None
 
     def ownerless(x: Lookup) -> bool:
         names = fields.get(x.record_type or "")

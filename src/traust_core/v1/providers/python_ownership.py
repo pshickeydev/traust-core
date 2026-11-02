@@ -20,7 +20,7 @@ from traust_core.v1.providers.route_ownership import (
 _Def = ast.FunctionDef | ast.AsyncFunctionDef
 _Pos = tuple[int, int]
 
-# record bases a model inherits nothing ownership-relevant from
+# record bases a model inherits nothing ownership-relevant from, unless the checkout defines them
 _FRAMEWORK_BASES = {
     "BaseModel",
     "SQLModel",
@@ -33,11 +33,26 @@ _FRAMEWORK_BASES = {
     "StrEnum",
     "IntEnum",
 }
-# a query constructor, the methods narrowing it, and the fetches that raise when nothing matched
-_QUERY_ROOTS = {"select", "update", "delete", "query"}
+# a query constructor, the methods narrowing it, the links that widen it, and the fetches that
+# return a row (None, or a raise, when nothing matched)
+_QUERY_ROOTS = {"select", "update", "delete", "insert", "query"}
 _QUERY_NARROWING = {"where", "filter", "filter_by"}
+_QUERY_WIDENING = {
+    "join",
+    "outerjoin",
+    "join_from",
+    "union",
+    "union_all",
+    "except_",
+    "except_all",
+    "intersect",
+    "intersect_all",
+    "select_from",
+    "from_statement",
+    "correlate",
+}
 _FETCH_OR_RAISE = {"one", "scalar_one", "one_or_404", "first_or_404", "get_or_404"}
-_READ_NAME = re.compile(r"^(get|find|fetch|load|read|lookup|select|query|search|retrieve)(_|$)")
+_FETCH = {"first", "one_or_none", "scalar_one_or_none", "scalar", "get", *_FETCH_OR_RAISE}
 _LOOKUP_NAME = re.compile(
     r"^(get|find|fetch|load|read|lookup|select|query|search|retrieve|delete|remove|pop|update)"
     r"(_|$)"
@@ -57,6 +72,8 @@ _THROWN = re.compile(r"(Exception|Error)$")
 # a caller flag whose holders may act on any record (owner decision 2026-11-02)
 _PRIVILEGE_FLAG = re.compile(r"^(is_)?(superuser|admin|staff)$")
 _MUTATORS = re.compile(r"^(set\w*|update|pop|clear|setdefault|__setitem__)$")
+_SETATTR = {"setattr", "object.__setattr__"}
+_FOREIGN_KEY = re.compile(r"""["']([A-Za-z_]\w*)\.\w+["']""")
 _MAX_DEPTH = 64
 
 
@@ -169,8 +186,9 @@ class _Module:
     rel: str
     funcs: dict[str, list[_Def]] = field(default_factory=dict)
     classes: dict[str, ast.ClassDef] = field(default_factory=dict)
-    instances: dict[str, str] = field(default_factory=dict)  # `service = Service()`
+    instances: dict[str, str] = field(default_factory=dict)  # `service = Service()`: its ctor
     containers: dict[str, str] = field(default_factory=dict)  # `_ITEMS: dict[int, Item]`
+    stores: set[str] = field(default_factory=set)  # every module-level dict
 
 
 @dataclass(frozen=True)
@@ -181,6 +199,14 @@ class Target:
     fn: _Def
     method: bool = False
     cls: ast.ClassDef | None = None
+
+
+@dataclass(frozen=True)
+class Opaque:
+    """A dependency the reader can't follow; `params`: the names it takes, None when unknown."""
+
+    span: CodeSpan
+    params: frozenset[str] | None
 
 
 class PyCode:
@@ -211,12 +237,19 @@ class PyCode:
         targets = node.targets if isinstance(node, ast.Assign) else [node.target]
         names = [t.id for t in targets if isinstance(t, ast.Name)]
         if isinstance(node.value, ast.Call) and (kind := _dotted(node.value.func)):
-            for n in names:
-                m.instances[n] = kind.rsplit(".", 1)[-1]
+            m.instances.update(dict.fromkeys(names, kind))
+        if isinstance(node.value, ast.Dict) or (
+            isinstance(node.value, ast.Call)
+            and _dotted(node.value.func).rsplit(".", 1)[-1]
+            in ("dict", "defaultdict", "OrderedDict")
+        ):
+            m.stores.update(names)
         if isinstance(node, ast.AnnAssign) and isinstance(node.annotation, ast.Subscript):
             outer = _dotted(node.annotation.value).rsplit(".", 1)[-1]
             args = node.annotation.slice
             elts = args.elts if isinstance(args, ast.Tuple) else [args]
+            if outer in ("dict", "Dict", "Mapping", "MutableMapping"):
+                m.stores.update(names)
             if outer in ("dict", "Dict", "Mapping", "MutableMapping") and len(elts) == 2:
                 inner = _type_names(elts[1]) - {"Optional", "None"}
                 if len(inner) == 1:
@@ -225,7 +258,8 @@ class PyCode:
     def _record_fields(self) -> tuple[dict[str, tuple[str, ...]], set[str]]:
         """Fields per class, inherited ones included. As on the Java side, a class that may be
         owned through another is left out unless it names an owner itself: an unknown base, a
-        field holding or held by another class, subclasses, another class's `<name>_id`."""
+        field holding or held by another class, subclasses, a foreign key or `<name>_id` pointing
+        at it; and a class whose fields we can't read (`__table__ = Table(…)`, none at all)."""
         defs: dict[str, list[ast.ClassDef]] = {}
         for m in self.by_rel.values():
             for name, c in m.classes.items():
@@ -233,6 +267,9 @@ class PyCode:
         own: dict[str, list[str]] = {}
         held: dict[str, set[str]] = {}
         bases: dict[str, list[str]] = {}
+        tables: dict[str, str] = {}
+        unreadable: set[str] = set()
+        pointed: set[str] = set()
         for name, cs in defs.items():
             if len(cs) > 1:
                 continue  # two classes of one name can't be told apart
@@ -244,13 +281,36 @@ class PyCode:
                     types |= _type_names(stmt.annotation) | _type_names(stmt.value)
                 elif isinstance(stmt, ast.Assign):
                     for t in stmt.targets:
-                        if isinstance(t, ast.Name) and not t.id.startswith("__"):
+                        if not isinstance(t, ast.Name):
+                            continue
+                        if t.id == "__table__":
+                            unreadable.add(name)
+                        elif t.id == "__tablename__" and isinstance(stmt.value, ast.Constant):
+                            tables[name] = str(stmt.value.value)
+                        elif not t.id.startswith("__"):
                             names.append(t.id)
                             types |= _type_names(stmt.value)
+                elif isinstance(stmt, ast.FunctionDef | ast.AsyncFunctionDef):
+                    # attributes a method sets on the instance (`self.owner_id = …`)
+                    names += [
+                        t.attr
+                        for n in ast.walk(stmt)
+                        if isinstance(n, ast.Assign)
+                        for t in n.targets
+                        if isinstance(t, ast.Attribute) and _dotted(t.value) == "self"
+                    ]
+                if not isinstance(stmt, ast.FunctionDef | ast.AsyncFunctionDef):
+                    pointed |= {
+                        m.group(1).replace("_", "").lower()
+                        for n in ast.walk(stmt)
+                        if isinstance(n, ast.Constant) and isinstance(n.value, str)
+                        for m in [_FOREIGN_KEY.fullmatch(f'"{n.value}"')]
+                        if m
+                    }
             own[name], held[name] = names, types
             bases[name] = [_dotted(b).rsplit(".", 1)[-1] for b in cs[0].bases]
         records = set(own)
-        pointed = {
+        pointed |= {
             re.sub(r"_?id$", "", f, flags=re.I).replace("_", "").lower()
             for names in own.values()
             for f in names
@@ -258,20 +318,26 @@ class PyCode:
         }
         parents = {b for bs in bases.values() for b in bs}
         held_by_others = {k for n, ts in held.items() for k in ts if k != n and k in records}
+        memo: dict[str, tuple[list[str], set[str]] | None] = {}
 
         def full(name: str, seen: frozenset[str]) -> tuple[list[str], set[str]] | None:
+            if name in memo:
+                return memo[name]
+            if len(seen) > _MAX_DEPTH:
+                return None  # too deep to read: never taken for ownerless
             names, types = list(own[name]), set(held[name])
+            result: tuple[list[str], set[str]] | None = (names, types)
             for b in bases[name]:
-                if b in _FRAMEWORK_BASES:
+                if b not in own and b in _FRAMEWORK_BASES:
                     continue
-                if b not in own or b in seen:
-                    return None
-                inherited = full(b, seen | {name})
+                inherited = full(b, seen | {name}) if b in own and b not in seen else None
                 if inherited is None:
-                    return None
+                    result = None
+                    break
                 names += inherited[0]
                 types |= inherited[1]
-            return names, types
+            memo[name] = result
+            return result
 
         out: dict[str, tuple[str, ...]] = {}
         for name in own:
@@ -279,10 +345,13 @@ class PyCode:
             names = resolved[0] if resolved else own[name]
             linked = (
                 resolved is None
+                or not names
+                or name in unreadable
                 or bool(resolved[1] & (records - {name}))
                 or name in held_by_others
                 or name in parents
                 or name.lower() in pointed
+                or tables.get(name, "").replace("_", "").lower() in pointed
             )
             if any(OWNER_FIELD_RX.match(f) for f in names) or not linked:
                 out[name] = tuple(names)
@@ -291,84 +360,110 @@ class PyCode:
     def _imported(self, rel: str, root: str) -> str | None:
         return self.imports.imported.get(rel, {}).get(root)
 
-    def _meaning(self, rel: str, text: str) -> str | list[Target] | None:
-        """What a dotted name means from `rel`: a class name, the functions it may be, or None."""
-        parts = text.split(".")
+    def _module(self, dotted: str) -> _Module | None:
+        return self.by_rel.get(self.imports.file(dotted) or "") if dotted else None
+
+    def class_def(self, rel: str, text: str) -> ast.ClassDef | None:
+        """The checkout class a dotted name refers to from `rel`, through its imports."""
+        parts = text.split(".") if text else []
         m = self.by_rel.get(rel)
         if len(parts) == 1:
             if m and parts[0] in m.classes:
-                return parts[0]
+                return m.classes[parts[0]]
+            target = self._imported(rel, parts[0])
+            if target is None:
+                return None
+            mod, _, name = target.rpartition(".")
+        elif parts and (root := self._imported(rel, parts[0])) is not None:
+            mod, name = ".".join([root, *parts[1:-1]]), parts[-1]
+        else:
+            return None
+        where = self._module(mod)
+        return where.classes.get(name) if where else None
+
+    def _instance(self, rel: str, text: str) -> tuple[str, str] | None:
+        """The module and constructor of a module-level instance a name refers to."""
+        parts = text.split(".")
+        m = self.by_rel.get(rel)
+        if len(parts) == 1:
+            if m and parts[0] in m.instances:
+                return rel, m.instances[parts[0]]
+            target = self._imported(rel, parts[0])
+            if target is None:
+                return None
+            mod, _, name = target.rpartition(".")
+        elif (root := self._imported(rel, parts[0])) is not None:
+            mod, name = ".".join([root, *parts[1:-1]]), parts[-1]
+        else:
+            return None
+        owner = self._module(mod)
+        return (owner.rel, owner.instances[name]) if owner and name in owner.instances else None
+
+    def instance_class(self, rel: str, expr: ast.AST | None) -> ast.ClassDef | None:
+        """The checkout class of the module-level instance an expression names."""
+        found = self._instance(rel, _dotted(expr)) if _dotted(expr) else None
+        return self.class_def(found[0], found[1]) if found else None
+
+    def _functions(self, rel: str, text: str) -> list[Target] | None:
+        """The functions a dotted name may be from `rel`: module functions, a class's or a
+        module-level instance's methods. None when it names none."""
+        parts = text.split(".")
+        m = self.by_rel.get(rel)
+        if len(parts) == 1:
             if m and parts[0] in m.funcs:
                 return [Target(rel, f) for f in m.funcs[parts[0]]]
             target = self._imported(rel, parts[0])
             if target is None:
                 return None
             mod, _, name = target.rpartition(".")
-            return self._in_module(self.imports.file(mod) if mod else None, name)
-        if (root := self._imported(rel, parts[0])) is not None:
-            dotted = ".".join([root, *parts[1:-1]])
-            if (where := self.imports.file(dotted)) is not None:
-                return self._in_module(where, parts[-1])
-            mod, _, holder = dotted.rpartition(".")
-            owner = self.by_rel.get(self.imports.file(mod) or "") if mod else None
-            if owner is not None and len(parts) == 2:
-                cls = owner.instances.get(holder) or (holder if holder in owner.classes else None)
-                return self._methods(owner.rel, cls, parts[-1]) if cls else None
-            return None
-        if m and len(parts) == 2:
-            cls = m.instances.get(parts[0]) or (parts[0] if parts[0] in m.classes else None)
-            return self._methods(rel, cls, parts[1]) if cls else None
+            where = self._module(mod)
+            return (
+                [Target(where.rel, f) for f in where.funcs.get(name, [])] or None if where else None
+            )
+        holder, name = ".".join(parts[:-1]), parts[-1]
+        if (root := self._imported(rel, parts[0])) is not None and (
+            where := self._module(".".join([root, *parts[1:-1]]))
+        ):
+            return [Target(where.rel, f) for f in where.funcs.get(name, [])] or None
+        cls = self.class_def(rel, holder)
+        if cls is not None:
+            return self._methods(cls, name, static=True)
+        inst = self._instance(rel, holder)
+        if inst is not None and (cls := self.class_def(inst[0], inst[1])) is not None:
+            return self._methods(cls, name)
         return None
 
-    def _in_module(self, where: str | None, name: str) -> str | list[Target] | None:
-        m = self.by_rel.get(where or "")
-        if m is None:
-            return None
-        if name in m.classes:
-            return name
-        return [Target(m.rel, f) for f in m.funcs.get(name, [])] or None
-
-    def _class(self, name: str, rel: str) -> ast.ClassDef | None:
-        m = self.by_rel.get(rel)
-        if m is not None and name in m.classes:
-            return m.classes[name]
-        found = [x.classes[name] for x in self.by_rel.values() if name in x.classes]
-        return found[0] if len(found) == 1 else None
-
-    def _methods(self, rel: str, cls: str, name: str) -> list[Target] | None:
-        """`cls.name`, in the class or its checkout bases, nearest first."""
-        c = self._class(cls, rel)
-        seen: set[str] = set()
-        while c is not None and c.name not in seen:
-            seen.add(c.name)
+    def _methods(
+        self, cls: ast.ClassDef, name: str, *, static: bool = False
+    ) -> list[Target] | None:
+        """`cls.name`, in the class or its checkout bases, nearest first; `static`: called on the
+        class, so only static and class methods skip a parameter."""
+        c: ast.ClassDef | None = cls
+        seen: set[int] = set()
+        while c is not None and id(c) not in seen:
+            seen.add(id(c))
+            rel = self.class_rel.get(id(c), "")
             found = [
                 s
                 for s in c.body
                 if isinstance(s, ast.FunctionDef | ast.AsyncFunctionDef) and s.name == name
             ]
             if found:
-                where = self.class_rel.get(id(c), rel)
-                static = any(_dotted(d) == "staticmethod" for d in found[0].decorator_list)
-                return [Target(where, f, not static, c) for f in found]
-            bases = [_dotted(b).rsplit(".", 1)[-1] for b in c.bases if _dotted(b)]
-            c = next((x for b in bases if (x := self._class(b, rel)) is not None), None)
+                decos = {_dotted(d) for d in found[0].decorator_list}
+                bound = "classmethod" in decos or not (static or "staticmethod" in decos)
+                return [Target(rel, f, bound, c) for f in found]
+            c = next(
+                (x for b in c.bases if (x := self.class_def(rel, _dotted(b))) is not None), None
+            )
         return None
 
     def text(self, rel: str) -> str:
         return self.texts.get(rel, "")
 
-    def class_module(self, rel: str, expr: ast.AST | None) -> str | None:
-        """The file defining the checkout class an expression names from `rel`."""
-        found = self._meaning(rel, _dotted(expr)) if _dotted(expr) else None
-        if not isinstance(found, str):
-            return None
-        c = self._class(found, rel)
-        return self.class_rel.get(id(c)) if c is not None else None
-
     def record(self, rel: str, expr: ast.AST | None) -> str | None:
-        """The checkout class an expression names from `rel` (`Item`, `models.Item`)."""
-        found = self._meaning(rel, _dotted(expr)) if _dotted(expr) else None
-        return found if isinstance(found, str) and found in self.records else None
+        """The record class an expression names from `rel` (`Item`, `models.Item`)."""
+        c = self.class_def(rel, _dotted(expr)) if _dotted(expr) else None
+        return c.name if c is not None and c.name in self.records else None
 
     def container(self, rel: str, expr: ast.AST | None) -> str | None:
         """The record a typed module-level container holds (`_ITEMS: dict[int, Item]`)."""
@@ -378,8 +473,19 @@ class PyCode:
         if not parts or (root := self._imported(rel, parts[0])) is None:
             return None
         mod, _, name = ".".join([root, *parts[1:]]).rpartition(".")
-        m = self.by_rel.get(self.imports.file(mod) or "") if mod else None
+        m = self._module(mod)
         return m.containers.get(name) if m is not None else None
+
+    def is_store(self, rel: str, expr: ast.AST | None) -> bool:
+        """A module-level dict (`_ITEMS = {}`), from `rel` or imported."""
+        parts = _dotted(expr).split(".") if _dotted(expr) else []
+        if len(parts) == 1 and (m := self.by_rel.get(rel)) and parts[0] in m.stores:
+            return True
+        if not parts or (root := self._imported(rel, parts[0])) is None:
+            return False
+        mod, _, name = ".".join([root, *parts[1:]]).rpartition(".")
+        m = self._module(mod)
+        return m is not None and name in m.stores
 
     def functions(
         self, rel: str, expr: ast.AST | None, cls: ast.ClassDef | None
@@ -388,11 +494,12 @@ class PyCode:
         text = _dotted(expr)
         if not text:
             return []
-        if text.count(".") == 1 and text.split(".")[0] in ("self", "cls") and cls is not None:
-            found = self._methods(self.class_rel.get(id(cls), rel), cls.name, text.split(".")[1])
+        head, _, tail = text.partition(".")
+        if head in ("self", "cls") and tail and "." not in tail:
+            found = self._methods(cls, tail) if cls is not None else None
         else:
-            found = self._meaning(rel, text)
-        if not isinstance(found, list):
+            found = self._functions(rel, text)
+        if not found:
             return []
         real = [
             t
@@ -400,6 +507,31 @@ class PyCode:
             if not any(_dotted(d).endswith("overload") for d in t.fn.decorator_list)
         ]
         return None if len(real) > 1 else real
+
+    def dependency(self, rel: str, expr: ast.AST | None) -> list[Target] | Opaque | None:
+        """What a `Depends(...)` target runs: one function; an Opaque when it is checkout code we
+        don't follow (a class, an instance, an ambiguous name); None when it isn't checkout code."""
+        span = CodeSpan(path=RepoPath(rel), line=getattr(expr, "lineno", 1))
+        node = _unawait(expr)
+        cls = None
+        if isinstance(node, ast.Call):
+            cls = self.class_def(rel, _dotted(node.func))
+            entry = "__call__"
+        elif (cls := self.class_def(rel, _dotted(node))) is not None:
+            entry = "__init__"
+        elif (cls := self.instance_class(rel, node)) is not None:
+            entry = "__call__"
+        if cls is not None:
+            where = self.class_rel.get(id(cls), rel)
+            if "path_params" in self.text(where):
+                return Opaque(span, None)  # it may read any path id off the request
+            methods = self._methods(cls, entry) or []
+            names = {p for t in methods for p in _params(t.fn)} - {"self", "cls"}
+            return Opaque(span, frozenset(names))
+        found = self.functions(rel, node, None)
+        if found is None:
+            return Opaque(span, None)  # two definitions of one name
+        return found or None
 
 
 # ---- one function body
@@ -417,13 +549,16 @@ class _Scan:
 
 
 class _Values:
-    """Which values in one function come from the caller alone."""
+    """Which values in one function come from the caller alone. `roots`: the callers the
+    function is handed (not locals derived from them)."""
 
-    def __init__(self, callers: set[str], requests: set[str]) -> None:
-        self.callers, self.requests = set(callers), requests
+    def __init__(self, callers: set[str], requests: set[str], params: set[str]) -> None:
+        self.callers, self.requests, self.params = set(callers), set(requests), params
+        self.roots = set(callers)
 
     def bind(self, fn: _Def) -> None:
-        """Adds caller-only locals bound once; drops any caller rebound or mutated."""
+        """Adds caller-only locals bound once; drops any caller or request rebound or mutated,
+        directly or through a local bound from it."""
         bound: dict[str, list[ast.AST | None]] = {}
         other: set[str] = set()
         mutated: set[str] = set()
@@ -431,6 +566,8 @@ class _Values:
         def root(target: ast.AST) -> None:
             while isinstance(target, ast.Attribute | ast.Subscript):
                 target = target.value
+            if isinstance(target, ast.Call) and _dotted(target.func) == "vars" and target.args:
+                target = target.args[0]
             if isinstance(target, ast.Name):
                 mutated.add(target.id)
 
@@ -460,27 +597,39 @@ class _Values:
             elif isinstance(n, ast.Delete):
                 for t in n.targets:
                     other |= _names(t)
-            elif isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute):
-                if _MUTATORS.match(n.func.attr):
-                    root(n.func.value)
-            elif isinstance(n, ast.Call) and _dotted(n.func) == "setattr" and n.args:
+            elif isinstance(n, ast.Call) and _dotted(n.func) in _SETATTR and n.args:
                 root(n.args[0])
+            elif (
+                isinstance(n, ast.Call)
+                and isinstance(n.func, ast.Attribute)
+                and _MUTATORS.match(n.func.attr)
+            ):
+                root(n.func.value)
+        # a local bound from a caller shares its object: writing it writes the caller
+        for name in list(mutated & set(bound)):
+            for v in bound[name]:
+                mutated |= _names(v)
+        self.requests -= set(bound) | other | mutated
         base = self.callers - set(bound) - other - mutated
+        self.roots &= base
         found: set[str] = set()
         while True:
             self.callers = base | found
             more = {
                 n
                 for n, values in bound.items()
-                if n not in found | other | mutated and len(values) == 1 and self.derived(values[0])
+                if n not in found | other | mutated | self.params
+                and len(values) == 1
+                and self.derived(values[0])
             }
             if not more:
                 return
             found |= more
 
-    def is_caller(self, node: ast.AST) -> bool:
+    def is_caller(self, node: ast.AST, *, rooted: bool = False) -> bool:
+        """A caller variable (`rooted`: only one handed in), or `request.user`."""
         if isinstance(node, ast.Name):
-            return node.id in self.callers
+            return node.id in (self.roots if rooted else self.callers)
         # `request.user`, set by Starlette's authentication middleware
         return (
             isinstance(node, ast.Attribute)
@@ -536,12 +685,13 @@ class _Walk:
         self.o, self.code, self.rel, self.fn = o, o.code, target.rel, target.fn
         self.cls, self.depth = target.cls, depth
         self.params = set(_params(self.fn))
-        self.v = _Values(callers, requests)
+        self.v = _Values(callers, requests, self.params)
         self.v.bind(self.fn)
         self.parents = {id(c): n for n in ast.walk(self.fn) for c in ast.iter_child_nodes(n)}
-        # each id name and the path id it holds exactly; a value merely built from one holds its own
+        # each id name and the path id it holds exactly; a value merely built from one, or a
+        # name bound more than once (a parameter counts as bound), holds an id of its own
         self.root = {i: i for i in ids}
-        bindings: dict[str, int] = {}
+        bindings: dict[str, int] = dict.fromkeys(self.params, 1)
         binders = (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.For, ast.AsyncFor, ast.NamedExpr)
         for n in sorted((n for n in ast.walk(self.fn) if isinstance(n, binders)), key=_pos):
             targets = n.targets if isinstance(n, ast.Assign) else [n.target]
@@ -557,14 +707,17 @@ class _Walk:
                     ):
                         exact = self.exact(value) if simple and t is x else None
                         self.root[x.id] = exact or x.id
+        moved = {n for n, c in bindings.items() if c > 1}
+        for n in moved & set(self.root):
+            self.root[n] = n
         self.ids = set(self.root)
-        moved = {n for n, c in bindings.items() if c > 1 or n in ids} & self.ids
-        self.unstable = moved | {self.root[n] for n in moved}
+        self.unstable = moved & self.ids
         self.lookups: list[Lookup] = []
         self.cover: list[set[str] | None] = []
         self.starts: list[_Pos] = []
         self.reads: list[bool] = []
         self.made: dict[int, list[int]] = {}  # id(node) -> the lookups it made
+        self.query_lookups: set[int] = set()
         self.queries: dict[str, int] = {}  # a local holding a query -> its lookup
         self.consumed: set[int] = set()
         self.hop_verified: dict[int, set[str]] = {}
@@ -642,8 +795,15 @@ class _Walk:
             if not (isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant))
             and not isinstance(s, ast.Pass)
         ]
-        for k, stmt in enumerate(body):
-            self.statement(stmt, body[k + 1 :])
+        # caller-only declarations, which can't act on a record, may sit before its check
+        following: list[list[ast.stmt]] = [[] for _ in body]
+        after: list[ast.stmt] = []
+        for k in range(len(body) - 1, -1, -1):
+            following[k] = after
+            if not self.caller_declaration(body[k]):
+                after = [body[k], *after[:1]]
+        for stmt, nxt in zip(body, following, strict=True):
+            self.statement(stmt, nxt)
         returns = [s for s in body if any(isinstance(n, ast.Return) for n in ast.walk(s))]
         return self.result(_pos(returns[0]) if returns else None, self.pure_read(body))
 
@@ -666,10 +826,13 @@ class _Walk:
 
     def predicates(self, links: list[ast.Call], record: str) -> list[tuple[str, ast.AST]] | None:
         """The (column, value) equalities a query narrows by; None when any narrowing is something
-        else (`or_`, `!=`, `in_`, another table's column, raw text)."""
+        else (`or_`, `!=`, `in_`, another table's column, raw text) or a link widens the query
+        (a join, a union)."""
         found: list[tuple[str, ast.AST]] = []
         for c in links[1:]:
             name = _call_name(c)
+            if name in _QUERY_WIDENING:
+                return None
             if name not in _QUERY_NARROWING:
                 continue
             if name == "filter_by":
@@ -712,6 +875,7 @@ class _Walk:
         k = self.add(
             root, Lookup(self.span(root), scoped, record_type=record), read=read, cover=cover
         )
+        self.query_lookups.add(k)
         for c in links[1:]:
             self.made.setdefault(id(c), []).append(k)
         parent = self.parents.get(id(links[-1]))
@@ -744,7 +908,8 @@ class _Walk:
         span, dotted = self.span(call), _dotted(call.func)
         if dotted in _CONVERSIONS or _INERT.match(dotted) or _THROWN.search(name):
             return
-        if receiver is not None and (record := self.code.container(self.rel, receiver)):
+        if receiver is not None and self.code.is_store(self.rel, receiver):
+            record = self.code.container(self.rel, receiver)
             self.add(call, Lookup(span, record_type=record), read=name == "get", cover=cover)
         elif (
             name in ("get", "get_one")
@@ -754,8 +919,8 @@ class _Walk:
             # `session.get(Item, item_id)`
             lookup = Lookup(span, record_type=record)
             self.add(call, lookup, read=True, cover=self.exact_ids(call.args[1:]))
-        elif self.code.record(self.rel, call.func) is not None:
-            self.handoff(call, cover)  # a record built with the id (`Item(id=item_id)`)
+        elif self.code.class_def(self.rel, dotted) is not None:
+            self.handoff(call, cover)  # an object built with the id (`Item(id=item_id)`)
         elif (targets := self.code.functions(self.rel, call.func, self.cls)) is None:
             if not _VALIDATOR_NAME.match(name):
                 self.handoff(call, cover)  # two definitions of one name: which runs isn't told
@@ -769,10 +934,9 @@ class _Walk:
         elif self.kept(call) and receiver is not None and not self.v.derived(receiver):
             # shape 4: a kept load we can't follow, handed a caller-only value (owner decision)
             scoped = any(self.v.derived(v) for v in values)
-            read = bool(_READ_NAME.match(name))
-            self.add(call, Lookup(span, scoped), read=read, cover=cover)
+            self.add(call, Lookup(span, scoped), read=False, cover=cover)
         elif _LOOKUP_NAME.match(name) and (receiver is None or not self.v.derived(receiver)):
-            self.add(call, Lookup(span), read=bool(_READ_NAME.match(name)), cover=cover)
+            self.add(call, Lookup(span), read=False, cover=cover)
         elif not _VALIDATOR_NAME.match(name):
             self.handoff(call, cover)
 
@@ -806,20 +970,27 @@ class _Walk:
         self.hop_owned[id(call)] = owned or set()
 
     # ---- the allow-listed statements
-    def load(self, expr: ast.AST | None, *, read: bool) -> int | None:
-        """The one lookup an expression makes: a store read, a query (inline or a local holding
-        one), or a hop doing only that read; `read`: never a write."""
+    def load(self, expr: ast.AST | None) -> int | None:
+        """The one read an expression is: `session.get(…)`, a typed store's `.get`, a subscript, a
+        query fetched for its row (`….first()`), or a hop doing only that; never a fallback, the
+        query itself or its result set."""
         expr = _unawait(expr)
-        if expr is None:
+        if not isinstance(expr, ast.Call | ast.Subscript):
+            return None
+        if any(isinstance(n, ast.BoolOp | ast.IfExp | ast.BinOp) for n in ast.walk(expr)):
             return None
         made = {k for n in ast.walk(expr) for k in self.made.get(id(n), [])}
         made |= {self.queries[n] for n in _names(expr) if n in self.queries}
         if len(made) != 1:
             return None
         k = next(iter(made))
-        return k if self.reads[k] or not read else None
+        if k in self.query_lookups and not (
+            isinstance(expr, ast.Call) and _call_name(expr) in _FETCH
+        ):
+            return None
+        return k if self.reads[k] else None
 
-    def statement(self, stmt: ast.stmt, rest: list[ast.stmt]) -> None:
+    def statement(self, stmt: ast.stmt, following: list[ast.stmt]) -> None:
         end = _end(stmt)
         value = (
             _unawait(stmt.value)
@@ -830,34 +1001,28 @@ class _Walk:
             return
         if isinstance(value, ast.Call):
             self.verify(self.hop_verified.get(id(value), set()), end)
-        k = self.load(value, read=False)
-        if (
-            k is not None
-            and self.lookups[k].scoped
-            and isinstance(value, ast.Call)
-            and _call_name(value) in _FETCH_OR_RAISE
-        ):
+        k = self.load(value)
+        scoped = k is not None and self.lookups[k].scoped
+        if scoped and isinstance(value, ast.Call) and _call_name(value) in _FETCH_OR_RAISE:
             # shape 1, refused when absent: a scoped query fetched with `.one()`
-            self.verify(self.cover[k] or set(), end)
+            self.verify(self.cover[k] or set(), end)  # type: ignore[index]
         record = _assigned_name(stmt)
-        following = [s for s in rest if not self.caller_declaration(s)]
         if record is None or not following:
             return
         nxt = following[0]
         absent = _refuses_absence(nxt, record)
-        if k is not None and self.lookups[k].scoped and absent:
-            # shape 1: a scoped query's result, then `if item is None: raise`
-            self.verify(self.cover[k] or set(), _end(nxt))
-        read = self.load(value, read=True)
+        if scoped and absent:
+            # shape 1: a scoped query's row, then `if item is None: raise`
+            self.verify(self.cover[k] or set(), _end(nxt))  # type: ignore[index]
         check = following[1] if absent and len(following) > 1 else nxt
-        if read is not None and self.refuses_foreign(check, record):
+        if k is not None and self.refuses_foreign(check, record):
             # shape 2: the load, then a refusal of a record the caller doesn't own
-            self.checked(read)
-            self.verify(self.cover[read] or set(), _end(check))
-        elif read is not None and self.returns_if_owned(nxt, record):
+            self.checked(k)
+            self.verify(self.cover[k] or set(), _end(check))
+        elif k is not None and self.returns_if_owned(nxt, record):
             # shape 5: the load, then `return r if r is not None and r.owner == me else None`
-            self.checked(read)
-            self.owned_or_null.update(dict.fromkeys(self.cover[read] or set(), _pos(nxt)))
+            self.checked(k)
+            self.owned_or_null.update(dict.fromkeys(self.cover[k] or set(), _pos(nxt)))
         elif isinstance(value, ast.Call) and absent:
             # a hop that returns its record only when owned, refused when absent
             self.verify(self.hop_owned.get(id(value), set()), _end(nxt))
@@ -890,13 +1055,13 @@ class _Walk:
         return compared
 
     def unprivileged(self, node: ast.AST) -> bool:
-        """`not current_user.is_superuser`: the caller lacks a privileged flag."""
+        """`not current_user.is_superuser`: the caller handed in lacks a privileged flag."""
         return (
             isinstance(node, ast.UnaryOp)
             and isinstance(node.op, ast.Not)
             and isinstance(node.operand, ast.Attribute)
             and bool(_PRIVILEGE_FLAG.match(node.operand.attr))
-            and self.v.is_caller(node.operand.value)
+            and self.v.is_caller(node.operand.value, rooted=True)
         )
 
     def returns_if_owned(self, stmt: ast.stmt, record: str) -> bool:
@@ -960,7 +1125,7 @@ class _Walk:
             value = body[0].value  # type: ignore[union-attr]
         else:
             return False
-        return len(self.lookups) == 1 and self.load(value, read=True) == 0
+        return len(self.lookups) == 1 and self.load(value) == 0
 
     def result(self, first_return: _Pos | None, pure_read: bool) -> _Scan:
         verified = {r: at for r, at in self.verified.items() if r not in self.unstable}
@@ -1000,13 +1165,13 @@ class _Walk:
 
 
 Callers = Callable[[Target], tuple[set[str], set[str]]]
-Dependencies = Callable[[Target], list[Target]]
+Dependencies = Callable[[Target], tuple[list[Target], list[Opaque]]]
 
 
 class PyOwnership:
-    """A FastAPI handler's ownership facts. `callers` names the parameters a dependency fills with
-    the authenticated caller (and the `Request` ones); `dependencies` the checkout functions a
-    function's parameters depend on. Both come from the route matrix's own dependency reading."""
+    """A FastAPI handler's ownership facts. `callers` names the parameters FastAPI fills with the
+    authenticated caller (and the `Request` ones); `dependencies` what a function's parameters
+    depend on. Both come from the route matrix's own dependency reading."""
 
     def __init__(self, code: PyCode, callers: Callers, dependencies: Dependencies) -> None:
         self.code, self.callers, self.dependencies = code, callers, dependencies
@@ -1016,41 +1181,58 @@ class PyOwnership:
         handler: Target,
         path_ids: set[str],
         route_deps: list[Target],
-        opaque: CodeSpan | None = None,
+        opaque: list[Opaque],
     ) -> HandlerFacts:
-        """`path_ids`: the route's path parameters; `route_deps`: its `dependencies=[…]`;
-        `opaque`: a route dependency reading the request's path ids in code we don't follow."""
+        """`path_ids`: the route's path parameters; `route_deps`/`opaque`: its own, its routers'
+        dependencies, followed or not."""
         ids = path_ids & set(_params(handler.fn))
         lookups: list[Lookup] = []
         caller = handoff = hop = None
         verified: set[str] = set()
         reached = bool(ids)
-        # dependencies run first: one handed a path id is a hop whose verification covers the body
-        for dep in [*self.dependencies(handler), *route_deps]:
+        # dependencies (and theirs) run first: one handed a path id is a hop whose verification
+        # covers the body; one we can't follow that may take a path id leaves the route unknown
+        own_deps, own_opaque = self.dependencies(handler)
+        pending, unread, seen = [*own_deps, *route_deps], [*own_opaque, *opaque], set()
+        while pending:
+            dep = pending.pop(0)
+            if id(dep.fn) in seen:
+                continue
+            seen.add(id(dep.fn))
+            more, hidden = self.dependencies(dep)
+            pending += more
+            unread += hidden
             dep_ids = path_ids & set(_params(dep.fn))
             if not dep_ids:
                 continue
             reached = True
-            scan = self.scan(dep, dep_ids, 1)
+            scan = self.scan(dep, dep_ids, 1, injected=True)
             lookups += scan.facts.lookups
             caller = caller or scan.facts.caller
-            hop = hop or CodeSpan(path=RepoPath(dep.rel), line=dep.fn.lineno)
+            if scan.facts.lookups or scan.facts.handoff:
+                # a dependency that only takes the id (`get_organization_path`) acts on nothing
+                hop = hop or CodeSpan(path=RepoPath(dep.rel), line=dep.fn.lineno)
             handoff = handoff or scan.facts.handoff
             verified |= scan.verified
-        if not reached:
+        blind = next((u for u in unread if u.params is None or u.params & path_ids), None)
+        if not reached and blind is None:
             # the path id reaches the handler some way we don't follow: never settle it
             span = CodeSpan(path=RepoPath(handler.rel), line=handler.fn.lineno)
             return HandlerFacts(handoff=span if path_ids else None, takes_id=bool(path_ids))
-        scan = self.scan(handler, ids, 0, verified) if ids else _Scan(HandlerFacts())
-        if opaque is not None:
-            # a check of the path id runs first in code we can't read: neither settled nor judged
-            return HandlerFacts(caller=caller or scan.facts.caller, handoff=opaque, takes_id=True)
+        scan = self.scan(handler, ids, 0, verified, injected=True) if ids else _Scan(HandlerFacts())
+        if blind is not None:
+            # the path id goes first to code we can't read: neither settled nor judged
+            return HandlerFacts(
+                caller=caller or scan.facts.caller, handoff=blind.span, takes_id=True
+            )
         return HandlerFacts(
             lookups=(*lookups, *scan.facts.lookups),
             caller=caller or scan.facts.caller,
             hop=hop or scan.facts.hop,
             handoff=handoff or scan.facts.handoff,
             takes_id=True,
+            # the handler gets no path id, and the dependencies that do use it for nothing
+            ignores_id=not ids and hop is None,
         )
 
     def scan(
@@ -1059,13 +1241,18 @@ class PyOwnership:
         ids: set[str],
         depth: int,
         verified: set[str] | None = None,
+        *,
+        injected: bool,
         handed: set[str] | None = None,
+        handed_requests: set[str] | None = None,
     ) -> _Scan:
-        """`handed`: parameters a caller passes the caller's values into."""
-        own, requests = self.callers(target)
+        """`injected`: FastAPI calls it, filling its dependencies (the handler, a dependency);
+        otherwise a call only hands it the caller values in `handed`/`handed_requests`."""
+        own, requests = self.callers(target) if injected else (set(), set())
         callers = own | (handed or set())
+        requests = requests | (handed_requests or set())
         key = (target.rel, target.fn.lineno, frozenset(ids), frozenset(callers), depth)
-        key += (frozenset(verified or ()),)
+        key += (frozenset(requests), frozenset(verified or ()))
         if key not in self.code.scans:
             walk = _Walk(self, target, ids, callers, requests, depth, set(verified or ()))
             self.code.scans[key] = walk.run()
@@ -1088,5 +1275,15 @@ class PyOwnership:
             return _Scan(HandlerFacts(handoff=walk.span(call))), {}
         inner_ids = {p for p, v in mapping.items() if _names(v) & walk.ids}
         handed = {p for p, v in mapping.items() if p not in inner_ids and walk.v.derived(v)}
-        scan = self.scan(target, inner_ids, walk.depth + 1, None, handed)
+        requests = {
+            p for p, v in mapping.items() if isinstance(v, ast.Name) and v.id in walk.v.requests
+        }
+        scan = self.scan(
+            target,
+            inner_ids,
+            walk.depth + 1,
+            injected=False,
+            handed=handed,
+            handed_requests=requests,
+        )
         return scan, {p: r for p, v in mapping.items() if (r := walk.exact(v))}

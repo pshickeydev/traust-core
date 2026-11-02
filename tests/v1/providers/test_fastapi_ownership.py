@@ -3,6 +3,7 @@ protected but isn't, which must stay judged."""
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from textwrap import dedent
 
@@ -539,3 +540,168 @@ def test_what_authenticates_a_fastapi_route(
 def _write(root: Path, code: str) -> Path:
     (root / "main.py").write_text(code)
     return root
+
+
+# Invented FastAPI apps from an independent review: code credited as protected while another user's
+# object stays reachable (each must stay judged or unknown), beside twins that are protected.
+_REVIEW = Path(__file__).parents[2] / "fixtures/code_facts/fastapi_ownership_review.json"
+_CASES = json.loads(_REVIEW.read_text())
+
+
+@pytest.mark.parametrize(
+    ("case", "method", "pattern", "ownership"),
+    [(c["case"], e["method"], e["pattern"], e["ownership"]) for c in _CASES for e in c["expect"]],
+)
+def test_holes_a_review_found_stay_closed(
+    tmp_path: Path, case: str, method: str, pattern: str, ownership: str
+) -> None:
+    files = next(c["files"] for c in _CASES if c["case"] == case)
+    base = {
+        "app/__init__.py": "",
+        "app/auth.py": AUTH,
+        "app/models.py": MODELS,
+        "app/main.py": "from fastapi import FastAPI\nfrom app import r\n"
+        "app = FastAPI()\napp.include_router(r.router)\n",
+    }
+    result = _tree(tmp_path, {**base, **files})
+    assert _row(result, method, pattern)["ownership"] == ownership
+
+
+def test_route_matrix_guards_are_what_they_claim(tmp_path: Path) -> None:
+    raw = {
+        "app/__init__.py": "",
+        "app/main.py": dedent(
+            """
+            from fastapi import FastAPI, APIRouter, Depends, HTTPException
+            from fastapi.security import HTTPBearer
+
+            app = FastAPI()
+            optional_bearer = HTTPBearer(auto_error=False)
+
+
+            def principal(cred=Depends(optional_bearer)):
+                return cred
+
+
+            def items_service():
+                return object()
+
+
+            class Authenticator:
+                def __init__(self, required=True):
+                    self.required = required
+
+                def __call__(self, request):
+                    return 1
+
+
+            maybe_user = Authenticator(required=False)
+
+
+            @app.delete("/things/{thing_id}")
+            def thing(thing_id: int, session, p=Depends(principal)):
+                session.delete(session.get(Thing, thing_id))
+
+
+            @app.get("/svc/{thing_id}")
+            def svc(thing_id: int, items=Depends(items_service)):
+                return thing_id
+
+
+            @app.get("/maybe/{thing_id}")
+            def maybe(thing_id: int, u=Depends(maybe_user)):
+                return thing_id
+            """
+        ),
+        "app/elsewhere.py": dedent(
+            """
+            def unrelated(identity, credential, ctx):
+                principal = identity.authenticate(credential)
+                items_service = ctx.require_items()
+                return principal, items_service
+            """
+        ),
+    }
+    result = _tree(tmp_path, raw)
+    # a local `principal = …authenticate(…)` elsewhere doesn't make these guards
+    assert any(
+        "fail-open" in u for u in _row(result, "DELETE", "/things/{thing_id}")["unguard_markers"]
+    )
+    assert _row(result, "GET", "/svc/{thing_id}")["guards"] == []
+    # an instance asked not to refuse fails open
+    assert any(
+        "fail-open" in u for u in _row(result, "GET", "/maybe/{thing_id}")["unguard_markers"]
+    )
+
+
+def test_deep_inheritance_neither_crashes_nor_crawls(tmp_path: Path) -> None:
+    chain = "".join(f"class C{k}(C{k - 1}):\n    f{k}: int\n\n\n" for k in range(1, 1200))
+    models = (
+        "from sqlmodel import SQLModel\n\n\nclass C0(SQLModel):\n    owner_id: int\n\n\n" + chain
+    )
+    routes = dedent(
+        """
+        from fastapi import FastAPI, Depends
+        from app.models import C1199
+        from app.auth import CurrentUser
+
+        app = FastAPI()
+
+
+        @app.get("/c/{c_id}")
+        def c(c_id: int, session, current_user: CurrentUser):
+            return session.get(C1199, c_id)
+        """
+    )
+    result = _tree(
+        tmp_path,
+        {
+            "app/__init__.py": "",
+            "app/auth.py": AUTH,
+            "app/models.py": models,
+            "app/main.py": routes,
+        },
+    )
+    assert _row(result, "GET", "/c/{c_id}")["ownership"] == "caller-blind"
+
+
+def test_a_path_id_only_a_no_op_dependency_takes_acts_on_nothing(tmp_path: Path) -> None:
+    routes = dedent(
+        """
+        from fastapi import APIRouter, Depends, FastAPI
+        from app.auth import get_current_user
+
+        app = FastAPI()
+
+
+        def tenant_path(tenant: str):
+            pass
+
+
+        tenant_router = APIRouter(prefix="/{tenant}", dependencies=[Depends(tenant_path)])
+
+
+        @tenant_router.post("/notes")
+        def create_note(session):
+            session.add(object())
+
+
+        @tenant_router.delete("/notes/{note_id}")
+        def drop_note(note_id: int, session):
+            session.exec(delete(Note).where(Note.id == note_id))
+
+
+        app.include_router(tenant_router, dependencies=[Depends(get_current_user)])
+        """
+    )
+    result = _tree(
+        tmp_path,
+        {
+            "app/__init__.py": "",
+            "app/auth.py": AUTH,
+            "app/models.py": MODELS,
+            "app/main.py": routes,
+        },
+    )
+    assert _row(result, "POST", "/{tenant}/notes")["ownership"] == "n/a"
+    assert _row(result, "DELETE", "/{tenant}/notes/{note_id}")["ownership"] == "caller-blind"
