@@ -669,7 +669,9 @@ def test_a_path_id_only_a_no_op_dependency_takes_acts_on_nothing(tmp_path: Path)
     routes = dedent(
         """
         from fastapi import APIRouter, Depends, FastAPI
+        from sqlmodel import delete
         from app.auth import get_current_user
+        from app.models import Item
 
         app = FastAPI()
 
@@ -688,7 +690,7 @@ def test_a_path_id_only_a_no_op_dependency_takes_acts_on_nothing(tmp_path: Path)
 
         @tenant_router.delete("/notes/{note_id}")
         def drop_note(note_id: int, session):
-            session.exec(delete(Note).where(Note.id == note_id))
+            session.exec(delete(Item).where(Item.id == note_id))
 
 
         app.include_router(tenant_router, dependencies=[Depends(get_current_user)])
