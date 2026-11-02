@@ -17,12 +17,25 @@ PATH_PARAM_RX = re.compile(
 # A guard that admits only a privileged role acts on any record by design: out of scope.
 PRIVILEGED_RX = re.compile(r"(?i)(admin|operator|superuser|staff)")
 _QUOTED_RX = re.compile(r"'([^'\"]*)'|\"([^'\"]*)\"")
-_ALTERNATIVE_RX = re.compile(r"(?i)(\bor\b|\|\||_or_|#\w|principal|authentication\.)")
+_ALTERNATIVE_RX = re.compile(r"(?i:\bor\b|\|\||_or_|#\w|principal|authentication\.)|Or[A-Z]")
 # owner-, tenant- or membership-shaped fields; broad on purpose, since a miss reads as ownerless
 OWNER_FIELD_RX = re.compile(
     r"(?i)^_?(owner\w*|owned_?by\w*|user\w*|uid|tenant\w*|team\w*|org|orgs?_?id|"
     r"organi[sz]ation\w*|account\w*|customer\w*|member\w*|workspace\w*|author\w*|"
     r"creator\w*|created_?by\w*|project\w*|group\w*|company\w*|client\w*|realm\w*)$"
+)
+# the owner fields an ownership check may compare: narrower than OWNER_FIELD_RX, which only says
+# a record might have an owner (`accountType` is no owner)
+OWNER_CHECK_RX = re.compile(
+    r"(?i)^_?(owner\w*|owned_?by\w*|user_?(id|name|email|uuid)?|username|uid|tenant(_?id)?|"
+    r"created_?by(_?id)?|creator(_?id)?|author(_?id)?|(account|customer|member|org|organi[sz]ation|"
+    r"workspace|team|client|group|project|company|realm)(_?(id|uuid|key))?)$"
+)
+# fields that tie a record to something else (`patientId`, `recipient`): not ownerless
+_LINK_RX = re.compile(
+    r"(?i)^(?!_?id$)(\w*(_id|id|_uuid|uuid|_key|key)|_?(recipient|sender|assignee|reporter|holder|"
+    r"subscriber|buyer|seller|payer|payee|patient|email|login|principal|participant|requester|"
+    r"approver|reviewer|parent)\w*)$"
 )
 _SPEL_ROLE_CALL = re.compile(r"has(?:Any)?(?:Role|Authority)\((.*)\)")
 _CONSTANT_ROLE = re.compile(r"\b(?:[A-Z]\w*\.)?[A-Z][A-Z0-9_]{2,}\b")
@@ -51,6 +64,7 @@ class HandlerFacts:
     check: CodeSpan | None = None
     hop: CodeSpan | None = None
     handoff: CodeSpan | None = None
+    takes_id: bool = False  # a path id reaches the handler, whatever the pattern shows
 
 
 def path_params(pattern: str) -> tuple[str, ...]:
@@ -59,7 +73,9 @@ def path_params(pattern: str) -> tuple[str, ...]:
 
 def privileged_only(guard: str) -> bool:
     """A guard naming only privileged roles, quoted or as constants, with no other way in."""
-    if not PRIVILEGED_RX.search(guard) or _ALTERNATIVE_RX.search(guard) or "…" in guard:
+    if guard.startswith("call:") or not PRIVILEGED_RX.search(guard):
+        return False  # a call's name (`logAdminView`) says nothing about who gets in
+    if _ALTERNATIVE_RX.search(guard) or "…" in guard:
         return False
     if guard.count("'") % 2 or guard.count('"') % 2:
         return False  # a label cut short may have lost a role
@@ -80,7 +96,9 @@ def _annotation_roles(name: str, args: str) -> list[str] | None:
     (`hasRole(@roles.admin())`, `@RolesAllowed(adminRole)`)."""
     if not args:
         return [name] if PRIVILEGED_RX.search(name) else None
-    if name in ("@PreAuthorize", "@PostAuthorize"):
+    if name == "@PostAuthorize":
+        return None  # runs after the handler
+    if name == "@PreAuthorize":
         expression = re.fullmatch(r'\s*(?:value\s*=\s*)?"(.*)"\s*', args)
         call = expression and _SPEL_ROLE_CALL.fullmatch(expression.group(1).strip())
         return _literals(call.group(1), "'") if call else None
@@ -109,11 +127,19 @@ def classify(
 ) -> tuple[RouteOwnership, OwnershipEvidence | None]:
     """`guards` are the route's effective guards; `fields` maps each record type the checkout
     declares to its field names."""
-    if not path_params(pattern) or not guards or any(privileged_only(g) for g in guards):
+    if not guards or any(privileged_only(g) for g in guards):
         return RouteOwnership.NOT_APPLICABLE, None
+    if not path_params(pattern):
+        # an unresolved pattern (`Routes.CARD_BY_ID`) may still carry the id
+        return (RouteOwnership.UNKNOWN if facts.takes_id else RouteOwnership.NOT_APPLICABLE), None
 
     def ownerless(x: Lookup) -> bool:
-        return x.record_type in fields and owner_field(x.record_type, fields) is None
+        names = fields.get(x.record_type or "")
+        return (
+            names is not None
+            and owner_field(x.record_type, fields) is None
+            and not any(_LINK_RX.match(f) for f in names)
+        )
 
     exposed = [x for x in facts.lookups if not (x.scoped or x.checked or ownerless(x))]
     # the most concerning access decides: an unprotected owner-bearing record, then any other
