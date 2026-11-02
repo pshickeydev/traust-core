@@ -40,7 +40,13 @@ THIRD_PARTY = {
     "rendering": {"pydantic"},
     "services": {"pydantic", "traust_ledger"},  # one module: test_architecture
     "context": {"pydantic", "yaml", "sqlalchemy"},
-    "rest": {"pydantic", "fastapi", "starlette", "uvicorn"},  # the [rest] extra; nothing else
+    "rest": {
+        "pydantic",
+        "pydantic_core",
+        "fastapi",
+        "starlette",
+        "uvicorn",
+    },  # the [rest] extra; pydantic_core: custom-type core schema (UtcDatetime)
 }
 
 
