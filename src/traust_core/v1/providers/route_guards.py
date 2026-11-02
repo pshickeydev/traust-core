@@ -10,6 +10,7 @@ import sys
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
+from typing import TYPE_CHECKING
 
 from traust_core.v1.models.code_facts import (
     CodeFactDetail,
@@ -27,10 +28,19 @@ from traust_core.v1.models.code_facts import (
 from traust_core.v1.models.common import CodeSpan, RepoPath
 from traust_core.v1.providers.base import Acquisition, Readiness, Result
 from traust_core.v1.providers.clock import Clock
-from traust_core.v1.providers.route_ownership import JUDGED, HandlerFacts, classify, rank
+from traust_core.v1.providers.route_ownership import (
+    JUDGED,
+    HandlerFacts,
+    classify,
+    path_params,
+    rank,
+)
 from traust_core.v1.providers.syntax import grammar_missing
 from traust_core.v1.providers.tools import ToolRequest
 from traust_core.v1.providers.tree import TreeFile, tree_files
+
+if TYPE_CHECKING:
+    from traust_core.v1.providers.python_ownership import Opaque, PyOwnership, Target
 
 GUARD_RX = re.compile(
     r"(?i)(auth[nz]?|authenticate|authoriz|login|rbac|permission|"
@@ -106,7 +116,8 @@ _FLASK_IMPORT = re.compile(
 )
 # A database or ORM session dependency (`get_db_session`, `SessionLocal`), not a session check
 _DB_SESSION_RX = re.compile(
-    r"(?i)^(get_|new_|open_)?(async_?|db_?|database_?|sql_?|orm_?)*session(_?(maker|local|factory|scope|dep))?$"
+    r"(?i)^(get_|new_|open_)?(async_?|db_?|database_?|sql_?|orm_?|read_?|write_?|readonly_?|replica_?)*"
+    r"session(_?(maker|local|factory|scope|dep))?$"
 )
 _FASTAPI_IMPORT = re.compile(r"^\s*(?:from\s+fastapi\b|import\s+fastapi\b)", re.M)
 _PY_WEB_IMPORT = re.compile(
@@ -981,6 +992,15 @@ FASTAPI_VERBS = ("get", "post", "put", "patch", "delete", "head", "options", "tr
 _FASTAPI_DECORATORS = {*FASTAPI_VERBS, "api_route", "websocket"}
 _DEPENDS = ("Depends", "Security")
 FAIL_OPEN = "fail-open"
+_OPTIONAL = "optional:"
+# methods that write into the object they are called on
+_MUTATORS = re.compile(r"^(set\w*|update|pop|clear|setdefault|__setitem__|append|extend|insert)$")
+# a dependency named for the authenticated caller
+_CALLER_DEPENDENCY = re.compile(
+    r"(?i)(^|_)(current|authenticated|logged_?in|signed_?in)(_[a-z]+)*_?"
+    r"(user|account|member|principal|identity|subject|superuser|admin)s?"
+    r"(_(authorizer|dependency|dep))?$"
+)
 _FASTAPI_SECURITY = re.compile(
     r"^(HTTPBearer|HTTPBasic|HTTPDigest|OAuth2\w*|APIKey(Header|Query|Cookie)|OpenIdConnect)$"
 )
@@ -1291,6 +1311,51 @@ def _middleware_rejects(fn: ast.AST) -> bool:
     return False
 
 
+def _terminates(body: list[ast.stmt]) -> bool:
+    """Every path through `body` ends in a return or a raise (never falls off its end)."""
+    last = body[-1] if body else None
+    if isinstance(last, ast.Return | ast.Raise):
+        return True
+    if isinstance(last, ast.If):
+        return _terminates(last.body) and _terminates(last.orelse)
+    if isinstance(last, ast.With | ast.AsyncWith):
+        return _terminates(last.body)
+    if isinstance(last, ast.Try):
+        if _terminates(last.finalbody):
+            return True
+        normal = last.orelse or last.body
+        return _terminates(normal) and all(_terminates(h.body) for h in last.handlers)
+    return False
+
+
+def _pos_of(node: ast.AST) -> tuple[int, int]:
+    return (getattr(node, "lineno", 0), getattr(node, "col_offset", 0))
+
+
+def _depends_calls(node: ast.AST | None, rel: str) -> list[tuple[str, ast.AST]]:
+    """The `Depends(…)` calls of a `dependencies=[…]` argument, with the file they are in."""
+    calls = node.elts if isinstance(node, ast.List | ast.Tuple) else []
+    return [
+        (rel, c) for c in calls if isinstance(c, ast.Call) and _last(_dotted(c.func)) in _DEPENDS
+    ]
+
+
+def _lets_missing_in(call: ast.Call) -> bool:
+    """`Authenticator(required=False)`, `HTTPBearer(auto_error=False)`, `optional=True`."""
+    return any(
+        isinstance(k.value, ast.Constant)
+        and (
+            (k.arg in ("required", "auto_error") and k.value.value is False)
+            or (k.arg == "optional" and k.value.value is True)
+        )
+        for k in call.keywords
+    )
+
+
+def _db_session_middleware(name: str) -> bool:
+    return bool(_DB_SESSION_RX.match(re.sub(r"(?i)_?middleware$", "", name)))
+
+
 def _guard_named(name: str) -> bool:
     return bool(GUARD_RX.search(name) or _FLASK_GUARD_EXTRA.search(name))
 
@@ -1305,7 +1370,7 @@ def _middleware_guard(
         _last(name)
     ):
         return False
-    if not _guard_named(_last(name)):
+    if not _guard_named(_last(name)) or _db_session_middleware(_last(name)):
         return False
     fn = modules.function(name, rel, functions)
     return fn is None or fn.node is None or _middleware_rejects(fn.node)
@@ -1317,6 +1382,7 @@ class _Mount:
     prefix: str
     guards: list[str]
     unguards: list[str]
+    calls: list[tuple[str, ast.AST]] = field(default_factory=list)  # its `Depends(…)` nodes
 
 
 @dataclass
@@ -1324,6 +1390,7 @@ class _Receiver:
     prefix: str = ""
     guards: list[str] = field(default_factory=list)
     unguards: list[str] = field(default_factory=list)
+    calls: list[tuple[str, ast.AST]] = field(default_factory=list)
 
 
 @dataclass
@@ -1331,6 +1398,7 @@ class _Scope:
     prefix: str
     guards: list[str]
     unguards: list[str]
+    calls: list[tuple[str, ast.AST]] = field(default_factory=list)
 
 
 def _chains(
@@ -1342,7 +1410,9 @@ def _chains(
 ) -> list[_Scope]:
     """Every way a receiver's routes are reached: each mount's prefix and the guards it adds."""
     recv = receivers[key]
-    own = _Scope(recv.prefix, [*recv.guards, *middleware.get(key, [])], list(recv.unguards))
+    own = _Scope(
+        recv.prefix, [*recv.guards, *middleware.get(key, [])], list(recv.unguards), recv.calls
+    )
     parents = [m for m in mounts.get(key, []) if m.parent not in seen and m.parent in receivers]
     if not parents:
         return [own]
@@ -1354,6 +1424,7 @@ def _chains(
                     up.prefix + m.prefix + own.prefix,
                     _unique([*up.guards, *m.guards, *own.guards]),
                     sorted({*up.unguards, *m.unguards, *own.unguards}),
+                    [*up.calls, *m.calls, *own.calls],
                 )
             )
     return out[:_MAX_MOUNTS]
@@ -1367,12 +1438,272 @@ class _FastApi:
         self.index, self.consts = index, consts
         self.modules, self.functions = index.modules, index.functions
         self.security: set[str] = set()
+        self.guard_instances: set[_Key] = set()
+        self._identities: dict[int, bool] = {}
+        self.fail_open_instances: set[_Key] = set()
         self.fail_open: set[str] = set()  # schemes built with auto_error=False: a missing
         # credential yields None, not a 401
         self.receivers: dict[_Key, _Receiver] = {}
         self.mounts: dict[_Key, list[_Mount]] = {}
         self.middleware: dict[_Key, list[str]] = {}
         self._bind()
+        self._ownership: PyOwnership | None = None
+        self._facts: dict[tuple[int, frozenset[str]], HandlerFacts] = {}
+
+    def ownership(self) -> PyOwnership:
+        """The handlers' ownership reader, built on first use over the same parsed tree."""
+        if self._ownership is None:
+            from traust_core.v1.providers.python_ownership import PyCode, PyOwnership
+
+            trees = {s.file.rel: s.tree for s in self.index.sources}
+            texts = {s.file.rel: s.file.text for s in self.index.sources}
+            code = PyCode(trees, self.modules, texts)
+            self._ownership = PyOwnership(code, self._callers, self._depends_on)
+        return self._ownership
+
+    def _param_dependencies(
+        self, fn: ast.AST, rel: str
+    ) -> list[tuple[str, ast.Call, str, ast.AST | None]]:
+        """Each parameter's `Depends(...)` (in its default or `Annotated` alias), with the file it
+        is resolved from and the parameter's annotation."""
+        args = getattr(fn, "args", None)
+        if args is None:
+            return []
+        positional = [*args.posonlyargs, *args.args]
+        defaults = [None] * (len(positional) - len(args.defaults)) + list(args.defaults)
+        pairs = [
+            *zip(positional, defaults, strict=True),
+            *zip(args.kwonlyargs, args.kw_defaults, strict=True),
+        ]
+        out = []
+        for param, default in pairs:
+            ann, where = _unquoted(param.annotation), rel
+            if isinstance(ann, ast.Name | ast.Attribute) and (
+                found := self.index.alias(_dotted(ann), rel)
+            ):
+                ann, where = found
+            if isinstance(ann, ast.Subscript) and _last(_dotted(ann.value)) == "Annotated":
+                parts = ann.slice.elts if isinstance(ann.slice, ast.Tuple) else [ann.slice]
+                out += [
+                    (param.arg, e, where, parts[0])
+                    for e in parts[1:]
+                    if isinstance(e, ast.Call) and _last(_dotted(e.func)) in _DEPENDS
+                ]
+            if isinstance(default, ast.Call) and _last(_dotted(default.func)) in _DEPENDS:
+                out.append((param.arg, default, rel, ann))
+        return out
+
+    def _callers(self, target: Target) -> tuple[set[str], set[str]]:
+        """The parameters a refusing authentication dependency fills (the caller), and the
+        `Request` ones (whose `.user` is the caller)."""
+        callers = set()
+        for name, call, where, ann in self._param_dependencies(target.fn, target.rel):
+            dependency = self._dependency(call, ann)
+            guards, unguards = self._classify([(dependency, where)])
+            bare = dependency.removeprefix("Security:").split("[")[0]
+            # the authentication dependency itself, not one that merely depends on it
+            # (`requested_owner(owner = Query(…), user = Depends(get_current_user))`)
+            if (
+                guards
+                and not unguards
+                and not dependency.startswith(_OPTIONAL)
+                and (self._guard_factory(call) or self._identifies(bare, where))
+            ):
+                callers.add(name)
+        args = target.fn.args
+        requests = {
+            a.arg
+            for a in (*args.posonlyargs, *args.args, *args.kwonlyargs)
+            if _last(_dotted(_unquoted(a.annotation))) in ("Request", "HTTPConnection")
+        }
+        return callers, requests
+
+    def _guard_factory(self, call: ast.AST) -> bool:
+        """`Depends(OrgPolicyGuard(…))`: a guard built inline by a checkout guard class or
+        factory, trusted as a module-level guard instance is."""
+        if not isinstance(call, ast.Call):
+            return False
+        target = call.args[0] if call.args else _kwarg(call, "dependency")
+        if not isinstance(target, ast.Call):
+            return False
+        ctor = _last(_dotted(target.func))
+        return (
+            (ctor in self.index.classes or ctor in self.functions)
+            and bool(GUARD_RX.search(ctor))
+            and not NON_ENFORCING_RX.search(ctor)
+            and not _lets_missing_in(target)
+        )
+
+    def _identifies(self, bare: str, rel: str) -> bool:
+        """Whether a dependency's value is who is calling: a security scheme or guard instance
+        (its credential), or a function whose every return is built from credentials."""
+        if (
+            _FASTAPI_SECURITY.match(_last(bare))
+            or _last(bare) in self.security
+            or self.modules.key(bare, rel, self.guard_instances) is not None
+        ):
+            return True
+        fn = self.index.callee(bare, rel) if bare else None
+        return fn is not None and fn.node is not None and self._identity(fn.node, fn.path)
+
+    def _identity(self, fn: ast.AST, rel: str, depth: int = 0) -> bool:
+        """`fn` returns the caller: every return is built from its credentials (an authenticating
+        dependency's value; for a caller-named function, its `Request`), never from request data
+        (`return owner` with `owner = Query(…)`), and is never `None`."""
+        if id(fn) in self._identities:
+            return self._identities[id(fn)]
+        self._identities[id(fn)] = False  # a cycle identifies nothing
+        deps = {
+            name: (call, where, ann) for name, call, where, ann in self._param_dependencies(fn, rel)
+        }
+        named = bool(_CALLER_DEPENDENCY.search(getattr(fn, "name", "")))
+        trusted: set[str] = set()
+        untrusted: set[str] = set()
+        args = fn.args  # type: ignore[attr-defined]
+        for a in (*args.posonlyargs, *args.args, *args.kwonlyargs):
+            if a.arg in ("self", "cls"):
+                continue
+            if a.arg in deps:
+                call, where, ann = deps[a.arg]
+                dependency = self._dependency(call, ann)
+                bare = dependency.removeprefix("Security:").split("[")[0]
+                if dependency.startswith(_OPTIONAL):
+                    untrusted.add(a.arg)
+                elif self._guard_factory(call) or (
+                    depth < _DEPTH and self._credential(bare, where, depth + 1)
+                ):
+                    trusted.add(a.arg)
+            elif _last(_dotted(_unquoted(a.annotation))) in ("Request", "HTTPConnection"):
+                (trusted if named else untrusted).add(a.arg)
+            else:
+                untrusted.add(a.arg)  # a path, query or body value
+        own = list(_own_nodes(fn))
+        aliases: dict[str, set[str]] = {}  # names bound to one object (`u = user`)
+
+        def group(name: str) -> set[str]:
+            return aliases.setdefault(name, {name})
+
+        def untrust(names: set[str]) -> None:
+            for name in names:
+                untrusted.update(group(name))
+                trusted.difference_update(group(name))
+
+        def names_in(node: ast.AST | None) -> set[str]:
+            return {x.id for x in ast.walk(node) if isinstance(x, ast.Name)} if node else set()
+
+        for n in sorted((n for n in own if isinstance(n, ast.Assign | ast.AnnAssign)), key=_pos_of):
+            if n.value is None:
+                continue
+            targets = n.targets if isinstance(n, ast.Assign) else [n.target]
+            names = {x.id for t in targets if isinstance(t, ast.Name) for x in [t]}
+            used = names_in(n.value)
+            if isinstance(n.value, ast.Name):
+                joined = group(n.value.id) | set().union(*(group(x) for x in names))
+                for x in joined:
+                    aliases[x] = joined
+            if used & untrusted:
+                untrust(names)
+            elif used & trusted:
+                trusted |= names
+        # writing request data into a trusted object (`user.update(owner=owner)`,
+        # `user["owner"] = owner`, `setattr(user, …)`) makes it no longer the caller
+        for n in own:
+            written: set[str] = set()
+            value: ast.AST | None = None
+            if isinstance(n, ast.Assign | ast.AugAssign):
+                targets = n.targets if isinstance(n, ast.Assign) else [n.target]
+                for t in targets:
+                    base = t
+                    while isinstance(base, ast.Attribute | ast.Subscript):
+                        base = base.value
+                    if base is not t and isinstance(base, ast.Name):
+                        written.add(base.id)
+                value = n.value
+            elif isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute):
+                base = n.func.value
+                if isinstance(base, ast.Name) and _MUTATORS.match(n.func.attr):
+                    written.add(base.id)
+                    value = n
+            elif isinstance(n, ast.Call) and _dotted(n.func) in ("setattr", "object.__setattr__"):
+                if n.args and isinstance(n.args[0], ast.Name):
+                    written.add(n.args[0].id)
+                    value = n
+            if written and names_in(value) - written & untrusted:
+                untrust(written)
+            elif written and names_in(value) - written - trusted:
+                untrust(written)  # anything but credentials written in
+        returns = [n for n in own if isinstance(n, ast.Return | ast.Yield)]
+        generator = any(isinstance(n, ast.Yield | ast.YieldFrom) for n in own)
+        body = getattr(fn, "body", [])
+        ok = (
+            bool(returns)
+            and (generator or _terminates(body))
+            and all(
+                r.value is not None
+                and not (isinstance(r.value, ast.Constant) and r.value.value is None)
+                and not ({x.id for x in ast.walk(r.value) if isinstance(x, ast.Name)} & untrusted)
+                and bool({x.id for x in ast.walk(r.value) if isinstance(x, ast.Name)} & trusted)
+                for r in returns
+            )
+        )
+        self._identities[id(fn)] = ok
+        return ok
+
+    def _credential(self, bare: str, rel: str, depth: int) -> bool:
+        """A dependency whose value is a credential or the caller."""
+        if (
+            _FASTAPI_SECURITY.match(_last(bare))
+            or _last(bare) in self.security
+            or self.modules.key(bare, rel, self.guard_instances) is not None
+        ):
+            return True
+        fn = self.index.callee(bare, rel) if bare else None
+        return fn is not None and fn.node is not None and self._identity(fn.node, fn.path, depth)
+
+    def _depends_on(self, target: Target) -> tuple[list[tuple[str | None, Target]], list[Opaque]]:
+        """What `target`'s parameters depend on, each with the parameter it fills: the checkout
+        functions, resolved exactly, and the checkout code we can't follow."""
+        return self._resolve_dependencies(
+            [
+                (where, call, ann, name)
+                for name, call, where, ann in self._param_dependencies(target.fn, target.rel)
+            ]
+        )
+
+    def _resolve_dependencies(
+        self, calls: list[tuple[str, ast.AST, ast.AST | None, str | None]]
+    ) -> tuple[list[tuple[str | None, Target]], list[Opaque]]:
+        code = self.ownership().code
+        found: list[tuple[str | None, Target]] = []
+        opaque: list[Opaque] = []
+        for where, call, ann, param in calls:
+            if not isinstance(call, ast.Call):
+                continue
+            dependency = call.args[0] if call.args else _kwarg(call, "dependency")
+            resolved = code.dependency(where, dependency if dependency is not None else ann)
+            if isinstance(resolved, list):
+                found += [(param, r) for r in resolved]
+            elif resolved is not None:
+                opaque.append(resolved)
+        return found, opaque
+
+    def _ownership_facts(
+        self, call: ast.Call, fn: ast.AST, rel: str, pattern: str, scope: _Scope
+    ) -> HandlerFacts:
+        """Per route: its handler with the route's and its routers' own dependencies."""
+        ids = frozenset(path_params(pattern))
+        calls = [*_depends_calls(_kwarg(call, "dependencies"), rel), *scope.calls]
+        key = (id(fn), ids, id(call), tuple(id(c) for _, c in calls))
+        if key not in self._facts:
+            from traust_core.v1.providers.python_ownership import Target
+
+            own = self.ownership()
+            handler = Target(self.index.paths.get(id(fn), rel), fn)  # type: ignore[arg-type]
+            deps, opaque = self._resolve_dependencies(
+                [(where, c, None, None) for where, c in calls]
+            )
+            self._facts[key] = own.handler(handler, set(ids), deps, opaque)
+        return self._facts[key]
 
     def _ctors(self) -> set[str]:
         """FastAPI and APIRouter, and the tree's subclasses of either."""
@@ -1389,6 +1720,7 @@ class _FastApi:
 
     def _bind(self) -> None:
         ctors = self._ctors()
+        module_level = {id(s) for src in self.index.sources for s in src.tree.body}
         for rel, assigns in self.index.assigns.items():
             for node in assigns:
                 if not isinstance(node.value, ast.Call):
@@ -1405,12 +1737,24 @@ class _FastApi:
                     auto_error = _kwarg(node.value, "auto_error")
                     if isinstance(auto_error, ast.Constant) and auto_error.value is False:
                         self.fail_open.update(names)
+                elif (
+                    id(node) in module_level
+                    and (ctor in self.index.classes or ctor in self.functions)
+                    and GUARD_RX.search(ctor)
+                    and not NON_ENFORCING_RX.search(ctor)
+                ):
+                    # a module-level guard built by a checkout class or factory (`Authenticator(…)`)
+                    keys = {(rel, n) for n in names}
+                    self.guard_instances |= keys
+                    if _lets_missing_in(node.value):
+                        self.fail_open_instances |= keys
                 if ctor not in ctors:
                     continue
                 guards, unguards = self._dependencies(_kwarg(node.value, "dependencies"), rel)
                 prefix = _const_str(_kwarg(node.value, "prefix")) or ""
                 for name in names:
-                    self.receivers[(rel, name)] = _Receiver(prefix, guards, unguards)
+                    calls = _depends_calls(_kwarg(node.value, "dependencies"), rel)
+                    self.receivers[(rel, name)] = _Receiver(prefix, guards, unguards, calls)
         bound = set(self.receivers)
         self.bindings = _Bindings(self.index, lambda expr, rel: self.modules.key(expr, rel, bound))
         for rel, calls in self.index.calls.items():
@@ -1425,7 +1769,7 @@ class _FastApi:
 
     def _middleware_fn(self, fn: ast.AST, recv: str, rel: str, enclosing: ast.AST | None) -> None:
         name = getattr(fn, "name", "")
-        if _guard_named(name) and _middleware_rejects(fn):
+        if _guard_named(name) and not _db_session_middleware(name) and _middleware_rejects(fn):
             for key in self.bindings.of(recv, rel, enclosing):
                 self.middleware.setdefault(key, []).append(f"middleware:{name}")
 
@@ -1462,12 +1806,20 @@ class _FastApi:
         for child in children:
             for parent in parents:
                 self.mounts.setdefault(child, []).append(
-                    _Mount(parent, _const_str(prefix_node) or "", guards, unguards)
+                    _Mount(
+                        parent,
+                        _const_str(prefix_node) or "",
+                        guards,
+                        unguards,
+                        _depends_calls(_kwarg(node, "dependencies"), rel),
+                    )
                 )
 
     def _dependency(self, call: ast.Call, annotation: ast.AST | None) -> str:
         target = call.args[0] if call.args else _kwarg(call, "dependency")
         name = _dotted(target if target is not None else annotation)
+        if isinstance(target, ast.Call) and _lets_missing_in(target):
+            return f"{_OPTIONAL}{name}"  # `get_user(required=False)` lets a missing caller in
         if _last(_dotted(call.func)) == "Security":
             scopes = _str_list(_kwarg(call, "scopes"))
             return f"Security:{name}" + (f"[{','.join(scopes)}]" if scopes else "")
@@ -1512,6 +1864,10 @@ class _FastApi:
         guards: list[str] = []
         unguards: list[str] = []
         for name, rel in names:
+            if name.startswith(_OPTIONAL):
+                guards.append(name.removeprefix(_OPTIONAL))
+                unguards.append(f"{FAIL_OPEN}:{name.removeprefix(_OPTIONAL)}")
+                continue
             bare = name.removeprefix("Security:").split("[")[0]
             if UNGUARD_RX.search(bare):
                 unguards.append(name)
@@ -1520,16 +1876,29 @@ class _FastApi:
                 or (GUARD_RX.search(bare) and not _DB_SESSION_RX.match(_last(bare)))
                 or _FASTAPI_SECURITY.match(_last(bare))
                 or _last(bare) in self.security
+                or self.modules.key(bare, rel, self.guard_instances) is not None
             ):
                 guards.append(name)
-                if _last(bare) in self.fail_open:
+                if _last(bare) in self.fail_open or (
+                    self.modules.key(bare, rel, self.fail_open_instances) is not None
+                ):
                     unguards.append(f"{FAIL_OPEN}:{name}")
             elif depth < _DEPTH and bare not in seen:
                 fn = self.index.callee(bare, rel) if bare else None
                 if fn is not None and fn.node is not None:
                     g, u = self._classify(self._params(fn.node, fn.path), depth + 1, seen | {bare})
-                    if _raises(fn.node):  # it refuses the missing credential itself
+                    raises = _raises(fn.node)
+                    if raises:
+                        # it refuses the missing credential itself
                         u = [x for x in u if not x.startswith(f"{FAIL_OPEN}:")]
+                    if (
+                        not g
+                        and raises
+                        and _CALLER_DEPENDENCY.search(_last(bare))
+                        and self._identity(fn.node, fn.path)
+                    ):
+                        # `get_current_user(request)`: refuses, and returns who is calling
+                        guards.append(bare)
                     guards += [f"{bare}>{x}" for x in g]
                     unguards += [f"{bare}>{x}" for x in u]
         return _unique(guards), sorted(set(unguards))
@@ -1604,6 +1973,9 @@ class _FastApi:
             )
             if fn is not None:
                 self.index.locate(row, fn)
+                if isinstance(fn, ast.FunctionDef | ast.AsyncFunctionDef):
+                    facts = self._ownership_facts(call, fn, rel, row.pattern, scope)
+                    row.own(facts, self.ownership().code.fields)
             rows.append(_mark(row, key[1], dynamic, rel))
         return rows
 
