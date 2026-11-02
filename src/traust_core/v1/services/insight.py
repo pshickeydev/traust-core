@@ -758,7 +758,16 @@ def _tally(views: Iterable[FindingView]) -> FindingTally:
         buckets[bucket] += 1
         decided += v.disposition is not None
         if bucket == FindingState.RESOLVED:
-            remediated[str(v.effective_severity)] += 1
+            # the open branch guards a missing severity; the resolved branch must too —
+            # an unrated finding resolved without a severity statement is the common
+            # cloud-config case, never a crash
+            remediated[
+                str(
+                    ScannerSeverity.UNRATED
+                    if v.effective_severity is None
+                    else v.effective_severity
+                )
+            ] += 1
         if bucket == _OPEN:
             severities[
                 str(

@@ -344,7 +344,9 @@ def _k8s(load: YamlLoader, files: list[TreeFile]) -> Iterator[ConfigTriple]:
                             str(k), v, ConfigSystem.K8S_CONFIGMAP, f.rel, _line_of(f.text, str(k))
                         )
             elif kind in _WORKLOAD_KINDS:
-                spec = doc.get("spec") or {}
+                spec = doc.get("spec")
+                if not isinstance(spec, dict):
+                    continue  # a scalar spec is a shape miss, not a crash
                 tpl = (
                     (spec.get("jobTemplate") or {}).get("spec", {}).get("template")
                     or spec.get("template")

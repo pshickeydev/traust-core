@@ -891,7 +891,9 @@ def _fleet_fix(doc: FleetFixArtifact, artifact: ArtifactRef) -> FleetFix:
 
 
 def _rank(view: FindingView) -> int:
-    return _SEVERITY_RANK[view.effective_severity]
+    # unrated (None) sorts last — an OSS Checkov finding without a severity statement
+    # ranks below informational, never crashes the candidates door
+    return _SEVERITY_RANK.get(view.effective_severity, len(_SEVERITY_RANK))
 
 
 def _source_finding(item: RemediationItem) -> dict[str, Any]:

@@ -911,7 +911,7 @@ def _predicate_errors(node: object, fields: frozenset[str], path: str = "predica
             f"over fields the enumerator never emits is prose, not a recipe (known fields: "
             f"{', '.join(sorted(fields))})"
         )
-    if op not in set(PredicateOp):
+    if not isinstance(op, str) or op not in set(PredicateOp):
         errors.append(f"{path}: unknown op {op!r} (ops: {', '.join(sorted(PredicateOp))})")
     elif op not in _VALUE_FREE_OPS and "value" not in node:
         errors.append(f"{path}: op {op!r} requires a `value`")

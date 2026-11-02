@@ -224,3 +224,13 @@ def test_mining_clusters_weaknesses_apart_and_only_weakness_rules_cover_them() -
     weak_rule = vuln_rule.model_copy(update={"id": "traust-python-y", "kind": "weakness"})
     mining = RuleMining.of(corpus, RulePack(name="p", version="1", rules=(weak_rule,)), [])
     assert [(c.kind, c.covered_by) for c in mining.covered] == [("weakness", ("traust-python-y",))]
+
+
+def test_a_predicate_leaf_with_an_unhashable_op_is_rejected_not_crashed() -> None:
+    """A YAML op that is a list makes 'op not in set(PredicateOp)' raise TypeError;
+    the validator's contract is a reason, never a crash."""
+    card = route_card()
+    card["predicate"] = {"field": "judgement_required", "op": [], "value": "x"}
+    deck = CardDeck.parse({"cards": [card]})
+    assert not deck.cards
+    assert "unknown op" in " ".join(deck.rejected[0].reasons)
