@@ -7,7 +7,7 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
@@ -15,7 +15,7 @@ from uuid import UUID, uuid4
 import pytest
 
 from tests.v1.repositories.tables import conftest as table_fixtures
-from tests.v1.repositories.tables.conftest import Seed
+from tests.v1.repositories.tables.conftest import Seed, apart
 from traust_core.v1.context import Config, Context
 from traust_core.v1.errors import (
     ConfigError,
@@ -807,3 +807,65 @@ def test_context_wires_the_compliance_service(tmp_path: Path) -> None:
         u.commit()
     scope = ctx.services().compliance.set_scope(scope_doc(), UNVERIFIED)
     assert scope.draft and ctx.services().compliance.resolve(scope.scope_id).repos == ("org/a",)  # type: ignore[arg-type]
+
+
+def test_a_scope_assessment_is_still_found_after_its_first_members_head_moves(
+    world: World,
+) -> None:
+    """Recorded posture must survive a routine re-observation: the assessment sits on the
+    ref it was recorded against, and a member's head moving must not hide it."""
+    world.publish_mapping()
+    a_repo = world.uow.repositories.get(world.a.repository_id)
+    b_repo = world.uow.repositories.get(world.b.repository_id)
+    for repo, sha in ((a_repo, "b" * 40), (b_repo, "c" * 40)):
+        world.seed.assessment(
+            world.seed.repository_ref(repo, is_default=True, sha=sha),
+            kind=AssessmentKind.REPO_STATE,
+            occurred_at=NOW,
+        )
+    scope_id = world.declared(
+        resolves_via="explicit",
+        include=[
+            {"repo": "org/a", "reason": "ships the service"},
+            {"repo": "org/b", "reason": "ships the service"},
+        ],
+        product=None,
+    )
+    run = world.run(scope_id, frameworks=(NIST,))
+    recorded = world.service.record(run.document, provenance())
+    # the first member's head is re-observed at a new sha: a new default ref, the old
+    # one keeps its history — exactly what PR #241's observations do
+    new_head = world.seed.repository_ref(a_repo, is_default=True, sha="d" * 40)
+    world.seed.assessment(
+        new_head, kind=AssessmentKind.REPO_STATE, occurred_at=NOW + timedelta(seconds=1)
+    )
+    world.uow.commit()
+    latest = world.service.latest(scope_id, NIST)
+    assert latest is not None and latest.artifact.digest == recorded.artifact.digest
+
+
+def test_record_refuses_an_assessment_whose_target_names_no_repos(world: World) -> None:
+    """A doc whose target omits repos attaches to nothing — the producer can legally
+    write one (product/environment-scoped runs), so the record gate refuses it loudly
+    instead of silently recording an assessment of nothing."""
+    world.publish_mapping()
+    run = world.run(world.declared(), frameworks=(NIST,))
+    stripped = edited(run, lambda doc: doc["metadata"]["target"].pop("repos"))
+    with pytest.raises(ValidationError, match="names no repos"):
+        world.service.record(stripped, provenance())
+
+
+def test_set_scope_still_demands_replace_when_the_boundary_fell_out_of_the_history_window(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The windowed declaration read must not turn an old boundary into a new one: a
+    boundary outside the newest SCOPE_HISTORY rows is still declared, and modifying it
+    still demands replace."""
+    monkeypatch.setattr("traust_core.v1.services.compliance.SCOPE_HISTORY", 3)
+    world.declared()  # acme-cde
+    for i in range(3):
+        apart()
+        world.service.set_scope(scope_doc(f"other-{i}"), ALICE)
+    world.uow.commit()
+    with pytest.raises(ConflictError, match="already declared"):
+        world.service.set_scope(scope_doc(), ALICE)
