@@ -413,6 +413,8 @@ def _flask_split(names: Iterable[str]) -> tuple[list[str], list[str]]:
     for n in names:
         if not n or _last(n) in _FLASK_REGISTRATION_ATTRS:
             continue
+        if _DB_SESSION_RX.search(n):
+            continue  # a database session is plumbing, not an auth guard
         if UNGUARD_RX.search(n) or _FLASK_UNGUARD_EXTRA.search(n):
             unguards.append(n)
         elif GUARD_RX.search(n) or _FLASK_GUARD_EXTRA.search(n):
@@ -440,7 +442,41 @@ def _method_decorators(node: ast.AST) -> tuple[list[str], dict[str, list[str]]]:
 
 
 def _raises(fn: ast.AST) -> bool:
-    return any(isinstance(n, ast.Raise) for n in ast.walk(fn))
+    """The function itself raises — a raise inside a nested helper is its behavior only
+    when the function can reach that helper through calls (directly, or through a helper
+    the call reaches)."""
+    own = list(_own_nodes(fn))
+    if any(isinstance(n, ast.Raise) for n in own):
+        return True
+    nested = {n.name: n for n in own if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef)}
+    if not nested:
+        return False
+
+    def called(scope: list[ast.AST]) -> set[str]:
+        return {
+            n.func.id for n in scope if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+        }
+
+    # helpers reachable from the function, including through sibling helpers it calls
+    reachable = called(own)
+    changed = True
+    while changed:
+        changed = False
+        for name in sorted(reachable):
+            if name in nested and (deeper := called(list(_own_nodes(nested[name]))) - reachable):
+                reachable |= deeper
+                changed = True
+    return any(name in nested and _raises(nested[name]) for name in reachable)
+
+
+def _own_nodes(fn: ast.AST):
+    """Walk fn's body without descending into nested function/class definitions."""
+    stack = list(ast.iter_child_nodes(fn))
+    while stack:
+        node = stack.pop()
+        yield node
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            stack.extend(ast.iter_child_nodes(node))
 
 
 def _can_reject(fn: ast.AST) -> bool:
@@ -679,7 +715,9 @@ def _class_info(node: ast.ClassDef, rel: str) -> _Class:
 
 
 def _string_constants(files: list[TreeFile]) -> dict[str, str]:
-    """Module-level UPPER_CASE string constants, so `rule=SOME_PATH` resolves to its path."""
+    """Module-level UPPER_CASE string constants, so `rule=SOME_PATH` resolves to its path.
+    A name defined in several modules keeps the first file's value — the same file the
+    route lives in is more likely its own module's constant than another's."""
     consts: dict[str, str] = {}
     for f in files:
         for m in _CONST.finditer(f.text):
@@ -1220,11 +1258,32 @@ def _middleware_rejects(fn: ast.AST) -> bool:
     args = getattr(fn, "args", None)
     params = [a.arg for a in args.args] if args else []
     onward = params[1] if len(params) > 1 else None
-    for n in ast.walk(fn):
+    # a returned name passes the request on only when every assignment to it (in this
+    # scope — nested scopes keep their own bindings) stores the onward call's response:
+    # a branch assigning a rejection response to that same name can be the returned value
+    passed_through: set[str] = set()
+    reassigned: set[str] = set()
+    for n in _own_nodes(fn):
+        if not isinstance(n, ast.Assign):
+            continue
+        names = [t.id for t in n.targets if isinstance(t, ast.Name)]
+        onward_call = (
+            isinstance(n.value, ast.Await)
+            and isinstance(n.value.value, ast.Call)
+            and _dotted(n.value.value.func) == onward
+        )
+        if onward_call:
+            passed_through.update(names)
+        else:
+            reassigned.update(names)
+    passed_through -= reassigned
+    for n in _own_nodes(fn):
         if isinstance(n, ast.Raise):
             return True
         if isinstance(n, ast.Return) and n.value is not None:
             value = n.value.value if isinstance(n.value, ast.Await) else n.value
+            if isinstance(value, ast.Name) and value.id in passed_through:
+                continue  # returning the stored onward response passes the request on
             if not (isinstance(value, ast.Call) and _dotted(value.func) == onward):
                 return True
     return False
@@ -1844,10 +1903,10 @@ def _asymmetries(rows: list[_Row]) -> list[RouteAsymmetry]:
 
 
 def _guard_families(row: _Row) -> set[GuardFamily]:
+    """Every family a guard string matches — one guard can carry several (a role check
+    is also a permission check), and each counts toward its own asymmetry."""
     return {
-        next(fam for fam, rx in GUARD_FAMILIES if rx.search(g))
-        for g in row.guards + row.scope_guards
-        if any(rx.search(g) for _, rx in GUARD_FAMILIES)
+        fam for g in row.guards + row.scope_guards for fam, rx in GUARD_FAMILIES if rx.search(g)
     }
 
 
