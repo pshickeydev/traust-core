@@ -124,6 +124,25 @@ def test_s3_uses_custom_endpoint_and_named_secrets(
     ]
 
 
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "http://localhost:9000",
+        "http://127.0.0.2:9000",
+        "http://[::1]:9000",
+        "https://rgw.example.com",
+    ],
+)
+def test_s3_accepts_secure_or_loopback_endpoints(tmp_path: Path, endpoint: str) -> None:
+    config = Config.from_home(
+        _home(
+            tmp_path, f"artifacts: {{s3: {{bucket: test-artifacts, endpoint_url: '{endpoint}'}}}}\n"
+        )
+    )
+    assert config.artifacts.s3 is not None
+    assert config.artifacts.s3.endpoint_url == endpoint
+
+
 def test_s3_missing_named_secret_fails_before_building_client(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -155,6 +174,9 @@ def test_injected_object_store_takes_priority_over_s3_config(tmp_path: Path) -> 
         "artifacts: {s3: {bucket: test-artifacts, endpoint_url: 'https://user:password@rgw.example.com'}}\n",
         "artifacts: {s3: {bucket: test-artifacts, endpoint_url: 'http://bad host'}}\n",
         "artifacts: {s3: {bucket: test-artifacts, endpoint_url: 'http://bad..host'}}\n",
+        "artifacts: {s3: {bucket: test-artifacts, endpoint_url: 'http://rgw.example.com'}}\n",
+        "artifacts: {s3: {bucket: test-artifacts, endpoint_url: 'http://10.0.0.2:9000'}}\n",
+        "artifacts: {s3: {bucket: test-artifacts, endpoint_url: 'http://localhost.evil.example.com'}}\n",
     ],
 )
 def test_invalid_s3_configuration_is_refused(tmp_path: Path, text: str) -> None:

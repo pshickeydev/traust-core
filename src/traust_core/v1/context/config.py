@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import os
+from ipaddress import ip_address
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 
 import pydantic
 import sqlalchemy as sa
@@ -69,6 +71,18 @@ class S3ArtifactsConfig(_Model):
     def _paired_credentials(self) -> S3ArtifactsConfig:
         if (self.access_key_env is None) != (self.secret_key_env is None):
             raise ValueError("artifacts.s3 credentials must name both environment variables")
+        return self
+
+    @pydantic.model_validator(mode="after")
+    def _secure_endpoint(self) -> S3ArtifactsConfig:
+        if self.endpoint_url is not None and self.endpoint_url.startswith("http://"):
+            host = urlsplit(self.endpoint_url).hostname
+            try:
+                loopback = ip_address(host or "").is_loopback
+            except ValueError:
+                loopback = host == "localhost"
+            if not loopback:
+                raise ValueError("artifacts.s3.endpoint_url requires HTTPS outside loopback")
         return self
 
     def credentials(self) -> tuple[str | None, str | None]:
