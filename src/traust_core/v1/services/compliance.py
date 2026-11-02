@@ -864,7 +864,10 @@ class ComplianceService:
 
     def _recorded(self, scope: ComplianceScope) -> Iterator[ComplianceAssessment]:
         """The scope's recorded assessments, newest first — across every ref of every
-        member repository, so a head re-observed since recording cannot hide posture."""
+        member repository, so a head re-observed since recording cannot hide posture.
+        The scan is kind-filtered and ref-bounded in SQL, so cost grows with the
+        member repos' recorded compliance assessments, not with scan history; the
+        scope check needs the document, since `scope_id` is payload, not a column."""
         members = self._members(scope)
         refs = [
             ref.id
