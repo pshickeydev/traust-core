@@ -195,7 +195,13 @@ class OidcLogin:
     @cached_property
     def _endpoints(self) -> Mapping[str, str]:
         url = f"{self.issuer.rstrip('/')}/.well-known/openid-configuration"
-        found = json.loads(self._http.get(url))
+        raw = self._http.get(url)
+        try:
+            found = json.loads(raw)
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            raise ServiceError(f"OIDC discovery document is not JSON: {e}") from e
+        if not isinstance(found, dict):
+            raise ServiceError("OIDC discovery document is not a JSON object")
         if not found.get("token_endpoint"):
             raise ServiceError(f"{self.issuer} publishes no token_endpoint")
         return found
@@ -210,7 +216,12 @@ class OidcLogin:
         )
         if status != 200:
             raise AuthenticationError(f"device authorization refused: {_oauth_error(body)}")
-        device = json.loads(body)
+        try:
+            device = json.loads(body)
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            raise AuthenticationError(f"device authorization returned non-JSON: {e}") from e
+        if not isinstance(device, dict) or "user_code" not in device:
+            raise AuthenticationError("device authorization response is incomplete")
         show(device.get("verification_uri") or device["verification_url"], device["user_code"])
         interval = float(device.get("interval", 5))
         while True:
@@ -253,7 +264,12 @@ class OidcLogin:
         return self._grant(body)
 
     def _grant(self, body: bytes) -> TokenGrant:
-        token = json.loads(body)
+        try:
+            token = json.loads(body)
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            raise AuthenticationError(f"token endpoint returned non-JSON: {e}") from e
+        if not isinstance(token, dict) or "access_token" not in token:
+            raise AuthenticationError("token response has no access_token")
         expires = token.get("expires_in")
         return TokenGrant(
             access_token=token["access_token"],
