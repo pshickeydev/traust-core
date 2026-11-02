@@ -158,6 +158,10 @@ class ForgeFacts(Model):
         stored = json.loads(doc.payload)
         compared = stored.get("comparison") or {}
         fork_of = stored.get("fork_of")
+        # a document omits `fork_of` both for an explicit non-fork and for an unreported
+        # status, so it cannot say "unknown" — the inventory's lineage may override
+        fork = facts.pop("fork", fork_of is not None)
+        parent = facts.pop("parent", urlsplit(fork_of).path.strip("/") if fork_of else None)
         return cls(
             repository_id=target.repository_id,
             repo=repo,
@@ -168,8 +172,8 @@ class ForgeFacts(Model):
             status=ComparisonStatus(stored["status"]),
             observed_at=datetime.fromisoformat(stored["observed_at"]),
             pushed_at=stored.get("pushed_at"),
-            fork=fork_of is not None,
-            parent=urlsplit(fork_of).path.strip("/") if fork_of else None,
+            fork=fork,
+            parent=parent,
             ahead_by=compared.get("ahead_by"),
             compare_truncated=compared.get("truncated"),
             changed_lines=compared.get("changed_lines"),

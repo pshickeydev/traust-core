@@ -472,3 +472,29 @@ def test_a_report_finding_carries_its_owasp_llm_categories(target: Target) -> No
     )
     assert found[0].owasp_llm_references == ("LLM01",)
     assert all(f.owasp_llm_references == () for f in found[1:])
+
+
+def test_reaccepting_an_assessment_records_its_new_locations(
+    engine: Engine, target: Target
+) -> None:
+    """A location the re-run newly reports — a new line on a stated path, which never
+    feeds the fingerprint — is new evidence for the same occurrence: it merges in,
+    never silently dropped."""
+    run = audit(engine, target)
+    first = intake(engine).accept(run, [candidate(target)])
+    again = intake(engine).accept(
+        run,
+        [
+            candidate(
+                target,
+                locations=(
+                    CodeSpan(path=RepoPath("controllers/reconcile.go"), line=41),
+                    CodeSpan(path=RepoPath("controllers/db.go"), line=13),
+                ),
+            )
+        ],
+    )
+    assert again.findings == first.findings
+    assert again.created == ()
+    got = rows(engine, first.findings[Label("OPERATOR-abcdef0-001")])
+    assert len(got["locations"]) == 3

@@ -37,15 +37,24 @@ class MarkdownRenderer:
     media_type = "text/markdown"
 
     def render(self, report: Report) -> bytes:
-        lines = [f"# {report.title}", "", f"_Generated {report.generated_at.isoformat()}_", ""]
+        # title, headings and sources are data (product names, labels from external
+        # threat models): one sanitized line each, the module's own contract — a
+        # hostile value cannot fabricate headings, bullets or rows. Section body is
+        # view-authored prose and keeps its paragraphs.
+        lines = [
+            f"# {inline(report.title)}",
+            "",
+            f"_Generated {report.generated_at.isoformat()}_",
+            "",
+        ]
         for s in report.sections:
-            lines += [f"## {s.heading}", ""]
+            lines += [f"## {inline(s.heading)}", ""]
             if s.body:
                 lines += [s.body, ""]
             if s.table:
                 lines += [*markdown_table(s.table.columns, s.table.rows), ""]
         if report.sources:
-            lines += ["## Sources", "", *(f"- {src}" for src in report.sources), ""]
+            lines += ["## Sources", "", *(f"- {inline(src)}" for src in report.sources), ""]
         return "\n".join(lines).encode()
 
 

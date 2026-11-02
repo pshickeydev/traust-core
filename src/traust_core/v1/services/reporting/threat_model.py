@@ -120,8 +120,10 @@ BOUNDARY_EXPOSURE_ENUM = {"public", "tenant", "partner", "internal"}
 BOUNDARY_COMPLEXITY_ENUM = {"low", "medium", "high"}
 DIMENSION_RESULT_ENUM = {"yes", "partial", "no", "na"}
 BOUNDARY_ID = re.compile(r"^IF-\d+$")
+#: the isolation review the boundary's dimensions came from — the artifact row's id,
+#: not a path: the store owns artifacts, and a file path is not an id
 ISOLATION_REVIEW_REF = re.compile(
-    r"^analysis-results/isolation/[A-Za-z0-9._-]+(/[A-Za-z0-9._-]*)*$"
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE
 )
 ASSETS_COLUMNS = ["asset", "description", "sensitivity"]
 ASSETS_OPTIONAL_COLUMNS = ["regulatory_scope", "example_records"]
@@ -629,8 +631,7 @@ def _lint_boundaries(body_lines: Lines, threat_ids: list[str]) -> list[str]:
         if ref and not ISOLATION_REVIEW_REF.match(ref):
             errors.append(
                 f"section 10 {bid}: isolation_review_ref '{ref}' must "
-                f"be empty or an analysis-results/isolation/"
-                f"<service-slug>/ path"
+                f"be empty or an isolation-review artifact id"
             )
     return errors
 

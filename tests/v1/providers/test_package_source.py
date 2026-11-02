@@ -157,6 +157,57 @@ def test_an_unreadable_archive_is_refused(tmp_path: Path) -> None:
         extract(tarball({"metadata.gz": b"x"}, mode="w"), "gem", tmp_path)
 
 
+def test_extraction_refuses_a_member_that_decompresses_past_the_cap(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The module's own contract: sizes are capped, and the cap is on the bytes that
+    land, not only the bytes on the wire — a small archive may not decompress without bound."""
+    monkeypatch.setattr("traust_core.v1.providers.package_source.MAX_BYTES", 1024)
+    bomb = io.BytesIO()
+    with zipfile.ZipFile(bomb, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        z.writestr("m@v1/big.bin", "\0" * 10_000)
+    assert len(bomb.getvalue()) < 1024  # well under the wire cap
+    with pytest.raises(FetchRefused, match="cap"):
+        extract(bomb.getvalue(), "zip", tmp_path / "out")
+
+
+def test_extraction_totals_the_cap_across_members(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Many small members may not add up past the cap either: each under it is not the
+    contract — the bytes that land are."""
+    monkeypatch.setattr("traust_core.v1.providers.package_source.MAX_BYTES", 1024)
+    bomb = io.BytesIO()
+    with zipfile.ZipFile(bomb, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        for i in range(5):
+            z.writestr(f"m@v1/f{i}.bin", "\0" * 400)
+    assert len(bomb.getvalue()) < 1024
+    with pytest.raises(FetchRefused, match="cap"):
+        extract(bomb.getvalue(), "zip", tmp_path / "out")
+
+
+def test_a_refused_extraction_leaves_nothing_for_a_retry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A retry in the same destination starts over: files a refused archive wrote before
+    its over-cap member must not taint the tree a valid archive then extracts."""
+    monkeypatch.setattr("traust_core.v1.providers.package_source.MAX_BYTES", 1024)
+    bomb = io.BytesIO()
+    with zipfile.ZipFile(bomb, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        z.writestr("m@v1/ok.py", "ok")
+        z.writestr("m@v1/big.bin", "\0" * 10_000)
+    with pytest.raises(FetchRefused, match="cap"):
+        extract(bomb.getvalue(), "zip", tmp_path / "out")
+    assert (tmp_path / "out" / "m@v1" / "ok.py").is_file()  # written before the refusal
+
+    good = io.BytesIO()
+    with zipfile.ZipFile(good, "w") as z:
+        z.writestr("m@v1/ok.go", "package m")
+    assert extract(good.getvalue(), "zip", tmp_path / "out") == 1
+    out = tmp_path / "out"
+    assert [p.relative_to(out) for p in out.rglob("*") if p.is_file()] == [Path("m@v1/ok.go")]
+
+
 def test_a_gem_extracts_its_data_archive(tmp_path: Path) -> None:
     blob = gem({"lib/rack/utils.rb": b"module Rack; end\n", "../escape.rb": b"x"})
     assert extract(blob, "gem", tmp_path) == 1

@@ -919,6 +919,27 @@ def test_a_pinned_package_without_reachability_is_likely_affected(
     assert scanned.tiers == ("L1", "manifest_scan", "source_scan")
 
 
+def test_an_undecided_range_is_not_recorded_as_a_pinned_in_range_claim(
+    engine: Engine,
+) -> None:
+    """A version that can't be ordered against the advisory's spans is undecided, not
+    in range: the manifest tier must say nothing, never assert a pin it could not check."""
+    [app] = refs(engine, 1)
+    assert app.id is not None
+    exposure = analyzing(engine, SourceScanAnalyzer(FixedClock(AT)), records=(LODASH,))
+    exposure.ingest_sbom(
+        json.dumps(
+            {"bomFormat": "CycloneDX", "components": [{"purl": "pkg:npm/lodash@next"}]}
+        ).encode(),
+        app.id,
+    )
+    record = exposure.find_advisory(LODASH.identifier)
+    assert record is not None and record.advisory_id is not None
+    graph = exposure.prepare(record.advisory_id, app.id)
+    assert graph.evidence.manifest_scan is None
+    assert graph.document("1").repos[0].classification == "inconclusive"
+
+
 def test_a_manifest_surface_says_it_has_no_reachability(engine: Engine) -> None:
     checkout = AdvisoryRecord(
         identifier=AdvisoryIdentifier("GHSA-surf-0000-0000"),

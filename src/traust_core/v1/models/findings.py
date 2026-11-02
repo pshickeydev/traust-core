@@ -377,14 +377,22 @@ class FindingCandidate(Model):
             if format == CandidateFormat.SARIF
             else parse[format](raw)
         )
-        seen: dict[str, int] = {}
+        taken: set[str] = set()
         out = []
         for i, f in enumerate(fields):
             base = str(f["label"] or f"{format.value}-{i + 1}")
-            seen[base] = seen.get(base, 0) + 1
+            label = base
+            if base in taken:
+                # a repeat — or a raw label that already carries the generated suffix:
+                # climb until the suffix itself is unused, so labels stay unique
+                n = 2
+                while f"{base}#{n}" in taken:
+                    n += 1
+                label = f"{base}#{n}"
+            taken.add(label)
             out.append(
                 cls(
-                    label=Label(base if seen[base] == 1 else f"{base}#{seen[base]}"),
+                    label=Label(label),
                     repository_id=repository_id,
                     title=f["title"],
                     description=f["description"],

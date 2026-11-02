@@ -54,5 +54,5 @@ example-mt-service serves many tenants from one shared deployment.
 
 | boundary_id | interface | kind | exposure | complexity | privilege | encryption | authentication | connectivity | hygiene | threat_ids | isolation_review_ref |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| IF-1 | tenant api | api | tenant | high | partial | yes | no | yes | partial | T1 | analysis-results/isolation/example-mt-service/ |
+| IF-1 | tenant api | api | tenant | high | partial | yes | no | yes | partial | T1 | 0f0e1d2c-3b4a-4968-87a9-8c7d6e5f4a3b |
 | IF-2 | metrics store | data-store | internal | low | yes | na | yes | yes | yes | | |

@@ -11,6 +11,7 @@ from uuid import UUID, uuid5
 
 from pydantic import Field, computed_field
 
+from traust_core.v1 import contracts
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.artifacts import ReportArtifact
 from traust_core.v1.models.base import AppendOnly, Dto, Model
@@ -38,6 +39,17 @@ from traust_core.v1.models.vocabulary import (
 )
 
 ToolName = NewType("ToolName", str)
+
+#: the closed result vocabulary for tenant-boundary dimensions (contracts enum
+#: isolation-check-result); classifier plan 03's rule applies at this boundary:
+#: spellings normalise on read, unmappable values pass through for the consumer
+#: to weigh worst, never as passing
+_DIMENSION_RESULTS = frozenset(contracts.enum_values("isolation-check-result"))
+
+
+def _dimension_result(value: str) -> str:
+    folded = value.strip().lower()
+    return folded if folded in _DIMENSION_RESULTS else value
 
 
 # The contracts schema of the document each kind records through `AssessmentService.record`;
@@ -364,7 +376,7 @@ class TenantBoundary(Model):
                 kind=b["kind"],
                 exposure=b["exposure"],
                 complexity=b.get("complexity"),
-                dimensions={d: b[d] for d in IsolationDimension if d in b},
+                dimensions={d: _dimension_result(b[d]) for d in IsolationDimension if d in b},
                 threat_ids=tuple(Label(t) for t in b.get("threat_ids") or ()),
                 isolation_review_ref=b.get("isolation_review_ref") or None,
             )
@@ -392,7 +404,9 @@ class Threat(Model):
     techniques: tuple[AttackTechnique, ...] = ()
     isolation_dimensions: tuple[IsolationDimension, ...] = ()  # the dimensions it stresses
     boundary_ids: tuple[str, ...] = ()  # the tenant boundaries naming it
-    isolation_review_ref: str | None = None  # the first naming boundary's full review
+    isolation_review_ref: str | None = (
+        None  # the first naming boundary's isolation-review artifact id
+    )
     mitigations: tuple[ThreatMitigation, ...] = ()
     linddun: bool = False  # a privacy-overlay row
 

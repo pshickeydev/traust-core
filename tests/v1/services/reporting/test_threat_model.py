@@ -352,7 +352,7 @@ def test_escaped_pipes_do_not_split_cells() -> None:
         ("| IF-2 |", "| B2 |", "boundary_id 'B2'"),
         ("| IF-2 |", "| IF-1 |", "duplicate boundary_id 'IF-1'"),
         (
-            "analysis-results/isolation/example-mt-service/",
+            "0f0e1d2c-3b4a-4968-87a9-8c7d6e5f4a3b",
             "somewhere/else",
             "isolation_review_ref",
         ),
@@ -372,6 +372,22 @@ def test_tenant_boundary_errors(old: str, new: str, expected: str) -> None:
 
 def test_the_isolation_column_needs_no_section_10() -> None:
     assert errors_of(VALID_ISOLATION[: VALID_ISOLATION.index("## 10. Tenant boundaries")]) == []
+
+
+def test_isolation_review_ref_is_an_artifact_id() -> None:
+    """A boundary names its isolation review by the artifact row's id — the store owns
+    artifacts, and a file path is not an id."""
+    model = VALID_ISOLATION.replace(
+        "analysis-results/isolation/example-mt-service/",
+        "0f0e1d2c-3b4a-4968-87a9-8c7d6e5f4a3b",
+    )
+    assert errors_of(model) == []
+    # a UUID is a UUID in any case: upper-case hexadecimal is still the artifact's id
+    upper = VALID_ISOLATION.replace(
+        "analysis-results/isolation/example-mt-service/",
+        "0F0E1D2C-3B4A-4968-87A9-8C7D6E5F4A3B",
+    )
+    assert errors_of(upper) == []
 
 
 def test_a_section_10_without_a_table_fails() -> None:

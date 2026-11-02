@@ -890,3 +890,15 @@ def test_prepare_carries_the_latest_validation_and_the_audits_remediation_hint(
         str(stamped.id): "not_validated",
         str(scanned.id): "not_validated",
     }
+
+
+def test_a_work_item_whose_findings_were_never_recorded_says_not_found(
+    service: RemediationService, engine: Engine
+) -> None:
+    """A REMEDIATION assessment can exist with no recorded decisions (a crash between
+    open()'s commits); asking for it is not found, not an unpacking ValueError."""
+    with SqlTraustUnitOfWork(engine) as uow:
+        scan = Seed(uow).assessment(kind="remediation")
+        uow.commit()
+    with pytest.raises(NotFoundError):
+        service.get(scan.id)

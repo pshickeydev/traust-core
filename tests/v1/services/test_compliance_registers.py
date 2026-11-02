@@ -409,6 +409,22 @@ def test_a_changed_record_supersedes_only_with_update(world: World) -> None:
     ]
 
 
+def test_a_correction_matching_an_unrelated_record_still_supersedes(world: World) -> None:
+    """Only a successor of the same record makes a re-import a no-op: the same content on
+    an unrelated record may not swallow a requested supersession."""
+    world.service.record(
+        register_doc(variance(claim="stale claim"), variance("dv-fips")), provenance()
+    )
+    # the corrected dv-tls content is identical to dv-fips's — an unrelated record
+    updated = world.service.record(register_doc(variance()), provenance(), update=True)
+    assert [(v.record, v.disposition) for v in updated] == [
+        ("dv-tls", "superseded"),
+        ("dv-fips", "open"),
+        ("dv-tls-r2", "open"),  # the successor is named for the register's length
+    ]
+    assert world.service.record(register_doc(variance()), provenance(), update=True) == updated
+
+
 @pytest.mark.parametrize(
     ("doc", "error", "message"),
     [
@@ -511,3 +527,13 @@ def test_collect_product_docs_refuses_without_official_guides(
     assert world.product.id is not None
     with pytest.raises(error, match=message):
         world.compliance(docs=docs).collect_product_docs(world.product.id)
+
+
+def test_rerecording_a_superseded_doc_variance_is_a_noop(world: World) -> None:
+    """The superseding record is already in the register: recording the same corrected
+    doc again changes nothing — no second successor per re-import."""
+    world.service.record(register_doc(variance()), provenance())
+    corrected = variance(disposition="doc_corrected")
+    updated = world.service.record(register_doc(corrected), provenance(), update=True)
+    again = world.service.record(register_doc(corrected), provenance(), update=True)
+    assert again == updated

@@ -8,6 +8,7 @@ from collections.abc import Collection, Iterable, Mapping, Sequence
 from datetime import date, datetime
 from time import perf_counter
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlsplit
 from uuid import UUID
 
 from traust_core.v1 import contracts
@@ -337,7 +338,13 @@ class PortfolioService:
                     if facts.visibility is None
                     else facts.visibility.lower() == "public",
                     archived=repository.archived if facts.archived is None else facts.archived,
-                    upstream_id=upstream.id if upstream else None,
+                    # fork=None means the forge did not say — keep the recorded lineage;
+                    # a reported fork repoints it, a reported non-fork clears it
+                    upstream_id=upstream.id
+                    if upstream
+                    else repository.upstream_id
+                    if facts.fork is None
+                    else None,
                 )
             )
             metadata_changed = current != repository
@@ -426,6 +433,11 @@ class PortfolioService:
             raise NotFoundError(f"audit baseline changed for {target.repo_url}; observe it again")
         with self._uow as uow:
             repository = uow.repositories.get(target.repository_id)
+            upstream = (
+                uow.repositories.get(repository.upstream_id)
+                if repository.upstream_id is not None
+                else None
+            )
         return ForgeFacts.from_document(
             target,
             observation_url(target.repo_url, self._hosts),
@@ -434,6 +446,10 @@ class PortfolioService:
             default_branch=ref.name,
             head=ref.sha,
             visibility="public" if repository.public else "private",
+            # the document cannot tell an unreported fork status from an explicit non-fork
+            # (both omit fork_of): the inventory's recorded lineage is what answers
+            fork=repository.upstream_id is not None,
+            parent=urlsplit(upstream.url).path.strip("/") if upstream else None,
         )
 
     def liveness(self, filter: RepositoryFilter, page: PageRequest) -> Page[Liveness]:

@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import timedelta
 
 from tests.v1.repositories.tables.conftest import T0, Seed, apart, same_rows
+from traust_core.v1.models.findings import Finding
 from traust_core.v1.models.vocabulary import Validity
 
 
@@ -202,6 +203,28 @@ def test_findings_for_review_are_machine_refutations_and_refuted_confirmations(
     judged({"severity": "low"})
     found = seed.uow.decisions.list_finding_ids_for_review()
     assert sorted(found, key=str) == sorted([machine, named_machine, both], key=str)
+
+
+def test_a_refuted_and_historically_confirmed_finding_is_for_review(seed: Seed) -> None:
+    """The never-silently-resolve rule: a finding both machine-refuted and confirmed
+    (any spelling validity_spellings reads as confirmed) is surfaced, never dropped."""
+    run = seed.assessment()
+
+    def pair(finding: Finding, confirmed_spelling: str) -> None:
+        seed.decision(finding, assessment_id=run.id, actor=None, validity=confirmed_spelling)
+        seed.decision(
+            finding,
+            assessment_id=run.id,
+            actor=None,
+            validity="false_positive",
+            auto_accept_tier=True,
+        )
+
+    legacy, hardening = seed.finding(), seed.finding()
+    pair(legacy, "true_positive")
+    pair(hardening, "hardening")
+    found = seed.uow.decisions.list_finding_ids_for_review()
+    assert sorted(found, key=str) == sorted([legacy.id, hardening.id], key=str)
 
 
 def test_historical_spellings_of_confirmed_are_confirmed_candidates(seed: Seed) -> None:
