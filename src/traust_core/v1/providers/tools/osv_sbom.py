@@ -77,7 +77,14 @@ def _require_syft(doc: object, source: str) -> Doc:
 
 
 def load_syft(path: Path) -> Doc:
-    return _require_syft(json.loads(Path(path).read_text(encoding="utf-8")), str(path))
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as e:
+        raise SbomFormatError(f"syft SBOM {path} unreadable: {e}") from e
+    try:
+        return _require_syft(json.loads(text), str(path))
+    except json.JSONDecodeError as e:
+        raise SbomFormatError(f"syft SBOM {path} is not JSON: {e}") from e
 
 
 def collect_sbom_packages(doc: Doc) -> tuple[dict[Key, Doc], Doc]:

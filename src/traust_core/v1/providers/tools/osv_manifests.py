@@ -357,7 +357,7 @@ def parse_pipfile_lock(text: str) -> Parsed:
 
 
 _SETUP_NAME_RE = re.compile(r"""\bname\s*=\s*['"]([^'"]+)['"]""")
-_INSTALL_REQUIRES_RE = re.compile(r"install_requires\s*=\s*\[(.*?)\]", re.S)
+_INSTALL_REQUIRES_RE = re.compile(r"install_requires\s*=\s*\[(.*)\]", re.S)
 _STR_LITERAL_RE = re.compile(r"""['"]([^'"]+)['"]""")
 
 
@@ -612,7 +612,7 @@ def parse_github_workflow(text: str) -> Parsed:
     return None, list(deps)
 
 
-_REQUIRE_RE = re.compile(r"^\s*([A-Za-z0-9._~\-/]+)\s+(v[^\s/]+)(\s*//\s*indirect)?\s*$")
+_REQUIRE_RE = re.compile(r"^\s*([A-Za-z0-9._~\-/]+)\s+(v[^\s/]+)(?:\s*//\s*(.*))?$")
 _MODULE_RE = re.compile(r"^\s*module\s+(\S+)\s*$", re.MULTILINE)
 
 
@@ -631,7 +631,9 @@ def parse_gomod(text: str) -> tuple[str | None, list[Dep]]:
             continue
         candidate = stripped if in_block else stripped.removeprefix("require ")
         if (in_block or stripped.startswith("require ")) and (rm := _REQUIRE_RE.match(candidate)):
-            requires.append((rm.group(1), rm.group(2), bool(rm.group(3))))
+            requires.append(
+                (rm.group(1), rm.group(2), bool(rm.group(3) and "indirect" in rm.group(3)))
+            )
     return (m.group(1) if m else None), requires
 
 

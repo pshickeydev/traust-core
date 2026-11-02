@@ -20,7 +20,7 @@ from traust_core.v1.providers.process import ProcessRunner
 
 CURL_TIMEOUT = 90.0  # curl's own --max-time is 60 s
 _ADR_READ_CAP = 262_144  # bytes per register file, as legacy read them
-_GITHUB_REPO = re.compile(r"github\.com[/:]([\w.-]+/[\w.-]+?)(?:\.git|/|$)")
+_GITHUB_REPO = re.compile(r"github\.com[/:]([\w.-]+/[\w.-]+?)(?:\.git/?|/|$)")
 _PIN = re.compile(r"[0-9a-f]{40}")
 _SLUG = re.compile(r"[A-Za-z0-9._-]+")
 

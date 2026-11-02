@@ -266,7 +266,9 @@ def gomod_replaces(text: str) -> dict[tuple[str, str | None], tuple[str, str | N
     out: dict[tuple[str, str | None], tuple[str, str | None]] = {}
     in_block = False
     for raw in text.splitlines():
-        line = raw.split("//", 1)[0].strip()
+        # a VCS replacement URL contains // that is not a comment; only strip a
+        # // that follows whitespace
+        line = re.split(r"\s//", raw, maxsplit=1)[0].strip()
         if line.startswith("replace ("):
             in_block = True
             continue
