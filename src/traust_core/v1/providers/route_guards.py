@@ -993,6 +993,8 @@ _FASTAPI_DECORATORS = {*FASTAPI_VERBS, "api_route", "websocket"}
 _DEPENDS = ("Depends", "Security")
 FAIL_OPEN = "fail-open"
 _OPTIONAL = "optional:"
+# methods that write into the object they are called on
+_MUTATORS = re.compile(r"^(set\w*|update|pop|clear|setdefault|__setitem__|append|extend|insert)$")
 # a dependency named for the authenticated caller
 _CALLER_DEPENDENCY = re.compile(
     r"(?i)(^|_)(current|authenticated|logged_?in|signed_?in)(_[a-z]+)*_?"
@@ -1309,6 +1311,23 @@ def _middleware_rejects(fn: ast.AST) -> bool:
     return False
 
 
+def _terminates(body: list[ast.stmt]) -> bool:
+    """Every path through `body` ends in a return or a raise (never falls off its end)."""
+    last = body[-1] if body else None
+    if isinstance(last, ast.Return | ast.Raise):
+        return True
+    if isinstance(last, ast.If):
+        return _terminates(last.body) and _terminates(last.orelse)
+    if isinstance(last, ast.With | ast.AsyncWith):
+        return _terminates(last.body)
+    if isinstance(last, ast.Try):
+        if _terminates(last.finalbody):
+            return True
+        normal = last.orelse or last.body
+        return _terminates(normal) and all(_terminates(h.body) for h in last.handlers)
+    return False
+
+
 def _pos_of(node: ast.AST) -> tuple[int, int]:
     return (getattr(node, "lineno", 0), getattr(node, "col_offset", 0))
 
@@ -1559,24 +1578,73 @@ class _FastApi:
             else:
                 untrusted.add(a.arg)  # a path, query or body value
         own = list(_own_nodes(fn))
+        aliases: dict[str, set[str]] = {}  # names bound to one object (`u = user`)
+
+        def group(name: str) -> set[str]:
+            return aliases.setdefault(name, {name})
+
+        def untrust(names: set[str]) -> None:
+            for name in names:
+                untrusted.update(group(name))
+                trusted.difference_update(group(name))
+
+        def names_in(node: ast.AST | None) -> set[str]:
+            return {x.id for x in ast.walk(node) if isinstance(x, ast.Name)} if node else set()
+
         for n in sorted((n for n in own if isinstance(n, ast.Assign | ast.AnnAssign)), key=_pos_of):
             if n.value is None:
                 continue
             targets = n.targets if isinstance(n, ast.Assign) else [n.target]
-            names = {x.id for t in targets for x in ast.walk(t) if isinstance(x, ast.Name)}
-            used = {x.id for x in ast.walk(n.value) if isinstance(x, ast.Name)}
+            names = {x.id for t in targets if isinstance(t, ast.Name) for x in [t]}
+            used = names_in(n.value)
+            if isinstance(n.value, ast.Name):
+                joined = group(n.value.id) | set().union(*(group(x) for x in names))
+                for x in joined:
+                    aliases[x] = joined
             if used & untrusted:
-                untrusted |= names
-                trusted -= names
+                untrust(names)
             elif used & trusted:
                 trusted |= names
+        # writing request data into a trusted object (`user.update(owner=owner)`,
+        # `user["owner"] = owner`, `setattr(user, …)`) makes it no longer the caller
+        for n in own:
+            written: set[str] = set()
+            value: ast.AST | None = None
+            if isinstance(n, ast.Assign | ast.AugAssign):
+                targets = n.targets if isinstance(n, ast.Assign) else [n.target]
+                for t in targets:
+                    base = t
+                    while isinstance(base, ast.Attribute | ast.Subscript):
+                        base = base.value
+                    if base is not t and isinstance(base, ast.Name):
+                        written.add(base.id)
+                value = n.value
+            elif isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute):
+                base = n.func.value
+                if isinstance(base, ast.Name) and _MUTATORS.match(n.func.attr):
+                    written.add(base.id)
+                    value = n
+            elif isinstance(n, ast.Call) and _dotted(n.func) in ("setattr", "object.__setattr__"):
+                if n.args and isinstance(n.args[0], ast.Name):
+                    written.add(n.args[0].id)
+                    value = n
+            if written and names_in(value) - written & untrusted:
+                untrust(written)
+            elif written and names_in(value) - written - trusted:
+                untrust(written)  # anything but credentials written in
         returns = [n for n in own if isinstance(n, ast.Return | ast.Yield)]
-        ok = bool(returns) and all(
-            r.value is not None
-            and not (isinstance(r.value, ast.Constant) and r.value.value is None)
-            and not ({x.id for x in ast.walk(r.value) if isinstance(x, ast.Name)} & untrusted)
-            and bool({x.id for x in ast.walk(r.value) if isinstance(x, ast.Name)} & trusted)
-            for r in returns
+        generator = any(isinstance(n, ast.Yield | ast.YieldFrom) for n in own)
+        body = getattr(fn, "body", [])
+        ok = (
+            bool(returns)
+            and (generator or _terminates(body))
+            and all(
+                r.value is not None
+                and not (isinstance(r.value, ast.Constant) and r.value.value is None)
+                and not ({x.id for x in ast.walk(r.value) if isinstance(x, ast.Name)} & untrusted)
+                and bool({x.id for x in ast.walk(r.value) if isinstance(x, ast.Name)} & trusted)
+                for r in returns
+            )
         )
         self._identities[id(fn)] = ok
         return ok

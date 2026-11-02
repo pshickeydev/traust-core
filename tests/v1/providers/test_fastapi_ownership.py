@@ -843,3 +843,127 @@ def test_the_caller_and_the_id_come_from_where_qodo_said(
         },
     )
     assert _row(result, method, pattern)["ownership"] == ownership
+
+
+SECOND_REVIEW = """
+from fastapi import APIRouter, Depends, HTTPException
+from sqlmodel import select
+
+from app.auth import CurrentUser, get_current_user, oauth2_scheme
+from app.models import Item
+
+router = APIRouter(prefix="/s")
+
+
+def current_user_patched(owner: int, token: str = Depends(oauth2_scheme)):
+    user = {"id": token}
+    user.update(owner=owner)
+    if not token:
+        raise HTTPException(status_code=401)
+    return user
+
+
+def current_user_plain(token: str = Depends(oauth2_scheme)):
+    user = {"owner": token}
+    if not token:
+        raise HTTPException(status_code=401)
+    return user
+
+
+def current_user_maybe(token: str = Depends(oauth2_scheme)):
+    if token == "revoked":
+        raise HTTPException(status_code=401)
+    if token:
+        return {"owner": token}
+
+
+def current_user_strict(token: str = Depends(oauth2_scheme)):
+    if token:
+        return {"owner": token}
+    raise HTTPException(status_code=401)
+
+
+@router.get("/patched/{item_id}")
+def patched(item_id: int, session, me=Depends(current_user_patched)):
+    statement = select(Item).where(Item.id == item_id, Item.owner_id == me["owner"])
+    item = session.exec(statement).first()
+    if item is None:
+        raise HTTPException(status_code=404)
+    return item
+
+
+@router.get("/plain/{item_id}")
+def plain(item_id: int, session, me=Depends(current_user_plain)):
+    statement = select(Item).where(Item.id == item_id, Item.owner_id == me["owner"])
+    item = session.exec(statement).first()
+    if item is None:
+        raise HTTPException(status_code=404)
+    return item
+
+
+@router.get("/maybe/{item_id}")
+def maybe(item_id: int, session, me=Depends(current_user_maybe)):
+    statement = select(Item).where(Item.id == item_id, Item.owner_id == me["owner"])
+    item = session.exec(statement).first()
+    if item is None:
+        raise HTTPException(status_code=404)
+    return item
+
+
+@router.get("/strict/{item_id}")
+def strict(item_id: int, session, me=Depends(current_user_strict)):
+    statement = select(Item).where(Item.id == item_id, Item.owner_id == me["owner"])
+    item = session.exec(statement).first()
+    if item is None:
+        raise HTTPException(status_code=404)
+    return item
+
+
+@router.get("/local-class/{item_id}", dependencies=[Depends(get_current_user)])
+def local_class(item_id: int, session):
+    class Loader:
+        def run(self):
+            return session.get(Item, item_id)
+
+    return Loader().run()
+
+
+@router.get("/unused-class/{item_id}", dependencies=[Depends(get_current_user)])
+def unused_class(item_id: int, session):
+    class Loader:
+        def run(self):
+            return session.get(Item, item_id)
+
+    return {"ok": True}
+"""
+
+
+@pytest.mark.parametrize(
+    ("method", "pattern", "ownership"),
+    [
+        ("GET", "/s/patched/{item_id}", "caller-blind"),  # a query value written into the caller
+        ("GET", "/s/plain/{item_id}", "scoped"),
+        ("GET", "/s/maybe/{item_id}", "caller-blind"),  # may fall through and return None
+        ("GET", "/s/strict/{item_id}", "scoped"),  # every path returns or raises
+        ("GET", "/s/local-class/{item_id}", "unknown"),  # a local class's method loads by the id
+        ("GET", "/s/unused-class/{item_id}", "n/a"),  # never instantiated: acts on nothing
+    ],
+)
+def test_holes_qodo_found_in_the_fixes_stay_closed(
+    tmp_path: Path, method: str, pattern: str, ownership: str
+) -> None:
+    main = (
+        "from fastapi import FastAPI\nfrom app import second\n"
+        "app = FastAPI()\napp.include_router(second.router)\n"
+    )
+    result = _tree(
+        tmp_path,
+        {
+            "app/__init__.py": "",
+            "app/auth.py": AUTH,
+            "app/models.py": MODELS,
+            "app/second.py": SECOND_REVIEW,
+            "app/main.py": main,
+        },
+    )
+    assert _row(result, method, pattern)["ownership"] == ownership

@@ -763,10 +763,11 @@ class _Walk:
         self.handoffs: list[tuple[CodeSpan, set[str] | None, _Pos]] = []
         self.hop: CodeSpan | None = None
         self.caller = next((self.span(n) for n in _own(self.fn) if self.v.is_caller(n)), None)
+        # local functions and classes: their bodies run only when called (or instantiated)
         self.nested = {
             n.name: n
             for n in _own(self.fn)
-            if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef)
+            if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef)
         }
         self.verified: dict[str, _Pos] = dict.fromkeys(verified & self.ids, (0, 0))
         self.owned_or_null: dict[str, _Pos] = {}
@@ -947,12 +948,17 @@ class _Walk:
         # a query passed to be run (`session.exec(select(…)…)`) is already its own lookup
         values = [v for v in _values(call) if id(_unawait(v)) not in self.consumed]
         receiver = call.func.value if isinstance(call.func, ast.Attribute) else None
-        nested = self.nested.get(_dotted(call.func))
-        if nested is not None:
-            # a local function using the id (its argument or its closure): not followed
-            if _names(nested) & self.ids or any(_names(v) & self.ids for v in values):
+        # a local function or class called, instantiated (`Loader().run()`) or handed on as a
+        # callback, using the id through its arguments or its closure: not followed
+        called = {n.id for n in ast.walk(call.func) if isinstance(n, ast.Name)} & self.nested.keys()
+        handed = {v.id for v in values if isinstance(v, ast.Name)} & self.nested.keys()
+        if called or handed:
+            if any(_names(self.nested[n]) & self.ids for n in called | handed) or (
+                called and any(_names(v) & self.ids for v in values)
+            ):
                 self.handoff(call, None)
-            return
+            if called:
+                return
         if not any(_names(v) & self.ids for v in values):
             # `map(lambda i: delete(i), ids)`: an id handed to a function value
             if any(isinstance(v, ast.Lambda) and _names(v) & self.ids for v in values):
