@@ -73,4 +73,4 @@ class SqlFindingRepository(SqlMutableRepository[Finding]):
         )
 
     def list_by_ids(self, finding_ids: Collection[UUID]) -> list[Finding]:
-        return self._many(f"list {len(finding_ids)} by id", self.table.c.id.in_(list(finding_ids)))
+        return self._many_in("list by id", self.table.c.id, finding_ids)

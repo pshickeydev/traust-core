@@ -61,6 +61,7 @@ class LocalObjectStore:
 
     def put(self, key: ObjectKey, data: bytes) -> ObjectRef:
         path = self._path(key)
+        fd, tmp = None, None
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
@@ -68,6 +69,10 @@ class LocalObjectStore:
                 f.write(data)
             Path(tmp).replace(path)
         except OSError as e:
+            # a failed write must not leave the dot-prefixed temp file behind —
+            # list() would surface it as a phantom object
+            if tmp:
+                Path(tmp).unlink(missing_ok=True)
             raise RepositoryError(f"LocalObjectStore: put {key} failed") from e
         return ObjectRef(key, sha256_hex(data), len(data))
 
