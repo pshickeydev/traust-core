@@ -528,7 +528,7 @@ def test_class_serializes_under_its_legacy_name(helm_repo):
     assert triple.model_dump(by_alias=True)["class"] == triple.config_class
 
 
-def test_a_workload_manifest_with_a_non_mapping_spec_is_skipped_not_fatal(tmp_path):
+def test_a_workload_manifest_with_a_non_mapping_spec_is_skipped_not_fatal(tmp_path: Path):
     """A parseable doc with a scalar spec is a shape miss, not a crash — the same
     'shapes are skipped' contract as the malformed-yaml test above."""
     (tmp_path / "dep.yaml").write_text("kind: Deployment\nspec: true\n")
