@@ -18,6 +18,17 @@ CITATION = re.compile(
     r"(?<![\w/])([\w.\-]+(?:/[\w.\-]+)*\.[A-Za-z]{1,6}[a-z0-9]?):(\d{1,6})(?:-\d{1,6})?"
 )
 _NOT_CITATIONS = ("http://", "https://", "none found", "n/a")
+
+
+def _is_not_citation(link: str) -> bool:
+    """A non-citation: a URL, a disclaimer, or the literal n/a — the 'n/a' check
+    must not match a path whose directory boundary spells it (src/main/api.py)."""
+    lower = link.lower()
+    if any(t in lower for t in _NOT_CITATIONS[:3]):
+        return True
+    return bool(re.search(r"(?:^|[/\s])n/a(?:$|[/\s])", lower))
+
+
 _DISMISSALS = {"false_positive", "hardening"}
 
 
@@ -62,7 +73,7 @@ def citations(links: tuple[str, ...], rationale: str | None) -> list[tuple[str, 
 
     def found() -> Iterator[tuple[str, int, str]]:
         for link in links:
-            if not any(t in link.lower() for t in _NOT_CITATIONS) and (m := CITATION.search(link)):
+            if not _is_not_citation(link) and (m := CITATION.search(link)):
                 yield m[1], int(m[2]), "first_links"
         for m in CITATION.finditer(rationale or ""):
             yield m[1], int(m[2]), "rationale"
@@ -78,7 +89,7 @@ def _defect(files: CitationFiles, path: str, line: int) -> str | None:
     counts = [n for n in map(files.line_count, matches) if n is not None]
     if not counts:
         return f"{path}:{line}: unreadable"
-    if line > max(counts):
+    if line < 1 or line > max(counts):
         exact = files.resolve(path) is not None
         where = "" if exact else f" (best suffix match of {len(matches)})"
         return f"{path}:{line}: line out of range ({max(counts)}-line file{where})"

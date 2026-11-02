@@ -29,6 +29,6 @@ def get_product(product_id: UUID, portfolio: Portfolio, _: Caller) -> Product:
     return portfolio.get_product(product_id)
 
 
-@router.get("/v1/products/{product_id}/refs", responses=PROBLEMS(401))
+@router.get("/v1/products/{product_id}/refs", responses=PROBLEMS(401, 404))
 def list_product_refs(product_id: UUID, portfolio: Portfolio, _: Caller) -> list[RepositoryRef]:
     return portfolio.list_product_refs(product_id)

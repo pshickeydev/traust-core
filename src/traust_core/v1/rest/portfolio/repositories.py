@@ -74,7 +74,7 @@ def register_ref(
     return portfolio.register_ref(repository_id, GitSha.parse(body.sha), body.name, body.kind)
 
 
-@router.get("/v1/repositories/{repository_id}/owners", responses=PROBLEMS(401))
+@router.get("/v1/repositories/{repository_id}/owners", responses=PROBLEMS(401, 404))
 def list_owners(repository_id: UUID, portfolio: Portfolio, _: Caller) -> list[Team]:
     return portfolio.list_owners(repository_id)
 
@@ -86,7 +86,7 @@ def set_owners(repository_id: UUID, body: Owners, portfolio: Portfolio, _: Calle
     return portfolio.set_owners(repository_id, body.teams)
 
 
-@router.get("/v1/repositories/{repository_id}/products", responses=PROBLEMS(401))
+@router.get("/v1/repositories/{repository_id}/products", responses=PROBLEMS(401, 404))
 def list_products_of(repository_id: UUID, portfolio: Portfolio, _: Caller) -> list[Product]:
     return portfolio.list_products_of(repository_id)
 
