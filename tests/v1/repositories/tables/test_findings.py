@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from datetime import timedelta
 
+import pytest
+
 from tests.v1.repositories.tables.conftest import T0, Seed, apart, same_rows
 from traust_core.v1.models.findings import Finding
 from traust_core.v1.models.vocabulary import Validity
@@ -152,6 +154,21 @@ def test_findings_by_ids(seed: Seed) -> None:
     seed.finding()
     assert same_rows(seed.uow.findings.list_by_ids({f1.id, f2.id}), [f1, f2])
     assert seed.uow.findings.list_by_ids([]) == []
+
+
+def test_read_by_ids_stays_in_creation_order_across_batches(
+    seed: Seed, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # ids whose input order reverses creation order, split over two 2-id batches
+    monkeypatch.setattr("traust_core.v1.repositories.tables._BATCH", 2)
+    f1 = seed.finding()
+    apart()
+    f2 = seed.finding()
+    apart()
+    f3 = seed.finding()
+    apart()
+    f4 = seed.finding()
+    assert seed.uow.findings.list_by_ids([f4.id, f3.id, f2.id, f1.id]) == [f1, f2, f3, f4]
 
 
 def test_cwes_and_decisions_of_many_findings(seed: Seed) -> None:

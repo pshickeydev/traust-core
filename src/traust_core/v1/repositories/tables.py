@@ -202,9 +202,14 @@ class SqlTableRepository(SqlRepository, Generic[R]):
     def _many_in(
         self, operation: str, column: sa.ColumnElement[Any], values: Collection[Any]
     ) -> list[R]:
-        """Rows whose `column` is one of `values`, read in bounded batches."""
+        """Rows whose `column` is one of `values`, read in bounded batches.
+
+        Batches are merged back into `_many`'s global (created_at, id) order,
+        which per-batch queries cannot preserve when values span batches.
+        """
         batches = self._batches(values)
-        return [row for batch in batches for row in self._many(operation, column.in_(batch))]
+        rows = [row for batch in batches for row in self._many(operation, column.in_(batch))]
+        return sorted(rows, key=lambda r: (r.created_at, r.id))
 
     @staticmethod
     def _batches(values: Collection[Any]) -> Iterator[list[Any]]:
