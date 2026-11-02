@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from datetime import datetime
 from typing import Annotated
 from uuid import UUID
 
@@ -9,6 +8,7 @@ from fastapi import APIRouter, Query
 from traust_core.v1.models.common import Cursor, Page, PageRequest
 from traust_core.v1.models.validation import ValidationAttempt, ValidationFilter
 from traust_core.v1.models.vocabulary import ValidationVerdict
+from traust_core.v1.rest.common.aware_datetime import UtcDatetime
 from traust_core.v1.rest.common.deps import Caller
 from traust_core.v1.rest.common.problems import PROBLEMS
 from traust_core.v1.rest.validation.service import Validation
@@ -23,7 +23,7 @@ def list_validation_attempts(
     finding_id: UUID | None = None,
     repository_id: Annotated[list[UUID] | None, Query()] = None,
     verdict: ValidationVerdict | None = None,
-    as_of: datetime | None = None,
+    as_of: UtcDatetime | None = None,
     limit: Annotated[int, Query(ge=1, le=1000)] = 100,
     cursor: Cursor | None = None,
 ) -> Page[ValidationAttempt]:

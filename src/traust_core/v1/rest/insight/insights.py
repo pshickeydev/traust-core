@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from datetime import datetime
 from typing import Annotated
 from uuid import UUID
 
@@ -9,6 +8,7 @@ from pydantic import SerializeAsAny
 
 from traust_core.v1.models.common import TimeBucket
 from traust_core.v1.models.insight import ViewFilter, ViewModel, ViewName
+from traust_core.v1.rest.common.aware_datetime import UtcDatetime
 from traust_core.v1.rest.common.deps import Caller
 from traust_core.v1.rest.common.problems import PROBLEMS
 from traust_core.v1.rest.insight.service import Insight
@@ -25,7 +25,7 @@ def get_insight(
     _: Caller,
     product_id: Ids = None,
     team_id: Ids = None,
-    as_of: datetime | None = None,
+    as_of: UtcDatetime | None = None,
     bucket: TimeBucket = TimeBucket.MONTH,
     artifact_id: UUID | None = None,
 ) -> SerializeAsAny[ViewModel]:

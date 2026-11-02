@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from datetime import datetime
 from typing import Annotated
 from uuid import UUID
 
@@ -19,6 +18,7 @@ from traust_core.v1.models.dependencies import (
 )
 from traust_core.v1.models.vocabulary import ImpactClassification
 from traust_core.v1.providers.feeds import FeedStatus
+from traust_core.v1.rest.common.aware_datetime import UtcDatetime
 from traust_core.v1.rest.common.deps import Caller
 from traust_core.v1.rest.common.problems import PROBLEMS
 from traust_core.v1.rest.exposure.service import Exposure
@@ -29,7 +29,7 @@ router = APIRouter()
 def exposure_filter(
     advisory_id: UUID | None = None,
     ecosystem: Ecosystem | None = None,
-    as_of: datetime | None = None,
+    as_of: UtcDatetime | None = None,
 ) -> ExposureFilter:
     return ExposureFilter(advisory_id=advisory_id, ecosystem=ecosystem, as_of=as_of)
 
