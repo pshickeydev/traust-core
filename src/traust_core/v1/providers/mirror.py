@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import fcntl
 import logging
+import os
 import shutil
 import tempfile
 import time
@@ -93,7 +94,14 @@ class MirrorCheckout:
             raise ValidationError(f"idle_days must be non-negative: {idle_days}")
         cutoff = self._clock.now().timestamp() - timedelta(days=idle_days).total_seconds()
         dropped = []
-        for mirror in sorted(self._root.rglob("*.git")):
+        mirrors = []
+        for top, dirs, files in os.walk(self._root, followlinks=False):
+            path = Path(top)
+            if path.name.endswith(".git") and ("HEAD" in files or _LAST_USE in files):
+                # Loose refs can end in .git; never descend into a mirror's contents.
+                dirs.clear()
+                mirrors.append(path)
+        for mirror in sorted(mirrors):
             with self._locked(mirror, blocking=False) as acquired:
                 if not acquired or not mirror.is_dir():
                     continue

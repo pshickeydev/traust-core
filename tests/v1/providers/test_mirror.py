@@ -431,6 +431,62 @@ def test_a_mirror_checked_out_today_is_kept(tmp_path: Path) -> None:
     assert mirror(cache).is_dir()
 
 
+def test_evicting_a_fresh_mirror_does_not_block_a_git_suffixed_branch(
+    tmp_path: Path, worktrees: Path
+) -> None:
+    forge = Forge(tmp_path)
+    head = forge.commit("a.txt", b"before\n")
+    git(forge.work, "push", "-q", str(forge.bare), "HEAD:refs/heads/release.git")
+    cache = cache_for(tmp_path, forge)
+    p = provider(cache)
+    p.refresh(URL, head)
+    assert (mirror(cache) / "refs" / "heads" / "release.git").is_file()
+
+    assert evictor(cache).evict(30) == []
+
+    moved = forge.commit("a.txt", b"after\n")
+    git(forge.work, "push", "-q", str(forge.bare), "HEAD:refs/heads/release.git")
+    p.refresh(URL, moved)
+    assert git(mirror(cache), "rev-parse", "refs/heads/release.git") == str(moved)
+    workspace = p.checkout(CheckoutRequest(repo=REPO, ref=moved)).data
+    try:
+        assert (workspace.path / "a.txt").read_bytes() == b"after\n"
+    finally:
+        p.release(workspace)
+
+
+def test_eviction_keeps_git_suffixed_namespaces_and_removes_only_the_mirror(
+    tmp_path: Path,
+) -> None:
+    forge = Forge(tmp_path)
+    head = forge.commit("a.txt", b"hello\n")
+    url = HttpsRepoUrl.parse(
+        "https://gitlab.example/group.git/subgroup/project", ("gitlab.example",)
+    )
+    cache = tmp_path / "cache"
+    cached = cache / url.host / f"{url.path}.git"
+    cached.mkdir(parents=True)
+    git(cached, "init", "--bare", "-q")
+    git(cached, "config", f"url.{forge.bare}.insteadOf", str(url))
+    p = MirrorCheckout(
+        LocalForge(("git",)),
+        SystemClock(),
+        cache,
+        ForgeApi(NoHttp(), {"gitlab.example": "gitlab"}),
+    )
+    p.refresh(url, head)
+    last_use = cached / "traust-last-checkout"
+    last_use.touch()
+    idle = time.time() - 40 * 86400
+    namespace = cache / url.host / "group.git"
+    os.utime(last_use, (idle, idle))
+    os.utime(namespace, (idle, idle))
+
+    assert p.evict(30) == [url]
+    assert namespace.is_dir()
+    assert not cached.exists()
+
+
 def test_a_mirror_never_checked_out_is_evicted_by_its_directory_age(tmp_path: Path) -> None:
     forge = Forge(tmp_path)
     cache = cache_for(tmp_path, forge)

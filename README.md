@@ -51,6 +51,9 @@ Eviction skips in-flight acquisitions and registered worktrees. Refresh does not
 last-checkout idle clock. Local-origin checkouts and history reads accept full SHA-1 and
 SHA-256 commit IDs, under the deployment's existing process policy.
 
+Eviction discovery stops at bare-mirror roots, so refs such as `release.git` are never treated
+as cache entries.
+
 ## Operational logging
 
 `traust-server` calls `Context.configure_logging()` before serving. Embedded callers call it
