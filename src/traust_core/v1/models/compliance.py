@@ -358,7 +358,10 @@ class ComplianceMapping(Dto):
         return mapping
 
     def check(self, check_id: str) -> Check:
-        return next(c for c in self.checks if c.id == check_id)
+        for c in self.checks:
+            if c.id == check_id:
+                return c
+        raise ValidationError(f"unknown check {check_id!r} in the compliance mapping")
 
 
 class ControlResult(Model):

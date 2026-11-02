@@ -594,7 +594,9 @@ _LEGACY_LINES_REVIEWED = ("lines_reviewed", "loc_reviewed", "lines_of_code")
 
 def _line_count(value: object) -> int | None:
     if isinstance(value, str):
-        value = int(value) if value.strip().isdigit() else None
+        # isdecimal, not isdigit: '①' and '²' are digits but not decimals — int()
+        # raises on them, and junk reads as absent per the contract
+        value = int(value) if value.strip().isdecimal() else None
     if isinstance(value, bool) or not isinstance(value, int | float) or value <= 0:
         return None
     return int(value)

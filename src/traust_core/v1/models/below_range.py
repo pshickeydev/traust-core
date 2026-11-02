@@ -341,7 +341,11 @@ def fix_links(
     ranked = []
     for rank, url in sorted(found, key=lambda t: t[0]):
         url = url.split("#")[0].split("?")[0]
-        if (urllib.parse.urlsplit(url).hostname or "") in forges and url not in seen:
+        try:
+            host = urllib.parse.urlsplit(url).hostname or ""
+        except ValueError:
+            continue  # external data can name a reference urlsplit cannot parse
+        if host in forges and url not in seen:
             seen.add(url)
             ranked.append((rank, url))
     return ranked

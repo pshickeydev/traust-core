@@ -60,3 +60,10 @@ def test_companion_lanes_come_from_the_additional_block() -> None:
         "cloud-config-audit",
     )
     assert scoped().companion_lanes == ()
+
+
+def test_a_legacy_lines_count_that_is_not_a_decimal_number_is_absent() -> None:
+    """'①'.isdigit() is True but int('①') raises: unicode digit lookalikes (and '²')
+    are junk, not a count — the 'return None for junk' contract holds for them too."""
+    assert scoped(additional={"lines_reviewed": "①"}).lines_reviewed is None
+    assert scoped(additional={"lines_reviewed": "²"}).lines_reviewed is None

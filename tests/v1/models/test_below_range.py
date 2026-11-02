@@ -344,3 +344,16 @@ def test_the_latest_commit_date_is_the_packets_commit_date() -> None:
     ]
     assert latest_authored(commits) == "2024-04-16T10:00:00+00:00"
     assert latest_authored([commit("x", "no date")]) is None
+
+
+def test_fix_links_skips_a_malformed_reference_url_that_urlsplit_cannot_parse() -> None:
+    """External advisory data can name a reference urlsplit cannot parse ('Invalid IPv6
+    URL'); one malformed link skips, never crashes the whole below-range prepare."""
+    rec = record(
+        {"type": "GIT", "repo": "https://github.com/ex/lib", "events": [{"introduced": "0"}]},
+        refs=(
+            {"type": "WEB", "url": "https://[foo/commit/deadbeef1234"},
+            {"type": "WEB", "url": "https://github.com/ex/lib/pull/7"},
+        ),
+    )
+    assert fix_links(rec, [], GITHUB) == [(2, "https://github.com/ex/lib/pull/7")]

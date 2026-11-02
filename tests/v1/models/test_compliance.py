@@ -439,3 +439,11 @@ def test_a_scope_is_one_boundary_and_draft_when_unsigned() -> None:
     two["boundaries"]["b2"] = two["boundaries"]["b1"]
     with pytest.raises(ValidationError, match="exactly one boundary"):
         ComplianceScope.of(None, ComplianceScopeArtifact.from_document(two))
+
+
+def test_compliance_mapping_check_refuses_an_unknown_check_id() -> None:
+    """check() with a check_id absent from the mapping is a typed refusal, never a
+    bare StopIteration."""
+    mapping = MAPPING
+    with pytest.raises(ValidationError, match="unknown check"):
+        mapping.check("chk-nonexistent")
