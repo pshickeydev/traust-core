@@ -553,7 +553,7 @@ _PATTERNS: tuple[tuple[str, re.Pattern[str], bool], ...] = (
     ("url-credentials", re.compile(r"://[A-Za-z0-9._%+-]+:([^@/\s'\"]{6,})@"), True),
     ("us-ssn", re.compile(r"\b(?!000|666|9\d\d)\d{3}-(?!00)\d{2}-(?!0000)\d{4}\b"), False),
     ("azure-client-secret", re.compile(r"\b[a-zA-Z0-9~_.\-]{3}8Q~[a-zA-Z0-9~_.\-]{30,}\b"), False),
-    ("gcp-sa-key", re.compile(r'"private_key_id"\s*:\s*"([a-f0-9]{40})"'), True),
+    ("gcp-sa-key", re.compile(r'\\?"private_key_id\\?"\s*:\s*\\?"([a-f0-9]{40})\\?"'), True),
 )
 # Vendor token formats are near-certainly real; the heuristic classes (assignments, SSN, card,
 # URL credentials) turn up in quoted audit evidence (a 400-report dry run: 0 vs 14 hits).
@@ -575,6 +575,9 @@ _PEM = re.compile(
     r"(-----BEGIN [A-Z ]*PRIVATE KEY-----)(.*?)(-----END [A-Z ]*PRIVATE KEY-----)", re.DOTALL
 )
 _PEM_REDACTED = "[PRIVATE KEY MATERIAL REDACTED]"
+# The run of newlines (raw or JSON-escaped to any depth) padding a PEM body.
+_PEM_PAD = re.compile(r"(?:\\+[rn]|\r?\n)+")
+_PEM_PAD_END = re.compile(r"(?:\\+[rn]|\r?\n)+$")
 _PAN_CANDIDATE = re.compile(r"\b(?:\d[ -]?){13,19}\b")
 
 
@@ -630,7 +633,11 @@ def _scrub(text: str, hits: list[RedactionHit], *, replace: bool) -> str:
         hits.append(RedactionHit(category="pem-private-key", match_prefix="-----"))
         if not replace:
             return m.group(0)
-        return f"{m.group(1)}\n{_PEM_REDACTED}\n{m.group(3)}"
+        body = m.group(2)
+        lead = _PEM_PAD.match(body)
+        tail = _PEM_PAD_END.search(body)
+        pad = (lead.group(0) if lead else "") + _PEM_REDACTED + (tail.group(0) if tail else "")
+        return f"{m.group(1)}{pad}{m.group(3)}"
 
     text = _PEM.sub(pem, text)
 
