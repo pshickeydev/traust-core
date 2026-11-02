@@ -84,8 +84,18 @@ class S3ObjectStore:
     def _probe_bucket(self) -> None:
         self._client.list_objects_v2(Bucket=self._bucket, Prefix=self._base, MaxKeys=1)
 
-    def _is_missing(self, error: ClientError) -> bool:
+    def _is_missing(self, error: ClientError, key: ObjectKey) -> bool:
         code = error.response.get("Error", {}).get("Code")
+        if code in {"AccessDenied", "403"}:
+            try:
+                listed = self._client.list_objects_v2(
+                    Bucket=self._bucket, Prefix=self._name(key), MaxKeys=1
+                )
+            except (BotoCoreError, ClientError) as e:
+                raise RepositoryError(f"S3ObjectStore: check {key} failed") from e
+            if not isinstance(listed, dict):
+                raise RepositoryError(f"S3ObjectStore: check {key} returned an invalid listing")
+            return not any(obj["Key"] == self._name(key) for obj in listed.get("Contents", ()))
         if code in _AMBIGUOUS_MISSING:
             try:
                 self._probe_bucket()
@@ -109,7 +119,7 @@ class S3ObjectStore:
         try:
             return self._client.get_object(Bucket=self._bucket, Key=self._name(key))["Body"].read()
         except ClientError as e:
-            if self._is_missing(e):
+            if self._is_missing(e, key):
                 raise NotFoundError(f"artifact {key}") from None
             raise RepositoryError(f"S3ObjectStore: read {key} failed") from e
         except BotoCoreError as e:
@@ -127,7 +137,7 @@ class S3ObjectStore:
         try:
             self._client.head_object(Bucket=self._bucket, Key=self._name(key))
         except ClientError as e:
-            if self._is_missing(e):
+            if self._is_missing(e, key):
                 return False
             raise RepositoryError(f"S3ObjectStore: head {key} failed") from e
         except BotoCoreError as e:

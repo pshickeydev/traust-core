@@ -89,6 +89,32 @@ def test_prefix_scoped_permissions_allow_storage_without_bucket_wide_access(
     assert not store.exists(ObjectKey.parse("missing.json"))
 
 
+def test_scoped_list_distinguishes_missing_key_403_from_denied_existing_key(
+    client: BaseClient,
+) -> None:
+    store = S3ObjectStore("traust", client=client, prefix="deploy-a")
+    missing = ObjectKey.parse("cache/missing.json")
+    protected = ObjectKey.parse("cache/protected.json")
+    client.put_object(Bucket="traust", Key="deploy-a/cache/protected.json", Body=b"private")
+
+    def denied_object(model: OperationModel, params: dict[str, object], **_: object) -> None:
+        if model.name in {"HeadObject", "GetObject"}:
+            raise ClientError({"Error": {"Code": "AccessDenied"}}, model.name)
+
+    client.meta.events.register("before-call.s3", denied_object)
+    assert not store.exists(missing)
+    with pytest.raises(NotFoundError):
+        store.stat(missing)
+    with pytest.raises(RepositoryError):
+        store.exists(protected)
+    with pytest.raises(RepositoryError):
+        store.stat(protected)
+    client.delete_object(Bucket="traust", Key="deploy-a/cache/protected.json")
+    client.delete_bucket(Bucket="traust")
+    with pytest.raises(RepositoryError):
+        store.exists(missing)
+
+
 def test_losing_the_bucket_after_construction_is_not_a_cache_miss(client: BaseClient) -> None:
     cache = ObjectCache(S3ObjectStore("traust", client=client, prefix="deploy-a"), "cache")
     assert cache.get("missing.json") is None
