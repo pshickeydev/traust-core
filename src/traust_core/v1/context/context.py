@@ -348,7 +348,26 @@ class Context:
 
     @cached_property
     def object_store(self) -> ObjectStore:
-        return self._object_store or LocalObjectStore(self.config.artifacts_path())
+        if self._object_store is not None:
+            return self._object_store
+        if (s3 := self.config.artifacts.s3) is None:
+            return LocalObjectStore(self.config.artifacts_path())
+        try:
+            from traust_core.v1.repositories.objects.s3 import S3ObjectStore
+
+            access_key, secret_key = s3.credentials()
+            return S3ObjectStore.from_settings(
+                s3.bucket,
+                prefix=s3.prefix,
+                endpoint_url=s3.endpoint_url,
+                region=s3.region,
+                access_key=access_key,
+                secret_key=secret_key,
+            )
+        except ModuleNotFoundError as e:
+            if e.name not in {"boto3", "botocore"}:
+                raise
+            raise ConfigError("artifacts.s3 requires traust-core[s3]") from e
 
     @cached_property
     def process(self) -> ProcessRunner:

@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import boto3
 import pydantic
 import pytest
 import yaml
+from moto import mock_aws
 
 from traust_core.v1 import contracts
 from traust_core.v1.context import Config, Context
@@ -18,6 +20,8 @@ from traust_core.v1.context.config import (
 )
 from traust_core.v1.errors import ConfigError
 from traust_core.v1.providers.osv import OsvAdvisoryLookup
+from traust_core.v1.repositories.objects import InMemoryObjectStore, ObjectKey
+from traust_core.v1.repositories.objects.s3 import S3ObjectStore
 
 LIVE_OSV = (
     "version: 1\nsources:\n  osv:\n    tier: live\n    url_template: https://osv.test/{ident}\n"
@@ -57,6 +61,102 @@ def test_an_empty_traust_yaml_is_the_defaults(tmp_path: Path) -> None:
     # model_dump: the loaded config knows the home it came from (a private attr), the
     # zero-config defaults do not; the values are what must match.
     assert Config.from_home(_home(tmp_path, "")).model_dump() == Config().model_dump()
+
+
+def test_traust_yaml_selects_s3_for_artifacts(tmp_path: Path) -> None:
+    with mock_aws():
+        client = boto3.client("s3", region_name="us-east-1")
+        client.create_bucket(Bucket="test-artifacts")
+        home = _home(
+            tmp_path,
+            f"home: {tmp_path / 'data'}\n"
+            "artifacts:\n  s3:\n    bucket: test-artifacts\n"
+            "    prefix: deploy-a\n    region: us-east-1\n",
+        )
+        ctx = Context(Config.from_home(home))
+        assert isinstance(ctx.object_store, S3ObjectStore)
+        key = ObjectKey.parse("reports/a.json")
+        ref = ctx.object_store.put(key, b"test")
+        assert ctx.object_store.get(ref) == b"test"
+        assert (
+            client.get_object(Bucket="test-artifacts", Key="deploy-a/reports/a.json")["Body"].read()
+            == b"test"
+        )
+        assert not (ctx.config.home / "artifacts").exists()
+        with pytest.raises(ConfigError, match=r"artifacts\.path"):
+            ctx.config.artifacts_path()
+
+
+def test_s3_uses_custom_endpoint_and_named_secrets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from unittest.mock import MagicMock
+
+    client = MagicMock()
+    called: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def build(*args: object, **kwargs: object) -> MagicMock:
+        called.append((args, kwargs))
+        return client
+
+    monkeypatch.setattr(boto3, "client", build)
+    monkeypatch.setenv("TEST_ACCESS_KEY", "example-access")
+    monkeypatch.setenv("TEST_SECRET_KEY", "example-secret")
+    config = Config.from_home(
+        _home(
+            tmp_path,
+            "artifacts:\n  s3:\n    bucket: test-artifacts\n"
+            "    endpoint_url: http://localhost:9000\n    region: us-east-1\n"
+            "    access_key_env: TEST_ACCESS_KEY\n    secret_key_env: TEST_SECRET_KEY\n",
+        )
+    )
+    assert isinstance(Context(config).object_store, S3ObjectStore)
+    assert called == [
+        (
+            ("s3",),
+            {
+                "endpoint_url": "http://localhost:9000",
+                "region_name": "us-east-1",
+                "aws_access_key_id": "example-access",
+                "aws_secret_access_key": "example-secret",
+            },
+        )
+    ]
+
+
+def test_s3_missing_named_secret_fails_before_building_client(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("TEST_MISSING_ACCESS", raising=False)
+    config = Config.from_home(
+        _home(
+            tmp_path,
+            "artifacts:\n  s3:\n    bucket: test-artifacts\n"
+            "    access_key_env: TEST_MISSING_ACCESS\n    secret_key_env: TEST_MISSING_SECRET\n",
+        )
+    )
+    with pytest.raises(ConfigError, match="TEST_MISSING_ACCESS"):
+        assert isinstance(Context(config).object_store, S3ObjectStore)
+
+
+def test_injected_object_store_takes_priority_over_s3_config(tmp_path: Path) -> None:
+    config = Config.from_home(_home(tmp_path, "artifacts: {s3: {bucket: test-artifacts}}\n"))
+    injected = InMemoryObjectStore()
+    assert Context(config, object_store=injected).object_store is injected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "artifacts: {s3: {bucket: ''}}\n",
+        "artifacts: {path: blobs, s3: {bucket: test-artifacts}}\n",
+        "artifacts: {s3: {bucket: test-artifacts, access_key_env: TEST_ACCESS}}\n",
+        "artifacts: {s3: {bucket: test-artifacts, secret_access_key: inline}}\n",
+    ],
+)
+def test_invalid_s3_configuration_is_refused(tmp_path: Path, text: str) -> None:
+    with pytest.raises(ConfigError, match=CONFIG_FILE):
+        Config.from_home(_home(tmp_path, text))
 
 
 def test_locations_are_inline_and_resolve_beside_the_file(tmp_path: Path) -> None:

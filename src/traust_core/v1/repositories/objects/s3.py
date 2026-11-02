@@ -49,6 +49,29 @@ class S3Client(Protocol):
 
 
 class S3ObjectStore:
+    @classmethod
+    def from_settings(
+        cls,
+        bucket: str,
+        *,
+        prefix: str = "",
+        endpoint_url: str | None = None,
+        region: str | None = None,
+        access_key: str | None = None,
+        secret_key: str | None = None,
+    ) -> S3ObjectStore:
+        import boto3
+
+        options: dict[str, str] = {}
+        if endpoint_url is not None:
+            options["endpoint_url"] = endpoint_url
+        if region is not None:
+            options["region_name"] = region
+        if access_key is not None and secret_key is not None:
+            options["aws_access_key_id"] = access_key
+            options["aws_secret_access_key"] = secret_key
+        return cls(bucket, client=boto3.client("s3", **options), prefix=prefix)
+
     def __init__(self, bucket: str, *, client: S3Client, prefix: str = "") -> None:
         self._bucket = bucket
         self._client = client
