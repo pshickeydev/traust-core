@@ -53,7 +53,14 @@ class DatabaseConfig(_Model):
 class S3ArtifactsConfig(_Model):
     bucket: str = pydantic.Field(min_length=1)
     prefix: str = ""
-    endpoint_url: str | None = pydantic.Field(default=None, pattern=r"^https?://[^/]+")
+    endpoint_url: str | None = pydantic.Field(
+        default=None,
+        pattern=(
+            r"^https?://(?:[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?"
+            r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)*|"
+            r"\[[0-9A-Fa-f:.]+\])(?::[0-9]{1,5})?/?$"
+        ),
+    )
     region: str | None = pydantic.Field(default=None, min_length=1)
     access_key_env: str | None = pydantic.Field(default=None, pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")
     secret_key_env: str | None = pydantic.Field(default=None, pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")

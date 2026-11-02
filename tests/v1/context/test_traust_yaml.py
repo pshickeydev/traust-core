@@ -152,6 +152,9 @@ def test_injected_object_store_takes_priority_over_s3_config(tmp_path: Path) -> 
         "artifacts: {path: blobs, s3: {bucket: test-artifacts}}\n",
         "artifacts: {s3: {bucket: test-artifacts, access_key_env: TEST_ACCESS}}\n",
         "artifacts: {s3: {bucket: test-artifacts, secret_access_key: inline}}\n",
+        "artifacts: {s3: {bucket: test-artifacts, endpoint_url: 'https://user:password@rgw.example.com'}}\n",
+        "artifacts: {s3: {bucket: test-artifacts, endpoint_url: 'http://bad host'}}\n",
+        "artifacts: {s3: {bucket: test-artifacts, endpoint_url: 'http://bad..host'}}\n",
     ],
 )
 def test_invalid_s3_configuration_is_refused(tmp_path: Path, text: str) -> None:
