@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import ast
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from typing import Protocol
 
@@ -110,6 +110,38 @@ def _unawait(node: ast.AST | None) -> ast.AST | None:
 
 def _names(node: ast.AST | None) -> set[str]:
     return {n.id for n in ast.walk(node) if isinstance(n, ast.Name)} if node is not None else set()
+
+
+def _own(fn: ast.AST) -> Iterator[ast.AST]:
+    """The nodes of `fn`'s own scope: nested definitions are yielded, their bodies are not."""
+    stack = list(ast.iter_child_nodes(fn))
+    while stack:
+        node = stack.pop()
+        yield node
+        if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef | ast.Lambda):
+            stack.extend(ast.iter_child_nodes(node))
+
+
+def returns_id(fn: _Def, ids: set[str]) -> bool:
+    """Whether `fn` returns (or yields) the id itself, or a value built from it (`return
+    item_id`, `return int(item_id)`); never a record loaded by it (`session.get(Item, item_id)`)."""
+    tainted = set(ids)
+
+    def carries(value: ast.AST) -> bool:
+        return bool(_names(value) & tainted) and not any(
+            (isinstance(n, ast.Call) and _dotted(n.func) not in _CONVERSIONS and _values(n))
+            or isinstance(n, ast.Subscript)
+            for n in ast.walk(value)
+        )
+
+    for n in sorted((n for n in _own(fn) if isinstance(n, ast.Assign | ast.AnnAssign)), key=_pos):
+        targets = n.targets if isinstance(n, ast.Assign) else [n.target]
+        if n.value is not None and carries(n.value):
+            tainted |= {x.id for t in targets for x in ast.walk(t) if isinstance(x, ast.Name)}
+    return any(
+        isinstance(n, ast.Return | ast.Yield) and n.value is not None and carries(n.value)
+        for n in _own(fn)
+    )
 
 
 def _call_name(call: ast.Call) -> str:
@@ -571,7 +603,7 @@ class _Values:
             if isinstance(target, ast.Name):
                 mutated.add(target.id)
 
-        for n in ast.walk(fn):
+        for n in _own(fn):
             if isinstance(n, ast.Assign):
                 for t in n.targets:
                     if isinstance(t, ast.Name):
@@ -579,7 +611,11 @@ class _Values:
                     else:
                         other |= {x.id for x in ast.walk(t) if isinstance(x, ast.Name)}
                         root(t)
-            elif isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name):
+            elif (
+                isinstance(n, ast.AnnAssign)
+                and isinstance(n.target, ast.Name)
+                and n.value is not None
+            ):
                 bound.setdefault(n.target.id, []).append(n.value)
             elif isinstance(n, ast.AugAssign | ast.For | ast.AsyncFor | ast.NamedExpr):
                 other |= _names(n.target)
@@ -590,8 +626,8 @@ class _Values:
                 other.add(n.name)
             elif isinstance(n, ast.comprehension):
                 other |= _names(n.target)
-            elif isinstance(n, ast.Lambda | ast.FunctionDef | ast.AsyncFunctionDef) and n is not fn:
-                other |= {a.arg for a in (*n.args.posonlyargs, *n.args.args, *n.args.kwonlyargs)}
+            elif isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+                other.add(n.name)  # a nested definition rebinds its name
             elif isinstance(n, ast.Global | ast.Nonlocal):
                 other |= set(n.names)
             elif isinstance(n, ast.Delete):
@@ -693,7 +729,9 @@ class _Walk:
         self.root = {i: i for i in ids}
         bindings: dict[str, int] = dict.fromkeys(self.params, 1)
         binders = (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.For, ast.AsyncFor, ast.NamedExpr)
-        for n in sorted((n for n in ast.walk(self.fn) if isinstance(n, binders)), key=_pos):
+        for n in sorted((n for n in _own(self.fn) if isinstance(n, binders)), key=_pos):
+            if isinstance(n, ast.AnnAssign) and n.value is None:
+                continue  # `user: User` binds nothing
             targets = n.targets if isinstance(n, ast.Assign) else [n.target]
             value = n.iter if isinstance(n, ast.For | ast.AsyncFor) else n.value
             simple = isinstance(n, ast.Assign | ast.AnnAssign)
@@ -724,7 +762,12 @@ class _Walk:
         self.hop_owned: dict[int, set[str]] = {}
         self.handoffs: list[tuple[CodeSpan, set[str] | None, _Pos]] = []
         self.hop: CodeSpan | None = None
-        self.caller = next((self.span(n) for n in ast.walk(self.fn) if self.v.is_caller(n)), None)
+        self.caller = next((self.span(n) for n in _own(self.fn) if self.v.is_caller(n)), None)
+        self.nested = {
+            n.name: n
+            for n in _own(self.fn)
+            if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef)
+        }
         self.verified: dict[str, _Pos] = dict.fromkeys(verified & self.ids, (0, 0))
         self.owned_or_null: dict[str, _Pos] = {}
 
@@ -777,8 +820,9 @@ class _Walk:
 
     # ---- the walk
     def run(self) -> _Scan:
+        # what the function itself runs: a nested function's body runs only when it is called
         nodes = sorted(
-            (n for n in ast.walk(self.fn) if isinstance(n, ast.Call | ast.Subscript)), key=_pos
+            (n for n in _own(self.fn) if isinstance(n, ast.Call | ast.Subscript)), key=_pos
         )
         # query roots first, so a chain (`select(M).where(…)`) is read as one query
         for n in nodes:
@@ -804,7 +848,11 @@ class _Walk:
                 after = [body[k], *after[:1]]
         for stmt, nxt in zip(body, following, strict=True):
             self.statement(stmt, nxt)
-        returns = [s for s in body if any(isinstance(n, ast.Return) for n in ast.walk(s))]
+        returns = [
+            s
+            for s in body
+            if isinstance(s, ast.Return) or any(isinstance(n, ast.Return) for n in _own(s))
+        ]
         return self.result(_pos(returns[0]) if returns else None, self.pure_read(body))
 
     def query_record(self, call: ast.Call) -> str | None:
@@ -899,6 +947,12 @@ class _Walk:
         # a query passed to be run (`session.exec(select(…)…)`) is already its own lookup
         values = [v for v in _values(call) if id(_unawait(v)) not in self.consumed]
         receiver = call.func.value if isinstance(call.func, ast.Attribute) else None
+        nested = self.nested.get(_dotted(call.func))
+        if nested is not None:
+            # a local function using the id (its argument or its closure): not followed
+            if _names(nested) & self.ids or any(_names(v) & self.ids for v in values):
+                self.handoff(call, None)
+            return
         if not any(_names(v) & self.ids for v in values):
             # `map(lambda i: delete(i), ids)`: an id handed to a function value
             if any(isinstance(v, ast.Lambda) and _names(v) & self.ids for v in values):
@@ -1165,7 +1219,8 @@ class _Walk:
 
 
 Callers = Callable[[Target], tuple[set[str], set[str]]]
-Dependencies = Callable[[Target], tuple[list[Target], list[Opaque]]]
+# a function's dependencies, each with the parameter it fills (None for `dependencies=[…]`)
+Dependencies = Callable[[Target], tuple[list[tuple[str | None, Target]], list[Opaque]]]
 
 
 class PyOwnership:
@@ -1180,7 +1235,7 @@ class PyOwnership:
         self,
         handler: Target,
         path_ids: set[str],
-        route_deps: list[Target],
+        route_deps: list[tuple[str | None, Target]],
         opaque: list[Opaque],
     ) -> HandlerFacts:
         """`path_ids`: the route's path parameters; `route_deps`/`opaque`: its own, its routers'
@@ -1193,19 +1248,23 @@ class PyOwnership:
         # dependencies (and theirs) run first: one handed a path id is a hop whose verification
         # covers the body; one we can't follow that may take a path id leaves the route unknown
         own_deps, own_opaque = self.dependencies(handler)
+        handed = {param for param, _ in own_deps}
         pending, unread, seen = [*own_deps, *route_deps], [*own_opaque, *opaque], set()
         while pending:
-            dep = pending.pop(0)
+            param, dep = pending.pop(0)
             if id(dep.fn) in seen:
                 continue
             seen.add(id(dep.fn))
             more, hidden = self.dependencies(dep)
-            pending += more
+            pending += [(None, d) for _, d in more]
             unread += hidden
             dep_ids = path_ids & set(_params(dep.fn))
             if not dep_ids:
                 continue
             reached = True
+            if param is not None and param in handed and returns_id(dep.fn, dep_ids):
+                # `item: int = Depends(valid_item_id)` returning the id: the handler has it too
+                ids.add(param)
             scan = self.scan(dep, dep_ids, 1, injected=True)
             lookups += scan.facts.lookups
             caller = caller or scan.facts.caller

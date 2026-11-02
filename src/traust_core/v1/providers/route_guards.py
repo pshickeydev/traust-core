@@ -116,7 +116,8 @@ _FLASK_IMPORT = re.compile(
 )
 # A database or ORM session dependency (`get_db_session`, `SessionLocal`), not a session check
 _DB_SESSION_RX = re.compile(
-    r"(?i)^(get_|new_|open_)?(async_?|db_?|database_?|sql_?|orm_?)*session(_?(maker|local|factory|scope|dep))?$"
+    r"(?i)^(get_|new_|open_)?(async_?|db_?|database_?|sql_?|orm_?|read_?|write_?|readonly_?|replica_?)*"
+    r"session(_?(maker|local|factory|scope|dep))?$"
 )
 _FASTAPI_IMPORT = re.compile(r"^\s*(?:from\s+fastapi\b|import\s+fastapi\b)", re.M)
 _PY_WEB_IMPORT = re.compile(
@@ -1308,6 +1309,10 @@ def _middleware_rejects(fn: ast.AST) -> bool:
     return False
 
 
+def _pos_of(node: ast.AST) -> tuple[int, int]:
+    return (getattr(node, "lineno", 0), getattr(node, "col_offset", 0))
+
+
 def _depends_calls(node: ast.AST | None, rel: str) -> list[tuple[str, ast.AST]]:
     """The `Depends(…)` calls of a `dependencies=[…]` argument, with the file they are in."""
     calls = node.elts if isinstance(node, ast.List | ast.Tuple) else []
@@ -1415,6 +1420,7 @@ class _FastApi:
         self.modules, self.functions = index.modules, index.functions
         self.security: set[str] = set()
         self.guard_instances: set[_Key] = set()
+        self._identities: dict[int, bool] = {}
         self.fail_open_instances: set[_Key] = set()
         self.fail_open: set[str] = set()  # schemes built with auto_error=False: a missing
         # credential yields None, not a 401
@@ -1478,15 +1484,12 @@ class _FastApi:
             bare = dependency.removeprefix("Security:").split("[")[0]
             # the authentication dependency itself, not one that merely depends on it
             # (`requested_owner(owner = Query(…), user = Depends(get_current_user))`)
-            itself = (
-                dependency.startswith("Security:")
-                or _FASTAPI_SECURITY.match(_last(bare))
-                or _last(bare) in self.security
-                or self.modules.key(bare, where, self.guard_instances) is not None
-                or bool(_CALLER_DEPENDENCY.search(_last(bare)))
-                or bool(GUARD_RX.search(_last(bare)) and not _DB_SESSION_RX.match(_last(bare)))
-            )
-            if guards and not unguards and itself and not dependency.startswith(_OPTIONAL):
+            if (
+                guards
+                and not unguards
+                and not dependency.startswith(_OPTIONAL)
+                and (self._guard_factory(call) or self._identifies(bare, where))
+            ):
                 callers.add(name)
         args = target.fn.args
         requests = {
@@ -1496,29 +1499,122 @@ class _FastApi:
         }
         return callers, requests
 
-    def _depends_on(self, target: Target) -> tuple[list[Target], list[Opaque]]:
-        """What `target`'s parameters depend on: the checkout functions, each resolved exactly,
-        and the checkout code we can't follow (a class, an instance, an ambiguous name)."""
+    def _guard_factory(self, call: ast.AST) -> bool:
+        """`Depends(OrgPolicyGuard(…))`: a guard built inline by a checkout guard class or
+        factory, trusted as a module-level guard instance is."""
+        if not isinstance(call, ast.Call):
+            return False
+        target = call.args[0] if call.args else _kwarg(call, "dependency")
+        if not isinstance(target, ast.Call):
+            return False
+        ctor = _last(_dotted(target.func))
+        return (
+            (ctor in self.index.classes or ctor in self.functions)
+            and bool(GUARD_RX.search(ctor))
+            and not NON_ENFORCING_RX.search(ctor)
+            and not _lets_missing_in(target)
+        )
+
+    def _identifies(self, bare: str, rel: str) -> bool:
+        """Whether a dependency's value is who is calling: a security scheme or guard instance
+        (its credential), or a function whose every return is built from credentials."""
+        if (
+            _FASTAPI_SECURITY.match(_last(bare))
+            or _last(bare) in self.security
+            or self.modules.key(bare, rel, self.guard_instances) is not None
+        ):
+            return True
+        fn = self.index.callee(bare, rel) if bare else None
+        return fn is not None and fn.node is not None and self._identity(fn.node, fn.path)
+
+    def _identity(self, fn: ast.AST, rel: str, depth: int = 0) -> bool:
+        """`fn` returns the caller: every return is built from its credentials (an authenticating
+        dependency's value; for a caller-named function, its `Request`), never from request data
+        (`return owner` with `owner = Query(…)`), and is never `None`."""
+        if id(fn) in self._identities:
+            return self._identities[id(fn)]
+        self._identities[id(fn)] = False  # a cycle identifies nothing
+        deps = {
+            name: (call, where, ann) for name, call, where, ann in self._param_dependencies(fn, rel)
+        }
+        named = bool(_CALLER_DEPENDENCY.search(getattr(fn, "name", "")))
+        trusted: set[str] = set()
+        untrusted: set[str] = set()
+        args = fn.args  # type: ignore[attr-defined]
+        for a in (*args.posonlyargs, *args.args, *args.kwonlyargs):
+            if a.arg in ("self", "cls"):
+                continue
+            if a.arg in deps:
+                call, where, ann = deps[a.arg]
+                dependency = self._dependency(call, ann)
+                bare = dependency.removeprefix("Security:").split("[")[0]
+                if dependency.startswith(_OPTIONAL):
+                    untrusted.add(a.arg)
+                elif self._guard_factory(call) or (
+                    depth < _DEPTH and self._credential(bare, where, depth + 1)
+                ):
+                    trusted.add(a.arg)
+            elif _last(_dotted(_unquoted(a.annotation))) in ("Request", "HTTPConnection"):
+                (trusted if named else untrusted).add(a.arg)
+            else:
+                untrusted.add(a.arg)  # a path, query or body value
+        own = list(_own_nodes(fn))
+        for n in sorted((n for n in own if isinstance(n, ast.Assign | ast.AnnAssign)), key=_pos_of):
+            if n.value is None:
+                continue
+            targets = n.targets if isinstance(n, ast.Assign) else [n.target]
+            names = {x.id for t in targets for x in ast.walk(t) if isinstance(x, ast.Name)}
+            used = {x.id for x in ast.walk(n.value) if isinstance(x, ast.Name)}
+            if used & untrusted:
+                untrusted |= names
+                trusted -= names
+            elif used & trusted:
+                trusted |= names
+        returns = [n for n in own if isinstance(n, ast.Return | ast.Yield)]
+        ok = bool(returns) and all(
+            r.value is not None
+            and not (isinstance(r.value, ast.Constant) and r.value.value is None)
+            and not ({x.id for x in ast.walk(r.value) if isinstance(x, ast.Name)} & untrusted)
+            and bool({x.id for x in ast.walk(r.value) if isinstance(x, ast.Name)} & trusted)
+            for r in returns
+        )
+        self._identities[id(fn)] = ok
+        return ok
+
+    def _credential(self, bare: str, rel: str, depth: int) -> bool:
+        """A dependency whose value is a credential or the caller."""
+        if (
+            _FASTAPI_SECURITY.match(_last(bare))
+            or _last(bare) in self.security
+            or self.modules.key(bare, rel, self.guard_instances) is not None
+        ):
+            return True
+        fn = self.index.callee(bare, rel) if bare else None
+        return fn is not None and fn.node is not None and self._identity(fn.node, fn.path, depth)
+
+    def _depends_on(self, target: Target) -> tuple[list[tuple[str | None, Target]], list[Opaque]]:
+        """What `target`'s parameters depend on, each with the parameter it fills: the checkout
+        functions, resolved exactly, and the checkout code we can't follow."""
         return self._resolve_dependencies(
             [
-                (where, call, ann)
-                for _, call, where, ann in self._param_dependencies(target.fn, target.rel)
+                (where, call, ann, name)
+                for name, call, where, ann in self._param_dependencies(target.fn, target.rel)
             ]
         )
 
     def _resolve_dependencies(
-        self, calls: list[tuple[str, ast.AST, ast.AST | None]]
-    ) -> tuple[list[Target], list[Opaque]]:
+        self, calls: list[tuple[str, ast.AST, ast.AST | None, str | None]]
+    ) -> tuple[list[tuple[str | None, Target]], list[Opaque]]:
         code = self.ownership().code
-        found: list[Target] = []
+        found: list[tuple[str | None, Target]] = []
         opaque: list[Opaque] = []
-        for where, call, ann in calls:
+        for where, call, ann, param in calls:
             if not isinstance(call, ast.Call):
                 continue
             dependency = call.args[0] if call.args else _kwarg(call, "dependency")
             resolved = code.dependency(where, dependency if dependency is not None else ann)
             if isinstance(resolved, list):
-                found += resolved
+                found += [(param, r) for r in resolved]
             elif resolved is not None:
                 opaque.append(resolved)
         return found, opaque
@@ -1535,7 +1631,9 @@ class _FastApi:
 
             own = self.ownership()
             handler = Target(self.index.paths.get(id(fn), rel), fn)  # type: ignore[arg-type]
-            deps, opaque = self._resolve_dependencies([(where, c, None) for where, c in calls])
+            deps, opaque = self._resolve_dependencies(
+                [(where, c, None, None) for where, c in calls]
+            )
             self._facts[key] = own.handler(handler, set(ids), deps, opaque)
         return self._facts[key]
 
@@ -1725,8 +1823,14 @@ class _FastApi:
                     if raises:
                         # it refuses the missing credential itself
                         u = [x for x in u if not x.startswith(f"{FAIL_OPEN}:")]
-                    if not g and raises and _CALLER_DEPENDENCY.search(_last(bare)):
-                        guards.append(bare)  # `get_current_user(request)` refusing no user
+                    if (
+                        not g
+                        and raises
+                        and _CALLER_DEPENDENCY.search(_last(bare))
+                        and self._identity(fn.node, fn.path)
+                    ):
+                        # `get_current_user(request)`: refuses, and returns who is calling
+                        guards.append(bare)
                     guards += [f"{bare}>{x}" for x in g]
                     unguards += [f"{bare}>{x}" for x in u]
         return _unique(guards), sorted(set(unguards))

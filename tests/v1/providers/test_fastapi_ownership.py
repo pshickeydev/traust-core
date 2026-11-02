@@ -507,8 +507,8 @@ def test_the_evidence_names_the_record_and_its_owner(app: dict) -> None:
         # a dependency named for the caller that refuses a missing one
         (
             "",
-            "def get_current_user(request):\n    if not request.headers:\n"
-            "        raise HTTPException(status_code=401)\n    return 1\n",
+            "def get_current_user(request: Request):\n    if not request.headers:\n"
+            "        raise HTTPException(status_code=401)\n    return request.headers['user']\n",
             True,
         ),
         # an instance of a guard class used as a dependency
@@ -524,7 +524,7 @@ def test_what_authenticates_a_fastapi_route(
     tmp_path, middleware: str, dependency: str, guarded: bool
 ) -> None:
     code = (
-        "from fastapi import FastAPI, Depends, HTTPException\n"
+        "from fastapi import FastAPI, Depends, HTTPException, Request\n"
         f"{dependency}\n"
         "app = FastAPI()\n"
         f"{middleware}\n"
@@ -707,3 +707,139 @@ def test_a_path_id_only_a_no_op_dependency_takes_acts_on_nothing(tmp_path: Path)
     )
     assert _row(result, "POST", "/{tenant}/notes")["ownership"] == "n/a"
     assert _row(result, "DELETE", "/{tenant}/notes/{note_id}")["ownership"] == "caller-blind"
+
+
+QODO = """
+from fastapi import APIRouter, Depends, HTTPException, Query, Security
+from sqlmodel import select
+
+from app.auth import CurrentUser, get_current_user, oauth2_scheme
+from app.models import Item, User
+
+router = APIRouter(prefix="/q")
+
+
+def authenticated_user(owner: int, token: str = Depends(oauth2_scheme)):
+    if not token:
+        raise HTTPException(status_code=401)
+    return owner
+
+
+def requested_owner(owner: int = Query(...), user=Security(get_current_user)):
+    return owner
+
+
+def RequireAuth():
+    def dependency(token: str = Depends(oauth2_scheme)):
+        return decode(token)
+
+    return dependency
+
+
+def valid_item_id(item_id: int) -> int:
+    if item_id < 0:
+        raise HTTPException(status_code=422)
+    return item_id
+
+
+@router.get("/raising/{item_id}")
+def raising(item_id: int, session, me=Depends(authenticated_user)):
+    statement = select(Item).where(Item.id == item_id, Item.owner_id == me)
+    item = session.exec(statement).first()
+    if item is None:
+        raise HTTPException(status_code=404)
+    return item
+
+
+@router.get("/secured/{item_id}")
+def secured(item_id: int, session, me: int = Security(requested_owner)):
+    statement = select(Item).where(Item.id == item_id, Item.owner_id == me)
+    item = session.exec(statement).first()
+    if item is None:
+        raise HTTPException(status_code=404)
+    return item
+
+
+@router.get("/factory/{item_id}")
+def factory(item_id: int, session, me=Depends(RequireAuth())):
+    statement = select(Item).where(Item.id == item_id, Item.owner_id == me.id)
+    item = session.exec(statement).first()
+    if item is None:
+        raise HTTPException(status_code=404)
+    return item
+
+
+@router.delete("/validated/{item_id}", dependencies=[Depends(get_current_user)])
+def validated(session, item: int = Depends(valid_item_id)):
+    session.delete(session.get(Item, item))
+
+
+@router.get("/uncalled/{item_id}", dependencies=[Depends(get_current_user)])
+def uncalled(item_id: int, session):
+    def helper():
+        return session.get(Item, item_id)
+
+    return {"ok": True}
+
+
+@router.get("/called/{item_id}", dependencies=[Depends(get_current_user)])
+def called(item_id: int, session):
+    def helper():
+        return session.get(Item, item_id)
+
+    return helper()
+
+
+@router.get("/nested-name/{item_id}")
+def nested_name(item_id: int, session, current_user: CurrentUser):
+    def reset():
+        current_user = None
+        return current_user
+
+    item = session.get(Item, item_id)
+    if item.owner_id != current_user.id:
+        raise HTTPException(status_code=403)
+    return item
+
+
+@router.get("/annotated/{item_id}")
+def annotated(item_id: int, session, current_user: CurrentUser):
+    current_user: User
+    item = session.get(Item, item_id)
+    if item.owner_id != current_user.id:
+        raise HTTPException(status_code=403)
+    return item
+"""
+
+
+@pytest.mark.parametrize(
+    ("method", "pattern", "ownership"),
+    [
+        ("GET", "/q/raising/{item_id}", "caller-blind"),  # returns a request value, not the caller
+        ("GET", "/q/secured/{item_id}", "caller-blind"),  # authenticates, returns a query value
+        ("GET", "/q/factory/{item_id}", "scoped"),  # a guard built inline by a checkout factory
+        ("DELETE", "/q/validated/{item_id}", "caller-blind"),  # the validator hands the id on
+        ("GET", "/q/uncalled/{item_id}", "n/a"),  # a helper never called acts on nothing
+        ("GET", "/q/called/{item_id}", "unknown"),  # a local helper using the id: not followed
+        ("GET", "/q/nested-name/{item_id}", "checked"),  # a nested scope's own `current_user`
+        ("GET", "/q/annotated/{item_id}", "checked"),  # an annotation alone binds nothing
+    ],
+)
+def test_the_caller_and_the_id_come_from_where_qodo_said(
+    tmp_path: Path, method: str, pattern: str, ownership: str
+) -> None:
+    main = (
+        "from fastapi import FastAPI\nfrom app import qodo\n"
+        "app = FastAPI()\napp.include_router(qodo.router)\n"
+    )
+    result = _tree(
+        tmp_path,
+        {
+            "app/__init__.py": "",
+            "app/auth.py": AUTH,
+            "app/models.py": MODELS,
+            "app/qodo.py": QODO,
+            "app/main.py": main,
+        },
+    )
+    assert _row(result, method, pattern)["ownership"] == ownership
