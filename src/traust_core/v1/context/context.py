@@ -1092,4 +1092,7 @@ def _sla_policy(path: Path) -> SlaPolicy:
         contracts.validate("sla-policy", document)
     except DocumentError as e:
         raise ConfigError(f"SLA policy {path}: {e}") from e
-    return SlaPolicy.model_validate(document)
+    try:
+        return SlaPolicy.model_validate(document)
+    except ValueError as e:
+        raise ConfigError(f"SLA policy {path}: {e}") from e

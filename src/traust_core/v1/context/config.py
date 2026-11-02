@@ -28,6 +28,8 @@ def _read_env(name: str | None, field: str) -> str | None:
         return None
     if (value := os.environ.get(name)) is None:
         raise ConfigError(f"{field} names unset variable {name}")
+    if value == "":
+        raise ConfigError(f"{field} names variable {name} that is set but empty")
     return value
 
 

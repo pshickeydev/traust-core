@@ -283,6 +283,10 @@ class CommandSourceProvider:
                     }
                     for row in map(dict, self._api.items(host, f"orgs/{org}/repos?per_page=100"))
                 ]
+            except (ValueError, TypeError) as e:
+                raise SourceError(
+                    f"malformed forge response from list_org: {e}", ComparisonStatus.ERROR
+                ) from e
             except ServiceError as exc:
                 raise self._refused(exc) from exc
         else:

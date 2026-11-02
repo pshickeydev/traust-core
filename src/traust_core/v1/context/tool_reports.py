@@ -349,7 +349,10 @@ def _scanner_json(done: ProcessResult, *, json_first: bool = False) -> Doc:
             f"osv-scanner failed (exit {done.returncode}): "
             + ("; ".join(errors[:3]) or stderr.strip()[-500:])
         )
-    return json.loads(stdout)
+    try:
+        return json.loads(stdout)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"osv-scanner printed invalid JSON (exit {done.returncode}): {e}") from e
 
 
 def _runner(ctx: Context, binaries: Sequence[str], timeout: float) -> ProcessRunner:

@@ -195,7 +195,13 @@ class OidcLogin:
     @cached_property
     def _endpoints(self) -> Mapping[str, str]:
         url = f"{self.issuer.rstrip('/')}/.well-known/openid-configuration"
-        found = json.loads(self._http.get(url))
+        raw = self._http.get(url)
+        try:
+            found = json.loads(raw)
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            raise ServiceError(f"OIDC discovery document is not JSON: {e}") from e
+        if not isinstance(found, dict):
+            raise ServiceError("OIDC discovery document is not a JSON object")
         if not found.get("token_endpoint"):
             raise ServiceError(f"{self.issuer} publishes no token_endpoint")
         return found
@@ -210,14 +216,30 @@ class OidcLogin:
         )
         if status != 200:
             raise AuthenticationError(f"device authorization refused: {_oauth_error(body)}")
-        device = json.loads(body)
-        show(device.get("verification_uri") or device["verification_url"], device["user_code"])
+        try:
+            device = json.loads(body)
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            raise AuthenticationError(f"device authorization returned non-JSON: {e}") from e
+        if not isinstance(device, dict):
+            raise AuthenticationError("device authorization response is incomplete")
+        user_code = device.get("user_code")
+        verification = device.get("verification_uri") or device.get("verification_url")
+        code = device.get("device_code")
+        if not (
+            isinstance(user_code, str)
+            and user_code
+            and verification
+            and isinstance(code, str)
+            and code
+        ):
+            raise AuthenticationError("device authorization response is incomplete")
+        show(verification, user_code)
         interval = float(device.get("interval", 5))
         while True:
             self._sleep(interval)
             form = {
                 "grant_type": DEVICE_CODE_GRANT,
-                "device_code": device["device_code"],
+                "device_code": code,
                 "client_id": self.client_id,
             }
             status, body = self._http.post_form(self._endpoints["token_endpoint"], form)
@@ -253,10 +275,18 @@ class OidcLogin:
         return self._grant(body)
 
     def _grant(self, body: bytes) -> TokenGrant:
-        token = json.loads(body)
+        try:
+            token = json.loads(body)
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            raise AuthenticationError(f"token endpoint returned non-JSON: {e}") from e
+        if not isinstance(token, dict):
+            raise AuthenticationError("token response has no access_token")
+        access_token = token.get("access_token")
+        if not isinstance(access_token, str) or not access_token:
+            raise AuthenticationError("token response has no access_token")
         expires = token.get("expires_in")
         return TokenGrant(
-            access_token=token["access_token"],
+            access_token=access_token,
             refresh_token=token.get("refresh_token"),
             expires_at=None if expires is None else self._clock.now() + timedelta(seconds=expires),
         )

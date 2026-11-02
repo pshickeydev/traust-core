@@ -329,7 +329,10 @@ def load_rule_allowlist(spec: str | None) -> opengrep.RuleAllowlist | None:
         path = Path(spec[1:]).expanduser()
         if not path.is_file():
             raise ValidationError(f"--rule-allow: no such file {path}")
-        text = path.read_text(encoding="utf-8")
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as e:
+            raise ValidationError(f"--rule-allow: {path} unreadable: {e}") from e
         try:
             doc = yaml.safe_load(text)
         except yaml.YAMLError:

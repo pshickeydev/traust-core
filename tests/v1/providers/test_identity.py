@@ -279,7 +279,7 @@ class Idp:
 
     def __init__(self, base: str, replies: list[tuple[int, dict[str, Any]]]) -> None:
         self.base, self.replies, self.forms = base, replies, []
-        self.device_endpoint, self.device_reply = True, (200, {})
+        self.device_endpoint, self.device_reply = True, None
 
 
 @pytest.fixture
@@ -306,7 +306,7 @@ def idp() -> Iterator[Idp]:
             server = state["idp"]
             form = self.rfile.read(int(self.headers["Content-Length"])).decode()
             server.forms.append(dict(p.split("=", 1) for p in form.split("&")))
-            if self.path == "/device" and server.device_reply[0] != 200:
+            if self.path == "/device" and server.device_reply:
                 self._reply(*server.device_reply)
             elif self.path == "/device":
                 self._reply(
@@ -398,6 +398,27 @@ def test_a_device_login_needs_the_providers_device_endpoint(idp: Idp) -> None:
 def test_a_refused_device_authorization_fails(idp: Idp) -> None:
     idp.device_reply = (400, {"error": "unauthorized_client"})
     with pytest.raises(AuthenticationError, match="unauthorized_client"):
+        login(idp).device_code(lambda uri, code: None)
+
+
+@pytest.mark.parametrize(
+    "missing",
+    [
+        {"device_code": "dc", "user_code": "ABCD", "interval": 0},
+        {"device_code": "dc", "interval": 0, "verification_uri": "uri"},
+        {"user_code": "ABCD", "interval": 0, "verification_uri": "uri"},
+    ],
+)
+def test_an_incomplete_device_authorization_is_refused(idp: Idp, missing: dict[str, Any]) -> None:
+    idp.device_reply = (200, missing)
+    with pytest.raises(AuthenticationError, match="incomplete"):
+        login(idp).device_code(lambda uri, code: None)
+
+
+@pytest.mark.parametrize("missing", [None, ""])
+def test_a_null_access_token_is_refused(idp: Idp, missing: str | None) -> None:
+    idp.replies.append((200, {"access_token": missing}))
+    with pytest.raises(AuthenticationError, match="access_token"):
         login(idp).device_code(lambda uri, code: None)
 
 
