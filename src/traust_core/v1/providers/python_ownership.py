@@ -624,8 +624,14 @@ class _Walk:
 
     # ---- the walk
     def run(self) -> _Scan:
-        nodes = (n for n in ast.walk(self.fn) if isinstance(n, ast.Call | ast.Subscript))
-        for n in sorted(nodes, key=_pos):
+        nodes = sorted(
+            (n for n in ast.walk(self.fn) if isinstance(n, ast.Call | ast.Subscript)), key=_pos
+        )
+        # query roots first, so a chain (`select(M).where(…)`) is read as one query
+        for n in nodes:
+            if isinstance(n, ast.Call) and (record := self.query_record(n)):
+                self.query(n, record)
+        for n in nodes:
             if isinstance(n, ast.Call):
                 self.call(n)
             else:
@@ -640,6 +646,12 @@ class _Walk:
             self.statement(stmt, body[k + 1 :])
         returns = [s for s in body if any(isinstance(n, ast.Return) for n in ast.walk(s))]
         return self.result(_pos(returns[0]) if returns else None, self.pure_read(body))
+
+    def query_record(self, call: ast.Call) -> str | None:
+        """`select(Item)`, `session.query(Item)`, `delete(Item)`: the record a query reads."""
+        if _call_name(call) not in _QUERY_ROOTS or not call.args:
+            return None
+        return self.code.record(self.rel, call.args[0])
 
     def chain(self, call: ast.Call) -> list[ast.Call]:
         """`call` and the method calls built on it (`select(M).where(…).limit(1)`), in order."""
@@ -720,14 +732,8 @@ class _Walk:
         if id(call) in self.consumed:
             return
         name = _call_name(call)
-        if (
-            name in _QUERY_ROOTS
-            and call.args
-            and (record := self.code.record(self.rel, call.args[0]))
-        ):
-            self.query(call, record)
-            return
-        values = _values(call)
+        # a query passed to be run (`session.exec(select(…)…)`) is already its own lookup
+        values = [v for v in _values(call) if id(_unawait(v)) not in self.consumed]
         receiver = call.func.value if isinstance(call.func, ast.Attribute) else None
         if not any(_names(v) & self.ids for v in values):
             # `map(lambda i: delete(i), ids)`: an id handed to a function value
