@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import os
+from ipaddress import ip_address
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 
 import pydantic
 import sqlalchemy as sa
@@ -50,8 +52,55 @@ class DatabaseConfig(_Model):
         return url.set(password=pw) if (pw := self.password()) else url
 
 
+class S3ArtifactsConfig(_Model):
+    bucket: str = pydantic.Field(min_length=1)
+    prefix: str = ""
+    endpoint_url: str | None = pydantic.Field(
+        default=None,
+        pattern=(
+            r"^https?://(?:[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?"
+            r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)*|"
+            r"\[[0-9A-Fa-f:.]+\])(?::[0-9]{1,5})?/?$"
+        ),
+    )
+    region: str | None = pydantic.Field(default=None, min_length=1)
+    access_key_env: str | None = pydantic.Field(default=None, pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")
+    secret_key_env: str | None = pydantic.Field(default=None, pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+    @pydantic.model_validator(mode="after")
+    def _paired_credentials(self) -> S3ArtifactsConfig:
+        if (self.access_key_env is None) != (self.secret_key_env is None):
+            raise ValueError("artifacts.s3 credentials must name both environment variables")
+        return self
+
+    @pydantic.model_validator(mode="after")
+    def _secure_endpoint(self) -> S3ArtifactsConfig:
+        if self.endpoint_url is not None and self.endpoint_url.startswith("http://"):
+            host = urlsplit(self.endpoint_url).hostname
+            try:
+                loopback = ip_address(host or "").is_loopback
+            except ValueError:
+                loopback = host == "localhost"
+            if not loopback:
+                raise ValueError("artifacts.s3.endpoint_url requires HTTPS outside loopback")
+        return self
+
+    def credentials(self) -> tuple[str | None, str | None]:
+        return (
+            _read_env(self.access_key_env, "artifacts.s3.access_key_env"),
+            _read_env(self.secret_key_env, "artifacts.s3.secret_key_env"),
+        )
+
+
 class ArtifactsConfig(_Model):
     path: Path = Path("artifacts")
+    s3: S3ArtifactsConfig | None = None
+
+    @pydantic.model_validator(mode="after")
+    def _one_store(self) -> ArtifactsConfig:
+        if self.s3 is not None and "path" in self.model_fields_set:
+            raise ValueError("artifacts.path and artifacts.s3 cannot both be set")
+        return self
 
 
 class ProcessConfig(_Model):
@@ -308,7 +357,9 @@ class Config(_Model):
         return _read_env(self.review.valve_salt_env, "review.valve_salt_env")
 
     def artifacts_path(self) -> Path:
-        """Where artifact bytes live: a relative `artifacts.path` is under `home`, never the cwd."""
+        """Where local artifact bytes live; relative paths are under home, never the cwd."""
+        if self.artifacts.s3 is not None:
+            raise ConfigError("artifacts.path is unavailable when artifacts.s3 is configured")
         path = self.artifacts.path.expanduser()
         return path if path.is_absolute() else self.home / path
 

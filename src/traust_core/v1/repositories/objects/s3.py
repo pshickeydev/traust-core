@@ -6,6 +6,7 @@ The caller builds the boto3 client, so endpoint and credentials stay deployment 
 from __future__ import annotations
 
 from collections.abc import Iterable, Iterator
+from contextlib import closing
 from typing import Literal, Protocol, TypedDict
 
 from traust_core.v1.errors import ConfigError, NotFoundError, RepositoryError, ValidationError
@@ -49,6 +50,29 @@ class S3Client(Protocol):
 
 
 class S3ObjectStore:
+    @classmethod
+    def from_settings(
+        cls,
+        bucket: str,
+        *,
+        prefix: str = "",
+        endpoint_url: str | None = None,
+        region: str | None = None,
+        access_key: str | None = None,
+        secret_key: str | None = None,
+    ) -> S3ObjectStore:
+        import boto3
+
+        options: dict[str, str] = {}
+        if endpoint_url is not None:
+            options["endpoint_url"] = endpoint_url
+        if region is not None:
+            options["region_name"] = region
+        if access_key is not None and secret_key is not None:
+            options["aws_access_key_id"] = access_key
+            options["aws_secret_access_key"] = secret_key
+        return cls(bucket, client=boto3.client("s3", **options), prefix=prefix)
+
     def __init__(self, bucket: str, *, client: S3Client, prefix: str = "") -> None:
         self._bucket = bucket
         self._client = client
@@ -61,8 +85,18 @@ class S3ObjectStore:
     def _probe_bucket(self) -> None:
         self._client.list_objects_v2(Bucket=self._bucket, Prefix=self._base, MaxKeys=1)
 
-    def _is_missing(self, error: ClientError) -> bool:
+    def _is_missing(self, error: ClientError, key: ObjectKey) -> bool:
         code = error.response.get("Error", {}).get("Code")
+        if code in {"AccessDenied", "403"}:
+            try:
+                listed = self._client.list_objects_v2(
+                    Bucket=self._bucket, Prefix=self._name(key), MaxKeys=1
+                )
+            except (BotoCoreError, ClientError) as e:
+                raise RepositoryError(f"S3ObjectStore: check {key} failed") from e
+            if not isinstance(listed, dict):
+                raise RepositoryError(f"S3ObjectStore: check {key} returned an invalid listing")
+            return not any(obj["Key"] == self._name(key) for obj in listed.get("Contents", ()))
         if code in _AMBIGUOUS_MISSING:
             try:
                 self._probe_bucket()
@@ -84,10 +118,13 @@ class S3ObjectStore:
 
     def _read(self, key: ObjectKey) -> bytes:
         try:
-            return self._client.get_object(Bucket=self._bucket, Key=self._name(key))["Body"].read()
+            with closing(
+                self._client.get_object(Bucket=self._bucket, Key=self._name(key))["Body"]
+            ) as body:
+                return body.read()
         except ClientError as e:
-            if self._is_missing(e):
-                raise NotFoundError(f"artifact {key}") from None
+            if self._is_missing(e, key):
+                raise NotFoundError(f"artifact {key}") from e
             raise RepositoryError(f"S3ObjectStore: read {key} failed") from e
         except BotoCoreError as e:
             raise RepositoryError(f"S3ObjectStore: read {key} failed") from e
@@ -104,7 +141,7 @@ class S3ObjectStore:
         try:
             self._client.head_object(Bucket=self._bucket, Key=self._name(key))
         except ClientError as e:
-            if self._is_missing(e):
+            if self._is_missing(e, key):
                 return False
             raise RepositoryError(f"S3ObjectStore: head {key} failed") from e
         except BotoCoreError as e:
