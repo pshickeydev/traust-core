@@ -12,7 +12,13 @@ from dataclasses import dataclass, field
 from traust_core.v1.models.code_facts import RouteFamily
 from traust_core.v1.models.common import CodeSpan, RepoPath
 from traust_core.v1.providers.route_guards import _guards_in, _mark, _Row, _row, _unique
-from traust_core.v1.providers.route_ownership import OWNER_FIELD_RX, HandlerFacts, Lookup
+from traust_core.v1.providers.route_ownership import (
+    OWNER_CHECK_RX,
+    OWNER_FIELD_RX,
+    HandlerFacts,
+    Lookup,
+    owner_field,
+)
 from traust_core.v1.providers.syntax import Node, Parsed, walk
 from traust_core.v1.providers.syntax import java_parser as parser
 from traust_core.v1.providers.tree import TreeFile
@@ -40,7 +46,17 @@ _GUARD_ANNOTATIONS = (
 )
 # Spring enforces these only once method security is enabled; JAX-RS containers enforce them.
 _METHOD_SECURITY_ANNOTATIONS = ("PreAuthorize", "PostAuthorize", "Secured", "RolesAllowed")
-_METHOD_SECURITY = re.compile(r"@Enable(?:Global|Reactive)?MethodSecurity\b")
+_METHOD_SECURITY = re.compile(r"Enable(Global|Reactive)?MethodSecurity")
+_TEST_PATH = re.compile(r"(^|/)src/test/|^tests?/")
+# the annotation family Spring enables each method-security annotation with
+_FAMILY = {
+    "PreAuthorize": "prepost",
+    "PostAuthorize": "prepost",
+    "Secured": "secured",
+    "RolesAllowed": "jsr250",
+    "PermitAll": "jsr250",
+    "DenyAll": "jsr250",
+}
 _FILTER_CHAIN = re.compile(
     r"\b(?:SecurityFilterChain|SecurityWebFilterChain|WebSecurityConfigurerAdapter)\b"
 )
@@ -75,35 +91,90 @@ _CALLER_TYPES = re.compile(
     r"^(Principal|Authentication|\w*AuthenticationToken|Jwt|OAuth2User|OidcUser|UserDetails|"
     r"SecurityContext|SecurityIdentity|JsonWebToken)$"
 )
+# a parameter Spring fills from the authentication without an annotation
+_PARAM_CALLER_TYPES = re.compile(r"^(Principal|Authentication|\w*AuthenticationToken)$")
 _CALLER_ANNOTATIONS = ("AuthenticationPrincipal", "CurrentSecurityContext")
+# framework objects whose `getUserPrincipal()` / `getRemoteUser()` is the authenticated caller
+_REQUEST_TYPES = re.compile(
+    r"^(\w+\.)*(HttpServletRequest|ServletRequest|HttpServletRequestWrapper|SecurityContext"
+    r"|SessionContext|EJBContext|ContainerRequestContext|ServerRequest|ServerWebExchange)$"
+)
 _CALLER_CALLS = re.compile(
     r"\b(SecurityContextHolder|getUserPrincipal|getRemoteUser|getCallerPrincipal)\b"
 )
 _REPOSITORIES = re.compile(r"^\w*(Crud|Jpa|Sorting|Mongo|R2dbc)?Repository(Base)?$|^Panache\w*$")
 _ENTITY_MANAGER_LOOKUPS = ("find", "getReference")
-_LOOKUP_NAME = re.compile(r"^(find|get|load|fetch|read|delete|remove|exists|lookup|select)")
-_AUTHORIZE_NAME = re.compile(r"(?i)^(check|verify|authori[sz]e|assert|ensure|validate|require|can)")
+_LOOKUP_NAME = re.compile(
+    r"^(find|get|load|fetch|read|delete|remove|exists|lookup|select)(?=[A-Z_]|$)"
+)
+# a store call that only reads (`findById`, `getReferenceById`, a map's `get`)
+_READ_NAME = re.compile(r"^(find|get|load|fetch|read|lookup|select|query|search)(?=[A-Z_]|$)")
+# a Spring Data derived query (`findByIdAndOwnerId`) and its predicates
+_DERIVED_QUERY = re.compile(
+    r"(?:find|get|read|query|search|stream|exists|count|delete|remove)\w*?By(\w+?)(?:OrderBy\w+)?"
+)
+_OR_QUERY = re.compile(r"Or[A-Z]")
+_QUERY_OPERATOR = re.compile(
+    r"(Not|Like|Containing|Contains|In|Between|LessThan|LessThanEqual|GreaterThan|GreaterThanEqual"
+    r"|Before|After|Null|True|False|StartingWith|StartsWith|EndingWith|EndsWith|IgnoreCase|Regex"
+    r"|Matches|Exists|Near|Within|Empty)$"
+)
+# the value types an id is converted into (`new DeviceId(…)`), and what's thrown with one
+_ID_TYPE = re.compile(r"^(\w*(Id|ID|Key|Uuid|UUID)|Long|Integer|Short|String|BigInteger|ObjectId)$")
+_THROWN = re.compile(r"\w*(Exception|Error)$")
+# annotations on a repository method that leave its query derived from the name
+_INERT_QUERY_ANNOTATIONS = {
+    "Override",
+    "Nullable",
+    "NonNull",
+    "Transactional",
+    "EntityGraph",
+    "QueryHints",
+    "Cacheable",
+    "Deprecated",
+}
+# how deep a caller value is read before it's taken for not the caller's
+_MAX_DEPTH = 64
+# calls that act on a loaded result, not on the id
+_RESULT_CALLS = frozenset(
+    {"orElseThrow", "orElse", "orElseGet", "get", "map", "flatMap", "filter", "ifPresent"}
+    | {"ifPresentOrElse", "isPresent", "isEmpty", "stream", "toList", "collect", "findFirst"}
+)
+# store calls that take an id with no lookup-shaped name: JPQL parameters, JdbcTemplate
+_QUERY_CALLS = ("setParameter", "queryForObject", "queryForList", "queryForMap", "query", "update")
+# an authorization-shaped helper earns a second hop (never credit by its name)
+_AUTHORIZE_NAME = re.compile(
+    r"^(check|verify|authori[sz]e|assert|ensure|require|validate|enforce|can|has|is|owns)(?=[A-Z_]|$)"
+)
+# a check of the id's form (`validateId`, `checkNotNull`) is presumed not to act on the object
+_VALIDATOR_NAME = re.compile(
+    r"^(validate|check|verify|assert|ensure|require)(Not(Null|Empty|Blank)|Non(Null|Empty|Blank)"
+    r"|Valid|Id|Ids|Uuid|UUID|Param|Parameter|Parameters|Params|Arg|Argument|Arguments|Format"
+    r"|Length|Size|Range|Positive|Input)?$"
+)
+# receivers of an id that don't act on the object
+_INERT_RECEIVERS = re.compile(
+    r"^(log|logger|LOG|LOGGER|System\.(out|err)|Objects|Assert|Preconditions|Validate|String"
+    r"|StringUtils|Math|Integer|Long|UUID|Optional|List|Set|Map|Arrays|Collections)$"
+)
 # a value derived from a path id (`new DeviceId(toUUID(id))`, `UUID.fromString(id)`) is that id
-_CONVERSION = re.compile(r"(?i)^(to\w*|from\w*|parse\w*|valueOf|of|decode|as\w*|uuid\w*)$")
-# method security on the object itself: `#id` (the path id), `returnObject`
-_SPEL_VARIABLE = re.compile(r"#(\w+)")
-_SPEL_OBJECT = re.compile(r"\b(returnObject|filterObject)\b")
-_SPEL_CALLER = re.compile(r"\b(principal|authentication)\b")
-_SPEL_BEAN_CALL = re.compile(r"@\w+\.\w+\(([^)]*)\)")
-# chained calls that narrow what was loaded (`findById(id).filter(i -> owns(i, me))`)
-_FILTERING = ("filter", "where", "and", "eq", "equal")
-_EQUALITY = ("equals", "equalsIgnoreCase", "contentEquals")
-_DENIAL = re.compile(
-    r"\b(FORBIDDEN|NOT_FOUND|UNAUTHORIZED|notFound|forbidden|badRequest|unauthorized|"
-    r"Optional\.empty|status\(\s*(401|403|404)\s*\))"
+_CONVERSION = re.compile(
+    r"^(to[A-Z]\w*|from[A-Z]\w*|parse\w*|valueOf|of|decode|trim|strip|format)$"
 )
-_STATEMENTS = (
-    "expression_statement",
-    "local_variable_declaration",
-    "return_statement",
-    "if_statement",
-    "throw_statement",
-)
+# shape 3: exactly one bean call (`@access.canRead(#id, authentication)`)
+_SPEL_SINGLE_BEAN = re.compile(r'@PreAuthorize\(\s*"\s*@\w+\.\w+\(([^()]*)\)\s*"\s*\)')
+_MAPPING_VERBS = {
+    "GetMapping": False,
+    "PostMapping": True,
+    "PutMapping": True,
+    "DeleteMapping": True,
+    "PatchMapping": True,
+    "GET": False,
+    "POST": True,
+    "PUT": True,
+    "DELETE": True,
+    "PATCH": True,
+}
 
 
 def _name(src: Parsed, ann: Node) -> str:
@@ -352,7 +423,8 @@ def _chains(sources: list[Parsed], consts: _Constants) -> list[_Chain]:
                     patterns = patterns or None
                 else:
                     continue
-                args = src.text(call.child_by_field_name("arguments")).strip("()")[:60]
+                full = src.text(call.child_by_field_name("arguments")).strip("()")
+                args = full[:60] + ("…" if len(full) > 60 else "")
                 chain.rules.append(
                     _Rule(
                         patterns,
@@ -439,20 +511,65 @@ class _Java:
     generated: dict[RouteFamily, list[str]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        self.hierarchies: dict[tuple[str, str], list[_Type]] = {}
+        self.resolved: dict[tuple[str, str], list[_Type]] = {}
         for src in self.sources:
             for t in _types(src):
                 self.types.setdefault(t.name, []).append(t)
         self.consts = _Constants(self.sources)
         self.chains = _chains(self.sources, self.consts)
         texts = [s.file.text for s in self.sources]
-        self.method_security = any(_METHOD_SECURITY.search(t) for t in texts)
+        # `@EnableMethodSecurity` on an annotation of the application's own (`@EnableSecurity`)
+        meta = {
+            src.text(n.child_by_field_name("name")): [
+                (a, node) for a, node in _annotations(src, n).items()
+            ]
+            for src in self.sources
+            if not _TEST_PATH.search(src.file.rel)
+            for n in walk(src.root)
+            if n.type == "annotation_type_declaration"
+        }
+        self.enforced = _enforced(self.types, meta)
         starter = any(_SECURITY_STARTER.search(m.text) for m in self.manifests)
         self.spring_default = starter and not any(_FILTER_CHAIN.search(t) for t in texts)
         self.quarkus = _Quarkus.of(self.files)
         self.app_path = self._application_path()
         self.fields = _record_fields(self.sources)
-        self.repositories = _repository_entities(self.sources)
-        self.caller_methods = _caller_methods(self.sources)
+        self.repositories, self.untyped_repositories = _repository_entities(self.sources)
+        # JPA named queries (`@NamedQuery(name = "Item.findByIdAndOwnerId")`, orm.xml) win over a
+        # query derived from the method name
+        self.named_queries = {
+            m
+            for f in self.files
+            if f.path.suffix in (".java", ".xml")
+            for m in re.findall(r"""name\s*=\s*["'](\w+\.\w+)["']""", f.text)
+        }
+        # shared across every handler: entities, implementations, fields, names, hop scans
+        self.entities = set(self.repositories.values()) | {
+            x.name
+            for ts in self.types.values()
+            for x in ts
+            if {"Entity", "Document", "Table", "MappedSuperclass"} & set(x.annotations)
+        }
+        self.implementations: dict[str, list[_Type]] = {}
+        for ts in self.types.values():
+            for x in ts:
+                if not x.interface and not x.abstract:
+                    for s in {*x.supers, *(h.name for h in self._hierarchy(x)[1:])}:
+                        self.implementations.setdefault(s, []).append(x)
+        # Spring Data fragment implementations (`CardRepositoryImpl`): their queries are custom
+        self.custom_methods: dict[str, set[tuple[str, int]]] = {}
+        for ts in self.types.values():
+            for x in ts:
+                if not x.interface and x.name.endswith("Impl"):
+                    self.custom_methods.setdefault(x.name.removesuffix("Impl"), set()).update(
+                        (x.src.text(m.child_by_field_name("name")), len(_params(x.src, m)))
+                        for m in x.node.child_by_field_name("body").named_children
+                        if m.type == "method_declaration"
+                    )
+        self.field_decls: dict[tuple[str, str], list[tuple[_Type, Node]]] = {}
+        self.scans: dict[tuple[str, int, frozenset[str], frozenset[str], int], _Scan] = {}
+        self.helpers: dict[tuple[str, str], frozenset[str]] = {}
 
     def _application_path(self) -> str:
         paths = {
@@ -465,15 +582,41 @@ class _Java:
         }
         return paths.pop() if len(paths) == 1 else ""
 
-    def _hierarchy(self, t: _Type, seen: frozenset[str] = frozenset()) -> list[_Type]:
+    def _hierarchy(self, t: _Type) -> list[_Type]:
         """`t`, then its superclasses and interfaces found in the checkout, nearest first."""
-        found = [t]
-        for name in t.supers:
-            if name in seen or name == t.name:
-                continue
-            for parent in self.types.get(name, [])[:1]:
-                found += self._hierarchy(parent, seen | {t.name})
-        return found
+        key = (t.src.file.rel, t.name)
+        if key not in self.hierarchies:
+            found: list[_Type] = []
+            seen: set[str] = set()
+            pending = [t]
+            while pending:
+                x = pending.pop()
+                if x.name in seen:
+                    continue
+                seen.add(x.name)
+                found.append(x)
+                pending += reversed(
+                    [p for n in x.supers if len(ps := self.resolve(x.src, n)) == 1 for p in ps]
+                )
+            self.hierarchies[key] = found
+        return self.hierarchies[key]
+
+    def resolve(self, src: Parsed, kind: str) -> list[_Type]:
+        """The checkout types a simple name refers to from `src`: by import, then package."""
+        key = (src.file.rel, kind)
+        if key not in self.resolved:
+            candidates = self.types.get(kind, [])
+            found = candidates
+            if len(candidates) > 1:
+                imported = re.findall(
+                    rf"^\s*import\s+([\w.]+)\.{re.escape(kind)}\s*;", src.file.text, re.M
+                )
+                for wanted in [*imported, _package(src)]:
+                    if matching := [c for c in candidates if _package(c.src) == wanted]:
+                        found = matching
+                        break
+            self.resolved[key] = found
+        return self.resolved[key]
 
     def rows(self) -> list[_Row]:
         rows: list[_Row] = []
@@ -577,7 +720,8 @@ class _Java:
                 if name == "PermitAll":
                     unguards.append("@PermitAll")
                 elif name in _GUARD_ANNOTATIONS:
-                    args = owner.src.text(ann.child_by_field_name("arguments")).strip("()")[:60]
+                    full = owner.src.text(ann.child_by_field_name("arguments")).strip("()")
+                    args = full[:60] + ("…" if len(full) > 60 else "")
                     label = f"@{name}" + (f"({args})" if args else "")
                     if "permitAll" in args:
                         unguards.append(label)
@@ -586,7 +730,7 @@ class _Java:
                     if (
                         family is RouteFamily.SPRING
                         and name in _METHOD_SECURITY_ANNOTATIONS
-                        and not self.method_security
+                        and _FAMILY[name] not in self.enforced
                     ):
                         unguards.append(METHOD_SECURITY_OFF)
         return _unique(guards), sorted(set(unguards))
@@ -631,7 +775,14 @@ class _Java:
                     )
                     _mark(row, None, dynamic or prefix_dynamic, src.file.rel)
                     row.view_class = t.name
-                    row.own(facts, self.fields, deploy_time=CONDITIONAL_CONFIG in row.unguards)
+                    effective = _effective_guards(
+                        family,
+                        self.enforced,
+                        (guards, unguards),
+                        (scope_guards, scope_unguards),
+                        (g, u),
+                    )
+                    row.own(facts, self.fields, guards=effective)
                     rows.append(row)
         return rows
 
@@ -661,11 +812,74 @@ class _Java:
         return _unique(scope), opened
 
 
+def _effective_guards(
+    family: RouteFamily,
+    enforced: frozenset[str],
+    method: tuple[list[str], list[str]],
+    scope: tuple[list[str], list[str]],
+    config: tuple[list[str], list[str]],
+) -> list[str]:
+    """The guards that authenticate a route, from (guards, unguards) of the method, its class and
+    the security config: the method's own annotations override the class's, an enforced one
+    overrides an open config, and annotations Spring doesn't enforce count for nothing."""
+
+    def counts(label: str) -> bool:
+        name = label[1:].split("(", 1)[0]
+        return label.startswith("@") and (
+            family is not RouteFamily.SPRING or name not in _FAMILY or _FAMILY[name] in enforced
+        )
+
+    own = [g for g in method[0] if counts(g)]
+    calls = [g for g in method[0] if not g.startswith("@")]
+    annotations = own or [g for g in scope[0] if counts(g)]
+    opened = [u for u in method[1] if counts(u)] or (
+        [] if own else [u for u in scope[1] if counts(u)]
+    )
+    if opened:
+        annotations = []  # `@PermitAll`: method security lets anyone in; the chain still decides
+        if not config[0] or config[1]:
+            return calls
+    if config[1]:
+        # the config opens the route, or which config runs is a deploy-time choice
+        return [*annotations, *calls]
+    return [*annotations, *calls, *config[0]]
+
+
+def _enforced(
+    types: dict[str, list[_Type]], meta: dict[str, list[tuple[str, Node]]]
+) -> frozenset[str]:
+    """The annotation families method security enforces, read from the application's own
+    configuration classes (directly or through one of its annotations): `@EnableMethodSecurity`
+    turns on pre/post by default, `@EnableGlobalMethodSecurity` only what it names."""
+    found = set()
+    for x in (x for ts in types.values() for x in ts if not _TEST_PATH.search(x.src.file.rel)):
+        for name, node in x.annotations.items():
+            for enabling, at in [(name, node), *meta.get(name, [])]:
+                kind = _METHOD_SECURITY.fullmatch(enabling)
+                if kind is None:
+                    continue
+                for flag, family, default in (
+                    ("prePostEnabled", "prepost", kind.group(1) != "Global"),
+                    ("securedEnabled", "secured", False),
+                    ("jsr250Enabled", "jsr250", False),
+                ):
+                    value = re.search(rf"\b{flag}\s*=\s*(true|false)\b", _node_text(at))
+                    if (value.group(1) == "true") if value else default:
+                        found.add(family)
+    return frozenset(found)
+
+
+def _node_text(node: Node) -> str:
+    return (node.text or b"").decode("utf-8", "replace")
+
+
 def _record_fields(sources: list[Parsed]) -> dict[str, tuple[str, ...]]:
     """Each class's and record's field names, inherited ones included, by simple type name. A type
-    whose superclass is outside the checkout is left out unless its own fields name an owner, so
-    it is never taken for ownerless."""
+    that may be owned through another is left out unless it names an owner itself, so never taken
+    for ownerless: its superclass is outside the checkout, it holds or is held by another checkout
+    type (`Patient patient`), or it has subclasses."""
     fields: dict[str, list[str]] = {}
+    held: dict[str, set[str]] = {}
     parents: dict[str, str] = {}
     for src in sources:
         for n in walk(src.root):
@@ -678,65 +892,122 @@ def _record_fields(sources: list[Parsed]) -> dict[str, tuple[str, ...]]:
                     src.text(superclass.named_children[0]).split("<", 1)[0].rsplit(".", 1)[-1]
                 )
             names = fields.setdefault(name, [])
-            if n.type == "record_declaration":
-                params = n.child_by_field_name("parameters")
-                names += [
-                    src.text(p.child_by_field_name("name"))
+            types = held.setdefault(name, set())
+            params = n.child_by_field_name("parameters") if n.type == "record_declaration" else None
+            body = n.child_by_field_name("body")
+            for f in [
+                *(
+                    p
                     for p in (params.named_children if params else [])
                     if p.type == "formal_parameter"
-                ]
-            body = n.child_by_field_name("body")
-            for f in body.named_children if body else []:
-                if f.type == "field_declaration":
-                    names += [
+                ),
+                *(
+                    f
+                    for f in (body.named_children if body else [])
+                    if f.type == "field_declaration"
+                ),
+            ]:
+                types |= {
+                    src.text(k)
+                    for k in walk(f.child_by_field_name("type"))
+                    if k.type == "type_identifier"
+                }
+                names += (
+                    [src.text(f.child_by_field_name("name"))]
+                    if f.type == "formal_parameter"
+                    else [
                         src.text(d.child_by_field_name("name"))
                         for d in f.named_children
                         if d.type == "variable_declarator"
                     ]
+                )
 
-    def resolved(name: str, seen: frozenset[str] = frozenset()) -> list[str] | None:
+    def resolved(
+        name: str, seen: frozenset[str] = frozenset()
+    ) -> tuple[list[str], set[str]] | None:
         parent = parents.get(name)
         if parent is None:
-            return fields[name]
+            return fields[name], held[name]
         if parent not in fields or parent in seen:
             return None
         inherited = resolved(parent, seen | {name})
-        return None if inherited is None else [*fields[name], *inherited]
+        if inherited is None:
+            return None
+        return [*fields[name], *inherited[0]], held[name] | inherited[1]
 
+    held_by_others = {k for name, types in held.items() for k in types if k != name}
+    pointed_at = {
+        re.sub(r"_?id$", "", f, flags=re.I).replace("_", "").lower()
+        for names in fields.values()
+        for f in names
+        if re.search(r"(?<=[a-z])Id$|_id$", f)
+    }
     out = {}
     for name, own in fields.items():
         full = resolved(name)
-        if full is not None:
-            out[name] = tuple(full)
+        owned = any(OWNER_FIELD_RX.match(f) for f in full[0]) if full is not None else False
+        if full is not None and (
+            owned
+            or not (
+                full[1] & fields.keys()
+                or name in held_by_others
+                or name in parents.values()
+                or name.lower() in pointed_at
+            )
+        ):
+            out[name] = tuple(full[0])
         elif any(OWNER_FIELD_RX.match(f) for f in own):
             out[name] = tuple(own)
     return out
 
 
-def _repository_entities(sources: list[Parsed]) -> dict[str, str]:
-    """The entity each checkout repository interface stores (`JpaRepository<Item, Long>`)."""
-    found = {}
+def _repository_entities(sources: list[Parsed]) -> tuple[dict[str, str], set[str]]:
+    """The entity each checkout repository interface stores (`JpaRepository<Item, Long>`, or
+    through a checkout base such as `BaseRepo<Item>`); and the repositories whose entity can't be
+    told (a generic base, two same-named repositories of different entities)."""
+    bases: list[tuple[str, list[tuple[str, str | None]], set[str]]] = []
     for src in sources:
         for n in walk(src.root):
-            if n.type not in _TYPE_DECLS:
+            if n.type != "interface_declaration":
                 continue
+            supers = []
             for g in walk(n):
-                if g.type == "class_body" or g.type == "interface_body":
+                if g.type == "interface_body":
                     break
-                if g.type != "generic_type" or not g.named_children:
+                if g.type not in ("generic_type", "type_identifier") or g.parent is None:
                     continue
-                base = src.text(g.named_children[0]).rsplit(".", 1)[-1]
+                if g.parent.type != "type_list":
+                    continue
+                base = src.text(g.named_children[0] if g.type == "generic_type" else g)
                 args = [c for c in g.named_children[1:] if c.type == "type_arguments"]
-                if _REPOSITORIES.match(base) and args and args[0].named_children:
-                    found[src.text(n.child_by_field_name("name"))] = src.text(
-                        args[0].named_children[0]
-                    ).split("<", 1)[0]
-                    break
-    return found
+                first = args[0].named_children[0] if args and args[0].named_children else None
+                arg = src.text(first).split("<", 1)[0] if first is not None else None
+                supers.append((base.rsplit(".", 1)[-1], arg))
+            params = n.child_by_field_name("type_parameters")
+            names = {
+                src.text(c.named_children[0])
+                for c in (walk(params) if params is not None else [])
+                if c.type == "type_parameter"
+            }
+            bases.append((src.text(n.child_by_field_name("name")), supers, names))
+    entities: dict[str, set[str | None]] = {}
+    while True:
+        before = sum(len(v) for v in entities.values())
+        for name, supers, params in bases:
+            for base, arg in supers:
+                if base in entities or (_REPOSITORIES.match(base) and arg is not None):
+                    inherited = {arg} if arg is not None else entities.get(base, {None})
+                    found = {None if e is None or e in params else e for e in inherited}
+                    entities.setdefault(name, set()).update(found)
+        if sum(len(v) for v in entities.values()) == before:
+            break
+    typed = {n: e for n, es in entities.items() if len(es) == 1 for e in es if e is not None}
+    return typed, set(entities) - set(typed)
 
 
 class _Ownership:
-    """A handler's ownership facts: its path ids, the caller, lookups by id, checks, one hop."""
+    """A handler's ownership facts. Lookups and hand-offs are read anywhere in the body; protection
+    counts only from the allow-listed shapes 1-5 (owner decisions 2026-10-31, 2026-11-02)."""
 
     def __init__(self, java: _Java, t: _Type) -> None:
         self.java, self.type = java, t
@@ -754,342 +1025,1034 @@ class _Ownership:
         mapped = _params(decls[0][0].src, decls[0][1])
         if len(mapped) == len(params):
             params = [(n, k, {**m[2], **a}) for (n, k, a), m in zip(params, mapped, strict=True)]
-        ids = {name for name, _, anns in params if any(a in anns for a in _PATH_ANNOTATIONS)}
-        callers = {n for n, kind, anns in params if _caller(kind, anns)} | self._caller_fields(
-            self.type
+        ids = {n for n, _, anns in params if any(a in anns for a in _PATH_ANNOTATIONS)}
+        ids |= self._path_fields(self.type)
+        callers = {n for n, kind, anns in params if self._caller(kind, anns, param=True)}
+        callers |= self._caller_fields(self.type) - {n for n, _, _ in params}
+        # shape 3: the most specific @PreAuthorize (implementation, then declaration, then class)
+
+        def pre(pairs: list[tuple[_Type, Node]]) -> list[tuple[_Type, Node]]:
+            for o, d in pairs:
+                found = [(o, a) for n, a in _annotations(o.src, d).items() if n == "PreAuthorize"]
+                if found:
+                    return found
+            return []
+
+        security = pre([*reversed(decls), *types]) if "prepost" in self.java.enforced else []
+        covered = {i for o, a in security for i in _bean_check_ids(o.src.text(a), ids)}
+        span = self._span(security[0][0].src, security[0][1]) if security else None
+        scan = self._scan(src, self.type, method, ids, callers, 0, covered)
+        # a command object Spring binds from the request may carry a path id we don't follow
+        bound = any(
+            (not anns or "ModelAttribute" in anns)
+            and kind in self.java.types
+            and not _ID_TYPE.match(kind)
+            and n not in callers
+            for n, kind, anns in params
         )
-        check = next(
-            (
-                self._span(owner.src, ann)
-                for owner, decl in [*decls, *types]
-                for name, ann in _annotations(owner.src, decl).items()
-                if name in ("PreAuthorize", "PostAuthorize")
-                and _object_security(owner.src.text(ann), ids)
-            ),
-            None,
-        )
-        facts = self._body(src, self.type, method, ids, callers, depth=0)
         return HandlerFacts(
-            lookups=facts.lookups,
-            caller=facts.caller,
-            check=check,
-            hop=facts.hop,
-            handoff=facts.handoff,
+            lookups=scan.facts.lookups,
+            caller=scan.facts.caller,
+            check=span if ids and ids <= covered - scan.unstable else None,
+            hop=scan.facts.hop,
+            handoff=scan.facts.handoff or (self._span(src, method) if bound else None),
+            takes_id=bool(ids),
         )
 
     def _span(self, src: Parsed, node: Node) -> CodeSpan:
         return CodeSpan(path=RepoPath(src.file.rel), line=src.line(node))
 
+    def _caller(self, kind: str, annotations: dict[str, Node], *, param: bool) -> bool:
+        """Spring resolves only a `Principal` parameter from the authentication unannotated; any
+        other parameter, or a checkout type sharing a framework name, is request data."""
+        if any(a in annotations for a in _CALLER_ANNOTATIONS):
+            return True
+        if kind in self.java.types:
+            return False
+        if param and "Context" not in annotations:
+            return bool(_PARAM_CALLER_TYPES.match(kind))
+        return bool(_CALLER_TYPES.match(kind))
+
+    def _fields(self, t: _Type) -> list[tuple[_Type, Node]]:
+        """The field declarations of `t` and its superclasses in the checkout."""
+        key = (t.src.file.rel, t.name)
+        if key not in self.java.field_decls:
+            self.java.field_decls[key] = [
+                (h, f)
+                for h in self.java._hierarchy(t)
+                for f in h.node.child_by_field_name("body").named_children
+                if f.type == "field_declaration"
+            ]
+        return self.java.field_decls[key]
+
+    def _field_names(self, h: _Type, f: Node) -> set[str]:
+        return {
+            h.src.text(d.child_by_field_name("name"))
+            for d in f.named_children
+            if d.type == "variable_declarator"
+        }
+
     def _caller_fields(self, t: _Type) -> set[str]:
-        names = set()
-        for f in t.node.child_by_field_name("body").named_children:
-            if f.type != "field_declaration":
-                continue
-            kind = t.src.text(f.child_by_field_name("type")).split("<", 1)[0]
-            if _caller(kind, _annotations(t.src, f)):
-                names |= {
-                    t.src.text(d.child_by_field_name("name"))
-                    for d in f.named_children
-                    if d.type == "variable_declarator"
-                }
-        return names
+        return {
+            n
+            for h, f in self._fields(t)
+            if self._caller(_type_name(h.src, f), _annotations(h.src, f), param=False)
+            for n in self._field_names(h, f)
+        }
+
+    def _path_fields(self, t: _Type) -> set[str]:
+        """JAX-RS resource fields injected from the path (`@PathParam("id") String id;`)."""
+        return {
+            n
+            for h, f in self._fields(t)
+            if any(a in _annotations(h.src, f) for a in _PATH_ANNOTATIONS)
+            for n in self._field_names(h, f)
+        }
 
     def _field_type(self, t: _Type, name: str) -> str | None:
-        for f in t.node.child_by_field_name("body").named_children:
-            if f.type == "field_declaration" and any(
-                d.type == "variable_declarator"
-                and t.src.text(d.child_by_field_name("name")) == name
-                for d in f.named_children
-            ):
-                return t.src.text(f.child_by_field_name("type")).split("<", 1)[0]
+        for h, f in self._fields(t):
+            if name in self._field_names(h, f):
+                return _type_name(h.src, f)
         return None
 
-    def _body(
-        self, src: Parsed, t: _Type, method: Node, ids: set[str], callers: set[str], depth: int
-    ) -> HandlerFacts:
-        body = method.child_by_field_name("body")
-        if body is None or not ids:
-            return HandlerFacts()
+    def _caller_helpers(self, t: _Type) -> frozenset[str]:
+        """No-argument methods of `t`'s own hierarchy whose every return is the caller alone."""
+        key = (t.src.file.rel, t.name)
+        if key in self.java.helpers:
+            return self.java.helpers[key]
+        fields = self._caller_fields(t)
+        nearest: dict[str, tuple[_Type, Node]] = {}
+        for h in self.java._hierarchy(t):
+            for m in h.node.child_by_field_name("body").named_children:
+                if (
+                    m.type == "method_declaration"
+                    and m.child_by_field_name("body") is not None
+                    and not _params(h.src, m)
+                ):
+                    nearest.setdefault(h.src.text(m.child_by_field_name("name")), (h, m))
+        found: frozenset[str] = frozenset()
+        while more := {
+            n
+            for n, (h, m) in nearest.items()
+            if n not in found
+            and _Values(
+                h.src, fields, found, kinds=lambda n, h=h: self._field_type(h, n)
+            ).returns_caller(m.child_by_field_name("body"))
+        }:
+            found |= more
+        self.java.helpers[key] = found
+        return found
 
-        def names(node: Node) -> set[str]:
-            return {src.text(n) for n in walk(node) if n.type == "identifier"}
+    def _resolve(self, src: Parsed, kind: str) -> list[_Type]:
+        return self.java.resolve(src, kind)
 
-        def is_caller(n: Node) -> bool:
-            if n.type == "identifier":
-                return src.text(n) in callers
-            if n.type != "method_invocation":
-                return False
-            receiver = src.text(n.child_by_field_name("object"))
-            name = src.text(n.child_by_field_name("name"))
-            return bool(_CALLER_CALLS.search(src.text(n))) or (
-                receiver in ("", "this", "super") and name in self.java.caller_methods
-            )
+    def _receiver_type(
+        self, src: Parsed, t: _Type, receiver: Node | None, local_types: dict[str, str]
+    ) -> list[_Type]:
+        if receiver is None or src.text(receiver) in ("this", "super"):
+            return [t]
+        text = src.text(receiver).removeprefix("this.")
+        if receiver.type == "object_creation_expression":
+            kind = src.text(receiver.child_by_field_name("type")).split("<", 1)[0]
+        elif receiver.type == "identifier" and text[:1].isupper() and text in self.java.types:
+            kind = text  # a static call on a checkout class
+        else:
+            kind = local_types.get(text) or self._field_type(t, text) or ""
+        return self._resolve(src, kind.rsplit(".", 1)[-1]) if kind else []
 
-        def calls_caller(node: Node) -> bool:
-            return any(is_caller(n) for n in walk(node))
-
-        for d in walk(body):
-            value = d.child_by_field_name("value") if d.type == "variable_declarator" else None
-            if value is None:
-                continue
-            if names(value) & ids and _converts(src, value):
-                ids = ids | {src.text(d.child_by_field_name("name"))}
-            elif calls_caller(value) and not names(value) & ids:
-                callers = callers | {src.text(d.child_by_field_name("name"))}
-        caller = next((self._span(src, n) for n in walk(body) if is_caller(n)), None)
-        lookups: list[Lookup] = []
-        produced: dict[tuple[int, int], list[int]] = {}  # call span -> the lookups it made
-        by_id: dict[str, list[int]] = {}  # path id -> the lookups made with it
-        hop_span = None
-        starts: list[int] = []  # where each lookup's call starts, for ordering
-        handoffs: list[tuple[CodeSpan, set[str], int]] = []  # where an id went unseen, which, at
-
-        for call in (n for n in walk(body) if n.type == "method_invocation"):
-            args = call.child_by_field_name("arguments")
-            if args is None or not names(args) & ids:
-                continue
-            receiver = src.text(call.child_by_field_name("object")).removeprefix("this.")
-            name = src.text(call.child_by_field_name("name"))
-            start = len(lookups)
-            chain = [call]
-            while chain[-1].parent is not None and chain[-1].parent.type == "method_invocation":
-                chain.append(chain[-1].parent)
-            with_caller = calls_caller(args) or any(
-                src.text(c.child_by_field_name("name")) in _FILTERING
-                and c.child_by_field_name("arguments") is not None
-                and calls_caller(c.child_by_field_name("arguments"))
-                for c in chain[1:]
-            )
-            if (
-                name in _ENTITY_MANAGER_LOOKUPS
-                and args.named_children[:1]
-                and (args.named_children[0].type == "class_literal")
-            ):
-                kind = src.text(args.named_children[0]).removesuffix(".class")
-                lookups.append(Lookup(self._span(src, call), with_caller, record_type=kind))
-            elif (kind := self.java.repositories.get(self._field_type(t, receiver) or "")) or (
-                receiver in self.java.fields and receiver[:1].isupper()
-            ):
-                if _LOOKUP_NAME.match(name):
-                    lookups.append(
-                        Lookup(self._span(src, call), with_caller, record_type=kind or receiver)
-                    )
-            elif (target := self._callee(t, receiver, name)) is not None:
-                # one hop, and a second only into an authorization-shaped helper (`checkXxxId`)
-                if depth >= 2 or (depth == 1 and not _AUTHORIZE_NAME.match(name)):
-                    handoffs.append((self._span(src, call), names(args) & ids, call.start_byte))
-                    continue
-                hop_span = hop_span or self._span(src, call)
-                callee_type, callee = target
-                inner = self._hop(src, callee_type, callee, args, ids, callers, depth + 1)
-                # handed the caller, and it uses it: to the route, the lookup is scoped
-                lookups += [
-                    Lookup(x.span, scoped=True, record_type=x.record_type)
-                    if with_caller and (x.scoped or x.checked)
-                    else x
-                    for x in inner.lookups
+    def _callees(
+        self, src: Parsed, t: _Type, call: Node, local_types: dict[str, str]
+    ) -> list[tuple[_Type, Node]] | None:
+        """The checkout methods a call reaches, with exactly its arity: every implementation and
+        overriding subclass. None when overloads of that arity make the target ambiguous."""
+        name = src.text(call.child_by_field_name("name"))
+        arity = len(_arguments(call))
+        receiver = call.child_by_field_name("object")
+        if receiver is not None and src.text(receiver) == "super":
+            targets = [p for n in t.supers if len(ps := self._resolve(t.src, n)) == 1 for p in ps]
+        else:
+            targets = [
+                x
+                for k in self._receiver_type(src, t, receiver, local_types)
+                for x in [
+                    *([] if k.interface or k.abstract else [k]),
+                    *self.java.implementations.get(k.name, []),
                 ]
-                caller = caller or inner.caller
-                if inner.handoff:
-                    handoffs.append((inner.handoff, names(args) & ids, call.start_byte))
-            elif with_caller and _LOOKUP_NAME.match(name):
-                lookups.append(Lookup(self._span(src, call), scoped=True))
-            elif with_caller and _AUTHORIZE_NAME.match(name):
-                if self._enforces(src, call, calls_caller):
-                    lookups.append(Lookup(self._span(src, call), checked=True))
-            elif not receiver[:1].isupper() and _LOOKUP_NAME.match(name):
-                lookups.append(Lookup(self._span(src, call)))
-            made = list(range(start, len(lookups)))
-            starts += [call.start_byte] * len(made)
-            produced[(call.start_byte, call.end_byte)] = made
-            for used in names(args) & ids:
-                by_id.setdefault(used, []).extend(made)
-        checked, checks = self._checked(src, body, produced, calls_caller)
-        verifications = [
-            (used, end)
-            for made, end in checks
-            for used, ids_made in by_id.items()
-            if set(made) & set(ids_made)
-        ]
-        # a scoped or checked lookup in a statement of the body itself verifies its id from there
-        verifications += [
-            (used, end)
-            for used, made in by_id.items()
-            for i in made
-            if (lookups[i].scoped or lookups[i].checked)
-            and (end := _dominating_end(body, starts[i])) is not None
-        ]
-        verified = {
-            used: min(end for u, end in verifications if u == used) for used, _ in verifications
-        }
-        # a verified id is covered from there on: later lookups and hand-offs of it
-        checked |= {
-            i
-            for used, made in by_id.items()
-            if used in verified
-            for i in made
-            if starts[i] >= verified[used]
-        }
-        handoff = next(
-            (
-                span
-                for span, used, at in handoffs
-                if any(u not in verified or at < verified[u] for u in used)
-            ),
-            None,
-        )
-        return HandlerFacts(
-            lookups=tuple(
-                Lookup(
-                    x.span, x.scoped, x.checked or (i in checked and not x.scoped), x.record_type
-                )
-                for i, x in enumerate(lookups)
-            ),
-            caller=caller,
-            hop=hop_span,
-            handoff=handoff,
-        )
-
-    def _checked(
-        self,
-        src: Parsed,
-        body: Node,
-        produced: dict[tuple[int, int], list[int]],
-        calls_caller: Callable[[Node], bool],
-    ) -> tuple[set[int], list[tuple[list[int], int]]]:
-        """Lookups whose loaded record a condition compares with the caller and denies when they
-        differ, and for each check that dominates the rest, those lookups and where it ends."""
-        loaded: dict[str, list[int]] = {}
-        for d in walk(body):
-            value = d.child_by_field_name("value") if d.type == "variable_declarator" else None
-            if value is None:
-                continue
-            made = [i for n in walk(value) for i in produced.get((n.start_byte, n.end_byte), [])]
-            if made:
-                loaded[src.text(d.child_by_field_name("name"))] = made
-        checked: set[int] = set()
-        verifications: list[tuple[list[int], int]] = []
-        for cond in walk(body):
-            if cond.type not in ("if_statement", "ternary_expression"):
-                continue
-            test = cond.child_by_field_name("condition")
-            for var, made in loaded.items():
-                if test is None or not self._guards_record(src, cond, test, var, calls_caller):
+                or [k]
+            ]
+        found: list[tuple[_Type, Node]] = []
+        for target in targets:
+            for h in self.java._hierarchy(target):
+                if h.interface:
                     continue
-                checked.update(made)
-                if (end := _dominating_end(body, test.start_byte)) is not None:
-                    verifications += [(made, end)]
-        return checked, verifications
+                methods = _methods(h, name, arity)
+                if len(methods) > 1:
+                    return None
+                if methods:
+                    if (h, methods[0]) not in found:
+                        found.append((h, methods[0]))
+                    break
+        return found
 
-    def _guards_record(
-        self, src: Parsed, cond: Node, test: Node, var: str, calls_caller: Callable[[Node], bool]
-    ) -> bool:
-        """`cond` compares `var` with the caller for equality and denies on the failing branch."""
-        for cmp in walk(test):
-            sides = _equality_sides(src, cmp)
-            if sides is None:
-                continue
-            left, right = sides
-            if not any(
-                var in _identifiers(src, a) and calls_caller(b)
-                for a, b in ((left, right), (right, left))
-            ):
-                continue
-            negated = (cmp.type == "binary_expression" and "!=" in _operator(src, cmp)) ^ (
-                _negations(cmp, test) % 2 == 1
-            )
-            if cond.type == "ternary_expression":
-                branch = cond.child_by_field_name("consequence" if negated else "alternative")
-                return branch is not None and _denies(src, branch)
-            if negated:
-                return _denies(src, cond.child_by_field_name("consequence"))
-            alternative = cond.child_by_field_name("alternative")
-            after = cond.next_named_sibling
-            return (alternative is not None and _denies(src, alternative)) or (
-                alternative is None and after is not None and _denies(src, after)
-            )
-        return False
+    def _declared(self, repository: str, name: str, arity: int) -> list[tuple[_Type, Node]]:
+        return [
+            (h, m)
+            for r in self._resolve_all(repository)
+            for h in self.java._hierarchy(r)
+            for m in _methods(h, name, arity)
+        ]
 
-    def _enforces(self, src: Parsed, call: Node, calls_caller: Callable[[Node], bool]) -> bool:
-        """An authorization call that refuses by itself (a bare statement, so it throws) or whose
-        result a condition denies on."""
-        parent = call.parent
-        if parent is not None and parent.type == "expression_statement":
-            return True
-        while parent is not None and parent.type not in ("if_statement", "ternary_expression"):
-            parent = parent.parent
-        if parent is None:
+    def _derived_by_name(self, repository: str, entity: str, name: str, arity: int) -> bool:
+        """Spring Data derives the query from the method's name: no declared query (any
+        annotation beyond a few inert ones), default body, named query or custom implementation."""
+        if f"{entity}.{name}" in self.java.named_queries:
             return False
-        test = parent.child_by_field_name("condition")
-        if test is None or not (test.start_byte <= call.start_byte < test.end_byte):
+        if any(
+            (name, arity) in self.java.custom_methods.get(h.name, ())
+            for r in self._resolve_all(repository)
+            for h in self.java._hierarchy(r)
+        ):
             return False
-        negated = _negations(call, test) % 2 == 1
-        if parent.type == "ternary_expression":
-            branch = parent.child_by_field_name("consequence" if negated else "alternative")
-            return branch is not None and _denies(src, branch)
-        if negated:
-            return _denies(src, parent.child_by_field_name("consequence"))
-        alternative = parent.child_by_field_name("alternative")
-        after = parent.next_named_sibling
-        return (alternative is not None and _denies(src, alternative)) or (
-            alternative is None and after is not None and _denies(src, after)
+        return not any(
+            m.child_by_field_name("body") is not None
+            or set(_annotations(h.src, m)) - _INERT_QUERY_ANNOTATIONS
+            for h, m in self._declared(repository, name, arity)
         )
 
-    def _callee(self, t: _Type, receiver: str, name: str) -> tuple[_Type, Node] | None:
-        kind = self._field_type(t, receiver) if receiver not in ("", "this", "super") else t.name
-        for candidate in self.java.types.get(kind or "", []):
-            for h in self.java._hierarchy(candidate):
-                if name in h.methods and not h.interface:
-                    return h, h.methods[name]
-        return None
+    def _owner_query(
+        self, repository: str, entity: str, name: str, values: list[Node], v: _Values
+    ) -> bool:
+        """Shape 1: a derived query of plain equalities, one of them on the owner and handed a
+        caller-only value."""
+        predicates = _derived_predicates(name)
+        if predicates is None or len(predicates) != len(values):
+            return False
+        if not self._derived_by_name(repository, entity, name, len(values)):
+            return False
+        return any(
+            OWNER_CHECK_RX.match(p) and v.derived(values[k]) for k, p in enumerate(predicates)
+        )
 
-    def _hop(
+    def _resolve_all(self, kind: str) -> list[_Type]:
+        return self.java.types.get(kind.rsplit(".", 1)[-1], [])
+
+    def _scan(
         self,
         src: Parsed,
         t: _Type,
-        callee: Node,
-        args: Node,
+        method: Node,
         ids: set[str],
         callers: set[str],
         depth: int,
-    ) -> HandlerFacts:
-        params = [n for n, _, _ in _params(t.src, callee)]
-        values = [a for a in args.named_children if a.type != "comment"]
-        inner_ids = {
-            p
-            for p, v in zip(params, values, strict=False)
-            if {src.text(n) for n in walk(v) if n.type == "identifier"} & ids
-        }
+        covered: set[str] | None = None,
+    ) -> _Scan:
+        body = method.child_by_field_name("body")
+        if body is None or not ids:
+            # a method we can't read (abstract), or an id reaching the handler some way we don't
+            # follow (a command object, a @BeanParam): never settle it
+            return _Scan(HandlerFacts(handoff=self._span(src, method)))
+        return _Walk(self, src, t, method, body, ids, callers, depth, covered or set()).run()
+
+    def _hop(
+        self, walk: _Walk, target: _Type, callee: Node, call: Node
+    ) -> tuple[_Scan, dict[str, str]]:
+        """The callee's facts, with its parameters mapped by position from the call's arguments;
+        and the outer path id each parameter is exactly."""
+        params = [n for n, _, _ in _params(target.src, callee)][: len(_arguments(call))]
+        values = _arguments(call)[: len(params)]
+        inner_ids = {p for p, v in zip(params, values, strict=True) if walk.names(v) & walk.ids}
         inner_callers = {
             p
-            for p, v in zip(params, values, strict=False)
-            if {src.text(n) for n in walk(v) if n.type == "identifier"} & callers
-            or _CALLER_CALLS.search(src.text(v))
-        } | self._caller_fields(t)
-        facts = self._body(t.src, t, callee, inner_ids, inner_callers, depth)
-        returns = t.src.text(callee.child_by_field_name("type")).split("<", 1)[0]
-        record = returns if returns in self.java.fields else None
-        return HandlerFacts(
-            lookups=tuple(
-                Lookup(x.span, x.scoped, x.checked, x.record_type or record) for x in facts.lookups
+            for p, v in zip(params, values, strict=True)
+            if p not in inner_ids and walk.v.derived(v)
+        } | (self._caller_fields(target) - set(params))
+        key = (
+            target.src.file.rel,
+            callee.start_byte,
+            frozenset(inner_ids),
+            frozenset(inner_callers),
+            walk.depth + 1,
+        )
+        if key not in self.java.scans:
+            self.java.scans[key] = self._scan(
+                target.src, target, callee, inner_ids, inner_callers, walk.depth + 1
+            )
+        scan = self.java.scans[key]
+        exact = {p: r for p, v in zip(params, values, strict=True) if (r := walk.exact(v))}
+        return scan, exact
+
+
+@dataclass
+class _Scan:
+    facts: HandlerFacts
+    verified: set[str] = field(default_factory=set)  # parameters verified before any return
+    owned_or_null: dict[str, int] = field(default_factory=dict)  # parameters returned if owned
+    unstable: set[str] = field(default_factory=set)  # ids reassigned in the body
+    reads: tuple[bool, ...] = ()  # per lookup: a read, not a write
+    covers: tuple[set[str] | None, ...] = ()  # per lookup: the parameters it is exactly by
+    handoff_cover: set[str] | None = None
+    pure_read: bool = False  # the body is one read, returned
+
+
+class _Values:
+    """Which values in one method body come from the caller alone."""
+
+    def __init__(
+        self,
+        src: Parsed,
+        callers: set[str],
+        helpers: frozenset[str],
+        params: frozenset[str] = frozenset(),
+        kinds: Callable[[str], str | None] = lambda _: None,
+    ) -> None:
+        self.src, self.callers, self.helpers, self.params = src, set(callers), helpers, params
+        self.kinds = kinds  # the declared type of a parameter, local or field
+        self.locals: set[str] = set()
+
+    def bind(self, body: Node) -> set[str]:
+        """Adds the body's caller-only locals, dropping any caller it reassigns or shadows; returns
+        the names it assigns."""
+        src = self.src
+        targets = [
+            src.text(a.child_by_field_name("left") or a.named_children[0]).removeprefix("this.")
+            for a in walk(body)
+            if a.type in ("assignment_expression", "update_expression") and a.named_children
+        ]
+        assigned = {x for x in targets if "." not in x}
+        # a caller object written to (`me.name = x`, `me.setName(x)`) is no longer the caller
+        mutated = {x.split(".", 1)[0] for x in targets if "." in x} | {
+            src.text(c.child_by_field_name("object"))
+            for c in walk(body)
+            if c.type == "method_invocation"
+            and src.text(c.child_by_field_name("name")).startswith("set")
+            and c.child_by_field_name("object") is not None
+        }
+        declared: dict[str, list[Node | None]] = {}
+        for d in walk(body):
+            if d.type == "variable_declarator":
+                name = src.text(d.child_by_field_name("name"))
+                declared.setdefault(name, []).append(d.child_by_field_name("value"))
+        shadowed = {
+            src.text(n)
+            for d in walk(body)
+            if d.type in ("lambda_expression", "enhanced_for_statement", "catch_formal_parameter")
+            for n in (
+                [d.child_by_field_name("name")]
+                if d.type != "lambda_expression"
+                else walk(d.child_by_field_name("parameters"))
+            )
+            if n is not None and n.type == "identifier"
+        }
+        self.locals = set(declared) | shadowed | assigned
+        base = self.callers - assigned - mutated - set(declared) - shadowed
+        found: set[str] = set()
+        while True:
+            self.callers = base | found
+            more = {
+                n
+                for n, values in declared.items()
+                if n not in found
+                and n not in assigned | shadowed | mutated
+                and all(v is not None and self.derived(v) for v in values)
+            }
+            if not more:
+                return assigned
+            found |= more
+
+    def returns_caller(self, body: Node) -> bool:
+        self.bind(body)
+        returns = [r for r in walk(body) if r.type == "return_statement"]
+        return bool(returns) and all(
+            r.named_children and self.derived(r.named_children[0]) for r in returns
+        )
+
+    def is_caller(self, n: Node) -> bool:
+        """A direct read of the caller: a caller variable, `SecurityContextHolder`, a caller
+        helper of the class, `request.getUserPrincipal()`."""
+        if n.type == "identifier":
+            return self.src.text(n) in self.callers
+        if n.type != "method_invocation":
+            return False
+        receiver = n.child_by_field_name("object")
+        name = self.src.text(n.child_by_field_name("name"))
+        if receiver is None or self.src.text(receiver) in ("this", "super"):
+            return name in self.helpers and not _arguments(n)
+        if self.src.text(receiver) == "SecurityContextHolder":
+            return True
+        # `request.getUserPrincipal()`: only on the caller or a framework request or context
+        text = self.src.text(receiver).removeprefix("this.")
+        return (
+            bool(_CALLER_CALLS.match(name))
+            and not _arguments(n)
+            and (text in self.callers or bool(_REQUEST_TYPES.match(self.kinds(text) or "")))
+        )
+
+    def derived(self, node: Node | None, depth: int = 0) -> bool:
+        """`me.getName()`, `getCurrentUser().getTenantId()`, `"t:" + me.getName()`: a value
+        built only from the caller and literals (never a ternary, a fallback or another input)."""
+        node = _unparen(node)
+        if node is None or depth > _MAX_DEPTH:
+            return False  # too deep to read: not the caller
+        if self.is_caller(node):
+            return True
+        kind = node.type
+        if kind == "cast_expression":
+            return self.derived(node.child_by_field_name("value"), depth + 1)
+        if kind == "field_access":
+            obj = node.child_by_field_name("object")
+            if self.src.text(obj) in ("this", "super"):
+                return self.src.text(node.child_by_field_name("field")) in self.callers
+            return self.derived(obj, depth + 1)
+        if kind == "binary_expression" and _operator(self.src, node) == "+":
+            sides = [node.child_by_field_name("left"), node.child_by_field_name("right")]
+            return any(self.derived(s, depth + 1) for s in sides) and all(
+                self.derived(s, depth + 1) or _literal(s) for s in sides
+            )
+        if kind in ("method_invocation", "object_creation_expression"):
+            args = _arguments(node)
+            obj = node.child_by_field_name("object") if kind == "method_invocation" else None
+            if kind == "object_creation_expression" or (
+                obj is not None and obj.type == "identifier" and self.src.text(obj)[:1].isupper()
+            ):
+                # a static conversion or a value type of the caller's values
+                return bool(args) and all(self.derived(a, depth + 1) for a in args)
+            if obj is not None and self.derived(obj, depth + 1):
+                return all(self.derived(a, depth + 1) or _literal(a) for a in args)
+            # a resolver handed only the caller (`tenants.of(auth)`): trusted (owner decision)
+            return (
+                obj is not None
+                and obj.type == "identifier"
+                and self.src.text(obj)[:1].islower()
+                # an injected field, never a local or parameter the request may have chosen
+                and self.src.text(obj) not in self.params | self.locals
+                and bool(args)
+                and all(self.derived(a, depth + 1) for a in args)
+            )
+        return False
+
+
+class _Walk:
+    """One method body: its lookups by id (with record types), hand-offs, and the ids each
+    allow-listed statement directly in the body verifies from its end on."""
+
+    def __init__(
+        self,
+        o: _Ownership,
+        src: Parsed,
+        t: _Type,
+        method: Node,
+        body: Node,
+        ids: set[str],
+        callers: set[str],
+        depth: int,
+        covered: set[str],
+    ) -> None:
+        self.o, self.src, self.t, self.method, self.body = o, src, t, method, body
+        self.depth = depth
+        params = _params(src, method)
+        self.params = {n for n, _, _ in params}
+        self.local_types: dict[str, str] = {}
+        for d in walk(body):
+            if d.type == "local_variable_declaration":
+                kind = src.text(d.child_by_field_name("type")).split("<", 1)[0]
+                for v in d.named_children:
+                    if v.type == "variable_declarator":
+                        self.local_types[src.text(v.child_by_field_name("name"))] = kind
+        kinds = {n: kind for n, kind, _ in params}
+        self.v = _Values(
+            src,
+            callers,
+            o._caller_helpers(t),
+            frozenset(self.params),
+            kinds=lambda n: kinds.get(n) or self.local_types.get(n) or o._field_type(t, n),
+        )
+        assigned = self.v.bind(body)
+        # each id name, and the path id it holds exactly (`Long key = Long.valueOf(raw)`); a value
+        # merely built from an id (`f ? id : 0L`, `"k" + id`) holds an id of its own
+        self.root = {i: i for i in ids}
+        self.ids = set(ids)
+        self.loaded: dict[tuple[int, int], bool] = {}
+        declared: dict[str, int] = {}
+        for d in walk(body):
+            if d.type == "variable_declarator":
+                name, value = (
+                    src.text(d.child_by_field_name("name")),
+                    d.child_by_field_name("value"),
+                )
+                declared[name] = declared.get(name, 0) + 1
+            elif d.type == "assignment_expression":
+                name, value = (
+                    src.text(d.child_by_field_name("left")),
+                    d.child_by_field_name("right"),
+                )
+            elif d.type == "enhanced_for_statement":
+                value = d.child_by_field_name("value")
+                if value is not None and self.names(value) & self.ids:
+                    name = src.text(d.child_by_field_name("name"))
+                    self.root[name] = name  # an element of an id list holds an id of its own
+                    self.ids.add(name)
+                continue
+            else:
+                continue
+            if value is not None and self.names(value) & self.ids and not self.loads(value):
+                self.root[name] = self.exact(value) or name
+                self.ids.add(name)
+        # a name declared twice (in sibling blocks) holds no one id
+        twice = {n for n, c in declared.items() if c > 1}
+        for name in twice & self.ids:
+            self.root[name] = name
+        moved = (assigned | twice) & self.ids
+        self.unstable = moved | {self.root[n] for n in moved}
+        self.lookups: list[Lookup] = []
+        self.cover: list[set[str] | None] = []  # the path ids each lookup is by, when exact
+        self.starts: list[int] = []
+        self.direct: set[int] = set()  # lookups a store call makes itself (not through a hop)
+        self.reads: list[bool] = []
+        self.made: dict[tuple[int, int], list[int]] = {}  # call span -> lookups it made
+        self.hop_verified: dict[tuple[int, int], set[str]] = {}
+        self.hop_owned_or_null: dict[tuple[int, int], set[str]] = {}
+        self.handoffs: list[tuple[CodeSpan, set[str] | None, int]] = []
+        self.hop: CodeSpan | None = None
+        self.caller = next((o._span(src, n) for n in walk(body) if self.v.is_caller(n)), None)
+        self.verified: dict[str, int] = dict.fromkeys(covered & self.ids, body.start_byte)
+        self.owned_or_null: dict[str, int] = {}
+        # `@PathVariable("id") Item item`: Spring loads the entity by the path id itself
+        for n, kind, _ in params:
+            if n in ids and kind in o.java.entities:
+                self.add(method, Lookup(o._span(src, method), record_type=kind), cover={n})
+
+    # ---- small helpers
+    def names(self, node: Node | None) -> set[str]:
+        return _identifiers(self.src, node)
+
+    def exact(self, node: Node | None) -> str | None:
+        """The path id a value is exactly: the id, a cast or conversion of it (`toUUID(id)`,
+        `new DeviceId(…)`), else None."""
+        node = _unparen(node)
+        if node is None:
+            return None
+        if node.type == "identifier":
+            return self.root.get(self.src.text(node))
+        if node.type == "cast_expression":
+            return self.exact(node.child_by_field_name("value"))
+        args = (
+            _arguments(node)
+            if node.type in ("method_invocation", "object_creation_expression")
+            else []
+        )
+        if node.type == "method_invocation" and _CONVERSION.match(
+            self.src.text(node.child_by_field_name("name"))
+        ):
+            obj = node.child_by_field_name("object")
+            if obj is not None and not args and (found := self.exact(obj)):
+                return found
+            if len(args) == 1 and (obj is None or _static(self.src, obj)):
+                return self.exact(args[0])
+        if node.type == "object_creation_expression" and len(args) == 1:
+            kind = _simple_type(self.src, node)
+            return self.exact(args[0]) if _ID_TYPE.match(kind) else None
+        return None
+
+    def exact_ids(self, call: Node) -> set[str] | None:
+        """The path ids a call is handed, when every id-carrying argument is exactly one."""
+        roots = [self.exact(v) for v in _arguments(call) if self.names(v) & self.ids]
+        return None if None in roots else set(roots)  # type: ignore[arg-type]
+
+    def loads(self, value: Node) -> bool:
+        """Whether a value is (or wraps) a call that may load something with the id."""
+        key = (value.start_byte, value.end_byte)
+        if key not in self.loaded:
+            self.loaded[key] = self._loads(value)
+        return self.loaded[key]
+
+    def _loads(self, value: Node) -> bool:
+        return any(
+            n.type == "method_invocation"
+            and self.names(n.child_by_field_name("arguments")) & self.ids
+            and not _CONVERSION.match(self.src.text(n.child_by_field_name("name")))
+            and not _INERT_RECEIVERS.match(self.src.text(n.child_by_field_name("object")))
+            and self.src.text(n.child_by_field_name("object")) not in self.ids
+            for n in walk(value)
+        )
+
+    def verify(self, roots: set[str], at: int) -> None:
+        for r in roots - self.unstable:
+            self.verified[r] = min(at, self.verified.get(r, at))
+
+    def add(
+        self,
+        call: Node,
+        lookup: Lookup,
+        *,
+        direct: bool = False,
+        read: bool | None = None,
+        cover: set[str] | bool | None = True,
+    ) -> None:
+        """`cover`: the path ids the lookup is exactly by; True reads them off the call."""
+        k = len(self.lookups)
+        self.lookups.append(lookup)
+        name = self.src.text(call.child_by_field_name("name"))
+        self.reads.append(bool(_READ_NAME.match(name)) if read is None else read)
+        self.cover.append(self.exact_ids(call) if cover is True else cover or None)
+        self.starts.append(call.start_byte)
+        self.made.setdefault((call.start_byte, call.end_byte), []).append(k)
+        if direct:
+            self.direct.add(k)
+
+    def handoff(self, node: Node) -> None:
+        self.handoffs.append((self.o._span(self.src, node), self.exact_ids(node), node.start_byte))
+
+    def mapped(self, inner: set[str] | None, exact: dict[str, str]) -> set[str] | None:
+        """A callee's parameter ids as the outer path ids they exactly are."""
+        if not inner or not inner <= exact.keys():
+            return None
+        return {exact[p] for p in inner}
+
+    def load(self, call: Node | None, *, read: bool) -> int | None:
+        """The one lookup a call makes, with nothing else loaded in its arguments. `read`: a read
+        (`find…`, `get…`; through a hop, one doing only that read), else the store call itself."""
+        if call is None or call.type != "method_invocation":
+            return None
+        made = self.made.get((call.start_byte, call.end_byte), [])
+        inner = [k for n in walk(call) for k in self.made.get((n.start_byte, n.end_byte), [])]
+        if len(made) != 1 or inner != made:
+            return None
+        k = made[0]
+        return k if (self.reads[k] if read else k in self.direct) else None
+
+    # ---- the walk
+    def run(self) -> _Scan:
+        for n in walk(self.body):
+            if n.type == "method_invocation":
+                self.call(n)
+            elif n.type == "object_creation_expression":
+                self.creation(n)
+        statements = [
+            s for s in self.body.named_children if s.type not in ("line_comment", "block_comment")
+        ]
+        # caller-only declarations, which can't act on a record, may sit before its check
+        following: list[Node | None] = [None] * len(statements)
+        after = None
+        for k in range(len(statements) - 1, -1, -1):
+            following[k] = after
+            if not self.caller_declaration(statements[k]):
+                after = statements[k]
+        for stmt, nxt in zip(statements, following, strict=True):
+            self.statement(stmt, nxt)
+        first_return = next(
+            (
+                s.start_byte
+                for s in statements
+                if any(n.type == "return_statement" for n in walk(s))
             ),
-            caller=facts.caller,
-            handoff=facts.handoff,
+            None,
+        )
+        return self.result(first_return, self.pure_read(statements))
+
+    def pure_read(self, statements: list[Node]) -> bool:
+        """`return <read>;` or `T r = <read>; return r;`, and nothing else."""
+        last = statements[-1] if statements else None
+        if last is None or last.type != "return_statement" or not last.named_children:
+            return False
+        returned = last.named_children[0]
+        if len(statements) == 1:
+            value = returned
+        elif len(statements) == 2 and statements[0].type == "local_variable_declaration":
+            declared = [d for d in statements[0].named_children if d.type == "variable_declarator"]
+            if len(declared) != 1 or self.src.text(returned) != self.src.text(
+                declared[0].child_by_field_name("name")
+            ):
+                return False
+            value = declared[0].child_by_field_name("value")
+        else:
+            return False
+        read = self.load(_unwrap_optional(self.src, value), read=True)
+        return len(self.lookups) == 1 and read == 0
+
+    def creation(self, node: Node) -> None:
+        """`new PurgeCommand(id)` hands the id on; an id value type or an exception doesn't."""
+        if self.names(node.child_by_field_name("arguments")) & self.ids and not (
+            _ID_TYPE.match(kind := _simple_type(self.src, node)) or _THROWN.match(kind)
+        ):
+            self.handoff(node)
+
+    def call(self, call: Node) -> None:
+        src = self.src
+        receiver = call.child_by_field_name("object")
+        rtext = src.text(receiver).removeprefix("this.") if receiver is not None else ""
+        name = src.text(call.child_by_field_name("name"))
+        values = _arguments(call)
+        if receiver is not None and self.loads(receiver) and name in _RESULT_CALLS:
+            return  # acts on a loaded result (`….orElseThrow(() -> new NotFound(id))`)
+        if not self.names(call.child_by_field_name("arguments")) & self.ids:
+            # `Optional.of(id).ifPresent(cards::deleteById)`: the id flows into a function
+            if (
+                receiver is not None
+                and self.names(receiver) & self.ids
+                and any(v.type in ("lambda_expression", "method_reference") for v in values)
+            ):
+                self.handoff(call)
+            return
+        span = self.o._span(src, call)
+        repository = self.local_types.get(rtext) or self.o._field_type(self.t, rtext) or ""
+        repository = repository.rsplit(".", 1)[-1]
+        if entity := self.o.java.repositories.get(repository):
+            scoped = self.o._owner_query(repository, entity, name, values, self.v)
+            declared = self.o._declared(repository, name, len(values))
+            # the declared return type says which entity a query loads (`Order findOrder(…)`)
+            returned = [
+                w
+                for h, m in declared
+                for w in re.findall(r"\w+", h.src.text(m.child_by_field_name("type")))
+                if w in self.o.java.entities
+            ]
+            read = bool(_READ_NAME.match(name)) and not any(
+                m.child_by_field_name("body") is not None or "Modifying" in _annotations(h.src, m)
+                for h, m in declared
+            )
+            record = returned[-1] if returned else entity
+            self.add(call, Lookup(span, scoped, record_type=record), direct=True, read=read)
+        elif repository in self.o.java.untyped_repositories:
+            self.add(call, Lookup(span), direct=True, read=False)
+        elif name in _ENTITY_MANAGER_LOOKUPS and values and values[0].type == "class_literal":
+            record = src.text(values[0]).removesuffix(".class")
+            self.add(call, Lookup(span, record_type=record), direct=True)
+        elif rtext in self.o.java.entities:
+            self.add(call, Lookup(span, record_type=rtext), direct=True)
+        elif name in _QUERY_CALLS:
+            self.add(call, Lookup(span), direct=True)
+        elif (targets := self.o._callees(src, self.t, call, self.local_types)) is None:
+            # overloads of one arity: which one runs is the argument types'
+            if not _VALIDATOR_NAME.match(name):
+                self.handoff(call)
+        elif targets:
+            # one hop, and a second only into an authorization-shaped helper (`checkXxxId`)
+            if self.depth >= 2 or (self.depth == 1 and not _AUTHORIZE_NAME.match(name)):
+                if not _VALIDATOR_NAME.match(name):
+                    self.handoff(call)
+                return
+            self.hop = self.hop or span
+            verified: set[str] | None = None
+            owned: set[str] | None = None
+            for target, callee in targets:
+                scan, exact = self.o._hop(self, target, callee, call)
+                v = {exact[p] for p in scan.verified if p in exact}
+                o = {exact[p] for p in scan.owned_or_null if p in exact}
+                returns = target.src.text(callee.child_by_field_name("type")).split("<", 1)[0]
+                # an owner-bearing return type says what an untyped lookup loaded; it never
+                # makes one ownerless
+                record = returns if owner_field(returns, self.o.java.fields) else None
+                for x, read, inner in zip(scan.facts.lookups, scan.reads, scan.covers, strict=True):
+                    lookup = Lookup(x.span, x.scoped, x.checked, x.record_type or record)
+                    cover = self.mapped(inner, exact)
+                    self.add(call, lookup, read=read and scan.pure_read, cover=cover)
+                self.caller = self.caller or scan.facts.caller
+                if scan.facts.handoff:
+                    cover = self.mapped(scan.handoff_cover, exact)
+                    self.handoffs.append((scan.facts.handoff, cover, call.start_byte))
+                verified = v if verified is None else verified & v
+                owned = o if owned is None else owned & o
+            key = (call.start_byte, call.end_byte)
+            self.hop_verified[key], self.hop_owned_or_null[key] = verified or set(), owned or set()
+        elif _INERT_RECEIVERS.match(rtext) or (
+            _CONVERSION.match(name) and (receiver is None or _static(src, receiver))
+        ):
+            return
+        elif rtext not in self.params and any(
+            _methods(k, name, len(values))
+            for k in self.o._receiver_type(src, self.t, receiver, self.local_types)
+        ):
+            # a checkout type declares it (a query we don't read): never trusted as shape 4
+            self.add(call, Lookup(span), direct=True, read=False)
+        elif call.parent is not None and call.parent.type == "variable_declarator":
+            # shape 4: a kept load we can't follow, handed a caller-only value (owner decision)
+            scoped = any(self.v.derived(v) for v in values)
+            self.add(call, Lookup(span, scoped=scoped), direct=True)
+        elif rtext[:1].islower() and _LOOKUP_NAME.match(name) and not _INERT_RECEIVERS.match(rtext):
+            self.add(call, Lookup(span), direct=True)
+        elif not (
+            _INERT_RECEIVERS.match(rtext)
+            or (_CONVERSION.match(name) and (receiver is None or _static(src, receiver)))
+            or _VALIDATOR_NAME.match(name)
+            or rtext in self.ids
+        ):
+            self.handoff(call)
+
+    def statement(self, stmt: Node, following: Node | None) -> None:
+        """The ids a statement directly in the body verifies, by the allow-list."""
+        end = stmt.end_byte
+        expr = _statement_value(stmt)
+        if expr is not None:
+            # shape 1, refused when absent: `repo.findByIdAndOwnerId(id, me).orElseThrow(…)`
+            k = self.load(_or_else_throw_root(self.src, expr), read=False)
+            if k is not None and self.lookups[k].scoped:
+                self.verify(self.cover[k] or set(), end)
+            if expr.type == "method_invocation":
+                self.verify(self.hop_verified.get((expr.start_byte, expr.end_byte), set()), end)
+            if stmt.type == "local_variable_declaration" and following is not None:
+                record = self.src.text(stmt.named_children[-1].child_by_field_name("name"))
+                k = self.load(_unwrap_optional(self.src, expr), read=True)
+                if k is not None and self.refuses_foreign(following, record):
+                    # shape 2: the load, then a refusal of a record the caller doesn't own
+                    self.checked(k)
+                    self.verify(self.cover[k] or set(), following.end_byte)
+                elif k is not None and self.returns_if_owned(following, record):
+                    # shape 5: the load, then `return r != null && r.owner.equals(me) ? r : null`
+                    self.checked(k)
+                    for r in self.cover[k] or set():
+                        self.owned_or_null[r] = following.start_byte
+                elif expr.type == "method_invocation" and _refuses_null(
+                    self.src, following, record
+                ):
+                    # a hop returning its record only when owned, refused when null
+                    owned = self.hop_owned_or_null.get((expr.start_byte, expr.end_byte), set())
+                    self.verify(owned, following.end_byte)
+        elif (
+            stmt.type == "if_statement"
+            and stmt.child_by_field_name("alternative") is None
+            and _bare_throw(stmt.child_by_field_name("consequence"))
+        ):
+            # shape 1, refused when absent: `if (!repo.existsByIdAndOwnerId(id, me)) throw …`
+            test = _unparen(stmt.child_by_field_name("condition"))
+            if test is not None and test.type == "unary_expression" and _is_not(test):
+                k = self.load(_unparen(test.named_children[-1]), read=False)
+                if k is not None and self.lookups[k].scoped:
+                    self.verify(self.cover[k] or set(), end)
+
+    def checked(self, k: int) -> None:
+        x = self.lookups[k]
+        self.lookups[k] = Lookup(x.span, x.scoped, True, x.record_type)
+
+    def caller_declaration(self, stmt: Node) -> bool:
+        """`String me = auth.getName();`: declares only caller-only locals."""
+        declarators = [d for d in stmt.named_children if d.type == "variable_declarator"]
+        return (
+            stmt.type == "local_variable_declaration"
+            and bool(declarators)
+            and all(
+                self.src.text(d.child_by_field_name("name")) in self.v.callers for d in declarators
+            )
+        )
+
+    def refuses_foreign(self, stmt: Node, record: str) -> bool:
+        """`if (!record.<owner>.equals(<caller-only>)) throw …;`, optionally after
+        `record == null ||`, and nothing else in the branch."""
+        if stmt.type != "if_statement" or stmt.child_by_field_name("alternative") is not None:
+            return False
+        if not _bare_throw(stmt.child_by_field_name("consequence")):
+            return False
+        parts = _parts(self.src, stmt.child_by_field_name("condition"), "||")
+        compared = False
+        for part in parts:
+            if _null_test(self.src, part, record, "=="):
+                continue
+            if not self.compares(part, record, negated=True):
+                return False
+            compared = True
+        return compared
+
+    def returns_if_owned(self, stmt: Node, record: str) -> bool:
+        """`return record != null && record.<owner>.equals(<caller-only>) ? record : null;`"""
+        if stmt.type != "return_statement" or not stmt.named_children:
+            return False
+        expr = _unparen(stmt.named_children[0])
+        if expr is None or expr.type != "ternary_expression":
+            return False
+        alternative = _unparen(expr.child_by_field_name("alternative"))
+        if self.src.text(expr.child_by_field_name("consequence")).strip() != record or (
+            alternative is None or alternative.type != "null_literal"
+        ):
+            return False
+        compared = False
+        for part in _parts(self.src, expr.child_by_field_name("condition"), "&&"):
+            if _null_test(self.src, part, record, "!="):
+                continue
+            if not self.compares(part, record, negated=False):
+                return False
+            compared = True
+        return compared
+
+    def compares(self, part: Node, record: str, *, negated: bool) -> bool:
+        """`record.f` compared with a caller-only value: `!record.f.equals(c)`, `!c.equals(…)`,
+        `!Objects.equals(…)`, `record.f != c` when `negated`, else the same without the `!`."""
+        part = _unparen(part)
+        if part is None:
+            return False
+        sides: tuple[Node, Node] | None = None
+        if part.type == "binary_expression" and _operator(self.src, part) == (
+            "!=" if negated else "=="
+        ):
+            sides = (part.child_by_field_name("left"), part.child_by_field_name("right"))
+        elif negated and part.type == "unary_expression" and _is_not(part):
+            inner = _unparen(part.named_children[-1])
+            sides = _equals_sides(self.src, inner) if inner is not None else None
+        elif not negated:
+            sides = _equals_sides(self.src, part)
+        if sides is None:
+            return False
+        return any(self.owner_of(a, record) and self.v.derived(b) for a, b in (sides, sides[::-1]))
+
+    def owner_of(self, node: Node, record: str) -> bool:
+        """`record.ownerId` or `record.getOwnerId()`: an owner member of the record (the narrow
+        set; the broad one only says a record might have an owner)."""
+        text = self.src.text(node).replace(" ", "")
+        found = re.fullmatch(rf"{re.escape(record)}\.(?:get)?(\w+)(?:\(\))?", text)
+        return bool(found) and bool(
+            OWNER_CHECK_RX.match(found.group(1)[:1].lower() + found.group(1)[1:])
+        )
+
+    def result(self, first_return: int | None, pure_read: bool) -> _Scan:
+        verified = {r: at for r, at in self.verified.items() if r not in self.unstable}
+
+        def holds(roots: set[str] | None, at: int) -> bool:
+            return bool(roots) and all(r in verified and verified[r] <= at for r in roots)
+
+        unheld = [(span, roots) for span, roots, at in self.handoffs if not holds(roots, at)]
+        handoff, handoff_cover = unheld[0] if unheld else (None, None)
+        return _Scan(
+            HandlerFacts(
+                lookups=tuple(
+                    Lookup(
+                        x.span,
+                        x.scoped,
+                        x.checked or (not x.scoped and holds(self.cover[k], self.starts[k])),
+                        x.record_type,
+                    )
+                    for k, x in enumerate(self.lookups)
+                ),
+                caller=self.caller,
+                hop=self.hop,
+                handoff=handoff,
+            ),
+            # what this body did for its caller, before anything in it could return
+            verified={r for r, at in verified.items() if first_return is None or at <= first_return}
+            & self.params,
+            owned_or_null={
+                r: at
+                for r, at in self.owned_or_null.items()
+                if r in self.params - self.unstable and (first_return is None or at <= first_return)
+            },
+            unstable=self.unstable,
+            reads=tuple(self.reads),
+            covers=tuple(self.cover),
+            handoff_cover=handoff_cover,
+            pure_read=pure_read,
         )
 
 
-def _object_security(expression: str, ids: set[str]) -> bool:
-    """Method security tying the object to the caller: the id (or the returned object) handed to a
-    bean check, or compared with `principal`/`authentication`; not `#id.equals('demo')`."""
-    for args in _SPEL_BEAN_CALL.findall(expression):
-        if set(_SPEL_VARIABLE.findall(args)) & ids or _SPEL_OBJECT.search(args):
-            return True
-    names_object = set(_SPEL_VARIABLE.findall(expression)) & ids or _SPEL_OBJECT.search(expression)
-    return bool(names_object and _SPEL_CALLER.search(expression))
+def _type_name(src: Parsed, decl: Node) -> str:
+    return src.text(decl.child_by_field_name("type")).split("<", 1)[0]
 
 
-def _identifiers(src: Parsed, node: Node) -> set[str]:
-    return {src.text(n) for n in walk(node) if n.type == "identifier"}
+def _simple_type(src: Parsed, node: Node) -> str:
+    return src.text(node.child_by_field_name("type")).split("<", 1)[0].rsplit(".", 1)[-1]
+
+
+def _static(src: Parsed, node: Node) -> bool:
+    """A class receiver (`UUID`, `Long`, `java.util.UUID`) or one that doesn't act on objects."""
+    text = src.text(node)
+    return text.rsplit(".", 1)[-1][:1].isupper() or bool(_INERT_RECEIVERS.match(text))
+
+
+def _literal(node: Node | None) -> bool:
+    return node is not None and node.type in (
+        "string_literal",
+        "character_literal",
+        "decimal_integer_literal",
+    )
+
+
+def _derived_predicates(name: str) -> list[str] | None:
+    """The properties a Spring Data derived query compares for plain equality, in argument order;
+    None when it isn't one, or any predicate is something else (`Not`, `Like`, `In`, `Or`, …)."""
+    found = _DERIVED_QUERY.fullmatch(name)
+    if found is None:
+        return None
+    predicates = []
+    for part in re.split(r"And(?=[A-Z])", found.group(1)):
+        if _OR_QUERY.search(part):
+            return None
+        part = re.sub(r"(?:Is|Equals|IsEqualTo)$", "", part)
+        if not part or _QUERY_OPERATOR.search(part):
+            return None
+        predicates.append(part[:1].lower() + part[1:])
+    return predicates
+
+
+def _statement_value(stmt: Node) -> Node | None:
+    """An expression statement's expression, or a single declaration's value."""
+    if stmt.type == "expression_statement" and stmt.named_children:
+        return stmt.named_children[0]
+    if stmt.type == "local_variable_declaration":
+        values = [d for d in stmt.named_children if d.type == "variable_declarator"]
+        return values[0].child_by_field_name("value") if len(values) == 1 else None
+    return None
+
+
+def _unwrap_optional(src: Parsed, expr: Node | None) -> Node | None:
+    """The load under `.orElseThrow(…)`, `.get()` or `.orElse(null)`."""
+    expr = _unparen(expr)
+    while expr is not None and expr.type == "method_invocation":
+        name, args = src.text(expr.child_by_field_name("name")), _arguments(expr)
+        if not (
+            name == "orElseThrow"
+            or (name == "get" and not args)
+            or (name == "orElse" and len(args) == 1 and args[0].type == "null_literal")
+        ):
+            break
+        inner = expr.child_by_field_name("object")
+        if inner is None or inner.type != "method_invocation":
+            break
+        expr = inner
+    return expr
+
+
+def _arguments(call: Node) -> list[Node]:
+    args = call.child_by_field_name("arguments")
+    return [a for a in (args.named_children if args is not None else []) if a.type != "comment"]
+
+
+def _package(src: Parsed) -> str:
+    found = re.search(r"^\s*package\s+([\w.]+)\s*;", src.file.text, re.M)
+    return found.group(1) if found else ""
+
+
+def _methods(t: _Type, name: str, arity: int) -> list[Node]:
+    """`t`'s own methods `name` a call with `arity` arguments may run, as Java picks them: those
+    taking exactly that many, else the varargs ones (overloads included)."""
+    body = t.node.child_by_field_name("body")
+    named = [
+        m
+        for m in (body.named_children if body is not None else [])
+        if m.type == "method_declaration" and t.src.text(m.child_by_field_name("name")) == name
+    ]
+
+    def varargs(m: Node) -> bool:
+        params = m.child_by_field_name("parameters")
+        return params is not None and any(
+            c.type == "spread_parameter" for c in params.named_children
+        )
+
+    fixed = [m for m in named if not varargs(m) and len(_params(t.src, m)) == arity]
+    return fixed or [m for m in named if varargs(m) and len(_params(t.src, m)) <= arity]
+
+
+def _bean_check_ids(expression: str, ids: set[str]) -> set[str]:
+    """Shape 3: the ids a `@PreAuthorize` covers when it is exactly one bean call handed the path
+    id and `authentication` (`@access.canRead(#id, authentication)`); none otherwise."""
+    found = _SPEL_SINGLE_BEAN.fullmatch(expression.strip())
+    if found is None:
+        return set()
+    args = [a.strip() for a in found.group(1).split(",")]
+    if "authentication" not in args and "principal" not in args:
+        return set()
+    return {a[1:] for a in args if a.startswith("#")} & ids
+
+
+def _identifiers(src: Parsed, node: Node | None) -> set[str]:
+    return (
+        {src.text(n) for n in walk(node) if n.type == "identifier"} if node is not None else set()
+    )
 
 
 def _operator(src: Parsed, node: Node) -> str:
@@ -1097,124 +2060,93 @@ def _operator(src: Parsed, node: Node) -> str:
     return src.text(op) if op is not None else ""
 
 
-def _equality_sides(src: Parsed, node: Node) -> tuple[Node, Node] | None:
-    """The two sides of an equality test: `a.equals(b)`, `Objects.equals(a, b)`, `a == b`."""
-    if node.type == "binary_expression" and _operator(src, node) in ("==", "!="):
-        return node.child_by_field_name("left"), node.child_by_field_name("right")
-    if node.type != "method_invocation":
-        return None
-    name = src.text(node.child_by_field_name("name"))
-    args = node.child_by_field_name("arguments")
-    values = [a for a in (args.named_children if args else []) if a.type != "comment"]
-    receiver = node.child_by_field_name("object")
-    if name in _EQUALITY and receiver is not None and len(values) == 1:
-        if src.text(receiver) == "Objects":
-            return None
-        return receiver, values[0]
-    if name == "equals" and src.text(receiver) == "Objects" and len(values) == 2:
-        return values[0], values[1]
-    return None
+def _unparen(node: Node | None) -> Node | None:
+    while node is not None and node.type == "parenthesized_expression" and node.named_children:
+        node = node.named_children[0]
+    return node
 
 
-def _negations(node: Node, root: Node) -> int:
-    """`!` operators between `node` and the condition `root`."""
-    count, n = 0, node.parent
-    while n is not None and n.start_byte >= root.start_byte and n.end_byte <= root.end_byte:
-        if n.type == "unary_expression" and n.children and n.children[0].type == "!":
-            count += 1
-        if (n.start_byte, n.end_byte) == (root.start_byte, root.end_byte):
-            break
-        n = n.parent
-    return count
+def _is_not(node: Node) -> bool:
+    return bool(node.children) and node.children[0].type == "!"
 
 
-def _denies(src: Parsed, node: Node | None) -> bool:
-    """A branch that refuses: throws, returns nothing or a 401/403/404 response."""
-    if node is None:
-        return False
-    if node.type in ("null_literal", "throw_statement"):
-        return True
-    for n in walk(node):
-        if n.type == "throw_statement" or n.type == "throw_expression":
-            return True
-        if n.type == "return_statement":
-            value = n.named_children[0] if n.named_children else None
-            if value is None or value.type == "null_literal" or _DENIAL.search(src.text(value)):
-                return True
-    return bool(_DENIAL.search(src.text(node))) and node.type != "block"
+def _parts(src: Parsed, node: Node | None, op: str) -> list[Node]:
+    """The operands of `a <op> b <op> c` (one when there's no `op`)."""
+    found, pending = [], [_unparen(node)]
+    while pending:
+        n = pending.pop()
+        if n is None:
+            continue
+        if n.type == "binary_expression" and _operator(src, n) == op:
+            pending += [
+                _unparen(n.child_by_field_name("right")),
+                _unparen(n.child_by_field_name("left")),
+            ]
+        else:
+            found.append(n)
+    return found
 
 
-def _dominating_end(body: Node, position: int) -> int | None:
-    """Where the statement of the method body holding `position` ends, when it sits directly in
-    the body (so it runs before everything after it); None when it is nested in a branch."""
-    for stmt in body.named_children:
-        if stmt.start_byte <= position < stmt.end_byte:
-            nested = any(
-                n.type
-                in (
-                    "if_statement",
-                    "while_statement",
-                    "for_statement",
-                    "lambda_expression",
-                    "enhanced_for_statement",
-                    "try_statement",
-                    "switch_expression",
-                )
-                and n.start_byte <= position < n.end_byte
-                and (n.start_byte, n.end_byte) != (stmt.start_byte, stmt.end_byte)
-                for n in walk(stmt)
-            ) or (
-                stmt.type in ("while_statement", "for_statement", "enhanced_for_statement")
-                or (stmt.type == "if_statement" and not _in_condition(stmt, position))
-            )
-            return None if nested else stmt.end_byte
-    return None
-
-
-def _in_condition(stmt: Node, position: int) -> bool:
-    test = stmt.child_by_field_name("condition")
-    return test is not None and test.start_byte <= position < test.end_byte
-
-
-def _converts(src: Parsed, value: Node) -> bool:
-    """Whether an assigned value is the id itself, converted, rather than something loaded."""
-    while value.type in ("cast_expression", "parenthesized_expression"):
-        value = value.named_children[-1]
-    if value.type in ("identifier", "object_creation_expression"):
-        return True
-    return value.type == "method_invocation" and bool(
-        _CONVERSION.match(src.text(value.child_by_field_name("name")))
+def _null_test(src: Parsed, node: Node, record: str, op: str) -> bool:
+    """`record == null` (or `!=`, by `op`)."""
+    node = _unparen(node)
+    return (
+        node is not None
+        and node.type == "binary_expression"
+        and _operator(src, node) == op
+        and {
+            src.text(node.child_by_field_name("left")),
+            src.text(node.child_by_field_name("right")),
+        }
+        == {record, "null"}
     )
 
 
-def _caller_methods(sources: list[Parsed]) -> frozenset[str]:
-    """No-argument helpers that read the caller (`getCurrentUser()`), directly or via another."""
-    bodies: dict[str, list[str]] = {}
-    for src in sources:
-        for m in walk(src.root):
-            if m.type != "method_declaration" or m.child_by_field_name("body") is None:
-                continue
-            params = m.child_by_field_name("parameters")
-            if params is not None and params.named_children:
-                continue
-            bodies.setdefault(src.text(m.child_by_field_name("name")), []).append(
-                src.text(m.child_by_field_name("body"))
-            )
-    found = {n for n, texts in bodies.items() if any(_CALLER_CALLS.search(b) for b in texts)}
-    while True:
-        more = (
-            {
-                n
-                for n, texts in bodies.items()
-                if n not in found
-                and any(re.search(rf"\b({'|'.join(found)})\s*\(", b) for b in texts)
-            }
-            if found
-            else set()
-        )
-        if not more:
-            return frozenset(found)
-        found |= more
+def _refuses_null(src: Parsed, stmt: Node, record: str) -> bool:
+    """`if (record == null) throw …;` and nothing else."""
+    return (
+        stmt.type == "if_statement"
+        and stmt.child_by_field_name("alternative") is None
+        and _bare_throw(stmt.child_by_field_name("consequence"))
+        and _null_test(src, stmt.child_by_field_name("condition"), record, "==")
+    )
+
+
+def _equals_sides(src: Parsed, node: Node) -> tuple[Node, Node] | None:
+    """`a.equals(b)` or `Objects.equals(a, b)`."""
+    if node.type != "method_invocation" or src.text(node.child_by_field_name("name")) != "equals":
+        return None
+    values = _arguments(node)
+    receiver = node.child_by_field_name("object")
+    if receiver is not None and src.text(receiver) == "Objects":
+        return (values[0], values[1]) if len(values) == 2 else None
+    return (receiver, values[0]) if receiver is not None and len(values) == 1 else None
+
+
+def _bare_throw(node: Node | None) -> bool:
+    """A branch that is only a throw: `throw …;` or `{ throw …; }`."""
+    if node is None:
+        return False
+    if node.type == "throw_statement":
+        return True
+    return (
+        node.type == "block"
+        and len(node.named_children) == 1
+        and (node.named_children[0].type == "throw_statement")
+    )
+
+
+def _or_else_throw_root(src: Parsed, expr: Node) -> Node | None:
+    """For `<call>.orElseThrow(…)`, the call the absent result refuses (top-down, no parents)."""
+    expr = _unparen(expr)
+    if (
+        expr is not None
+        and expr.type == "method_invocation"
+        and src.text(expr.child_by_field_name("name")) == "orElseThrow"
+    ):
+        root = expr.child_by_field_name("object")
+        return root if root is not None and root.type == "method_invocation" else None
+    return None
 
 
 def _params(src: Parsed, method: Node) -> list[tuple[str, str, dict[str, Node]]]:
@@ -1229,10 +2161,6 @@ def _params(src: Parsed, method: Node) -> list[tuple[str, str, dict[str, Node]]]
         for p in (params.named_children if params else [])
         if p.type == "formal_parameter"
     ]
-
-
-def _caller(kind: str, annotations: dict[str, Node]) -> bool:
-    return bool(_CALLER_TYPES.match(kind)) or any(a in annotations for a in _CALLER_ANNOTATIONS)
 
 
 def _body_guard_calls(src: Parsed, method: Node) -> list[str]:

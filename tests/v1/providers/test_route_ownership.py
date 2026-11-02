@@ -282,6 +282,17 @@ def test_classify(
         ("require_admin_or_owner", False),
         ("@PreAuthorize(\"hasRole('ADMIN') or #id == principal.id\")", False),
         ("requireAuth", False),
+        ("@PreAuthorize(\"hasAnyRole('ADMIN', 'OPERATOR')\")", True),
+        ("@RolesAllowed(Roles.ADMIN)", True),
+        ('@PreAuthorize("hasRole(@roles.admin())")', False),
+        ("@RolesAllowed(adminRole)", False),
+        ("@PreAuthorize(\"hasAuthority('TENANT_ADMIN')\")", False),  # one tenant's admin
+        ("@PreAuthorize(\"hasAuthority('SYS_ADMIN')\")", True),
+        ("@PreAuthorize(\"hasRole('NON_ADMIN')\")", False),
+        ('@Secured("ROLE_COOPERATOR")', False),
+        ("call:logAdminView", False),  # a call's name
+        ("@PostAuthorize(\"hasRole('ADMIN')\")", False),  # runs after the handler
+        ("@PreAuthorize(\"hasRole('ADMIN') and #id > 0\")", False),
     ],
 )
 def test_privileged_only_needs_every_way_in_to_be_privileged(guard: str, privileged: bool) -> None:
@@ -378,7 +389,7 @@ def test_a_guard_beside_an_unguard_marker_is_not_authentication() -> None:
         (['@PreAuthorize("isAuthenticated()")'], RouteOwnership.CALLER_BLIND),
     ],
 )
-def test_a_deploy_time_config_counts_only_the_routes_own_guards(
+def test_the_enumerators_effective_guards_decide_authentication(
     guards: list[str], expected: RouteOwnership
 ) -> None:
     row = _row(
@@ -392,7 +403,7 @@ def test_a_deploy_time_config_counts_only_the_routes_own_guards(
         ["spring-security:authenticated"],
         ["spring-security:conditional-config", "spring-security:permitAll"],
     )
-    row.own(HandlerFacts(lookups=(Lookup(at(3), record_type="Item"),)), FIELDS, deploy_time=True)
+    row.own(HandlerFacts(lookups=(Lookup(at(3), record_type="Item"),)), FIELDS, guards=row.guards)
     assert row.ownership is expected
 
 
