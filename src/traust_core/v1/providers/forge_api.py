@@ -3,11 +3,14 @@ kind comes from `forge_hosts`, its token from `Config.forge_tokens`, sent only a
 
 from __future__ import annotations
 
+import base64
 import json
 from collections.abc import Callable, Iterator, Mapping
 from typing import Any, BinaryIO, TypeVar
+from urllib.parse import quote
 
 from traust_core.v1.errors import ServiceError, ValidationError
+from traust_core.v1.models.values import HttpsRepoUrl
 from traust_core.v1.providers.http import HttpFetcher
 
 T = TypeVar("T")
@@ -45,6 +48,52 @@ class ForgeApi:
             if self.kind(host) == GITLAB
             else {"Authorization": f"Bearer {token}"}
         )
+
+    def git_headers(self, host: str) -> dict[str, str]:
+        """Auth for git's smart-HTTP transport, which takes HTTP Basic, not REST headers."""
+        token = self._tokens.get(host)
+        if not token:
+            return {}
+        username = "oauth2" if self.kind(host) == GITLAB else "x-access-token"
+        basic = base64.b64encode(f"{username}:{token}".encode()).decode()
+        return {"Authorization": f"Basic {basic}"}
+
+    def review_refs(self, repo: HttpsRepoUrl, sha: str) -> tuple[str, ...]:
+        """Review refs associated with a commit by the repository's forge, not by shared objects."""
+        kind = self.kind(repo.host)
+        if kind is None:
+            return ()
+        project = quote(repo.path, safe="")
+        endpoint = (
+            f"repos/{repo.path}/commits/{sha}/pulls?per_page=100"
+            if kind == GITHUB
+            else f"projects/{project}/repository/commits/{sha}/merge_requests?per_page=100"
+        )
+        try:
+            items = list(self.items(repo.host, endpoint))
+        except ServiceError as e:
+            if e.status == 404:
+                return ()
+            raise
+        refs = []
+        for item in items:
+            if not isinstance(item, dict):
+                raise ServiceError(f"{endpoint}: expected a review object")
+            number = item.get("number" if kind == GITHUB else "iid")
+            if not isinstance(number, int) or isinstance(number, bool) or number < 1:
+                raise ServiceError(f"{endpoint}: expected a positive review number")
+            if kind == GITHUB:
+                base = item.get("base")
+                if not isinstance(base, dict) or not isinstance(base.get("repo"), dict):
+                    raise ServiceError(f"{endpoint}: expected a base repository")
+                if base["repo"].get("full_name") != repo.path:
+                    continue
+            refs.append(
+                f"refs/pull/{number}/head"
+                if kind == GITHUB
+                else f"refs/merge-requests/{number}/head"
+            )
+        return tuple(refs)
 
     def get(self, host: str, endpoint: str, headers: Mapping[str, str] | None = None) -> Any:
         sent = {**self.headers(host), **(headers or {})}

@@ -1,5 +1,6 @@
 """A local checkout read through git: read-only, list argv, never a fetch, and never a command
-the checkout's own config names (fsmonitor, external diff, textconv)."""
+the checkout's own config names (fsmonitor, external diff, textconv). Fetching a repository is
+`RepoCheckoutService`'s job, not this reader's."""
 
 from __future__ import annotations
 
@@ -10,14 +11,12 @@ from pathlib import Path
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.providers.process import ProcessRunner
 
-_SHA = re.compile(r"[0-9a-f]{7,40}")
-_HARDENED = ("-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null")
+_SHA = re.compile(r"[0-9a-f]{7,40}|[0-9a-f]{64}")
+HARDENED = ("-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null")
 _RENAME_BRACE = re.compile(r"\{[^{}]*=> ?([^{}]*)\}")
 
 
 _CHANGE = {"A": "added", "D": "deleted", "R": "renamed"}
-# https only: no transport helper (ext::, ssh) a hostile URL could name ever runs.
-_NETWORK_ENV = {"GIT_ALLOW_PROTOCOL": "https", "GIT_TERMINAL_PROMPT": "0"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,7 +47,7 @@ class GitCheckout:
         self._runner = runner
 
     def _git(self, checkout: Path, *args: str, check: bool = True) -> str:
-        result = self._runner.run(["git", "-C", str(checkout), *_HARDENED, *args], check=check)
+        result = self._runner.run(["git", "-C", str(checkout), *HARDENED, *args], check=check)
         return result.stdout.decode(errors="replace") if result.returncode == 0 else ""
 
     def is_checkout(self, checkout: Path) -> bool:
@@ -59,7 +58,7 @@ class GitCheckout:
     def reachable(self, checkout: Path, sha: str) -> bool:
         return bool(_SHA.fullmatch(sha)) and (
             self._runner.run(
-                ["git", "-C", str(checkout), *_HARDENED, "cat-file", "-e", f"{sha}^{{commit}}"],
+                ["git", "-C", str(checkout), *HARDENED, "cat-file", "-e", f"{sha}^{{commit}}"],
                 check=False,
             ).returncode
             == 0
@@ -133,13 +132,3 @@ class GitCheckout:
         if since.startswith("-"):
             raise ValidationError(f"not a ref: {since!r}")
         return self._git(checkout, "diff", "--name-only", f"{since}..HEAD", "--").splitlines()
-
-    def clone(self, url: str, dest: Path, *, timeout_seconds: float) -> None:
-        """A shallow clone of `url`'s default branch into `dest`; https only."""
-        if not url.startswith("https://"):
-            raise ValidationError(f"clone needs an https URL, got {url!r}")
-        self._runner.run(
-            ["git", "clone", "-q", "--depth", "1", "--", url, str(dest)],
-            env=_NETWORK_ENV,
-            timeout_seconds=timeout_seconds,
-        )

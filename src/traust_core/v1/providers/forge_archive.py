@@ -20,7 +20,7 @@ from traust_core.v1.providers.base import Acquisition, Readiness, Result
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.forge_api import GITLAB, ForgeApi
 from traust_core.v1.providers.http import HttpFetcher
-from traust_core.v1.providers.sources import CheckoutRequest, Workspace
+from traust_core.v1.providers.sources import CheckoutProviderName, CheckoutRequest, Workspace
 
 log = logging.getLogger(__name__)
 
@@ -31,7 +31,7 @@ class ArchiveCheckout:
     """`SourceProvider`'s checkout seam over the archive API: GitHub `tarball/{sha}`, GitLab
     `repository/archive.tar.gz?sha=`; a host's token (from `Config`) goes only in a header."""
 
-    name = "forge-archive"
+    name = CheckoutProviderName.ARCHIVE
 
     def __init__(
         self,
@@ -47,8 +47,6 @@ class ArchiveCheckout:
         return Readiness(ready=True)
 
     def checkout(self, request: CheckoutRequest) -> Result[Workspace]:
-        if request.ref is None:
-            raise ValidationError("an archive checkout needs the commit's sha")
         sha = str(request.ref)
         host, endpoint = request.repo.host, self._archive(request.repo, sha)
         url = self._api.url(host, endpoint)
@@ -63,7 +61,7 @@ class ArchiveCheckout:
         repo_hash = hashlib.sha256(str(request.repo).encode()).hexdigest()[:16]
         log.info("checked out repo_hash=%s ref=%s: %d bytes kept", repo_hash, sha, kept)
         return Result(
-            Workspace(repo=request.repo, sha=request.ref, path=dest),
+            Workspace(repo=request.repo, sha=request.ref, path=dest, provider=self.name),
             Acquisition(provider=self.name, acquired_at=self._clock.now(), source=url),
         )
 

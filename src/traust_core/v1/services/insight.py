@@ -27,7 +27,7 @@ from traust_core.v1.models.assessment import (
     Threat,
     ThreatFilter,
 )
-from traust_core.v1.models.common import Provenance, every_item
+from traust_core.v1.models.common import Provenance, TimeWindow, every_item
 from traust_core.v1.models.compliance import (
     ComplianceDimension,
     ComplianceFilter,
@@ -256,7 +256,7 @@ class InsightService:
 
     def refresh(self, views: Sequence[ViewName] | None, filter: ViewFilter) -> RefreshResult:
         """Render each view (all registered, bar single-item renders, when None); a view that
-        fails doesn't stop the rest.
+        fails doesn't stop the rest; a windowed view with no window covers the month of `as_of`.
         A ConfigError is the deployment's, not one view's, so it stops the refresh."""
         names = (
             [n for n, v in self._views.items() if not getattr(v, "per_item", False)]
@@ -265,11 +265,15 @@ class InsightService:
         )
         for name in names:
             self._view(name)
+        month = filter.model_copy(
+            update={"window": TimeWindow.month_of(filter.as_of or self._clock.now())}
+        )
         rendered: dict[ViewName, RenderedView] = {}
         failed: dict[ViewName, str] = {}
         for name in names:
+            windowed = filter.window is None and getattr(self._views[name], "windowed", False)
             try:
-                rendered[name] = self.publish(name, filter)
+                rendered[name] = self.publish(name, month if windowed else filter)
             except ConfigError:
                 raise
             except TraustError as e:
@@ -1434,7 +1438,7 @@ class AttackCoverageView:
         assessment: AssessmentService,
         findings: FindingService,
         portfolio: PortfolioService,
-        catalog: AttackCatalog,
+        catalog: AttackCatalog | None,
         clock: Clock,
     ) -> None:
         self._assessment = assessment
@@ -1443,7 +1447,18 @@ class AttackCoverageView:
         self._catalog = catalog
         self._clock = clock
 
+    def _require_catalog(self) -> AttackCatalog:
+        # NotFoundError, as the SLA view: a batch refresh records it per view, a direct build
+        # raises it to the caller.
+        if self._catalog is None:
+            raise NotFoundError(
+                "no ATT&CK catalog: register one (Context.register_attack_catalog; the pack "
+                "pins the technique table and mapping)"
+            )
+        return self._catalog
+
     def build(self, filter: ViewFilter) -> AttackCoverage:
+        catalog = self._require_catalog()
         as_of = filter.as_of or self._clock.now()
         _, _, repositories = _scope(self._portfolio, filter)
         ids = tuple(r.id for r in repositories)  # type: ignore[misc]
@@ -1455,7 +1470,7 @@ class AttackCoverageView:
         for threat in every_item(lambda p: self._assessment.threats(query, p)):
             models.add(threat.assessment_id)
             cited = {t.id for t in threat.techniques}
-            live = {i for i in cited if not self._catalog.invalid((i,))}
+            live = {i for i in cited if not catalog.invalid((i,))}
             dropped.update(cited - live)
             modeled.update(live)
             with_techniques += bool(live)
@@ -1464,7 +1479,7 @@ class AttackCoverageView:
         for repository_id in ids:
             category = FindingFilter(repository_id=repository_id, as_of=as_of)
             for group in self._findings.summary(category, FindingDimension.CATEGORY):
-                implied = self._catalog.category_map.get(group.key or "", ())
+                implied = catalog.category_map.get(group.key or "", ())
                 if implied:
                     mapped += group.findings
                     derived.update(dict.fromkeys(implied, group.findings))
@@ -1472,8 +1487,8 @@ class AttackCoverageView:
             (
                 TechniqueCoverage(
                     technique_id=i,
-                    name=self._catalog.techniques[i].name,
-                    tactics=self._catalog.techniques[i].tactics,
+                    name=catalog.techniques[i].name,
+                    tactics=catalog.techniques[i].tactics,
                     modeled=modeled[i],
                     derived=derived[i],
                     score=2 if modeled[i] else 1,
@@ -1484,9 +1499,9 @@ class AttackCoverageView:
         )
         model = AttackCoverage(
             as_of=as_of,
-            attack_version=self._catalog.attack_version,
-            mapping_version=self._catalog.mapping_version,
-            attribution=self._catalog.attribution,
+            attack_version=catalog.attack_version,
+            mapping_version=catalog.mapping_version,
+            attribution=catalog.attribution,
             repositories=len(ids),
             threat_models=len(models),
             threats_with_techniques=with_techniques,
@@ -2810,6 +2825,7 @@ class ProgramView:
     derived from spend events and run orders, never a stored snapshot."""
 
     name = ViewName.PROGRAM
+    windowed = True
 
     def __init__(
         self, spend: SpendService, ops: OpsService, assets: Callable[[], Sequence[str]]

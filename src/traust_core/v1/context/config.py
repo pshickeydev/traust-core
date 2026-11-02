@@ -68,6 +68,9 @@ class HttpConfig(_Model):
     jitter_seconds: float = 0.5
 
 
+FIRST_PARTY_LOGGERS = ("traust", "traust_core", "traust_engine", "traust_ledger")
+
+
 class LoggingConfig(_Model):
     outputs: tuple[Literal["stderr", "file"], ...] = ("stderr", "file")
     level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
@@ -91,8 +94,11 @@ class LoggingConfig(_Model):
     @pydantic.field_validator("levels")
     @classmethod
     def _project_loggers_only(cls, value: dict[str, str]) -> dict[str, str]:
-        if any(not name.startswith("traust_core.") for name in value):
-            raise ValueError("logger level overrides must name traust_core loggers")
+        if any(
+            not any(name == root or name.startswith(f"{root}.") for root in FIRST_PARTY_LOGGERS)
+            for name in value
+        ):
+            raise ValueError("logger level overrides must name first-party traust loggers")
         return value
 
 
@@ -116,6 +122,7 @@ class Locations(_Model):
     product_definitions: str | None = None
     sarif_tool_uri: str | None = None
     inputs: str | None = None
+    mirror_cache: str | None = None
 
     def _absolute(self, home: Path) -> dict[str, str]:
         # Same rule as traust-contracts' loader: URIs stay as written; `inputs` follows traust's.
@@ -177,6 +184,15 @@ class Locations(_Model):
         root = self.analysis_results_dir()
         return root / "graph" / "findings.db" if root else None
 
+    def mirror_cache_dir(self, home: Path) -> Path:
+        """The git mirror cache root: `mirror_cache` when set, else `<home>/mirrors`. Unlike the
+        locations above it has a default, so checkouts work with no configuration."""
+        if self.mirror_cache is None:
+            return home / "mirrors"
+        if (local := _local_path(self.mirror_cache)) is None:
+            raise ConfigError("locations.mirror_cache must be a local path")
+        return local if local.is_absolute() else home / local
+
 
 class FeedsConfig(_Model):
     osv_access: Literal["api", "air-gapped"] = "api"  # air-gapped: exported OSV records only
@@ -223,6 +239,7 @@ _PATH_FIELDS = (
     "feeds_cache",
     "gitleaks_config",
     "opengrep_rules",
+    "mirror_cache",
 )
 
 
@@ -253,6 +270,25 @@ class Config(_Model):
     execution: ExecutionConfig = ExecutionConfig()
     campaign: CampaignConfig = CampaignConfig()
     overrides: OverridesConfig = OverridesConfig()
+    # The top-level keys the traust.yaml file set (the file's own keys, never defaults); the
+    # zero-config defaults and hand-built configs set none. Private: the contracts schema owns
+    # the public field set. Preflight checks requirements against it.
+    _provided: frozenset[str] = pydantic.PrivateAttr(default=frozenset())
+    # The home this config was loaded from (None for the zero-config defaults); preflight's
+    # completeness audit examines it, not whatever $TRAUST_CONFIG_HOME points at. Private for
+    # the same reason as _provided.
+    _config_home: Path | None = pydantic.PrivateAttr(default=None)
+
+    @property
+    def provided(self) -> frozenset[str]:
+        """The top-level keys the traust.yaml file set; preflight checks config requirements
+        against it."""
+        return self._provided
+
+    @property
+    def config_home(self) -> Path | None:
+        """The directory this config was loaded from; None when nothing was loaded."""
+        return self._config_home
 
     @pydantic.field_validator("home")
     @classmethod
@@ -294,6 +330,7 @@ class Config(_Model):
             raise ConfigError(f"cannot read {path}") from e
         try:
             contracts.validate_config("traust", data)
+            provided = frozenset(data)
             locations = Locations.model_validate(
                 {k: v for k, v in data.pop("locations", {}).items() if k in Locations.model_fields}
             )
@@ -302,9 +339,12 @@ class Config(_Model):
             raise ConfigError(f"{path}: {e}") from e
         home = path.parent
         overrides = {k: (home / v).resolve() for k, v in config.overrides if v is not None}
-        return config.model_copy(
+        loaded = config.model_copy(
             update={
                 "locations": locations.model_copy(update=locations._absolute(home)),
                 "overrides": config.overrides.model_copy(update=overrides),
             }
         )
+        loaded._provided = provided
+        loaded._config_home = home
+        return loaded

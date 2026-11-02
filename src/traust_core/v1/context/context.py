@@ -3,7 +3,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import shutil
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import cached_property
@@ -35,6 +35,7 @@ from traust_core.v1.context.feeds import (
 )
 from traust_core.v1.context.logging import configure_logging as install_logging
 from traust_core.v1.context.observation import command_source, comment_sources
+from traust_core.v1.context.preflight import preflight as preflight_requirements
 from traust_core.v1.context.tools import (
     checkov_tool,
     compliance_sources,
@@ -85,7 +86,7 @@ from traust_core.v1.models.assessment import AtlasCatalog, AttackCatalog
 from traust_core.v1.models.below_range import GapReason
 from traust_core.v1.models.cloud_config import CHECKOV
 from traust_core.v1.models.insight import SlaPolicy, ViewName
-from traust_core.v1.models.operations import Invoice
+from traust_core.v1.models.operations import Invoice, Requirement
 from traust_core.v1.providers.base import ProviderRegistry
 from traust_core.v1.providers.checkout import GitCheckout
 from traust_core.v1.providers.clock import Clock, SystemClock
@@ -116,6 +117,8 @@ from traust_core.v1.providers.identity import (
 )
 from traust_core.v1.providers.impact import GovulncheckAnalyzer, SourceScanAnalyzer
 from traust_core.v1.providers.llm_app import LlmAppDetector
+from traust_core.v1.providers.local import LocalCheckout
+from traust_core.v1.providers.mirror import FETCH_TIMEOUT_SECONDS, MirrorCheckout
 from traust_core.v1.providers.model_catalog import ModelCatalog, RegistryModelCatalog
 from traust_core.v1.providers.osv import ExportedAdvisoryLookup
 from traust_core.v1.providers.package_source import PackageSources
@@ -234,6 +237,7 @@ from traust_core.v1.services.remediation import (
     RemediationService,
     VerificationService,
 )
+from traust_core.v1.services.repo_checkout import RepoCheckoutService
 from traust_core.v1.services.reporting import ReportingService
 from traust_core.v1.services.validation import ValidationRecords, ValidationService
 
@@ -274,6 +278,7 @@ class Services:
     verification: VerificationService
     redaction: RedactionPolicy
     reporting: ReportingService
+    checkouts: RepoCheckoutService
 
 
 @dataclass(frozen=True)
@@ -319,21 +324,27 @@ class Context:
         self.tool_floors: dict[str, str] = {}  # pack policy: minimum tool versions
         self._toolchain_files: tuple[Path, Path] | None = None
         self._rule_pack_files: tuple[Path, Path | None] | None = None
-        self.model_catalog: ModelCatalog | None = None  # so is the spend view
+        self.model_catalog: ModelCatalog | None = None  # the spend view raises without one
         self.invoices: tuple[Invoice, ...] = ()  # the spend view reconciles against these
         # The SLA view is built only with one: this run's policy, or the default a recorded one
         # replaces.
         self.sla_policy: SlaPolicy | None = None
         self.default_sla_policy: SlaPolicy | None = None
-        self.attack_catalog: AttackCatalog | None = None  # so is the ATT&CK coverage view
-        self.atlas_catalog: AtlasCatalog | None = None  # ATLAS IDs are then shape-checked only
+        # The ATT&CK coverage view raises without its catalog; threat-model lint requires both
+        self.attack_catalog: AttackCatalog | None = None
+        self.atlas_catalog: AtlasCatalog | None = None
+
+    def preflight(self, requirements: Iterable[Requirement]) -> None:
+        """Refuse before any work when an enabled asset's requirement is unmet, listing every
+        gap with its fix (the engine's start gate and `traust doctor` call the same door)."""
+        preflight_requirements(self, requirements)
 
     @classmethod
     def from_file(cls, path: Path) -> Context:
         return cls(Config.from_file(path))
 
-    def configure_logging(self) -> None:
-        install_logging(self.config.logging, self.config.home)
+    def configure_logging(self, *logger_roots: str) -> None:
+        install_logging(self.config.logging, self.config.home, ("traust_ledger", *logger_roots))
 
     @cached_property
     def object_store(self) -> ObjectStore:
@@ -351,6 +362,29 @@ class Context:
     @cached_property
     def git(self) -> GitCheckout:
         return GitCheckout(self.process)
+
+    @cached_property
+    def checkouts(self) -> RepoCheckoutService:
+        """The one door for a commit's files: every consumer that needs a tree asks it, so the
+        mirror cache is shared and wired once."""
+        # fetches and worktrees run under the process policy (allowlist, env, timeout); the
+        # fetch cap only tightens the configured timeout, never loosens it
+        return RepoCheckoutService(
+            ArchiveCheckout(
+                self.http, self.clock, self.config.forge_hosts, self.config.forge_token_values()
+            ),
+            MirrorCheckout(
+                ProcessRunner(
+                    self.config.process.allowed_binaries,
+                    keep_env=self.config.process.keep_env,
+                    timeout_seconds=min(FETCH_TIMEOUT_SECONDS, self.config.process.timeout_seconds),
+                ),
+                self.clock,
+                self.config.locations.mirror_cache_dir(self.config.home),
+                self.forge_api,
+            ),
+            LocalCheckout(self.process, self.clock),
+        )
 
     @cached_property
     def symbols(self) -> SymbolIndex:
@@ -442,11 +476,15 @@ class Context:
         self.advisories = ExportedAdvisoryLookup(paths, clock=self.clock)
 
     @property
-    def deps_dev(self) -> DepsDevResolver | None:
+    def deps_dev(self) -> DepsDevResolver:
         """deps.dev resolution through the registry's `deps_dev` source, cached in the object
-        store; None when the registry has no enabled `deps_dev`."""
+        store; raises when the registry has no enabled `deps_dev` (the pack declares the
+        feed required)."""
         if DEPS_DEV not in self.feed_sources.names():
-            return None
+            raise ConfigError(
+                f"no {DEPS_DEV} feed source: enable it in the feeds registry "
+                "(Context.register_feeds)"
+            )
         return DepsDevResolver(
             self.feed_sources.get(DEPS_DEV),
             self.clock,
@@ -546,9 +584,10 @@ class Context:
         return tool
 
     def register_fleet_fix(self) -> None:
-        """Apply fleet fixes and run their ast-grep golden tests through git and ast-grep."""
+        """Apply fleet fixes and run their ast-grep golden tests over a writable checkout from
+        the checkout service."""
         self.fleet_fix_applier = self.fleet_fix_goldens = git_fleet_fix(
-            self.config.process.keep_env, self.clock
+            self.config.process.keep_env, self.clock, self.checkouts
         )
 
     def register_compliance_sources(self) -> None:
@@ -591,8 +630,11 @@ class Context:
             supplements=lambda: self.rule_pack_supplements,
             canary_sources=canary_sources,
             canary_repos=canary_repos,
+            checkouts=self.checkouts,
         )
-        self.rule_sweeper = OpengrepRuleSweep(self.rule_pack, self.config.process.keep_env)
+        self.rule_sweeper = OpengrepRuleSweep(
+            self.rule_pack, self.config.process.keep_env, self.checkouts
+        )
 
     def register_rule_drafts(self, root: Path) -> None:
         """Stage rule drafts in the adopter's `root` (`locations.rule_drafts`), resolving rule
@@ -767,9 +809,7 @@ class Context:
             hosts=hosts,
             sbom_tool=SyftSbom(self.process, self.clock),
             findings=findings,
-            checkout=ArchiveCheckout(
-                self.http, self.clock, hosts, self.config.forge_token_values()
-            ),
+            checkout=self.checkouts,
         )
         sync = PortfolioSync(portfolio, sources, clock=self.clock)
         catalog = ProviderCatalog(
@@ -895,6 +935,7 @@ class Context:
                 StatementPolicy(),
             ),
             exposure=exposure,
+            checkouts=self.checkouts,
             below_range=BelowRangeService(
                 exposure,
                 advisories=self.advisories,
@@ -940,11 +981,11 @@ class Context:
                 rule_packs=self.rule_packs,
                 canaries=self.canaries,
                 code_facts=code_facts,
-                sync=sync,
                 objects=self.object_store,
                 rule_drafts=self.rule_drafts,
                 sweeper=self.rule_sweeper,
                 git=self.git,
+                checkouts=self.checkouts,
             ),
             pqc=pqc,
             remediation=remediation,
@@ -997,27 +1038,17 @@ class Context:
                         self.clock,
                         recorded=None if self.sla_policy else sla_policies,
                     ),
-                    *(
-                        ()
-                        if self.model_catalog is None
-                        else (
-                            SpendView(
-                                spend,
-                                portfolio,
-                                FindingsRollupView(findings, portfolio, assessment),
-                                self.model_catalog,
-                                self.invoices,
-                            ),
-                        )
+                    # Always in the set: each raises naming its file when its catalog is missing
+                    # (the SlaView pattern), never silently absent.
+                    SpendView(
+                        spend,
+                        portfolio,
+                        FindingsRollupView(findings, portfolio, assessment),
+                        self.model_catalog,
+                        self.invoices,
                     ),
-                    *(
-                        ()
-                        if self.attack_catalog is None
-                        else (
-                            AttackCoverageView(
-                                assessment, findings, portfolio, self.attack_catalog, self.clock
-                            ),
-                        )
+                    AttackCoverageView(
+                        assessment, findings, portfolio, self.attack_catalog, self.clock
                     ),
                 ),
                 self.clock,

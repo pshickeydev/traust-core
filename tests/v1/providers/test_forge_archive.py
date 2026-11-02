@@ -9,11 +9,13 @@ import logging
 import shutil
 import subprocess
 import tarfile
+import tempfile
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, BinaryIO
 
+import pydantic
 import pytest
 
 from traust_core.v1.errors import ServiceError, ValidationError
@@ -161,24 +163,24 @@ def test_each_forge_is_asked_for_its_archive_with_its_token_in_a_header(
 
 
 @pytest.mark.parametrize(
-    ("repo", "ref", "match"),
-    [
-        ("https://unknown.example/o/r", REF, "not a known forge"),
-        ("https://github.com/o/r", None, "needs the commit's sha"),
-    ],
+    ("repo", "match"),
+    [("https://unknown.example/o/r", "not a known forge")],
 )
-def test_bad_requests_are_refused_before_any_fetch(
-    repo: str, ref: GitSha | None, match: str
-) -> None:
+def test_bad_requests_are_refused_before_any_fetch(repo: str, match: str) -> None:
     fetcher, archive = checkout(tarball({"go.mod": GO_MOD}))
     with pytest.raises(ValidationError, match=match):
-        archive.checkout(CheckoutRequest(repo=repo, ref=ref))
+        archive.checkout(CheckoutRequest(repo=repo, ref=REF))
+    assert fetcher.asked == []
+
+
+def test_a_request_without_a_commit_is_refused_before_any_fetch() -> None:
+    fetcher, _ = checkout(tarball({"go.mod": GO_MOD}))
+    with pytest.raises(pydantic.ValidationError, match="ref"):
+        CheckoutRequest(repo="https://github.com/o/r")  # type: ignore[call-arg]
     assert fetcher.asked == []
 
 
 def leftovers() -> set[str]:
-    import tempfile
-
     return {p.name for p in Path(tempfile.gettempdir()).glob("checkout-*")}
 
 
@@ -192,8 +194,13 @@ def leftovers() -> set[str]:
     ids=["absolute", "parent", "over-cap"],
 )
 def test_an_unsafe_or_oversized_archive_fails_and_leaves_nothing(
-    body: bytes, error: type[Exception], match: str
+    body: bytes,
+    error: type[Exception],
+    match: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
     before = leftovers()
     _, archive = checkout(body, cap=len(GO_MOD) * 8)
     with pytest.raises(error, match=match):

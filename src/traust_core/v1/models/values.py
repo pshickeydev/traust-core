@@ -4,7 +4,8 @@ import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
-from urllib.parse import urlsplit
+from pathlib import Path
+from urllib.parse import quote, unquote, urlsplit
 from uuid import UUID
 
 from pydantic import GetCoreSchemaHandler
@@ -20,6 +21,7 @@ from traust_core.v1.errors import ValidationError
 _SHA = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 _CVE = re.compile(r"CVE-\d{4}-\d{4,}")
 _PATH_SEGMENT = re.compile(r"[A-Za-z0-9._-]+")
+_HOST = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?")
 _SLUG = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
 
@@ -123,10 +125,16 @@ class HttpsRepoUrl:
         """Structural validation only (scheme, no credentials, owner/repo path); host-agnostic."""
         if not raw.isascii() or raw != raw.strip() or raw.startswith("-"):
             raise ValidationError(f"repo url has unsafe characters: {raw!r}")
-        parts = urlsplit(raw)
+        # urlsplit and its port access raise bare ValueError on malformed netlocs; the parse
+        # contract is a typed ValidationError
+        try:
+            parts = urlsplit(raw)
+            port = parts.port
+        except ValueError as e:
+            raise ValidationError(f"repo url is malformed: {raw!r}") from e
         if parts.scheme != "https":
             raise ValidationError(f"repo url must be https: {raw!r}")
-        if parts.username or parts.password or parts.port or parts.query or parts.fragment:
+        if parts.username or parts.password or port or parts.query or parts.fragment:
             raise ValidationError(f"repo url must be host and path only: {raw!r}")
         segments = parts.path.strip("/").removesuffix(".git").split("/")
         if len(segments) < 2 or any(
@@ -134,7 +142,12 @@ class HttpsRepoUrl:
             for s in segments
         ):
             raise ValidationError(f"repo url path is invalid: {raw!r}")
-        return cls((parts.hostname or "").lower(), "/".join(segments))
+        host = (parts.hostname or "").lower()
+        # the host becomes a directory under the mirror cache root: it must be a
+        # plain hostname, never "..", a leading dash or anything path-like
+        if not _HOST.fullmatch(host) or ".." in host:
+            raise ValidationError(f"repo url host is invalid: {raw!r}")
+        return cls(host, "/".join(segments))
 
     @classmethod
     def parse(cls, raw: str, allowed_hosts: Iterable[str]) -> HttpsRepoUrl:
@@ -162,3 +175,52 @@ class HttpsRepoUrl:
 
     def __str__(self) -> str:
         return f"https://{self.host}/{self.path}"
+
+
+@dataclass(frozen=True, slots=True)
+class LocalRepoUrl:
+    """A git repository on this machine: an absolute path, cited as `file://…` or a plain path."""
+
+    path: Path
+
+    @classmethod
+    def parse(cls, raw: str) -> LocalRepoUrl:
+        if raw != raw.strip() or raw.startswith("-"):
+            raise ValidationError(f"repo path has unsafe characters: {raw!r}")
+        cited = raw
+        if raw[:5].lower() == "file:":
+            parts = urlsplit(raw)
+            if parts.query or parts.fragment or parts.netloc not in ("", "localhost"):
+                raise ValidationError(f"repo url must be a local file path only: {raw!r}")
+            cited = unquote(parts.path)
+        path = Path(cited)
+        if not path.is_absolute():
+            raise ValidationError(f"repo path must be absolute: {raw!r}")
+        return cls(path)
+
+    @classmethod
+    def __get_pydantic_core_schema__(
+        cls, source: object, handler: GetCoreSchemaHandler
+    ) -> core_schema.CoreSchema:
+        from_str = core_schema.chain_schema(
+            [
+                core_schema.str_schema(),
+                core_schema.no_info_plain_validator_function(cls.parse),
+            ]
+        )
+        return core_schema.json_or_python_schema(
+            json_schema=from_str,
+            python_schema=core_schema.union_schema([core_schema.is_instance_schema(cls), from_str]),
+            serialization=core_schema.plain_serializer_function_ser_schema(
+                str, when_used="json", return_schema=core_schema.str_schema()
+            ),
+        )
+
+    def __str__(self) -> str:
+        # quoted: a raw `#`, `?` or `%` in the path would read back as fragment, query or
+        # an escape when the citation is parsed again
+        return f"file://{quote(str(self.path))}"
+
+
+# Where a checkout reads a repository from: a forge over https, or a repository on this machine.
+RepoOrigin = HttpsRepoUrl | LocalRepoUrl

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -9,23 +9,27 @@ from uuid import uuid4
 import pytest
 import sqlalchemy as sa
 
-from tests.v1.conftest import SQL_BACKENDS, contract_db
+from tests.v1.conftest import SQL_BACKENDS, contract_db, git
 from tests.v1.repositories.tables.conftest import T0, Seed, saved_id
 from traust_core.v1 import contracts
 from traust_core.v1.context import (
+    CheckoutRequest,
     Clock,
     Config,
     Context,
     FeedQuery,
     OpsService,
+    ProcessConfig,
     Router,
     SpendService,
+    Workspace,
     validate_config,
 )
-from traust_core.v1.errors import ConfigError
+from traust_core.v1.errors import ConfigError, ValidationError
 from traust_core.v1.models.findings import RecordDecision
 from traust_core.v1.models.identity import IdentitySource, Principal
 from traust_core.v1.models.operations import BudgetStatus, ConfigDigest, LaneName, OrderRequest
+from traust_core.v1.models.values import GitSha
 from traust_core.v1.models.vocabulary import ActorKind
 from traust_core.v1.providers import clock
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
@@ -46,6 +50,32 @@ def _write(tmp_path: Path, text: str) -> Path:
     path = tmp_path / "traust.yaml"
     path.write_text(text)
     return path
+
+
+def test_the_facade_serves_the_checkout_shapes_a_consumer_builds() -> None:
+    request = CheckoutRequest(repo="https://github.com/o/r", ref=GitSha.parse("a" * 40))
+    workspace = Workspace(
+        repo=request.repo, sha=request.ref, path=Path("/nowhere"), provider="git-mirror"
+    )
+    assert (request.keep, workspace.provider) == (None, "git-mirror")
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [lambda repo: str(repo), lambda repo: "https://github.com/o/r"],
+    ids=["local", "mirror"],
+)
+def test_checkouts_run_only_binaries_the_process_policy_allows(
+    tmp_path: Path, origin: Callable[[Path], str]
+) -> None:
+    repo = tmp_path / "canary"
+    repo.mkdir()
+    git(repo, "init", "-q")
+    config = Config(home=tmp_path / "home", process=ProcessConfig(allowed_binaries=("wc",)))
+    checkouts = Context(config).services().checkouts
+    request = CheckoutRequest(repo=origin(repo), ref=GitSha.parse("a" * 40))
+    with pytest.raises(ValidationError, match="binary not allowed"):
+        checkouts.checkout(request)
 
 
 @pytest.fixture(params=SQL_BACKENDS)
