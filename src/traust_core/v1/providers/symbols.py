@@ -205,7 +205,11 @@ class SymbolIndex:
         included; one pass over the checkout."""
         if not names:
             return []
-        pattern = re.compile(rf"\b(?:{'|'.join(map(re.escape, sorted(names)))})\b")
+        # \b before $ requires a preceding word character — a $-prefixed name at
+        # line start never matches. Use lookaround instead: not preceded/followed by
+        # a word character or $.
+        alternation = "|".join(map(re.escape, sorted(names)))
+        pattern = re.compile(rf"(?<![\w$])(?:{alternation})(?![\w$])")
         found = []
         for rel, path, _ in source_files(root):
             lines = path.read_text(errors="replace").splitlines()

@@ -357,18 +357,44 @@ def parse_pipfile_lock(text: str) -> Parsed:
 
 
 _SETUP_NAME_RE = re.compile(r"""\bname\s*=\s*['"]([^'"]+)['"]""")
-_INSTALL_REQUIRES_RE = re.compile(r"install_requires\s*=\s*\[(.*?)\]", re.S)
+_INSTALL_REQUIRES_RE = re.compile(r"install_requires\s*=\s*\[")
 _STR_LITERAL_RE = re.compile(r"""['"]([^'"]+)['"]""")
 
 
+def _bracketed_list(text: str, open_at: int) -> str:
+    """The text between the `[` at `open_at` and its matching `]`, honoring quoted strings and
+    the extras brackets inside them (`'requests[security]'`); '' when it never closes."""
+    i, depth, quote = open_at, 0, ""
+    while i < len(text):
+        c = text[i]
+        if quote:  # a bracket inside a string literal is not a list delimiter
+            if c == "\\":  # an escaped quote does not end the string
+                i += 2
+                continue
+            if c == quote:
+                quote = ""
+        elif c in "'\"":
+            quote = c
+        elif c == "[":
+            depth += 1
+        elif c == "]":
+            depth -= 1
+            if depth == 0:
+                return text[open_at + 1 : i]
+        i += 1
+    return ""
+
+
 def parse_setup_py(text: str) -> Parsed:
-    """setup.py's literal `install_requires=[...]`; a computed list reads as no dependencies."""
+    """setup.py's literal `install_requires=[...]`; a computed list reads as no dependencies.
+    Only that list is read: a later `extras_require` dict holds optional packages, not runtime
+    dependencies."""
     m = _SETUP_NAME_RE.search(text)
     deps: list[Dep] = []
     if im := _INSTALL_REQUIRES_RE.search(text):
         deps = [
             (p[0], p[1], False)
-            for sm in _STR_LITERAL_RE.finditer(im.group(1))
+            for sm in _STR_LITERAL_RE.finditer(_bracketed_list(text, im.end() - 1))
             if (p := _parse_pep508(sm.group(1)))
         ]
     return (m.group(1) if m else None), deps
@@ -612,7 +638,7 @@ def parse_github_workflow(text: str) -> Parsed:
     return None, list(deps)
 
 
-_REQUIRE_RE = re.compile(r"^\s*([A-Za-z0-9._~\-/]+)\s+(v[^\s/]+)(\s*//\s*indirect)?\s*$")
+_REQUIRE_RE = re.compile(r"^\s*([A-Za-z0-9._~\-/]+)\s+(v[^\s/]+)(?:\s*//\s*(.*))?$")
 _MODULE_RE = re.compile(r"^\s*module\s+(\S+)\s*$", re.MULTILINE)
 
 
@@ -631,7 +657,10 @@ def parse_gomod(text: str) -> tuple[str | None, list[Dep]]:
             continue
         candidate = stripped if in_block else stripped.removeprefix("require ")
         if (in_block or stripped.startswith("require ")) and (rm := _REQUIRE_RE.match(candidate)):
-            requires.append((rm.group(1), rm.group(2), bool(rm.group(3))))
+            # go's own marker is the comment `// indirect`, exactly — not any comment naming it
+            requires.append(
+                (rm.group(1), rm.group(2), bool(rm.group(3) and rm.group(3).strip() == "indirect"))
+            )
     return (m.group(1) if m else None), requires
 
 
