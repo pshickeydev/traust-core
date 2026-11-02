@@ -310,7 +310,7 @@ class ComplianceService:
             # home in the model yet. Declare repo-graph or explicit membership.
             raise ValidationError(f"{name}: resolves_via=deployment-iac is not supported")
         current = self._current_scopes()
-        if name in current and not replace:
+        if (name in current or self._ever_declared(name)) and not replace:
             raise ConflictError(f"boundary {name!r} already declared — pass replace to modify it")
         declarant = str(entry["declared_by"]).removeprefix("draft:")
         signed = principal.is_verified_human() and _is(principal, declarant)
@@ -830,6 +830,28 @@ class ComplianceService:
     def _current_scopes(self) -> dict[str, ComplianceScope]:
         return {scope.boundary: scope for _, scope in self._declarations()}
 
+    def _ever_declared(self, name: str) -> bool:
+        """Whether any imported declaration names the boundary. `_declarations` reads only
+        the newest SCOPE_HISTORY rows; a boundary whose last declaration fell out of that
+        window is still declared, and modifying it still demands replace. Declaring is rare
+        and human-driven, so the exhaustive scan lives here — not on the read paths: widen
+        the window until it stops growing, reading each declaration once."""
+        checked: set[UUID] = set()
+        limit = SCOPE_HISTORY
+        while page := self._publisher.history(ComplianceScopeArtifact, limit):
+            fresh = [row for row in page if row.id not in checked]
+            if not fresh:
+                return False
+            for row in fresh:
+                assert row.id is not None
+                checked.add(row.id)
+                if self.get_scope(row.id).boundary == name:
+                    return True
+            if len(page) < limit:
+                return False
+            limit *= 4
+        return False
+
     def _declarations(self) -> list[tuple[tuple[datetime, UUID], ComplianceScope]]:
         """The current declaration per boundary with its position, newest first."""
         rows = self._publisher.history(ComplianceScopeArtifact, SCOPE_HISTORY)
@@ -841,10 +863,19 @@ class ComplianceService:
         return sorted(current.values(), key=lambda d: (d[0][0], str(d[0][1])), reverse=True)
 
     def _recorded(self, scope: ComplianceScope) -> Iterator[ComplianceAssessment]:
-        """The scope's recorded assessments, newest first."""
-        ref_id = self._members(scope)[0].repository_ref_id
+        """The scope's recorded assessments, newest first — across every ref of every
+        member repository, so a head re-observed since recording cannot hide posture.
+        The scan is kind-filtered and ref-bounded in SQL, so cost grows with the
+        member repos' recorded compliance assessments, not with scan history; the
+        scope check needs the document, since `scope_id` is payload, not a column."""
+        members = self._members(scope)
+        refs = [
+            ref.id
+            for ref in self._portfolio.inventory.list_refs_of([m.repository_id for m in members])
+            if ref.id is not None
+        ]
         kind = ComplianceAssessmentArtifact
-        recorded = self._log.list_of(AssessmentKind.COMPLIANCE, [ref_id])
+        recorded = self._log.list_of(AssessmentKind.COMPLIANCE, refs)
         for a, row in self._log.documents(recorded, [kind.schema]):
             assert row.id is not None and a.id is not None
             doc = self._publisher.read(row.id, kind)
@@ -1029,7 +1060,13 @@ def _variances(
 def _assessed(
     resolved: ResolvedScope, doc: ComplianceAssessmentArtifact
 ) -> tuple[ScopeMember, ...]:
-    repos = set(json.loads(doc.payload)["metadata"]["target"].get("repos") or ())
+    target = json.loads(doc.payload)["metadata"].get("target") or {}
+    repos = set(target.get("repos") or ())
+    if not repos:
+        # the producer can legally omit repos (product/environment-scoped runs), but such
+        # a doc attaches to nothing — refuse loudly, never record an assessment of
+        # nothing that reads back as never-assessed
+        raise ValidationError("compliance assessment target names no repos — nothing to attach")
     if gone := sorted(repos - set(resolved.repos)):
         raise ConflictError(
             f"scope membership changed since evaluation ({', '.join(gone)}): re-run"
