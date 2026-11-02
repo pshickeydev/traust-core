@@ -15,7 +15,16 @@ PATH_PARAM_RX = re.compile(
     r"\{([A-Za-z_]\w*)[^}]*\}|(?<![?\w]):([A-Za-z_]\w*)|<(?:\w+:)?([A-Za-z_]\w*)>"
 )
 # A guard that admits only a privileged role acts on any record by design: out of scope.
-PRIVILEGED_RX = re.compile(r"(?i)(admin|operator|superuser|staff)")
+# a privileged role as a word: `ROLE_ADMIN`, `isAdmin`, `require_superuser`; not `COOPERATOR`
+PRIVILEGED_RX = re.compile(
+    r"(?:(?<![A-Za-z])(?i:admin|operator|superuser|staff)|(?<=[a-z])(?:Admin|Operator|Superuser|Staff))"
+    r"(?:s|S)?(?![a-z])"
+)
+# an admin of one tenant can still reach another tenant's objects (owner decision 2026-11-02)
+_TENANT_ADMIN_RX = re.compile(
+    r"(?i)(tenant|org|organi[sz]ation|customer|team|project|workspace|group|account|company|"
+    r"client|realm|site|store|shop|partner|department|non|not|no)[_\-\s]?admin"
+)
 _QUOTED_RX = re.compile(r"'([^'\"]*)'|\"([^'\"]*)\"")
 _ALTERNATIVE_RX = re.compile(r"(?i:\bor\b|\|\||_or_|#\w|principal|authentication\.)|Or[A-Z]")
 # owner-, tenant- or membership-shaped fields; broad on purpose, since a miss reads as ownerless
@@ -71,6 +80,10 @@ def path_params(pattern: str) -> tuple[str, ...]:
     return tuple(next(g for g in m.groups() if g) for m in PATH_PARAM_RX.finditer(pattern))
 
 
+def _privileged(role: str) -> bool:
+    return bool(PRIVILEGED_RX.search(role)) and not _TENANT_ADMIN_RX.search(role)
+
+
 def privileged_only(guard: str) -> bool:
     """A guard naming only privileged roles, quoted or as constants, with no other way in."""
     if guard.startswith("call:") or not PRIVILEGED_RX.search(guard):
@@ -82,20 +95,20 @@ def privileged_only(guard: str) -> bool:
     name, _, args = guard.partition("(")
     if name.startswith("@"):
         roles = _annotation_roles(name, args.removesuffix(")"))
-        return bool(roles) and all(PRIVILEGED_RX.search(r) for r in roles)
+        return bool(roles) and all(_privileged(r) for r in roles)
     quoted = [a or b for a, b in _QUOTED_RX.findall(args)]
     roles = [r for q in quoted for r in re.split(r"[,\s]+", q) if r]
     roles += _CONSTANT_ROLE.findall(_QUOTED_RX.sub(" ", args))
     if not roles:
-        return not args and bool(PRIVILEGED_RX.search(name))
-    return all(PRIVILEGED_RX.search(r) for r in roles)
+        return not args and _privileged(name)
+    return all(_privileged(r) for r in roles)
 
 
 def _annotation_roles(name: str, args: str) -> list[str] | None:
     """The roles a Java security annotation names, or None when any isn't a literal or constant
     (`hasRole(@roles.admin())`, `@RolesAllowed(adminRole)`)."""
     if not args:
-        return [name] if PRIVILEGED_RX.search(name) else None
+        return [name] if _privileged(name) else None
     if name == "@PostAuthorize":
         return None  # runs after the handler
     if name == "@PreAuthorize":

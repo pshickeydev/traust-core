@@ -286,6 +286,12 @@ def test_classify(
         ("@RolesAllowed(Roles.ADMIN)", True),
         ('@PreAuthorize("hasRole(@roles.admin())")', False),
         ("@RolesAllowed(adminRole)", False),
+        ("@PreAuthorize(\"hasAuthority('TENANT_ADMIN')\")", False),  # one tenant's admin
+        ("@PreAuthorize(\"hasAuthority('SYS_ADMIN')\")", True),
+        ("@PreAuthorize(\"hasRole('NON_ADMIN')\")", False),
+        ('@Secured("ROLE_COOPERATOR")', False),
+        ("call:logAdminView", False),  # a call's name
+        ("@PostAuthorize(\"hasRole('ADMIN')\")", False),  # runs after the handler
         ("@PreAuthorize(\"hasRole('ADMIN') and #id > 0\")", False),
     ],
 )

@@ -1117,3 +1117,318 @@ def test_long_conditions_and_many_declarations_neither_crash_nor_crawl(tmp_path)
     result = _tree(tmp_path, {"pom.xml": POM, "src/main/java/app/Api.java": api})
     assert _row(result, "GET", "/long/{id}")["ownership"] == "caller-blind"
     assert _row(result, "GET", "/many/{id}")["ownership"] == "checked"
+
+
+# A fourth independent review: more ways a caller still reaches another user's object.
+ITEMS = (
+    "import org.springframework.web.bind.annotation.*;\n"
+    "import java.security.Principal;\n"
+    "@Entity class Item { Long id; String ownerId; String title; }\n"
+    "@Entity class Board { Long id; String ownerId; }\n"
+    "@Entity class Order { Long id; String ownerId; }\n"
+    "@Entity class CatalogItem { Long id; String name; }\n"
+    "@Entity class Doc { Long id; String body; }\n"
+    "@Entity class DocShare { Long id; Long docId; String userId; }\n"
+    '@NamedQuery(name = "Board.findByIdAndOwnerId",'
+    ' query = "select b from Board b where b.id = ?1")\n'
+    "class BoardQueries {}\n"
+    "interface ItemRepository extends JpaRepository<Item, Long> {\n"
+    "  Optional<Item> findByIdAndOwnerId(Long id, String ownerId);\n"
+    "  @Procedure Item findByIdAndTitle(Long id, String title);\n"
+    "  @Modifying @Query(\"update Item i set i.title = 'x' where i.id = ?1\")\n"
+    "  Optional<Item> findLocked(Long id);\n}\n"
+    "interface BoardRepository extends JpaRepository<Board, Long> {\n"
+    "  Optional<Board> findByIdAndOwnerId(Long id, String ownerId);\n}\n"
+    "@NoRepositoryBean interface BaseRepo<T> extends JpaRepository<T, Long> {}\n"
+    "interface OrderRepository extends BaseRepo<Order> {\n"
+    '  @Query("select o from Order o where o.id = ?1")\n'
+    "  Order findByIdAndOwnerId(Long id, String ownerId);\n}\n"
+    "interface CatalogRepository extends JpaRepository<CatalogItem, Long> {\n"
+    '  @Query("select o from Order o where o.id = ?1") Order findOrder(Long id);\n}\n'
+    "interface DocRepository extends JpaRepository<Doc, Long> {}\n"
+    "class ItemService {\n"
+    "  ItemRepository items;\n"
+    "  Item load(Long id, String owner) {\n"
+    "    return items.findByIdAndOwnerId(id, owner).orElseThrow();\n  }\n"
+    "  Item find(Long id, String owner) {\n"
+    "    return items.findByIdAndOwnerId(id, owner).orElseThrow();\n  }\n"
+    "  Item open(Long id) {\n"
+    "    Item r = items.findById(id).orElseThrow();\n"
+    '    r.title = "opened";\n'
+    "    items.save(r);\n"
+    "    return r;\n  }\n"
+    "  Item read(Long id) {\n"
+    "    Item r = items.findById(id).orElseThrow();\n"
+    "    return r;\n  }\n"
+    "  Board board(Long boardId, Long cardId) {\n"
+    "    return boards.findById(boardId).orElseThrow();\n  }\n"
+    "  BoardRepository boards;\n"
+    "  Map<String, Item> drafts;\n"
+    "  Item owned(Long id, String me) {\n"
+    "    if (drafts.containsKey(me)) return drafts.get(me);\n"
+    "    Item r = items.findById(id).orElse(null);\n"
+    "    return r != null && r.ownerId.equals(me) ? r : null;\n  }\n}\n"
+    "@Primary class FastService extends ItemService {\n"
+    "  Item load(Long id, String owner) {\n"
+    "    return items.findById(id).orElseThrow();\n  }\n}\n"
+    "class Overloaded {\n"
+    "  ItemRepository items;\n"
+    "  Item get(Long id, String owner) {\n"
+    "    return items.findByIdAndOwnerId(id, owner).orElseThrow();\n  }\n"
+    "  Item get(Long id, Long other) {\n"
+    "    return items.findById(id).orElseThrow();\n  }\n}\n"
+    "class BaseController {\n"
+    "  ItemRepository items;\n"
+    "  Item find(Long id, String owner) {\n"
+    "    return items.findById(id).orElseThrow();\n  }\n}\n"
+    "class ItemRef { Long itemId; }\n"
+    '@RestController @RequestMapping("/f")\n'
+    "class Fourth extends BaseController {\n"
+    "  private ItemRepository items;\n"
+    "  private BoardRepository boards;\n"
+    "  private OrderRepository orders;\n"
+    "  private CatalogRepository catalog;\n"
+    "  private DocRepository docs;\n"
+    "  private ItemService service;\n"
+    "  private Overloaded overloaded;\n"
+    "  private Directory directory;\n"
+    '  @GetMapping("/try/{raw}") Item tried(@PathVariable String raw) {\n'
+    "    long id;\n"
+    "    try { id = Long.parseLong(raw); } catch (NumberFormatException e) {\n"
+    "      throw new IllegalArgumentException();\n    }\n"
+    "    return items.findById(id).orElseThrow();\n  }\n"
+    '  @DeleteMapping("/each/{ids}") void each(@PathVariable List<Long> ids) {\n'
+    "    for (Long id : ids) { items.deleteById(id); }\n  }\n"
+    '  @GetMapping("/bound/{id}") Item bound(@PathVariable("id") Item item) {\n'
+    "    return item;\n  }\n"
+    '  @DeleteMapping("/boards/{boardId}/cards/{raw}")\n'
+    "  void card(@PathVariable Long boardId, @PathVariable String raw, Principal me) {\n"
+    "    boards.findByIdAndOwnerId(boardId, me.getName()).orElseThrow();\n"
+    "    Long cid;\n"
+    "    cid = Long.valueOf(raw);\n"
+    "    items.deleteById(cid);\n  }\n"
+    '  @DeleteMapping("/siblings/{a}/{b}")\n'
+    "  void siblings(@PathVariable Long a, @PathVariable Long b, Principal me, boolean flag) {\n"
+    "    items.findByIdAndOwnerId(b, me.getName()).orElseThrow();\n"
+    "    if (flag) { Long key = a; items.deleteById(key); }\n"
+    "    else { Long key = b; items.deleteById(key); }\n  }\n"
+    '  @GetMapping("/overloaded/{id}") Item viaOverload(@PathVariable Long id, Principal me) {\n'
+    "    return overloaded.get(id, me.getName());\n  }\n"
+    '  @GetMapping("/primary/{id}") Item primary(@PathVariable Long id, Principal me) {\n'
+    "    return service.load(id, me.getName());\n  }\n"
+    "  Item find(Long id, String owner) {\n"
+    "    return items.findByIdAndOwnerId(id, owner).orElseThrow();\n  }\n"
+    '  @GetMapping("/super/{id}") Item viaSuper(@PathVariable Long id, Principal me) {\n'
+    "    return super.find(id, me.getName());\n  }\n"
+    '  @GetMapping("/opened/{id}") Item opened(@PathVariable Long id, Principal me) {\n'
+    "    Item r = service.open(id);\n"
+    "    if (!r.ownerId.equals(me.getName())) throw new IllegalStateException();\n"
+    "    return r;\n  }\n"
+    '  @DeleteMapping("/read/{id}") void read(@PathVariable Long id, Principal me) {\n'
+    "    Item r = service.read(id);\n"
+    "    if (!r.ownerId.equals(me.getName())) throw new IllegalStateException();\n"
+    "    items.deleteById(id);\n  }\n"
+    '  @DeleteMapping("/board/{boardId}/{cardId}")\n'
+    "  void board(@PathVariable Long boardId, @PathVariable Long cardId, Principal me) {\n"
+    "    Board b = service.board(boardId, cardId);\n"
+    "    if (!b.ownerId.equals(me.getName())) throw new IllegalStateException();\n"
+    "    items.deleteById(cardId);\n  }\n"
+    '  @DeleteMapping("/owned/{id}") void owned(@PathVariable Long id, Principal me) {\n'
+    "    Item r = service.owned(id, me.getName());\n"
+    "    if (r == null) throw new IllegalStateException();\n"
+    "    items.deleteById(id);\n  }\n"
+    '  @GetMapping("/orders/{id}") Order order(@PathVariable Long id, Principal me) {\n'
+    "    Order o = orders.findByIdAndOwnerId(id, me.getName());\n"
+    "    return o;\n  }\n"
+    '  @GetMapping("/named/{id}") Board named(@PathVariable Long id, Principal me) {\n'
+    "    return boards.findByIdAndOwnerId(id, me.getName()).orElseThrow();\n  }\n"
+    '  @GetMapping("/procedure/{id}") Item procedure(@PathVariable Long id, Principal me) {\n'
+    "    return items.findByIdAndTitle(id, me.getName());\n  }\n"
+    '  @GetMapping("/catalog/{id}") Order catalogOrder(@PathVariable Long id) {\n'
+    "    return catalog.findOrder(id);\n  }\n"
+    '  @GetMapping("/principal/{id}")\n'
+    "  Item principal(@PathVariable Long id, @RequestParam String u) {\n"
+    "    String owner = directory.getUserPrincipal(u).getName();\n"
+    "    return items.findByIdAndOwnerId(id, owner).orElseThrow();\n"
+    "  }\n"
+    '  @GetMapping("/mutated/{id}")\n'
+    "  Item mutated(@PathVariable Long id, @AuthenticationPrincipal AppUser me, String as) {\n"
+    "    me.setName(as);\n"
+    "    return items.findByIdAndOwnerId(id, me.getName()).orElseThrow();\n  }\n"
+    '  @GetMapping("/act-as/{id}")\n'
+    "  Item actAs(@PathVariable Long id, Principal me, @RequestParam Map<String, String> as) {\n"
+    "    return items.findByIdAndOwnerId(id, as.getOrDefault(me.getName(), me.getName()))"
+    ".orElseThrow();\n  }\n"
+    '  @DeleteMapping("/boards/{id}/items/{itemId}")\n'
+    "  void command(@PathVariable Long id, ItemRef ref, Principal me) {\n"
+    "    items.findByIdAndOwnerId(id, me.getName()).orElseThrow();\n"
+    "    items.deleteById(ref.itemId);\n  }\n"
+    '  @GetMapping("/converted/{id}") Item converted(@PathVariable String id, Principal me) {\n'
+    "    Long key = Long.valueOf(id);\n"
+    "    return items.findByIdAndOwnerId(key, me.getName()).orElseThrow();\n  }\n"
+    '  @GetMapping("/docs/{id}") Doc doc(@PathVariable Long id) {\n'
+    "    return docs.findById(id).orElseThrow();\n  }\n"
+    '  @GetMapping("/locked/{id}") Item locked(@PathVariable Long id, Principal me) {\n'
+    "    Item r = items.findLocked(id).orElseThrow();\n"
+    "    if (!r.ownerId.equals(me.getName())) throw new IllegalStateException();\n"
+    "    return r;\n  }\n"
+    '  @PreAuthorize("permitAll()")\n'
+    '  @GetMapping("/open/{id}") Item open(@PathVariable Long id) {\n'
+    "    return items.findById(id).orElseThrow();\n  }\n"
+    '  @GetMapping("/long/{id}") Item longValue(@PathVariable Long id) {\n'
+    "    return items.findById(id).orElseThrow();\n  }\n"
+    "  String label() {\n"
+    "    return " + " + ".join(['"x"'] * 600) + ";\n  }\n"
+    "}\n"
+)
+
+
+@pytest.fixture(scope="module")
+def fourth(tmp_path_factory: pytest.TempPathFactory) -> dict:
+    root = tmp_path_factory.mktemp("fourth")
+    return _tree(
+        root,
+        {
+            "pom.xml": POM,
+            "src/main/java/fourth/MethodSecurity.java": METHOD_SECURITY,
+            "src/main/java/fourth/Fourth.java": ITEMS,
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    ("method", "pattern", "ownership"),
+    [
+        ("GET", "/f/try/{raw}", "caller-blind"),  # the id assigned in a try
+        ("DELETE", "/f/each/{ids}", "caller-blind"),  # each id of a path list
+        ("GET", "/f/bound/{id}", "caller-blind"),  # Spring loads the entity by the path id
+        ("DELETE", "/f/boards/{boardId}/cards/{raw}", "unchecked"),  # the card id assigned later
+        ("DELETE", "/f/siblings/{a}/{b}", "unchecked"),  # `key` is `a` in one branch
+        ("GET", "/f/overloaded/{id}", "unknown"),  # which overload runs is the types'
+        ("GET", "/f/primary/{id}", "unchecked"),  # an overriding subclass may run
+        ("GET", "/f/super/{id}", "unchecked"),  # `super.find` is the superclass's
+        ("GET", "/f/opened/{id}", "unchecked"),  # the hop writes before the refusal
+        ("DELETE", "/f/read/{id}", "checked"),  # the hop only reads
+        ("DELETE", "/f/board/{boardId}/{cardId}", "unchecked"),  # verified the board only
+        ("DELETE", "/f/owned/{id}", "unchecked"),  # returns something else first
+        ("GET", "/f/orders/{id}", "unchecked"),  # an @Query behind a custom base repository
+        ("GET", "/f/named/{id}", "unchecked"),  # a JPA named query wins over the name
+        ("GET", "/f/procedure/{id}", "unchecked"),  # a stored procedure
+        ("GET", "/f/catalog/{id}", "caller-blind"),  # the query loads an Order
+        ("GET", "/f/principal/{id}", "caller-blind"),  # another user's principal
+        ("GET", "/f/mutated/{id}", "caller-blind"),  # the caller object rewritten
+        ("GET", "/f/act-as/{id}", "unchecked"),  # a request map picks the owner
+        ("DELETE", "/f/boards/{id}/items/{itemId}", "unknown"),  # a path id in a command object
+        ("GET", "/f/converted/{id}", "scoped"),  # a converted id is the id
+        ("GET", "/f/docs/{id}", "caller-blind"),  # shared through DocShare.docId
+        ("GET", "/f/locked/{id}", "unchecked"),  # a @Modifying query isn't a read
+        ("GET", "/f/open/{id}", "caller-blind"),  # permitAll() leaves the chain's guard
+    ],
+)
+def test_only_the_allowed_shapes_count_after_a_fourth_review(
+    fourth: dict, method: str, pattern: str, ownership: str
+) -> None:
+    row = _row(fourth, method, pattern)
+    assert row["ownership"] == ownership
+    assert row["judgement_required"] is (ownership in ("caller-blind", "unchecked"))
+
+
+def test_method_security_in_tests_doesnt_enable_it_for_the_application(tmp_path) -> None:
+    api = (
+        "import org.springframework.web.bind.annotation.*;\n"
+        "@Entity class Item { Long id; String ownerId; }\n"
+        "@RestController class Api {\n"
+        "  private EntityManager em;\n"
+        "  @PreAuthorize(\"hasRole('ADMIN')\")\n"
+        '  @GetMapping("/admin/{id}") Item admin(@PathVariable Long id) {\n'
+        "    return em.find(Item.class, id);\n  }\n}\n"
+    )
+    result = _tree(
+        tmp_path,
+        {
+            "pom.xml": POM,
+            "src/test/java/app/TestSecurity.java": METHOD_SECURITY,
+            "src/main/java/app/Comment.java": "// @EnableMethodSecurity\nclass Comment {}\n",
+            "src/main/java/app/Api.java": api,
+        },
+    )
+    assert _row(result, "GET", "/admin/{id}")["ownership"] == "caller-blind"
+
+
+def test_the_implementations_own_pre_authorize_wins(tmp_path) -> None:
+    api = (
+        "import org.springframework.web.bind.annotation.*;\n"
+        "@Entity class Item { Long id; String ownerId; }\n"
+        "interface ItemApi {\n"
+        '  @PreAuthorize("@access.canRead(#id, authentication)")\n'
+        '  @GetMapping("/items/{id}") Item get(@PathVariable("id") Long id);\n}\n'
+        "@RestController class Api implements ItemApi {\n"
+        "  private EntityManager em;\n"
+        "  @PreAuthorize(\"hasRole('USER')\")\n"
+        "  public Item get(Long id) { return em.find(Item.class, id); }\n}\n"
+    )
+    result = _tree(
+        tmp_path,
+        {
+            "pom.xml": POM,
+            "src/main/java/app/MethodSecurity.java": METHOD_SECURITY,
+            "src/main/java/app/Api.java": api,
+        },
+    )
+    assert _row(result, "GET", "/items/{id}")["ownership"] == "caller-blind"
+
+
+def test_same_named_repositories_in_two_modules_are_never_ownerless(tmp_path) -> None:
+    def module(name: str, entity: str, owner: str) -> str:
+        return (
+            f"package {name};\n"
+            "import org.springframework.web.bind.annotation.*;\n"
+            f"@Entity class {entity} {{ Long id; {owner} }}\n"
+            f"interface ItemRepository extends JpaRepository<{entity}, Long> {{}}\n"
+            f'@RestController @RequestMapping("/{name}") class Api {{\n'
+            "  private ItemRepository items;\n"
+            '  @GetMapping("/{id}") Object get(@PathVariable Long id) {\n'
+            "    return items.findById(id).orElseThrow();\n  }\n}\n"
+        )
+
+    result = _tree(
+        tmp_path,
+        {
+            "pom.xml": POM,
+            "a/src/main/java/a/Api.java": module("a", "Item", "String ownerId;"),
+            "b/src/main/java/b/Api.java": module("b", "Tag", "String label;"),
+        },
+    )
+    assert _row(result, "GET", "/a/{id}")["ownership"] == "caller-blind"
+    assert _row(result, "GET", "/b/{id}")["ownership"] == "caller-blind"
+
+
+def test_a_tenant_finder_behind_overloaded_helpers_stays_scoped(tmp_path) -> None:
+    base = (
+        "import org.springframework.web.bind.annotation.*;\n"
+        "class Device { Long id; String tenantId; }\n"
+        "class User { String getTenantId() { return null; } }\n"
+        "interface Finder<T, I, E> { E apply(T tenant, I id); }\n"
+        "class Base {\n"
+        "  User getCurrentUser() {\n"
+        "    return (User) SecurityContextHolder.getContext().getAuthentication().getPrincipal();\n"
+        "  }\n"
+        "  <T> T checkNotNull(T value) { return value; }\n"
+        "  <T> T checkNotNull(T value, String message) { return value; }\n"
+        "  <T> T checkNotNull(Optional<T> value, String message) { return value.get(); }\n"
+        "  <E, I> E checkEntityId(I id, Finder<String, I, E> finder, String op) {\n"
+        "    User user = getCurrentUser();\n"
+        "    E entity = finder.apply(user.getTenantId(), id);\n"
+        '    checkNotNull(entity, "missing " + id);\n'
+        "    return entity;\n  }\n"
+        "  <E, I> E checkEntityId(I id, Finder<String, I, E> finder, String op, String... more) {\n"
+        "    return null;\n  }\n"
+        "  Device checkDeviceId(Long id, String op) {\n"
+        "    return checkEntityId(id, devices::findByTenantAndId, op);\n  }\n"
+        "  DeviceService devices;\n}\n"
+        '@RestController @RequestMapping("/api") class Api extends Base {\n'
+        '  @GetMapping("/devices/{id}") Device get(@PathVariable Long id) {\n'
+        '    return checkDeviceId(id, "read");\n  }\n}\n'
+    )
+    result = _tree(tmp_path, {"pom.xml": POM, "src/main/java/app/Api.java": base})
+    assert _row(result, "GET", "/api/devices/{id}")["ownership"] == "scoped"
