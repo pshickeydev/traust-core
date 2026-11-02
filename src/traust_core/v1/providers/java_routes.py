@@ -6,6 +6,7 @@ Spring Boot default that authenticates every request when the security starter h
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from traust_core.v1.models.code_facts import RouteFamily
@@ -46,7 +47,7 @@ _GUARD_ANNOTATIONS = (
 # Spring enforces these only once method security is enabled; JAX-RS containers enforce them.
 _METHOD_SECURITY_ANNOTATIONS = ("PreAuthorize", "PostAuthorize", "Secured", "RolesAllowed")
 _METHOD_SECURITY = re.compile(r"Enable(Global|Reactive)?MethodSecurity")
-_TEST_PATH = re.compile(r"(^|/)src/test/|(^|/)tests?/")
+_TEST_PATH = re.compile(r"(^|/)src/test/|^tests?/")
 # the annotation family Spring enables each method-security annotation with
 _FAMILY = {
     "PreAuthorize": "prepost",
@@ -93,6 +94,11 @@ _CALLER_TYPES = re.compile(
 # a parameter Spring fills from the authentication without an annotation
 _PARAM_CALLER_TYPES = re.compile(r"^(Principal|Authentication|\w*AuthenticationToken)$")
 _CALLER_ANNOTATIONS = ("AuthenticationPrincipal", "CurrentSecurityContext")
+# framework objects whose `getUserPrincipal()` / `getRemoteUser()` is the authenticated caller
+_REQUEST_TYPES = re.compile(
+    r"^(\w+\.)*(HttpServletRequest|ServletRequest|HttpServletRequestWrapper|SecurityContext"
+    r"|SessionContext|EJBContext|ContainerRequestContext|ServerRequest|ServerWebExchange)$"
+)
 _CALLER_CALLS = re.compile(
     r"\b(SecurityContextHolder|getUserPrincipal|getRemoteUser|getCallerPrincipal)\b"
 )
@@ -513,7 +519,17 @@ class _Java:
         self.consts = _Constants(self.sources)
         self.chains = _chains(self.sources, self.consts)
         texts = [s.file.text for s in self.sources]
-        self.enforced = _enforced(self.types)
+        # `@EnableMethodSecurity` on an annotation of the application's own (`@EnableSecurity`)
+        meta = {
+            src.text(n.child_by_field_name("name")): [
+                (a, node) for a, node in _annotations(src, n).items()
+            ]
+            for src in self.sources
+            if not _TEST_PATH.search(src.file.rel)
+            for n in walk(src.root)
+            if n.type == "annotation_type_declaration"
+        }
+        self.enforced = _enforced(self.types, meta)
         starter = any(_SECURITY_STARTER.search(m.text) for m in self.manifests)
         self.spring_default = starter and not any(_FILTER_CHAIN.search(t) for t in texts)
         self.quarkus = _Quarkus.of(self.files)
@@ -542,14 +558,15 @@ class _Java:
                     for s in {*x.supers, *(h.name for h in self._hierarchy(x)[1:])}:
                         self.implementations.setdefault(s, []).append(x)
         # Spring Data fragment implementations (`CardRepositoryImpl`): their queries are custom
-        self.custom_methods = {
-            (x.src.text(m.child_by_field_name("name")), len(_params(x.src, m)))
-            for ts in self.types.values()
-            for x in ts
-            if not x.interface and x.name.endswith("Impl")
-            for m in x.node.child_by_field_name("body").named_children
-            if m.type == "method_declaration"
-        }
+        self.custom_methods: dict[str, set[tuple[str, int]]] = {}
+        for ts in self.types.values():
+            for x in ts:
+                if not x.interface and x.name.endswith("Impl"):
+                    self.custom_methods.setdefault(x.name.removesuffix("Impl"), set()).update(
+                        (x.src.text(m.child_by_field_name("name")), len(_params(x.src, m)))
+                        for m in x.node.child_by_field_name("body").named_children
+                        if m.type == "method_declaration"
+                    )
         self.field_decls: dict[tuple[str, str], list[tuple[_Type, Node]]] = {}
         self.scans: dict[tuple[str, int, frozenset[str], frozenset[str], int], _Scan] = {}
         self.helpers: dict[tuple[str, str], frozenset[str]] = {}
@@ -828,25 +845,32 @@ def _effective_guards(
     return [*annotations, *calls, *config[0]]
 
 
-def _enforced(types: dict[str, list[_Type]]) -> frozenset[str]:
+def _enforced(
+    types: dict[str, list[_Type]], meta: dict[str, list[tuple[str, Node]]]
+) -> frozenset[str]:
     """The annotation families method security enforces, read from the application's own
-    configuration classes: `@EnableMethodSecurity` turns on pre/post by default,
-    `@EnableGlobalMethodSecurity` only what it names."""
+    configuration classes (directly or through one of its annotations): `@EnableMethodSecurity`
+    turns on pre/post by default, `@EnableGlobalMethodSecurity` only what it names."""
     found = set()
     for x in (x for ts in types.values() for x in ts if not _TEST_PATH.search(x.src.file.rel)):
         for name, node in x.annotations.items():
-            kind = _METHOD_SECURITY.fullmatch(name)
-            if kind is None:
-                continue
-            for flag, family, default in (
-                ("prePostEnabled", "prepost", kind.group(1) != "Global"),
-                ("securedEnabled", "secured", False),
-                ("jsr250Enabled", "jsr250", False),
-            ):
-                value = re.search(rf"\b{flag}\s*=\s*(true|false)\b", x.src.text(node))
-                if (value.group(1) == "true") if value else default:
-                    found.add(family)
+            for enabling, at in [(name, node), *meta.get(name, [])]:
+                kind = _METHOD_SECURITY.fullmatch(enabling)
+                if kind is None:
+                    continue
+                for flag, family, default in (
+                    ("prePostEnabled", "prepost", kind.group(1) != "Global"),
+                    ("securedEnabled", "secured", False),
+                    ("jsr250Enabled", "jsr250", False),
+                ):
+                    value = re.search(rf"\b{flag}\s*=\s*(true|false)\b", _node_text(at))
+                    if (value.group(1) == "true") if value else default:
+                        found.add(family)
     return frozenset(found)
+
+
+def _node_text(node: Node) -> str:
+    return (node.text or b"").decode("utf-8", "replace")
 
 
 def _record_fields(sources: list[Parsed]) -> dict[str, tuple[str, ...]]:
@@ -971,7 +995,7 @@ def _repository_entities(sources: list[Parsed]) -> tuple[dict[str, str], set[str
         before = sum(len(v) for v in entities.values())
         for name, supers, params in bases:
             for base, arg in supers:
-                if _REPOSITORIES.match(base) or base in entities:
+                if base in entities or (_REPOSITORIES.match(base) and arg is not None):
                     inherited = {arg} if arg is not None else entities.get(base, {None})
                     found = {None if e is None or e in params else e for e in inherited}
                     entities.setdefault(name, set()).update(found)
@@ -1111,7 +1135,9 @@ class _Ownership:
             n
             for n, (h, m) in nearest.items()
             if n not in found
-            and _Values(h.src, fields, found).returns_caller(m.child_by_field_name("body"))
+            and _Values(
+                h.src, fields, found, kinds=lambda n, h=h: self._field_type(h, n)
+            ).returns_caller(m.child_by_field_name("body"))
         }:
             found |= more
         self.java.helpers[key] = found
@@ -1181,7 +1207,11 @@ class _Ownership:
         annotation beyond a few inert ones), default body, named query or custom implementation."""
         if f"{entity}.{name}" in self.java.named_queries:
             return False
-        if (name, arity) in self.java.custom_methods:
+        if any(
+            (name, arity) in self.java.custom_methods.get(h.name, ())
+            for r in self._resolve_all(repository)
+            for h in self.java._hierarchy(r)
+        ):
             return False
         return not any(
             m.child_by_field_name("body") is not None
@@ -1273,8 +1303,11 @@ class _Values:
         callers: set[str],
         helpers: frozenset[str],
         params: frozenset[str] = frozenset(),
+        kinds: Callable[[str], str | None] = lambda _: None,
     ) -> None:
         self.src, self.callers, self.helpers, self.params = src, set(callers), helpers, params
+        self.kinds = kinds  # the declared type of a parameter, local or field
+        self.locals: set[str] = set()
 
     def bind(self, body: Node) -> set[str]:
         """Adds the body's caller-only locals, dropping any caller it reassigns or shadows; returns
@@ -1310,6 +1343,7 @@ class _Values:
             )
             if n is not None and n.type == "identifier"
         }
+        self.locals = set(declared) | shadowed | assigned
         base = self.callers - assigned - mutated - set(declared) - shadowed
         found: set[str] = set()
         while True:
@@ -1345,7 +1379,13 @@ class _Values:
             return name in self.helpers and not _arguments(n)
         if self.src.text(receiver) == "SecurityContextHolder":
             return True
-        return bool(_CALLER_CALLS.match(name)) and not _arguments(n)
+        # `request.getUserPrincipal()`: only on the caller or a framework request or context
+        text = self.src.text(receiver).removeprefix("this.")
+        return (
+            bool(_CALLER_CALLS.match(name))
+            and not _arguments(n)
+            and (text in self.callers or bool(_REQUEST_TYPES.match(self.kinds(text) or "")))
+        )
 
     def derived(self, node: Node | None, depth: int = 0) -> bool:
         """`me.getName()`, `getCurrentUser().getTenantId()`, `"t:" + me.getName()`: a value
@@ -1383,7 +1423,8 @@ class _Values:
                 obj is not None
                 and obj.type == "identifier"
                 and self.src.text(obj)[:1].islower()
-                and self.src.text(obj) not in self.params
+                # an injected field, never a local or parameter the request may have chosen
+                and self.src.text(obj) not in self.params | self.locals
                 and bool(args)
                 and all(self.derived(a, depth + 1) for a in args)
             )
@@ -1410,8 +1451,6 @@ class _Walk:
         self.depth = depth
         params = _params(src, method)
         self.params = {n for n, _, _ in params}
-        self.v = _Values(src, callers, o._caller_helpers(t), frozenset(self.params))
-        assigned = self.v.bind(body)
         self.local_types: dict[str, str] = {}
         for d in walk(body):
             if d.type == "local_variable_declaration":
@@ -1419,6 +1458,15 @@ class _Walk:
                 for v in d.named_children:
                     if v.type == "variable_declarator":
                         self.local_types[src.text(v.child_by_field_name("name"))] = kind
+        kinds = {n: kind for n, kind, _ in params}
+        self.v = _Values(
+            src,
+            callers,
+            o._caller_helpers(t),
+            frozenset(self.params),
+            kinds=lambda n: kinds.get(n) or self.local_types.get(n) or o._field_type(t, n),
+        )
+        assigned = self.v.bind(body)
         # each id name, and the path id it holds exactly (`Long key = Long.valueOf(raw)`); a value
         # merely built from an id (`f ? id : 0L`, `"k" + id`) holds an id of its own
         self.root = {i: i for i in ids}

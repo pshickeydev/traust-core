@@ -1432,3 +1432,114 @@ def test_a_tenant_finder_behind_overloaded_helpers_stays_scoped(tmp_path) -> Non
     )
     result = _tree(tmp_path, {"pom.xml": POM, "src/main/java/app/Api.java": base})
     assert _row(result, "GET", "/api/devices/{id}")["ownership"] == "scoped"
+
+
+# Qodo's review of the allow-list: request data passing as the caller, and real protection or
+# real method security going unseen.
+QODO = (
+    "package qodo;\n"
+    "import org.springframework.web.bind.annotation.*;\n"
+    "import java.security.Principal;\n"
+    "@Entity class Card { Long id; String ownerEmail; }\n"
+    "@Entity class Note { Long id; String ownerEmail; }\n"
+    "class Dto { String getRemoteUser() { return null; } }\n"
+    "interface CustomizedCardRepository { void touch(Card c); }\n"
+    "interface CardRepository extends JpaRepository<Card, Long>, CustomizedCardRepository {\n"
+    "  Optional<Card> findByIdAndOwnerEmail(Long id, String ownerEmail);\n}\n"
+    "interface NoteRepository extends JpaRepository<Note, Long> {\n"
+    "  Optional<Note> findByIdAndOwnerEmail(Long id, String ownerEmail);\n}\n"
+    "class NoteRepositoryImpl {\n"
+    "  Optional<Note> findByIdAndOwnerEmail(Long id, String e) { return Optional.empty(); }\n}\n"
+    "class OtherRepositoryImpl {\n"
+    "  Optional<Card> findByIdAndOwnerEmail(Long id, String e) { return Optional.empty(); }\n}\n"
+    '@RestController @RequestMapping("/q")\n'
+    "class Qodo {\n"
+    "  private CardRepository cards;\n"
+    "  private NoteRepository notes;\n"
+    "  private Registry registry;\n"
+    "  private Owners owners;\n"
+    '  @GetMapping("/selected/{id}")\n'
+    "  Card selected(@PathVariable Long id, @RequestParam String tenant, Principal me) {\n"
+    "    Resolver resolver = registry.forTenant(tenant);\n"
+    "    return cards.findByIdAndOwnerEmail(id, resolver.resolve(me.getName())).orElseThrow();\n"
+    "  }\n"
+    '  @GetMapping("/injected/{id}") Card injected(@PathVariable Long id, Principal me) {\n'
+    "    return cards.findByIdAndOwnerEmail(id, owners.resolve(me.getName())).orElseThrow();\n"
+    "  }\n"
+    '  @GetMapping("/fragment/{id}") Card fragment(@PathVariable Long id, Principal me) {\n'
+    "    return cards.findByIdAndOwnerEmail(id, me.getName()).orElseThrow();\n  }\n"
+    '  @GetMapping("/custom/{id}") Note custom(@PathVariable Long id, Principal me) {\n'
+    "    return notes.findByIdAndOwnerEmail(id, me.getName()).orElseThrow();\n  }\n"
+    '  @GetMapping("/body/{id}") Card body(@PathVariable Long id, @RequestBody Dto body) {\n'
+    "    return cards.findByIdAndOwnerEmail(id, body.getRemoteUser()).orElseThrow();\n  }\n"
+    '  @GetMapping("/request/{id}")\n'
+    "  Card request(@PathVariable Long id, HttpServletRequest request) {\n"
+    "    return cards.findByIdAndOwnerEmail(id, request.getRemoteUser()).orElseThrow();\n  }\n"
+    "}\n"
+)
+
+
+@pytest.fixture(scope="module")
+def qodo(tmp_path_factory: pytest.TempPathFactory) -> dict:
+    root = tmp_path_factory.mktemp("qodo")
+    return _tree(
+        root,
+        {
+            "pom.xml": POM,
+            "src/main/java/qodo/MethodSecurity.java": METHOD_SECURITY,
+            "src/main/java/qodo/Qodo.java": QODO,
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    ("method", "pattern", "ownership"),
+    [
+        ("GET", "/q/selected/{id}", "unchecked"),  # a resolver the request chose
+        ("GET", "/q/injected/{id}", "scoped"),  # an injected resolver handed only the caller
+        ("GET", "/q/fragment/{id}", "scoped"),  # a fragment interface beside the entity's base
+        ("GET", "/q/custom/{id}", "unchecked"),  # this repository's own `…Impl` implements it
+        ("GET", "/q/body/{id}", "caller-blind"),  # a request body's getter isn't the caller
+        ("GET", "/q/request/{id}", "scoped"),  # the servlet request's authenticated user
+    ],
+)
+def test_the_caller_and_the_query_come_from_where_qodo_said(
+    qodo: dict, method: str, pattern: str, ownership: str
+) -> None:
+    row = _row(qodo, method, pattern)
+    assert row["ownership"] == ownership
+    assert row["judgement_required"] is (ownership in ("caller-blind", "unchecked"))
+
+
+BEAN_CHECKED = (
+    "import org.springframework.web.bind.annotation.*;\n"
+    "@Entity class Card { Long id; String ownerEmail; }\n"
+    "@RestController class Api {\n"
+    "  private EntityManager em;\n"
+    '  @PreAuthorize("@access.canRead(#id, authentication)")\n'
+    '  @GetMapping("/cards/{id}") Card get(@PathVariable Long id) {\n'
+    "    return em.find(Card.class, id);\n  }\n}\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("rel", "config"),
+    [
+        # a production package named `test` is no test source
+        ("src/main/java/com/test/SecurityConfig.java", METHOD_SECURITY),
+        # enabled through an annotation of the application's own
+        (
+            "src/main/java/app/SecurityConfig.java",
+            "import org.springframework.security.config.annotation.method.configuration.*;\n"
+            "@EnableMethodSecurity @interface EnableSecurity {}\n"
+            "@EnableSecurity class SecurityConfig {}\n",
+        ),
+    ],
+)
+def test_method_security_enabled_in_the_application_is_seen(
+    tmp_path, rel: str, config: str
+) -> None:
+    result = _tree(
+        tmp_path, {"pom.xml": POM, rel: config, "src/main/java/app/Api.java": BEAN_CHECKED}
+    )
+    assert _row(result, "GET", "/cards/{id}")["ownership"] == "checked"
