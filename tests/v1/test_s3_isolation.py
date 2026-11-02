@@ -20,14 +20,15 @@ for m in pkgutil.walk_packages(traust_core.__path__, "traust_core."):
         __import__(m.name)
 try:
     import traust_core.v1.repositories.objects.s3
-except ModuleNotFoundError as e:
-    print(e)
+except ModuleNotFoundError:
+    pass
+else:
+    raise AssertionError("the adapter requires the optional SDK")
 """
 
 
-def test_core_imports_and_the_adapter_explains_itself_without_the_s3_extra() -> None:
+def test_core_imports_without_the_s3_extra_but_the_adapter_requires_it() -> None:
     done = subprocess.run(
         [sys.executable, "-c", BLOCK], capture_output=True, text=True, check=False, cwd=SRC
     )
     assert done.returncode == 0, done.stderr
-    assert "pip install 'traust-core[s3]'" in done.stdout

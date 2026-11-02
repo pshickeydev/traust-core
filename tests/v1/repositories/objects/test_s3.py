@@ -3,10 +3,14 @@ from unittest.mock import MagicMock
 
 import boto3
 import pytest
+from botocore.client import BaseClient
 from botocore.exceptions import ClientError
+from botocore.model import OperationModel
+from botocore.stub import Stubber
 from moto import mock_aws
 
-from traust_core.v1.errors import ConfigError, IntegrityError, RepositoryError
+from traust_core.v1.context.feeds import ObjectCache
+from traust_core.v1.errors import ConfigError, IntegrityError, NotFoundError, RepositoryError
 from traust_core.v1.repositories import ObjectKey
 from traust_core.v1.repositories.objects.s3 import S3ObjectStore
 
@@ -14,7 +18,7 @@ KEY = ObjectKey.parse("feeds/epss/abc/epss.csv.gz")
 
 
 @pytest.fixture
-def client() -> Iterator[object]:
+def client() -> Iterator[BaseClient]:
     with mock_aws():
         c = boto3.client("s3", region_name="us-east-1")
         c.create_bucket(Bucket="traust")
@@ -63,6 +67,51 @@ def test_a_missing_bucket_fails_at_construction() -> None:
         client = boto3.client("s3", region_name="us-east-1")
         with pytest.raises(ConfigError, match="nope"):
             S3ObjectStore("nope", client=client)
+
+
+def test_prefix_scoped_permissions_allow_storage_without_bucket_wide_access(
+    client: BaseClient,
+) -> None:
+    def prefix_only(model: OperationModel, params: dict[str, object], **_: object) -> None:
+        query = params.get("query_string")
+        scoped = isinstance(query, dict) and str(query.get("prefix", "")).startswith("deploy-a/")
+        if model.name == "HeadBucket" or (model.name == "ListObjectsV2" and not scoped):
+            raise ClientError(
+                {"Error": {"Code": "AccessDenied"}, "ResponseMetadata": {"HTTPStatusCode": 403}},
+                model.name,
+            )
+
+    client.meta.events.register("before-call.s3", prefix_only)
+    store = S3ObjectStore("traust", client=client, prefix="deploy-a")
+    ref = store.put(KEY, b"scoped data")
+    assert store.get(ref) == b"scoped data"
+    assert list(store.list()) == [KEY]
+    assert not store.exists(ObjectKey.parse("missing.json"))
+
+
+def test_losing_the_bucket_after_construction_is_not_a_cache_miss(client: BaseClient) -> None:
+    cache = ObjectCache(S3ObjectStore("traust", client=client, prefix="deploy-a"), "cache")
+    assert cache.get("missing.json") is None
+    client.delete_bucket(Bucket="traust")
+    with pytest.raises(RepositoryError):
+        cache.get("missing.json")
+
+
+def test_ambiguous_read_404_distinguishes_a_missing_key_from_a_lost_bucket(
+    client: BaseClient,
+) -> None:
+    store = S3ObjectStore("traust", client=client, prefix="deploy-a")
+    with Stubber(client) as stub:
+        stub.add_client_error("get_object", service_error_code="404", http_status_code=404)
+        stub.add_response("list_objects_v2", {})
+        stub.add_client_error("get_object", service_error_code="404", http_status_code=404)
+        stub.add_client_error(
+            "list_objects_v2", service_error_code="NoSuchBucket", http_status_code=404
+        )
+        with pytest.raises(NotFoundError):
+            store.stat(KEY)
+        with pytest.raises(RepositoryError):
+            store.stat(KEY)
 
 
 def test_list_yields_before_reading_every_page() -> None:

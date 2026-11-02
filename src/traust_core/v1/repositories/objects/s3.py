@@ -5,8 +5,8 @@ The caller builds the boto3 client, so endpoint and credentials stay deployment 
 
 from __future__ import annotations
 
-from collections.abc import Iterator
-from typing import Any
+from collections.abc import Iterable, Iterator
+from typing import Literal, Protocol, TypedDict
 
 from traust_core.v1.errors import ConfigError, NotFoundError, RepositoryError, ValidationError
 from traust_core.v1.models.integrity import sha256_hex
@@ -14,24 +14,63 @@ from traust_core.v1.repositories.objects.store import ObjectKey, ObjectRef, _ver
 
 try:
     from botocore.exceptions import BotoCoreError, ClientError
+    from botocore.response import StreamingBody
 except ModuleNotFoundError as e:
     raise ModuleNotFoundError(
         "S3ObjectStore needs the s3 extra: pip install 'traust-core[s3]'", name=e.name
     ) from e
 
 _MISSING = {"NoSuchKey", "NotFound", "404"}
+_AMBIGUOUS_MISSING = {"NotFound", "404"}
+
+
+class _S3Object(TypedDict):
+    Key: str
+
+
+class _S3Page(TypedDict, total=False):
+    Contents: list[_S3Object]
+
+
+class _S3Read(TypedDict):
+    Body: StreamingBody
+
+
+class _S3Paginator(Protocol):
+    def paginate(self, *, Bucket: str, Prefix: str) -> Iterable[_S3Page]: ...
+
+
+class S3Client(Protocol):
+    def list_objects_v2(self, *, Bucket: str, Prefix: str, MaxKeys: int) -> _S3Page: ...
+    def put_object(self, *, Bucket: str, Key: str, Body: bytes) -> object: ...
+    def get_object(self, *, Bucket: str, Key: str) -> _S3Read: ...
+    def head_object(self, *, Bucket: str, Key: str) -> object: ...
+    def get_paginator(self, operation_name: Literal["list_objects_v2"]) -> _S3Paginator: ...
 
 
 class S3ObjectStore:
-    def __init__(self, bucket: str, *, client: Any, prefix: str = "") -> None:
+    def __init__(self, bucket: str, *, client: S3Client, prefix: str = "") -> None:
         self._bucket = bucket
         self._client = client
         self._base = f"{prefix.strip('/')}/" if prefix.strip("/") else ""
-        # HEAD answers 404 for a missing bucket too; fail here, not as "every object absent".
         try:
-            client.head_bucket(Bucket=bucket)
+            self._probe_bucket()
         except (BotoCoreError, ClientError) as e:
             raise ConfigError(f"S3ObjectStore: bucket {bucket!r} is not reachable") from e
+
+    def _probe_bucket(self) -> None:
+        self._client.list_objects_v2(Bucket=self._bucket, Prefix=self._base, MaxKeys=1)
+
+    def _is_missing(self, error: ClientError) -> bool:
+        code = error.response.get("Error", {}).get("Code")
+        if code in _AMBIGUOUS_MISSING:
+            try:
+                self._probe_bucket()
+            except (BotoCoreError, ClientError) as e:
+                raise RepositoryError(
+                    f"S3ObjectStore: bucket {self._bucket!r} is not reachable"
+                ) from e
+        return code in _MISSING
 
     def _name(self, key: ObjectKey) -> str:
         return f"{self._base}{key.value}"
@@ -47,7 +86,7 @@ class S3ObjectStore:
         try:
             return self._client.get_object(Bucket=self._bucket, Key=self._name(key))["Body"].read()
         except ClientError as e:
-            if e.response.get("Error", {}).get("Code") in _MISSING:
+            if self._is_missing(e):
                 raise NotFoundError(f"artifact {key}") from None
             raise RepositoryError(f"S3ObjectStore: read {key} failed") from e
         except BotoCoreError as e:
@@ -65,7 +104,7 @@ class S3ObjectStore:
         try:
             self._client.head_object(Bucket=self._bucket, Key=self._name(key))
         except ClientError as e:
-            if e.response.get("Error", {}).get("Code") in _MISSING:
+            if self._is_missing(e):
                 return False
             raise RepositoryError(f"S3ObjectStore: head {key} failed") from e
         except BotoCoreError as e:
