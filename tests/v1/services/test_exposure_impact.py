@@ -66,6 +66,7 @@ from traust_core.v1.repositories.objects import (
 from traust_core.v1.services.exposure import REACHED_THROUGH, ExposureService
 from traust_core.v1.services.findings import FindingIntake, IdentityPolicy, TaxonomyPolicy
 from traust_core.v1.services.portfolio import PortfolioPolicy, PortfolioService
+from traust_core.v1.services.reporting import ReportingService
 
 FIXTURES = Path(__file__).parents[2] / "fixtures" / "dependencies"
 AT = datetime(2026, 10, 23, 12, tzinfo=UTC)
@@ -236,6 +237,30 @@ def test_the_recorded_sample_against_the_real_grpc_advisory(engine: Engine) -> N
         )
         artifact = uow.artifacts.get(recorded.artifact_id)
         assert (artifact.assessment_id, artifact.kind) == (assessment.id, "impact-analysis")
+
+
+@pytest.mark.parametrize("strict", [False, True])
+def test_impact_without_a_report_repository_validates_and_records(
+    engine: Engine, tmp_path: Path, strict: bool
+) -> None:
+    [app] = refs(engine, 1)
+    assert app.id is not None
+    exposure = service(engine)
+    exposure.ingest_sbom(SAMPLE, app.id)
+    doc = exposure.prepare(advisory_id(exposure), app.id).document("1.0.0-abc1234")
+    assert "repository" not in json.loads(doc.payload)["metadata"]
+    path = tmp_path / "app-impact-analysis.json"
+    path.write_bytes(doc.payload)
+
+    (result,) = ReportingService((), None, clock=FixedClock(AT)).validate_reports(
+        path, strict=strict
+    )
+
+    assert result.passed, result.errors
+    assert not any("metadata.repository" in warning for warning in result.warnings)
+    recorded = exposure.record(app.id, doc, provenance())
+    assert recorded.classification == doc.repos[0].classification
+    assert path.read_bytes() == doc.payload
 
 
 def test_replayed_impact_does_not_log_another_outcome(

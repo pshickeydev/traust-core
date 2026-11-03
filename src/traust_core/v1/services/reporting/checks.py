@@ -64,6 +64,7 @@ CIS_CONTROL_TEXT_RE = re.compile(
 _REPO_SEGMENT_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 _REPO_HOST_RE = re.compile(r"^[a-z0-9-]+(\.[a-z0-9-]+)+$")
 _REPO_URL_RE = re.compile(r"^https://[a-z0-9.-]+/[^/]+/.+$", re.I)
+_LOCAL_FIXTURE_RE = re.compile(r"file:///[^;\s?#<>]*[^/;\s?#<>]")
 
 _BANDS = (("critical", 9.0), ("high", 7.0), ("medium", 4.0), ("low", 0.1))
 _BAND_ORDER = ["informational", "low", "medium", "high", "critical"]
@@ -89,6 +90,7 @@ _NON_AUDIT = (
     "operator-priv-profile",
     "pqc-readiness",
     "adapter-result",
+    "impact-analysis",
 )
 _SCHEMA_ONLY = ("refuted-register", "operator-priv-profile", "pqc-readiness", "adapter-result")
 
@@ -283,7 +285,9 @@ def cross_validate(report: Report, result: ReportValidation) -> None:
                 "metadata.repository contains whitespace/multiple URLs "
                 f"({repo_raw[:80]!r}) — use exactly one repository URL"
             )
-        elif not re.match(r"^(https?://|git@)", repo_raw.strip()):
+        elif not re.match(r"^(https?://|git@)", repo_raw.strip()) and not _is_local_fixture_url(
+            repo_raw
+        ):
             result.warn(
                 f"metadata.repository ({repo_raw[:80]!r}) is not a URL — "
                 "use the full https:// (or git@) repository URL"
@@ -343,12 +347,20 @@ def check_metadata_repository(report: Report, result: ReportValidation) -> None:
             "wrong identity. Set it from the caller, not from the model."
         )
         return
-    s = str(repo).strip()
+    repo_raw = str(repo)
+    s = repo_raw.strip()
     if s.startswith("<") and s.endswith(">"):
         result.error(
             f"metadata.repository is wrapped in markdown autolink brackets "
             f"({s[:60]}) — the brackets are hashed into the fingerprint. "
             "Strip them."
+        )
+        return
+    if _is_local_fixture_url(repo_raw):
+        result.warn(
+            f"metadata.repository {s[:60]!r} is a local fixture checkout (file://). "
+            "Accepted only for recall-benchmark and seeded-fixture runs; "
+            "a campaign report needs the https:// repository URL."
         )
         return
     if not _REPO_URL_RE.match(s):
@@ -358,6 +370,10 @@ def check_metadata_repository(report: Report, result: ReportValidation) -> None:
             f"the cross-scan fingerprint, so a malformed value yields a wrong "
             f"identity."
         )
+
+
+def _is_local_fixture_url(value: str) -> bool:
+    return _LOCAL_FIXTURE_RE.fullmatch(value) is not None
 
 
 def _cross_validate_review_surfaces(report: Report, result: ReportValidation) -> None:
@@ -1129,13 +1145,14 @@ def strict_checks(report: Report, result: ReportValidation, context: CheckContex
             result.warn(msg)
     if "dependency_audit" not in report:
         result.warn("Strict: missing recommended section 'dependency_audit'")
-    repo_url = (report.get("metadata", {}).get("repository") or "").strip()
+    repo_raw = report.get("metadata", {}).get("repository") or ""
+    repo_url = repo_raw.strip()
     if not repo_url:
         result.warn(
             "Strict: metadata.repository missing — org-index and repo-graph "
             "cannot attribute this report to a repository"
         )
-    elif not _repository_parses(repo_url):
+    elif not _repository_parses(repo_url) and not _is_local_fixture_url(repo_raw):
         result.warn(
             f"Strict: metadata.repository {repo_url!r} does not parse as "
             "https://<host>/<org>/<repo> — build_org_index.py skips such "
