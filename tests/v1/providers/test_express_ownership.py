@@ -808,7 +808,7 @@ def test_holes_a_review_found_stay_closed(
             'app.delete("/a/:id", requireAuth, async (req, res) => {\n'
             "  const post = await Post.findById(req.params.id);\n"
             "  if (!post || "
-            + " || ".join(f"post.user !== req.user.id{k}" for k in range(1200))
+            + " || ".join(["post.user !== req.user.id"] * 1200)
             + ") return res.sendStatus(403);\n"
             "  await Post.deleteOne({ _id: req.params.id });\n});\n",
             "checked",
@@ -989,3 +989,52 @@ def test_middleware_building_the_caller_from_request_data_forges_it(
     )
     result = _tree(tmp_path, {"auth.ts": AUTH, "models.ts": models, "app.ts": app_code})
     assert _row(result, method, pattern)["ownership"] == ownership
+
+
+@pytest.mark.parametrize(
+    ("handler", "ownership"),
+    [
+        # another user the caller names is not the caller
+        ("findOne({ _id: req.params.id, user: req.user.managerId })", "unchecked"),
+        ("findOne({ _id: req.params.id, user: req.user['managerId'] })", "unchecked"),
+        ("findOne({ _id: req.params.id, user: req.user.manager.id })", "unchecked"),
+        # the caller's own id, through a payload, and its tenant
+        ("findOne({ _id: req.params.id, user: req.user.id })", "scoped"),
+        ("findOne({ _id: req.params.id, user: req.user.payload.sub })", "scoped"),
+        ("findOne({ _id: req.params.id, user: req.user.userId })", "scoped"),
+    ],
+)
+def test_only_the_callers_own_fields_stand_for_it(
+    tmp_path: Path, handler: str, ownership: str
+) -> None:
+    app = (
+        'import express from "express";\nimport { requireAuth } from "./auth";\n'
+        'import { Post } from "./models";\nconst app = express();\n'
+        'app.get("/a/:id", requireAuth, async (req, res) => {\n'
+        f"  res.json(await Post.{handler});\n}});\n"
+    )
+    result = _tree(tmp_path, {"auth.ts": AUTH, "models.ts": MODELS, "app.ts": app})
+    assert _row(result, "GET", "/a/:id")["ownership"] == ownership
+
+
+@pytest.mark.parametrize(
+    ("bind", "ownership"),
+    [
+        ("const { managerId } = req.user;", "unchecked"),
+        ("const { id } = req.user;", "checked"),
+    ],
+)
+def test_a_destructured_field_is_the_caller_only_when_its_own(
+    tmp_path: Path, bind: str, ownership: str
+) -> None:
+    name = bind.split("{ ")[1].split(" }")[0]
+    app = (
+        'import express from "express";\nimport { requireAuth } from "./auth";\n'
+        'import { Post } from "./models";\nconst app = express();\n'
+        'app.delete("/a/:id", requireAuth, async (req, res) => {\n'
+        f"  {bind}\n  const post = await Post.findById(req.params.id);\n"
+        f"  if (!post || post.user !== {name}) return res.sendStatus(403);\n"
+        "  await post.deleteOne();\n});\n"
+    )
+    result = _tree(tmp_path, {"auth.ts": AUTH, "models.ts": MODELS, "app.ts": app})
+    assert _row(result, "DELETE", "/a/:id")["ownership"] == ownership

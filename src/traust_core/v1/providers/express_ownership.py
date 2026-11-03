@@ -96,6 +96,13 @@ _CONVERSION_METHODS = {"toString", "valueOf"}
 _INERT_ROOTS = re.compile(r"^(console|logger|log|JSON|Math|Object\.keys|debug)$")
 _THROWN = re.compile(r"(Error|Exception)$")
 _ID_TYPES = re.compile(r"^(\w+\.)*(ObjectId|ObjectID|Number|String|BigInt|Date)$")
+# what a caller object holds about itself (`req.user.id`, `req.auth.payload.sub`, its tenant);
+# never another user it names (`req.user.managerId`)
+_SELF_FIELD = re.compile(
+    r"(?i)^(_?id|sub|uid|uuid|oid|user_?(id|uuid|name)?|email|login|payload|claims|data|"
+    r"(account|org|organi[sz]ation|tenant|team|workspace|company|customer|client|realm|group)"
+    r"_?(id|uuid)?)$"
+)
 _PRIVILEGE_FLAG = re.compile(r"^(is)?(Admin|Superuser|SuperUser|Staff|admin|superuser|staff)$")
 _MUTATORS = re.compile(r"^(set\w*|push|splice|assign|update|delete)$")
 # library calls that write into their first argument (`_.merge(req.user, req.body)`)
@@ -1230,6 +1237,11 @@ class _Walk:
                 index = unwrap(node.child_by_field_name("index"))
                 if index is None or index.type not in ("string", "number"):
                     return False
+                field = self.src.text(index).strip("'\"`")
+            else:
+                field = self.src.text(node.child_by_field_name("property"))
+            if not _SELF_FIELD.match(field):
+                return False
             return self.derived(node.child_by_field_name("object"), depth + 1)
         if (inner := converted(self.src, node)) is not None:
             return self.derived(inner, depth + 1)
@@ -1382,6 +1394,7 @@ class _Walk:
                             base
                             and self.derived(value)
                             and c.type in ("pair_pattern", "shorthand_property_identifier_pattern")
+                            and _SELF_FIELD.match(key)
                         ):
                             self.callers.add(name)  # `const { id } = req.user`
                     continue
