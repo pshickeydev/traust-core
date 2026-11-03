@@ -1370,12 +1370,15 @@ class _Walk:
                 if pattern.type == "object_pattern":
                     base = chain_text(src, value)
                     for c in pattern.named_children:
-                        key = (
-                            src.text(c)
-                            if c.type == "shorthand_property_identifier_pattern"
-                            else src.text(c.child_by_field_name("left"))
+                        key_node = (
+                            c.child_by_field_name("left")
                             if c.type == "object_assignment_pattern"
-                            else src.text(c.child_by_field_name("key") or c)
+                            else c.child_by_field_name("key") or c
+                        )
+                        # a static key: the property name, unquoted (`{ "id": ownerId }`);
+                        # a computed key (`{ [k]: v }`) is no field name we can read
+                        key = string_value(src, key_node) or (
+                            "" if key_node.type == "computed_property_name" else src.text(key_node)
                         )
                         local = bound_names(src, c)[:1]
                         if not local or local[0] != name:

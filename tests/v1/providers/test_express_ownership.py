@@ -1018,16 +1018,21 @@ def test_only_the_callers_own_fields_stand_for_it(
 
 
 @pytest.mark.parametrize(
-    ("bind", "ownership"),
+    ("bind", "name", "ownership"),
     [
-        ("const { managerId } = req.user;", "unchecked"),
-        ("const { id } = req.user;", "checked"),
+        ("const { managerId } = req.user;", "managerId", "unchecked"),
+        ("const { id } = req.user;", "id", "checked"),
+        # a quoted key is its string value: the caller's own id under another name
+        ('const { "id": ownerId } = req.user;', "ownerId", "checked"),
+        ("const { 'id': ownerId } = req.user;", "ownerId", "checked"),
+        ('const { "managerId": ownerId } = req.user;', "ownerId", "unchecked"),
+        # a computed key is no field name we can read
+        ("const { [key]: ownerId } = req.user;", "ownerId", "unchecked"),
     ],
 )
 def test_a_destructured_field_is_the_caller_only_when_its_own(
-    tmp_path: Path, bind: str, ownership: str
+    tmp_path: Path, bind: str, name: str, ownership: str
 ) -> None:
-    name = bind.split("{ ")[1].split(" }")[0]
     app = (
         'import express from "express";\nimport { requireAuth } from "./auth";\n'
         'import { Post } from "./models";\nconst app = express();\n'
