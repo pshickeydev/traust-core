@@ -97,9 +97,20 @@ _THROWN = re.compile(r"(Error|Exception)$")
 _ID_TYPES = re.compile(r"^(\w+\.)*(ObjectId|ObjectID|Number|String|BigInt|Date)$")
 _PRIVILEGE_FLAG = re.compile(r"^(is)?(Admin|Superuser|SuperUser|Staff|admin|superuser|staff)$")
 _MUTATORS = re.compile(r"^(set\w*|push|splice|assign|update|delete)$")
+# library calls that write into their first argument (`_.merge(req.user, req.body)`)
+_WRITES_FIRST = re.compile(
+    r"^(Object\.assign|Object\.defineProperty|Reflect\.set|(\w+\.)?(merge\w*|assign\w*|extend|"
+    r"defaults\w*|set\w*))$"
+)
+# library calls that only read the request they are handed
+_READS_REQUEST = {"validationResult", "matchedData"}
+# request members that may carry a path id another way
+_OPAQUE_REQUEST = {"param", "path", "url", "originalUrl", "baseUrl", "route", "_parsedUrl"}
 _MAX_DEPTH = 64
 _FUNCTION_VALUES = ("arrow_function", "function_expression", "function")
 _Pos = int
+# what a check verifies and a lookup needs verified: (the id, the model, the field); "*" is any
+_Key = tuple[str, str, str]
 
 
 def unwrap(node: Node | None) -> Node | None:
@@ -108,7 +119,7 @@ def unwrap(node: Node | None) -> Node | None:
             (
                 c
                 for c in node.named_children
-                if c.type not in ("type_annotation", "predefined_type")
+                if c.type not in ("type_annotation", "predefined_type", "type_arguments")
             ),
             None,
         )
@@ -180,22 +191,25 @@ def bound_names(src: Parsed, pattern: Node | None) -> list[str]:
 
 def chain_text(src: Parsed, node: Node | None) -> str:
     """`req.user.sub` for a member chain of plain names, else ''."""
+    parts: list[str] = []
     node = unwrap(node)
-    if node is None:
+    while node is not None and node.type in ("member_expression", "subscript_expression"):
+        if node.type == "member_expression":
+            prop = node.child_by_field_name("property")
+            if prop is None:
+                return ""
+            parts.append(src.text(prop))
+        else:
+            index = unwrap(node.child_by_field_name("index"))
+            if index is None or index.type != "string":
+                return ""
+            parts.append(
+                "".join(src.text(c) for c in index.named_children if c.type == "string_fragment")
+            )
+        node = unwrap(node.child_by_field_name("object"))
+    if node is None or node.type not in ("identifier", "this"):
         return ""
-    if node.type in ("identifier", "this"):
-        return src.text(node)
-    if node.type == "member_expression":
-        base = chain_text(src, node.child_by_field_name("object"))
-        prop = node.child_by_field_name("property")
-        return f"{base}.{src.text(prop)}" if base and prop is not None else ""
-    if node.type == "subscript_expression":
-        index = unwrap(node.child_by_field_name("index"))
-        base = chain_text(src, node.child_by_field_name("object"))
-        if base and index is not None and index.type == "string":
-            text = "".join(src.text(c) for c in index.named_children if c.type == "string_fragment")
-            return f"{base}.{text}"
-    return ""
+    return ".".join([src.text(node), *reversed(parts)])
 
 
 def callee_name(src: Parsed, call: Node) -> str:
@@ -250,20 +264,25 @@ class _File:
     imports: dict[str, tuple[str, str]] = field(default_factory=dict)  # local -> (file, export)
     namespaces: dict[str, str] = field(default_factory=dict)  # `import * as m` -> file
     exports: dict[str, str] = field(default_factory=dict)  # exported -> local
+    rebound: set[str] = field(default_factory=set)  # names or objects assigned after definition
 
 
 @dataclass(frozen=True)
 class Target:
-    """A checkout function a call runs, and the class it is a method of."""
+    """A checkout function a call runs, the class it is a method of, and the class of the
+    instance it runs on, when known (`this` resolves from it)."""
 
     rel: str
     fn: Node
     cls: Node | None = None
+    instance: tuple[str, Node] | None = None
 
 
 @dataclass(frozen=True)
 class _Model:
     record: str | None  # the record type a model or store holds, when known
+    key: str  # which model or store it is
+    sync: bool = False  # a `Map`, read without awaiting
 
 
 class JsCode:
@@ -274,6 +293,9 @@ class JsCode:
         self.files = {s.file.rel: _File(s) for s in sources}
         self.fields_by_record: dict[str, list[str]] = {}
         self.holds: dict[str, set[str]] = {}
+        # records whose fields we can't all read, or that point at another record
+        self.linked: set[str] = set()
+        self.mongoose: set[str] = set()  # Mongoose drops a filter key its schema lacks
         for f in self.files.values():
             self._index(f)
         for text in prisma:
@@ -346,8 +368,13 @@ class JsCode:
                 self._export(f, n)
             elif t == "assignment_expression":
                 self._commonjs_export(f, n)
+                left = unwrap(n.child_by_field_name("left"))
+                target = chain_text(src, left)
+                if target and not target.startswith(("exports.", "module.exports")):
+                    f.rebound.add(target.split(".", 1)[0])  # `show = …`, `ctrl.show = …`
             elif t == "call_expression":
                 self._sequelize_init(src, n)
+                self._associations(src, n)
 
     def _declarator(self, f: _File, n: Node) -> None:
         src = f.src
@@ -408,8 +435,9 @@ class JsCode:
                 # `const getOrder = asyncHandler(async (req, res) => …)`: the wrapped function
                 f.functions.setdefault(local, []).append(wrapped)
 
-    def _object_functions(self, src: Parsed, obj: Node) -> dict[str, Node]:
-        out = {}
+    def _object_functions(self, src: Parsed, obj: Node) -> dict[str, Node | None]:
+        """An object literal's functions; None for any name a spread may supply."""
+        out: dict[str, Node | None] = {}
         for p in obj.named_children:
             if p.type == "pair":
                 value = unwrap(p.child_by_field_name("value"))
@@ -418,6 +446,9 @@ class JsCode:
                     out[key] = value
             elif p.type == "method_definition" and (name := p.child_by_field_name("name")):
                 out[src.text(name)] = p
+            elif p.type == "spread_element":
+                out = dict.fromkeys(out)  # `{ show, ...legacy }`: `legacy.show` may win
+                out["..."] = None
         return out
 
     def _model_call(self, f: _File, call: Node) -> str | bool | None:
@@ -427,17 +458,28 @@ class JsCode:
         name = callee_name(src, call)
         a = args(call)
         if name == "model" and a and (record := string_value(src, a[0])):
+            self.mongoose.add(record)
             if len(a) > 1:
-                self.fields_by_record.setdefault(record, []).extend(self._schema_fields(f, a[1]))
+                self._schema_fields(f, a[1], record)
             return record
         if name == "define" and len(a) >= 2 and (record := string_value(src, a[0])):
-            obj = unwrap(a[1])
-            if obj is not None and obj.type == "object":
-                self.fields_by_record.setdefault(record, []).extend(self._keys(src, obj))
+            self._record(src, record, unwrap(a[1]))
             return record
         if name == "getRepository" and a:
             return src.text(a[0])
         return False
+
+    def _associations(self, src: Parsed, call: Node) -> None:
+        """`Task.belongsTo(User)`: an association adds a key to one side, so both are linked."""
+        fn = unwrap(call.child_by_field_name("function"))
+        if (
+            fn is not None
+            and fn.type == "member_expression"
+            and src.text(fn.child_by_field_name("property"))
+            in ("belongsTo", "hasOne", "hasMany", "belongsToMany")
+        ):
+            self.linked.add(src.text(fn.child_by_field_name("object")))
+            self.linked.update(src.text(x) for x in args(call)[:1])
 
     def _sequelize_init(self, src: Parsed, call: Node) -> None:
         """`Item.init({ … }, { sequelize })`: a Sequelize model class's fields."""
@@ -455,33 +497,53 @@ class JsCode:
                 for c in a[1].named_children  # type: ignore[union-attr]
             )
         ):
-            name = src.text(fn.child_by_field_name("object"))
-            self.fields_by_record.setdefault(name, []).extend(self._keys(src, a[0]))
+            self._record(src, src.text(fn.child_by_field_name("object")), a[0])
 
-    def _schema_fields(self, f: _File, node: Node) -> list[str]:
-        src = f.src
+    def _schema_fields(self, f: _File, node: Node | None, record: str) -> None:
+        """A Mongoose schema's fields: `new Schema({ … })`, or a name bound to one."""
+        src, seen = f.src, set()
         node = unwrap(node)
-        if node is None:
-            return []
-        if node.type == "new_expression":
-            first = args(node)[:1]
-            return self._keys(src, unwrap(first[0])) if first else []
-        if node.type == "identifier":
-            for d in walk(src.root):
-                if d.type == "variable_declarator" and src.text(
-                    d.child_by_field_name("name")
-                ) == src.text(node):
-                    return self._schema_fields(f, d.child_by_field_name("value"))
-        return []
+        while node is not None and node.type == "identifier" and src.text(node) not in seen:
+            name = src.text(node)
+            seen.add(name)
+            if any(
+                n.type == "call_expression"
+                and chain_text(src, n.child_by_field_name("function"))
+                in (f"{name}.add", f"{name}.plugin", f"{name}.loadClass")
+                for n in walk(src.root)
+            ):
+                self.linked.add(record)  # fields added later
+            node = next(
+                (
+                    unwrap(d.child_by_field_name("value"))
+                    for d in walk(src.root)
+                    if d.type == "variable_declarator"
+                    and src.text(d.child_by_field_name("name")) == name
+                ),
+                None,
+            )
+        if node is not None and node.type == "new_expression" and args(node):
+            self._record(src, record, unwrap(args(node)[0]))
+        else:
+            self.linked.add(record)
 
-    def _keys(self, src: Parsed, obj: Node | None) -> list[str]:
+    def _record(self, src: Parsed, record: str, obj: Node | None) -> None:
+        """A model's fields from its definition object; a spread, a computed key or a reference
+        to another model (`{ type: ObjectId, ref: "User" }`) links it."""
+        fields = self.fields_by_record.setdefault(record, [])
         if obj is None or obj.type != "object":
-            return []
-        return [
-            src.text(p.child_by_field_name("key")).strip("'\"")
-            for p in obj.named_children
-            if p.type == "pair"
-        ] + [src.text(p) for p in obj.named_children if p.type == "shorthand_property_identifier"]
+            self.linked.add(record)
+            return
+        for p in obj.named_children:
+            if p.type == "shorthand_property_identifier":
+                fields.append(src.text(p))
+            elif p.type == "pair" and p.child_by_field_name("key").type != "computed_property_name":
+                fields.append(src.text(p.child_by_field_name("key")).strip("'\""))
+                value = src.text(p.child_by_field_name("value"))
+                if re.search(r"\bref\s*:|ObjectId|references\s*:", value):
+                    self.linked.add(record)
+            elif p.type != "comment":
+                self.linked.add(record)
 
     def _class_fields(self, src: Parsed, name: str, cls: Node) -> None:
         body = cls.child_by_field_name("body")
@@ -491,6 +553,8 @@ class JsCode:
             if m.type in ("public_field_definition", "field_definition")
         ]
         if fields:
+            if any(c.type == "class_heritage" for c in cls.named_children):
+                self.linked.add(name)  # inherited fields
             self.fields_by_record.setdefault(name, []).extend(f for f in fields if f)
             self.holds.setdefault(name, set()).update(
                 {
@@ -503,6 +567,11 @@ class JsCode:
 
     def _type_fields(self, src: Parsed, name: str, node: Node) -> None:
         props = [n for n in walk(node) if n.type == "property_signature"]
+        value = node.child_by_field_name("value")
+        if any(c.type == "extends_type_clause" for c in node.named_children) or (
+            value is not None and value.type != "object_type"
+        ):
+            self.linked.add(name)  # `interface Doc extends Owned`, `Owned & { … }`
         if props:
             self.fields_by_record.setdefault(name, []).extend(
                 src.text(p.child_by_field_name("name")) for p in props
@@ -512,7 +581,7 @@ class JsCode:
             )
 
     def _prisma(self, text: str) -> None:
-        for name, body in re.findall(r"(?m)^model\s+(\w+)\s*\{([^}]*)\}", text):
+        for name, body in re.findall(r"(?ms)^model\s+(\w+)\s*\{(.*?)^\}", text):
             fields = re.findall(r"(?m)^\s*(\w+)\s+(\w+)", body)
             self.fields_by_record.setdefault(name, []).extend(f for f, _ in fields)
             self.holds.setdefault(name, set()).update(kind for _, kind in fields)
@@ -596,6 +665,7 @@ class JsCode:
         for name, fs in self.fields_by_record.items():
             linked = (
                 not fs
+                or name in self.linked
                 or bool(self.holds.get(name, set()) & (records - {name}))
                 or name in held_by_others
                 or name.lower() in pointed
@@ -642,9 +712,11 @@ class JsCode:
                 return None
             f = self.files[found[0]]
             if found[1] in f.models:
-                return _Model(f.models[found[1]])
+                record = f.models[found[1]]
+                sync = f.instances.get(found[1], "").rsplit(".", 1)[-1] == "Map"
+                return _Model(record, record or f"{found[0]}:{found[1]}", sync)
             if found[1] in f.classes and found[1] in self.fields_by_record:
-                return _Model(found[1])  # `class Item extends Model` (Sequelize)
+                return _Model(found[1], found[1])  # `class Item extends Model` (Sequelize)
             return None
         if node.type == "member_expression":
             obj = chain_text(src, node.child_by_field_name("object"))
@@ -652,9 +724,9 @@ class JsCode:
             # `prisma.item`, `db.Item`, `models.Item`
             matches = [r for r in self.fields_by_record if r.lower() == prop.lower()]
             if obj.rsplit(".", 1)[-1] in ("prisma", "db", "models", "client", "orm") and matches:
-                return _Model(matches[0])
+                return _Model(matches[0], matches[0])
             if obj.rsplit(".", 1)[-1] == "prisma":
-                return _Model(None)
+                return _Model(None, f"prisma:{prop.lower()}")
             if (
                 node.child_by_field_name("object") is not None
                 and unwrap(node.child_by_field_name("object")).type == "call_expression"
@@ -663,13 +735,19 @@ class JsCode:
                 if callee_name(src, inner) == "model" and (
                     record := string_value(src, (args(inner) or [None])[0])
                 ):
-                    return _Model(record)  # `mongoose.model("Item").findById(…)`
+                    return _Model(record, record)  # `mongoose.model("Item").findById(…)`
         if node.type == "call_expression" and callee_name(src, node) == "model":
             record = string_value(src, (args(node) or [None])[0])
-            return _Model(record) if record else None
+            return _Model(record, record) if record else None
         return None
 
-    def functions(self, rel: str, node: Node | None, cls: Node | None) -> list[Target] | None:
+    def functions(
+        self,
+        rel: str,
+        node: Node | None,
+        cls: Node | None,
+        instance: tuple[str, Node] | None = None,
+    ) -> list[Target] | None:
         """The checkout functions an expression names: [] when none, None when ambiguous."""
         node = unwrap(node)
         if node is None:
@@ -683,8 +761,11 @@ class JsCode:
         prop = src.text(node.child_by_field_name("property"))
         if obj is None:
             return []
+        if obj.type == "this" and instance is not None:
+            return self._methods(instance[0], instance[1], prop, instance)
         if obj.type == "this" and cls is not None:
-            return self._methods(rel, cls, prop)
+            # an instance of a subclass may run its override
+            return None if self._overridden(rel, cls, prop) else self._methods(rel, cls, prop)
         if obj.type == "call_expression" and callee_name(src, obj) == "require":
             # `require("./get-order").default`
             module = self._resolve_module(rel, string_value(src, (args(obj) or [None])[0]))
@@ -708,12 +789,17 @@ class JsCode:
             return self._named(module, exported) if module is not None and exported else []
         where, local = found
         g = self.files[where]
+        if local in g.rebound:
+            return None
         if local in g.objects:
-            fn = g.objects[local].get(prop)
+            functions = g.objects[local]
+            if "..." in functions and functions.get(prop) is None:
+                return None
+            fn = functions.get(prop)
             return [Target(where, fn)] if fn is not None else []
         if local in g.instances:
             cls_found = self._class(where, g.instances[local])
-            return self._methods(cls_found[0], cls_found[1], prop) if cls_found else []
+            return self._methods(cls_found[0], cls_found[1], prop, cls_found) if cls_found else []
         if local in g.classes:
             return self._methods(where, g.classes[local], prop)
         return []
@@ -723,9 +809,44 @@ class JsCode:
         if found is None:
             return []
         fns = self.files[found[0]].functions.get(found[1], [])
-        if len(fns) > 1:
+        if len(fns) > 1 or (fns and found[1] in self.files[found[0]].rebound):
             return None
         return [Target(found[0], fns[0])] if fns else []
+
+    def _overridden(self, rel: str, cls: Node, name: str) -> bool:
+        """Whether a subclass of `cls` (at any depth) defines method `name`."""
+        pending, seen = [(rel, cls)], set()
+        while pending:
+            base_rel, base = pending.pop()
+            if (base_rel, base.start_byte) in seen:
+                continue
+            seen.add((base_rel, base.start_byte))
+            for where, f in self.files.items():
+                for sub in f.classes.values():
+                    heritage = next(
+                        (c for c in sub.named_children if c.type == "class_heritage"), None
+                    )
+                    ident = (
+                        next((c for c in walk(heritage) if c.type == "identifier"), None)
+                        if heritage
+                        else None
+                    )
+                    parent = self._class(where, f.src.text(ident)) if ident is not None else None
+                    if (
+                        parent is None
+                        or parent[0] != base_rel
+                        or parent[1].start_byte != base.start_byte
+                    ):
+                        continue
+                    body = sub.child_by_field_name("body")
+                    if any(
+                        m.type == "method_definition"
+                        and f.src.text(m.child_by_field_name("name")) == name
+                        for m in (body.named_children if body is not None else [])
+                    ):
+                        return True
+                    pending.append((where, sub))
+        return False
 
     def _class(self, rel: str, ctor: str) -> tuple[str, Node] | None:
         found = self._local(rel, ctor)
@@ -734,7 +855,9 @@ class JsCode:
         cls = self.files[found[0]].classes.get(found[1])
         return (found[0], cls) if cls is not None else None
 
-    def _methods(self, rel: str, cls: Node, name: str) -> list[Target] | None:
+    def _methods(
+        self, rel: str, cls: Node, name: str, instance: tuple[str, Node] | None = None
+    ) -> list[Target] | None:
         src = self.files[rel].src
         seen: set[int] = set()
         current: Node | None = cls
@@ -750,7 +873,7 @@ class JsCode:
             if len(found) > 1:
                 return None
             if found:
-                return [Target(where, found[0], current)]
+                return [Target(where, found[0], current, instance)]
             heritage = next((c for c in current.named_children if c.type == "class_heritage"), None)
             base = (
                 next((c for c in walk(heritage) if c.type == "identifier"), None)
@@ -771,11 +894,13 @@ class JsCode:
 @dataclass
 class _Scan:
     facts: HandlerFacts
-    verified: set[str] = field(default_factory=set)
-    owned_or_null: set[str] = field(default_factory=set)
-    covers: tuple[set[str] | None, ...] = ()
+    verified: set[_Key] = field(default_factory=set)
+    owned_or_null: set[_Key] = field(default_factory=set)
+    covers: tuple[set[_Key] | None, ...] = ()
     reads: tuple[bool, ...] = ()
-    handoff_cover: set[str] | None = None
+    handoff_cover: set[_Key] | None = None
+    asynchronous: tuple[bool, ...] = ()
+    seen: bool = False
     pure_read: bool = False
 
 
@@ -794,6 +919,7 @@ class _Walk:
         depth: int,
         handler: tuple[bool, bool],
     ) -> None:
+        self.instance = target.instance
         self.o, self.code, self.rel, self.fn, self.cls = (
             o,
             o.code,
@@ -819,14 +945,16 @@ class _Walk:
         }
         self._bind()
         self.lookups: list[Lookup] = []
-        self.cover: list[set[str] | None] = []
+        self.cover: list[set[_Key] | None] = []
+        self.asynchronous: list[bool] = []  # lookups whose result must be awaited
         self.starts: list[_Pos] = []
         self.reads: list[bool] = []
         self.made: dict[int, list[int]] = {}
         self.consumed: set[int] = set()
         self.raising: set[int] = set()  # lookups whose chain refuses a missing record (`orFail`)
-        self.hop_verified: dict[int, set[str]] = {}
-        self.hop_owned: dict[int, set[str]] = {}
+        self.hop_verified: dict[int, set[_Key]] = {}
+        self.hop_owned: dict[int, set[_Key]] = {}
+        self.hop_async: set[int] = set()  # hops into an async function
         self.handoffs: list[tuple[CodeSpan, set[str] | None, _Pos]] = []
         self.hop: CodeSpan | None = None
         self.caller = next(
@@ -844,8 +972,10 @@ class _Walk:
                 None,
             ),
         )
-        self.verified: dict[str, _Pos] = {}
-        self.owned_or_null: dict[str, _Pos] = {}
+        self.verified: dict[_Key, _Pos] = {}
+        self.owned_or_null: dict[_Key, _Pos] = {}
+        self.swallows = False  # a closing `try` whose `catch` doesn't rethrow
+        self.seen = False  # whether a path id is read here or where the request is handed
         self.uncovered: list[tuple[_Pos, _Pos]] = []  # a closing `try`'s `catch` and `finally`
 
     # -- the id and the caller
@@ -888,9 +1018,9 @@ class _Walk:
         inner = converted(self.src, node)
         return self.exact(inner) if inner is not None else None
 
-    def exact_ids(self, values: list[Node]) -> set[str] | None:
+    def exact_ids(self, values: list[Node], store: str = "*", key: str = "*") -> set[_Key] | None:
         roots = [self.exact(v) for v in values if self.mentions(v)]
-        return None if not roots or None in roots else {r for r in roots if r}
+        return None if not roots or None in roots else {(r, store, key) for r in roots if r}
 
     def is_caller(self, node: Node | None) -> bool:
         """`req.user`, `req.auth`, `res.locals.user`, or a caller name."""
@@ -938,45 +1068,66 @@ class _Walk:
         bindings: dict[str, int] = dict.fromkeys(self.params, 1)
         values: dict[str, list[Node | None]] = {}
         written: set[str] = set()
-        for n in own(self.fn):
+        aliases: dict[str, str] = {}  # `const u = req.user`: a local naming the request's state
+        body = self.fn.child_by_field_name("body")
+        for n in walk(body) if body is not None else []:
             if n.type == "variable_declarator":
                 pattern, value = n.child_by_field_name("name"), n.child_by_field_name("value")
                 if pattern is None:
                     continue
                 for name in bound_names(src, pattern):
                     bindings[name] = bindings.get(name, 0) + 1
-                    values.setdefault(name, []).append(n)
+                    values.setdefault(name, []).append(n if own_scope(self.fn, n) else None)
+                chain = chain_text(src, value)
+                if pattern.type == "identifier" and chain.split(".", 1)[0] in (self.req, self.res):
+                    aliases[src.text(pattern)] = chain
             elif n.type in ("assignment_expression", "augmented_assignment_expression"):
                 left = n.child_by_field_name("left")
-                text = chain_text(src, left)
                 if left is not None and left.type == "identifier":
-                    bindings[text] = bindings.get(text, 0) + 1
-                    values.setdefault(text, []).append(None)
-                elif text:
-                    written.add(text)
+                    bindings[src.text(left)] = bindings.get(src.text(left), 0) + 1
+                    values.setdefault(src.text(left), []).append(None)
+                elif left is not None and left.type in ("object_pattern", "array_pattern"):
+                    for m in walk(left):  # `({ user: req.user } = req.body)`
+                        if m.type in ("member_expression", "subscript_expression"):
+                            written.add(written_path(src, m))
+                        elif m.type in ("identifier", "shorthand_property_identifier_pattern"):
+                            bindings[src.text(m)] = bindings.get(src.text(m), 0) + 1
+                            values.setdefault(src.text(m), []).append(None)
+                elif left is not None:
+                    written.add(written_path(src, left))  # `req.user.id = …`, `req.user[k] = …`
             elif n.type == "update_expression":
-                written.add(chain_text(src, n.child_by_field_name("argument")))
+                written.add(written_path(src, n.child_by_field_name("argument")))
             elif n.type == "call_expression":
                 fn = unwrap(n.child_by_field_name("function"))
                 if fn is not None and fn.type == "member_expression":
                     prop = src.text(fn.child_by_field_name("property"))
                     if _MUTATORS.match(prop):
-                        written.add(chain_text(src, fn.child_by_field_name("object")))
-                if src.text(fn) in ("Object.assign", "Reflect.set") and args(n):
-                    written.add(chain_text(src, args(n)[0]))
+                        written.add(written_path(src, fn.child_by_field_name("object")))
+                if _WRITES_FIRST.match(chain_text(src, fn)) and args(n):
+                    written.add(written_path(src, args(n)[0]))
             elif n.type in ("for_in_statement",):
                 for name in bound_names(src, n.child_by_field_name("left")):
                     bindings[name] = bindings.get(name, 0) + 2  # rebound on every pass
+            elif n.type in _FUNCTION_VALUES or n.type in (
+                "function_declaration",
+                "method_definition",
+            ):
+                if n != self.fn:
+                    for name in {x for q in param_patterns(n) for x in bound_names(src, q)}:
+                        bindings[name] = bindings.get(name, 0) + 2  # shadowed in a closure
+        for w in list(written):
+            head, _, rest = w.partition(".")
+            if head in aliases:
+                written.add(f"{aliases[head]}.{rest}" if rest else aliases[head])
+        written.discard("")
         # a caller path written in the handler (`req.user = …`, `req.user.id = …`) isn't the caller
         self.caller_paths = {
             p
             for p in self.caller_paths
-            if not any(
-                w == p or w.startswith(p + ".") or p.startswith(w + ".") for w in written if w
-            )
+            if not any(w == p or w.startswith(p + ".") or p.startswith(w + ".") for w in written)
         }
         self.callers -= {n for n, c in bindings.items() if c > 1}
-        self.callers -= {w.split(".", 1)[0] for w in written if w}
+        self.callers -= {w.split(".", 1)[0] for w in written}
         # ids and caller locals, bound once
         for _ in range(3):
             for name, decls in values.items():
@@ -990,9 +1141,11 @@ class _Walk:
                     base = chain_text(src, value)
                     for c in pattern.named_children:
                         key = (
-                            src.text(c.child_by_field_name("key") or c)
-                            if c.type != "shorthand_property_identifier_pattern"
-                            else src.text(c)
+                            src.text(c)
+                            if c.type == "shorthand_property_identifier_pattern"
+                            else src.text(c.child_by_field_name("left"))
+                            if c.type == "object_assignment_pattern"
+                            else src.text(c.child_by_field_name("key") or c)
                         )
                         local = bound_names(src, c)[:1]
                         if not local or local[0] != name:
@@ -1044,21 +1197,31 @@ class _Walk:
         )
 
     # -- recording
-    def add(self, node: Node, lookup: Lookup, *, read: bool, cover: set[str] | None) -> int:
+    def add(
+        self,
+        node: Node,
+        lookup: Lookup,
+        *,
+        read: bool,
+        cover: set[_Key] | None,
+        asynchronous: bool = True,
+    ) -> int:
         k = len(self.lookups)
         self.lookups.append(lookup)
         self.cover.append(cover)
+        self.asynchronous.append(asynchronous)
         self.starts.append(node.start_byte)
         self.reads.append(read)
         self.made.setdefault(self.key(node), []).append(k)
         return k
 
-    def handoff(self, node: Node, cover: set[str] | None) -> None:
+    def handoff(self, node: Node, cover: set[_Key] | None) -> None:
         self.handoffs.append((self.span(node), cover, node.start_byte))
 
-    def verify(self, roots: set[str], at: _Pos) -> None:
-        for r in roots - self.unstable:
-            self.verified[r] = min(at, self.verified.get(r, at))
+    def verify(self, keys: set[_Key], at: _Pos) -> None:
+        for key in keys:
+            if key[0] not in self.unstable:
+                self.verified[key] = min(at, self.verified.get(key, at))
 
     @staticmethod
     def key(node: Node) -> int:
@@ -1081,6 +1244,17 @@ class _Walk:
                 self.creation(n)
             else:
                 self.call(n)
+        self.opaque()
+        body_node = self.fn.child_by_field_name("body")
+        self.seen = (
+            self.seen
+            or any(
+                self.path_id(m) is not None
+                for m in (walk(body_node) if body_node is not None else [])
+                if m.type in ("member_expression", "subscript_expression")
+            )
+            or any(r in self.path_ids for r in self.root.values())
+        )
         body = statements(self.fn)
         if body and body[-1].type == "try_statement":
             # `try { … } catch (err) { next(err) }` closing the body: its block runs in order, and
@@ -1089,6 +1263,11 @@ class _Walk:
             for name in ("handler", "finalizer"):
                 if (part := last.child_by_field_name(name)) is not None:
                     self.uncovered.append((part.start_byte, part.end_byte))
+            handler = last.child_by_field_name("handler")
+            caught = statements(handler) if handler is not None else []
+            self.swallows = handler is not None and not (
+                caught and caught[-1].type == "throw_statement"
+            )
             block = last.child_by_field_name("body")
             body = body[:-1] + [
                 s
@@ -1116,6 +1295,133 @@ class _Walk:
             else (body[0].start_byte if expression_body and body else None)
         )
         return self.result(first, self.pure_read(body))
+
+    def opaque(self) -> None:
+        """Hand-offs for what reaches the id where it isn't read: a closure that calls with it
+        (`res.on("finish", () => Post.deleteOne(…))`), and the request used other than through
+        `req.params.<id>` (`const { params } = req`, `const r = req`, `req.param("id")`)."""
+        body = self.fn.child_by_field_name("body")
+        for n in own(self.fn):
+            if (
+                n != body
+                and n.type in _SCOPES
+                and any(
+                    m.type in ("call_expression", "new_expression", "subscript_expression")
+                    and self.mentions(m)
+                    for m in walk(n)
+                )
+            ):
+                self.handoff(n, self.carried(n))
+            elif (
+                n.type == "variable_declarator"
+                and (value := n.child_by_field_name("value")) is not None
+                and self.mentions(value)
+                and not self.loads(value)
+                and not self.binds(n)
+            ):
+                self.handoff(n, None)  # `const [id] = [req.params.id]`: the id under another name
+            elif (
+                n.type == "assignment_expression"
+                and (left := n.child_by_field_name("left")) is not None
+                and left.type != "identifier"
+                and self.mentions(n.child_by_field_name("right"))
+                and not self.loads(n.child_by_field_name("right"))
+            ):
+                self.handoff(n, None)  # `ctx.id = req.params.id`
+        if not self.req or body is None:
+            return
+        for n in walk(body):
+            if n.type != "identifier" or self.src.text(n) != self.req or self.declares(n):
+                continue
+            node = n
+            while node.parent is not None and node.parent.type in _UNWRAP:
+                node = node.parent
+            parent = node.parent
+            if parent is None or parent.type == "arguments":
+                continue  # handed on: read where the call is
+            if parent.type == "member_expression" and parent.child_by_field_name("object") == node:
+                prop = self.src.text(parent.child_by_field_name("property"))
+                if prop not in _OPAQUE_REQUEST and (prop != "params" or self.named_param(parent)):
+                    continue
+            elif parent.type == "variable_declarator" and self.destructures(parent, "params"):
+                continue
+            self.handoff(n, None)
+
+    def carried(self, node: Node) -> set[_Key] | None:
+        """The ids a closure uses, when each use is one exactly."""
+        uses = [
+            m
+            for m in walk(node)
+            if (
+                m.type == "member_expression"
+                and self.mentions(m)
+                and m.parent is not None
+                and not (
+                    m.parent.type == "member_expression"
+                    and m.parent.child_by_field_name("object") == m
+                )
+            )
+            or (m.type == "identifier" and self.src.text(m) in self.root)
+        ]
+        return self.exact_ids(uses)
+
+    def binds(self, decl: Node) -> bool:
+        """A declaration `_bind` reads: one name, or `{ id } = req.params`."""
+        pattern = decl.child_by_field_name("name")
+        if pattern is not None and pattern.type == "identifier":
+            return True
+        value = chain_text(self.src, decl.child_by_field_name("value"))
+        return bool(self.req) and value == f"{self.req}.params" and self.destructures(decl, None)
+
+    def declares(self, node: Node) -> bool:
+        parent = node.parent
+        return parent is not None and parent.type in (
+            "required_parameter",
+            "optional_parameter",
+            "formal_parameters",
+        )
+
+    def named_param(self, params: Node) -> bool:
+        """`req.params.<name>`, `req.params["name"]`, or `const { id } = req.params`."""
+        node = params
+        while node.parent is not None and node.parent.type in _UNWRAP:
+            node = node.parent
+        parent = node.parent
+        if parent is None:
+            return False
+        if parent.type == "member_expression" and parent.child_by_field_name("object") == node:
+            return True
+        if parent.type == "subscript_expression" and parent.child_by_field_name("object") == node:
+            if chain_text(self.src, parent):
+                return True
+            # `ObjectId.isValid(req.params[name])`: only validated
+            call = parent.parent.parent if parent.parent is not None else None
+            return (
+                parent.parent.type == "arguments"
+                and call is not None
+                and bool(_VALIDATOR_NAME.match(callee_name(self.src, call)))
+            )
+        return parent.type == "variable_declarator" and self.destructures(parent, None)
+
+    def destructures(self, decl: Node, avoiding: str | None) -> bool:
+        """A plain `{ a, b: c, d = 1 }` pattern, without the `avoiding` key."""
+        pattern = decl.child_by_field_name("name")
+        if pattern is None or pattern.type != "object_pattern":
+            return False
+        for c in pattern.named_children:
+            if c.type == "shorthand_property_identifier_pattern":
+                key = self.src.text(c)
+            elif c.type == "pair_pattern" and c.child_by_field_name("value").type == "identifier":
+                key = self.src.text(c.child_by_field_name("key"))
+            elif c.type == "object_assignment_pattern":
+                key = self.src.text(c.child_by_field_name("left"))
+            elif c.type == "comment":
+                continue
+            else:
+                return False
+            if key == avoiding:
+                return False
+        return True
 
     def _own_of(self, node: Node) -> Iterator[Node]:
         stack = [node]
@@ -1156,6 +1462,15 @@ class _Walk:
             ),
             None,
         )
+        children = [c for c in value.named_children if c.type != "comment"]
+        spreads = [k for k, c in enumerate(children) if c.type == "spread_element"]
+        wheres = [
+            k
+            for k, c in enumerate(children)
+            if c.type == "pair" and self.src.text(c.child_by_field_name("key")) == "where"
+        ]
+        if spreads and (not wheres or max(spreads) > wheres[-1]):
+            return None  # `{ where, ...req.query }`: the spread may replace it
         if where is not None:
             return self.filters(where)  # the rest are options (`include`, Prisma's `data`)
         pairs: list[tuple[str, Node]] = []
@@ -1177,7 +1492,8 @@ class _Walk:
                 pairs.append((name, v))
             elif p.type != "comment":
                 return None
-        return pairs
+        names = [k for k, _ in pairs]
+        return pairs if len(names) == len(set(names)) else None  # the last duplicate wins
 
     def relation(self, value: Node) -> Node | None:
         """The id a relation filter equals: `{ id: me }`, one plain pair and nothing else."""
@@ -1204,21 +1520,48 @@ class _Walk:
         objects = [x for x in (unwrap(y) for y in a) if x is not None and x.type == "object"]
         first = unwrap(a[0]) if a else None
         if first is not None and first.type != "object":
-            scoped, cover = False, self.exact_ids(a[:1])  # by key: `findById(id)`, `.delete(id)`
+            # by key: `findById(id)`, `.delete(id)`
+            scoped, cover = False, self.exact_ids(a[:1], model.key, "pk")
         else:
-            # the filter: Sequelize's `update(values, { where })` names it second
-            query = next((o for o in objects if self.keyed(o, "where")), first)
+            # the filter, first but for Sequelize's `update(values, { where })`
+            second = unwrap(a[1]) if len(a) > 1 else None
+            query = (
+                second
+                if name == "update"
+                and second is not None
+                and second.type == "object"
+                and self.keyed(second, "where")
+                else first
+            )
             pairs = self.filters(query)
+            known = (
+                self.code.fields_by_record.get(model.record or "")
+                if model.record in self.code.mongoose
+                else None
+            )
             if pairs is None:
                 scoped, cover = False, None
             else:
-                # shape 1: plain equalities, one on an owner field with a caller-only value
-                scoped = any(OWNER_CHECK_RX.match(k) and self.derived(v) for k, v in pairs)
-                cover = self.exact_ids([v for _, v in pairs if self.mentions(v)])
+                # shape 1: plain equalities, one on an owner field (of the schema, for Mongoose)
+                # with a caller-only value
+                scoped = any(
+                    OWNER_CHECK_RX.match(k) and (known is None or k in known) and self.derived(v)
+                    for k, v in pairs
+                )
+                keys = [
+                    self.exact_ids([v], model.key, "pk" if k in ("_id", "id") else k)
+                    for k, v in pairs
+                    if self.mentions(v)
+                ]
+                cover = None if not keys or None in keys else set().union(*keys)  # type: ignore[arg-type]
             raising = raising or any(self.keyed(o, "rejectOnEmpty") for o in objects)
         read = name in _READS
         k = self.add(
-            links[-1], Lookup(span, scoped, record_type=model.record), read=read, cover=cover
+            links[-1],
+            Lookup(span, scoped, record_type=model.record),
+            read=read,
+            cover=cover,
+            asynchronous=not model.sync,
         )
         for c in links:
             self.made.setdefault(self.key(c), [])
@@ -1238,8 +1581,9 @@ class _Walk:
             return
         if self.derived(node.child_by_field_name("object")):
             return
-        lookup = Lookup(self.span(node))
-        self.add(node, lookup, read=True, cover=self.exact_ids([node.child_by_field_name("index")]))
+        store = f"{self.rel}:{chain_text(self.src, node.child_by_field_name('object'))}"
+        cover = self.exact_ids([node.child_by_field_name("index")], store, "pk")
+        self.add(node, Lookup(self.span(node)), read=True, cover=cover, asynchronous=False)
 
     def creation(self, node: Node) -> None:
         a = args(node)
@@ -1289,12 +1633,14 @@ class _Walk:
             for y in a
         )
         if passes and not used and name not in ("next",) and root_of(src, fn) != self.res:
-            targets = self.code.functions(self.rel, fn, self.cls)
+            targets = self.code.functions(self.rel, fn, self.cls, self.instance)
             if targets is None or (targets and self.depth >= 1):
                 self.handoff(call, None)
             elif targets:
                 self.hop_into(call, targets)
-            return  # a library reading the request (`validationResult(req)`) can't load ours
+            elif name not in _READS_REQUEST:
+                self.handoff(call, None)  # code we can't read may load by `req.params`
+            return
         if not used:
             if (
                 receiver is not None
@@ -1322,7 +1668,7 @@ class _Walk:
             return  # the response: `res.json(…)`, `res.status(404)`
         if dotted == "next" or (self.req and root == self.req):
             return
-        targets = self.code.functions(self.rel, fn, self.cls)
+        targets = self.code.functions(self.rel, fn, self.cls, self.instance)
         if targets is None:
             if not _VALIDATOR_NAME.match(name):
                 self.handoff(call, cover)
@@ -1351,24 +1697,38 @@ class _Walk:
 
     def hop_into(self, call: Node, targets: list[Target]) -> None:
         self.hop = self.hop or self.span(call)
-        verified: set[str] | None = None
-        owned: set[str] | None = None
+        verified: set[_Key] | None = None
+        owned: set[_Key] | None = None
         for target in targets:
             scan, exact = self.o.hop(self, target, call)
 
-            def mapped(inner: set[str] | None, exact: dict[str, str] = exact) -> set[str] | None:
-                return {exact[p] for p in inner} if inner and inner <= exact.keys() else None
+            def mapped(inner: set[_Key] | None, exact: dict[str, str] = exact) -> set[_Key] | None:
+                if not inner or any(r not in exact for r, _, _ in inner):
+                    return None
+                return {(exact[r], s, f) for r, s, f in inner}
 
-            for x, read, inner in zip(scan.facts.lookups, scan.reads, scan.covers, strict=True):
+            self.seen = self.seen or scan.seen
+            asynchronous = _is_async(target.fn)
+            if asynchronous:
+                self.hop_async.add(self.key(call))
+            for x, read, inner, waits in zip(
+                scan.facts.lookups, scan.reads, scan.covers, scan.asynchronous, strict=True
+            ):
                 lookup = Lookup(x.span, x.scoped, x.checked, x.record_type)
-                self.add(call, lookup, read=read and scan.pure_read, cover=mapped(inner))
+                self.add(
+                    call,
+                    lookup,
+                    read=read and scan.pure_read,
+                    cover=mapped(inner),
+                    asynchronous=waits or asynchronous,
+                )
             self.caller = self.caller or scan.facts.caller
             if scan.facts.handoff:
                 self.handoffs.append(
                     (scan.facts.handoff, mapped(scan.handoff_cover), call.start_byte)
                 )
-            v = {exact[p] for p in scan.verified if p in exact}
-            o = {exact[p] for p in scan.owned_or_null if p in exact}
+            v = {(exact[r], s, f) for r, s, f in scan.verified if r in exact}
+            o = {(exact[r], s, f) for r, s, f in scan.owned_or_null if r in exact}
             verified = v if verified is None else verified & v
             owned = o if owned is None else owned & o
         self.hop_verified[self.key(call)] = verified or set()
@@ -1420,9 +1780,16 @@ class _Walk:
         ):
             value = stmt  # an arrow's expression body
         inner = unwrap(value)
-        if inner is not None and inner.type == "call_expression":
+        awaited = value is not None and _bare(value).type == "await_expression"
+        if (
+            inner is not None
+            and inner.type == "call_expression"
+            and (awaited or self.key(inner) not in self.hop_async)
+        ):
             self.verify(self.hop_verified.get(self.key(inner), set()), end)
         k = self.load(value)
+        if k is not None and self.asynchronous[k] and not awaited:
+            k = None  # an un-awaited query never runs, and its promise is never missing
         scoped = k is not None and self.lookups[k].scoped
         if scoped and k in self.raising:
             # shape 1, refused when absent: `.orFail()`, `findUniqueOrThrow`, `rejectOnEmpty`
@@ -1445,7 +1812,12 @@ class _Walk:
             # shape 5: the load, then `return item?.owner === me ? item : undefined`
             self.checked(k)
             self.owned_or_null.update(dict.fromkeys(self.cover[k] or set(), nxt.start_byte))
-        elif inner is not None and inner.type == "call_expression" and absent:
+        elif (
+            inner is not None
+            and inner.type == "call_expression"
+            and absent
+            and (awaited or self.key(inner) not in self.hop_async)
+        ):
             self.verify(self.hop_owned.get(self.key(inner), set()), nxt.end_byte)
 
     def checked(self, k: int) -> None:
@@ -1506,7 +1878,9 @@ class _Walk:
         return (
             self.src.text(node.child_by_field_name("function")) == "next"
             and len(a) == 1
-            and string_value(self.src, a[0]) not in ("route", "router")
+            and unwrap(a[0]) is not None
+            and unwrap(a[0]).type in ("identifier", "new_expression", "call_expression")
+            and self.src.text(unwrap(a[0])) != "undefined"
         )
 
     def condition(self, stmt: Node) -> Node | None:
@@ -1517,18 +1891,19 @@ class _Walk:
         return unwrap(stmt.child_by_field_name("condition"))
 
     def parts(self, node: Node | None, op: str) -> list[Node]:
-        node = unwrap(node)
-        if node is None:
-            return []
-        if (
-            node.type == "binary_expression"
-            and self.src.text(node.child_by_field_name("operator")) == op
-        ):
-            return [
-                *self.parts(node.child_by_field_name("left"), op),
-                *self.parts(node.child_by_field_name("right"), op),
-            ]
-        return [node]
+        out, stack = [], [node]
+        while stack:
+            n = unwrap(stack.pop())
+            if n is None:
+                continue
+            if (
+                n.type == "binary_expression"
+                and self.src.text(n.child_by_field_name("operator")) == op
+            ):
+                stack += [n.child_by_field_name("right"), n.child_by_field_name("left")]
+            else:
+                out.append(n)
+        return out
 
     def absence(self, node: Node | None, record: str, *, present: bool) -> bool:
         node = unwrap(node)
@@ -1712,18 +2087,31 @@ class _Walk:
         return len(self.lookups) == 1 and self.load(value) == 0
 
     def result(self, first_return: int | None, pure_read: bool) -> _Scan:
-        verified = {r: at for r, at in self.verified.items() if r not in self.unstable}
+        verified = {k: at for k, at in self.verified.items() if k[0] not in self.unstable}
 
-        def holds(roots: set[str] | None, at: int) -> bool:
+        def holds(keys: set[_Key] | None, at: int) -> bool:
             return (
-                bool(roots)
-                and all(r in verified and verified[r] <= at for r in roots)
+                bool(keys)
+                and all(
+                    any(
+                        v[0] == r
+                        and pos <= at
+                        and (
+                            (s in ("*", v[1]) and f in ("*", v[2]))
+                            # `Comment.deleteMany({ post: id })` once the post is the caller's
+                            or (s != v[1] and f != "pk" and v[2] == "pk")
+                        )
+                        for v, pos in verified.items()
+                    )
+                    for r, s, f in keys  # type: ignore[union-attr]
+                )
                 and not any(start <= at < end for start, end in self.uncovered)
             )
 
-        unheld = [(span, roots) for span, roots, at in self.handoffs if not holds(roots, at)]
+        unheld = [(span, keys) for span, keys, at in self.handoffs if not holds(keys, at)]
         handoff, handoff_cover = unheld[0] if unheld else (None, None)
         before = first_return if first_return is not None else 1 << 60
+        exported = set() if self.swallows else self.params | self.path_ids
         return _Scan(
             HandlerFacts(
                 lookups=tuple(
@@ -1739,18 +2127,75 @@ class _Walk:
                 hop=self.hop,
                 handoff=handoff,
             ),
-            verified={r for r, at in verified.items() if at <= before}
-            & (self.params | self.path_ids),
+            verified={k for k, at in verified.items() if at <= before and k[0] in exported},
             owned_or_null={
-                r
-                for r, at in self.owned_or_null.items()
-                if r in (self.params | self.path_ids) - self.unstable and at <= before
+                k
+                for k, at in self.owned_or_null.items()
+                if k[0] in exported - self.unstable and at <= before
             },
             covers=tuple(self.cover),
             reads=tuple(self.reads),
             handoff_cover=handoff_cover,
             pure_read=pure_read,
+            asynchronous=tuple(self.asynchronous),
+            seen=self.seen,
         )
+
+
+def _passes_on(code: JsCode, wrapper: Target, made: Target) -> bool:
+    """`fn => (req, res, next) => fn(req, res, next).catch(next)`: the wrapper's handler only
+    calls the function it wraps (and catches)."""
+    src = code.files[wrapper.rel].src
+    params = param_patterns(wrapper.fn)
+    if len(params) != 1 or params[0].type != "identifier":
+        return False
+    wrapped = src.text(params[0])
+    for n in walk(made.fn):
+        if n.type in ("new_expression", "subscript_expression"):
+            return False
+        if n.type == "call_expression":
+            fn = unwrap(n.child_by_field_name("function"))
+            name = callee_name(src, n)
+            if not (
+                src.text(fn) in (wrapped, "Promise.resolve")
+                or (
+                    fn is not None
+                    and fn.type == "member_expression"
+                    and name in ("catch", "then", "finally")
+                )
+            ):
+                return False
+    return True
+
+
+def _bare(node: Node) -> Node:
+    while node.type == "parenthesized_expression" and node.named_children:
+        node = node.named_children[0]
+    return node
+
+
+def _is_async(fn: Node) -> bool:
+    return any(c.type == "async" for c in fn.children)
+
+
+def written_path(src: Parsed, node: Node | None) -> str:
+    """The named path a write lands under: `req.user` for `req.user[k]`."""
+    node = unwrap(node)
+    while node is not None and node.type in ("member_expression", "subscript_expression"):
+        if text := chain_text(src, node):
+            return text
+        node = unwrap(node.child_by_field_name("object"))
+    return chain_text(src, node)
+
+
+def own_scope(fn: Node, node: Node) -> bool:
+    """Whether `node` is in `fn`'s own scope, not a function or class nested in it."""
+    parent = node.parent
+    while parent is not None and parent != fn:
+        if parent.type in _SCOPES:
+            return False
+        parent = parent.parent
+    return True
 
 
 def root_of(src: Parsed, node: Node | None) -> str:
@@ -1771,6 +2216,53 @@ def _flat(nodes: list[Node]) -> Iterator[Node]:
             yield node
 
 
+def _refuses(src: Parsed, fn: Node) -> bool:
+    """Whether a middleware can refuse a request: a 4xx response, a throw, or `next(err)`."""
+    for n in walk(fn):
+        if n.type == "throw_statement":
+            return True
+        if n.type != "call_expression":
+            continue
+        name, a = callee_name(src, n), args(n)
+        if name in ("status", "sendStatus") and a and src.text(a[0]).startswith("4"):
+            return True
+        if src.text(n.child_by_field_name("function")) == "next" and a:
+            value = unwrap(a[0])
+            if value is not None and value.type in (
+                "identifier",
+                "new_expression",
+                "call_expression",
+            ):
+                return True
+    return False
+
+
+def _sets_caller(src: Parsed, fn: Node) -> bool:
+    """Whether a middleware writes who is calling (`req.user`, `req.auth`, `res.locals.user`)."""
+    params = param_patterns(fn)
+    names = [src.text(p) if p.type == "identifier" else "" for p in params[:2]]
+    req, res = [*names, "", ""][:2]
+    paths = {f"{req}.user", f"{req}.auth"} if req else set()
+    if res:
+        paths.add(f"{res}.locals")
+    for n in walk(fn):
+        written = ""
+        if n.type in ("assignment_expression", "augmented_assignment_expression"):
+            written = written_path(src, n.child_by_field_name("left"))
+        elif (
+            n.type == "call_expression"
+            and _WRITES_FIRST.match(chain_text(src, n.child_by_field_name("function")))
+            and args(n)
+        ):
+            written = written_path(src, args(n)[0])
+        if written and any(
+            written == p or written.startswith(p + ".") or p.startswith(written + ".")
+            for p in paths
+        ):
+            return True
+    return False
+
+
 class ExpressOwnership:
     """An Express handler's ownership facts. `guarded`: an authenticating middleware runs before
     it, so `req.user` (and `req.auth`, `res.locals.user`) is the caller (owner decision)."""
@@ -1788,7 +2280,16 @@ class ExpressOwnership:
         guarded: bool,
         middleware: list[Node] = (),  # type: ignore[assignment]
         preloaded: set[str] = frozenset(),  # type: ignore[assignment]
+        unguarded: list[Node] = (),  # type: ignore[assignment]
     ) -> HandlerFacts:
+        """`unguarded`: the chain's middleware that isn't a guard: one writing `req.user` makes
+        it no caller."""
+        if any(
+            (m := self._target(rel, node)) is not None
+            and _sets_caller(self.code.files[m.rel].src, m.fn)
+            for node in _flat(unguarded)
+        ):
+            guarded = False
         target = self._target(rel, fn_node)
         if target is None:
             span = CodeSpan(path=RepoPath(rel), line=self.code.files[rel].src.line(fn_node))
@@ -1809,6 +2310,10 @@ class ExpressOwnership:
             and ".params" in self.code.files[m.rel].src.text(m.fn)
             and _plain_request(self.code.files[m.rel].src, m.fn)
         ]
+        if path_ids and not (scan.seen or any(s.seen for s in loaders)):
+            # the path id is read nowhere we can see: by middleware, `req.param`, `req.path`, …
+            span = CodeSpan(path=RepoPath(rel), line=self.code.files[rel].src.line(fn_node))
+            return HandlerFacts(handoff=span, takes_id=True)
         facts = [*(s.facts for s in loaders), scan.facts]
         return HandlerFacts(
             lookups=tuple(x for f in facts for x in f.lookups),
@@ -1817,6 +2322,11 @@ class ExpressOwnership:
             handoff=next((f.handoff for f in facts if f.handoff), None),
             takes_id=bool(path_ids),
         )
+
+    def refuses(self, rel: str, node: Node) -> bool | None:
+        """Whether checkout middleware can refuse a request; None when it isn't checkout code."""
+        target = self._target(rel, node)
+        return None if target is None else _refuses(self.code.files[target.rel].src, target.fn)
 
     def _target(self, rel: str, node: Node) -> Target | None:
         node = unwrap(node)
@@ -1827,38 +2337,45 @@ class ExpressOwnership:
         if node.type == "call_expression":
             a = args(node)
             inner = unwrap(a[0]) if len(a) == 1 else None
-            if inner is not None and (wrapped := self._target(rel, inner)) is not None:
-                return wrapped  # `asyncHandler(async (req, res) => …)`
-            # a factory: `retrieveBasket()` returning the handler it builds
             found = self.code.functions(rel, node.child_by_field_name("function"), None)
-            if not found or len(found) != 1:
-                return None
-            made = [
-                fn
-                for s in statements(found[0].fn)
-                if (
-                    fn := unwrap(
-                        s.named_children[0]
-                        if s.type == "return_statement" and s.named_children
-                        else s
-                    )
+            made_by = self._made(found[0]) if found and len(found) == 1 else None
+            if (
+                inner is not None
+                and (
+                    not found or (made_by is not None and _passes_on(self.code, found[0], made_by))
                 )
-                is not None
-                and fn.type in _FUNCTION_VALUES
-            ]
-            returns = [n for n in own(found[0].fn) if n.type == "return_statement"]
-            expression_body = (
-                found[0].fn.child_by_field_name("body") or found[0].fn
-            ).type != "statement_block"
-            return (
-                Target(found[0].rel, made[0])
-                if len(made) == 1 and (expression_body or len(returns) == 1)
-                else None
-            )
+                and (wrapped := self._target(rel, inner)) is not None
+            ):
+                return wrapped  # `asyncHandler(async (req, res) => …)`
+            # a factory: `retrieveBasket()` (or a wrapper `cached(show)`) returning the handler
+            return made_by
         found = self.code.functions(rel, node, None)
         if found and len(found) == 1:
             return found[0]
         return None
+
+    def _made(self, factory: Target) -> Target | None:
+        """The one function a factory returns."""
+        made = [
+            fn
+            for s in statements(factory.fn)
+            if (
+                fn := unwrap(
+                    s.named_children[0] if s.type == "return_statement" and s.named_children else s
+                )
+            )
+            is not None
+            and fn.type in _FUNCTION_VALUES
+        ]
+        returns = [n for n in own(factory.fn) if n.type == "return_statement"]
+        expression_body = (factory.fn.child_by_field_name("body") or factory.fn).type != (
+            "statement_block"
+        )
+        return (
+            Target(factory.rel, made[0])
+            if len(made) == 1 and (expression_body or len(returns) == 1)
+            else None
+        )
 
     def scan(
         self,
@@ -1872,6 +2389,8 @@ class ExpressOwnership:
         guarded = self.guarded and handler[0]
         key = (target.rel, target.fn.start_byte, frozenset(ids), frozenset(path_ids))
         key += (frozenset(handed), depth, handler, guarded)
+        if target.instance is not None:
+            key += (target.instance[0], target.instance[1].start_byte)
         if key not in self.code.scans:
             walk_ = _Walk(self, target, ids, path_ids, set(handed), depth, handler)
             self.code.scans[key] = walk_.run()

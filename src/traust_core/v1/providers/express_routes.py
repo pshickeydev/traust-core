@@ -508,6 +508,7 @@ class _Express:
                     guarded=bool(authenticating),
                     middleware=handlers[:-1],
                     preloaded=self._preloaded(key),
+                    unguarded=[h for h in handlers[:-1] if not self._names(src, h)[0]],
                 )
                 row.own(facts, own.code.fields, guards=authenticating)
             rows.append(_mark(row, key[1], dynamic, src.file.rel))
@@ -530,9 +531,15 @@ class _Express:
                     if src.text(fn.child_by_field_name("property")) != "param":
                         continue
                     receiver = self._receiver(src, fn.child_by_field_name("object"))
-                    name = src.string((_args(call) or [None])[0])
-                    if receiver is not None and name is not None:
-                        self._params.setdefault(receiver, set()).add(name)
+                    first = _unwrap((_args(call) or [None])[0])
+                    items = (
+                        first.named_children
+                        if first is not None and first.type == "array"
+                        else [first]
+                    )
+                    names = {n for x in items if (n := src.string(x)) is not None}
+                    if receiver is not None:
+                        self._params.setdefault(receiver, set()).update(names)
         names: set[str] = set()
         seen: set[_Key] = set()
         pending = [key]
@@ -555,8 +562,10 @@ class _Express:
             if node.type == "call_expression":
                 if src.text(node.child_by_field_name("function")) in guards:
                     guards.append(text[:200])
-            elif _ADMIN_MIDDLEWARE.match(text.rsplit(".", 1)[-1]):
-                guards.append(text)
+            elif _ADMIN_MIDDLEWARE.match(text.rsplit(".", 1)[-1]) and (
+                self.ownership().refuses(src.file.rel, node) is not False
+            ):
+                guards.append(text)  # read from its name when it isn't checkout code
         return guards
 
 

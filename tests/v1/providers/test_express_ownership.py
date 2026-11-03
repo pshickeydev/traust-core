@@ -3,6 +3,7 @@ protected but isn't, which must stay judged."""
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from textwrap import dedent
 
@@ -61,7 +62,17 @@ export const Holidays = { get: (id: string) => holidays.get(id) };
 """
 
 LOADERS = """
+import mongoose from "mongoose";
 import { Post } from "./models";
+
+export const checkId = (name) => (req, res, next) => {
+  if (!mongoose.Types.ObjectId.isValid(req.params[name])) return res.sendStatus(400);
+  next();
+};
+export const loadBy = (name) => async (req, res, next) => {
+  req.post = await Post.findById(req.params[name]);
+  next();
+};
 
 export const loadOwnPost = async (req, res, next) => {
   req.post = await Post.findOne({ _id: req.params.id, user: req.user.id });
@@ -103,7 +114,7 @@ import { PrismaClient } from "@prisma/client";
 import { requireAuth, admin, auth } from "./auth";
 import { Post } from "./models";
 import { Comment, Holidays } from "./store";
-import { loadOwnPost, loadAnyPost, showPost } from "./loaders";
+import { loadOwnPost, loadAnyPost, showPost, checkId, loadBy } from "./loaders";
 const posts = require("./controller");
 
 const prisma = new PrismaClient();
@@ -345,6 +356,16 @@ app.delete("/loaded-any/:id", requireAuth, loadAnyPost, async (req, res) => {
   res.sendStatus(204);
 });
 app.get("/passed/:id", requireAuth, (req, res) => posts.show(req, res));
+app.delete("/valid-id/:id", [requireAuth, checkId("id")], async (req, res) => {
+  const post = await Post.findById(req.params.id);
+  if (!post || post.user !== req.user.id) return res.sendStatus(403);
+  await Post.deleteOne({ _id: req.params.id });
+});
+app.delete("/loaded-by/:id", requireAuth, loadBy("id"), async (req, res) => {
+  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });
+  if (!post) return res.sendStatus(404);
+  await req.post.remove();
+});
 app.get("/handed-body/:id", requireAuth, async (req, res) => {
   const post = await posts.mine(req.body, req.params.id);
   if (!post) return res.sendStatus(404);
@@ -464,6 +485,8 @@ def app(tmp_path_factory: pytest.TempPathFactory) -> dict:
         ("DELETE", "/loaded-any/:id", "caller-blind"),  # a loader that loads anyone's
         ("GET", "/preloaded/:id", "unknown"),  # `router.param` loads it first
         ("GET", "/passed/:id", "scoped"),  # `posts.show(req, res)` continues the handler
+        ("DELETE", "/valid-id/:id", "checked"),  # middleware that only validates `req.params[name]`
+        ("DELETE", "/loaded-by/:id", "unchecked"),  # middleware loading by `req.params[name]`
         ("GET", "/handed-body/:id", "caller-blind"),  # a helper's `input.user` isn't the caller
         ("GET", "/destructured/:id", "unknown"),  # `({ params }, res)` isn't read
         ("GET", "/validated/:id", "scoped"),  # a library reading `req` loads nothing of ours
@@ -640,3 +663,65 @@ def test_the_code_a_handler_reaches_is_resolved(
     row = _row(resolved, method, pattern)
     assert row["ownership"] == ownership
     assert (row["ownership_evidence"] or {}).get("record_type") == record
+
+
+# Invented Express apps from an independent review: code credited as protected while another
+# user's object stays reachable (each must stay judged or unknown), beside twins that are protected.
+_REVIEW = Path(__file__).parents[2] / "fixtures/code_facts/express_ownership_review.json"
+_CASES = json.loads(_REVIEW.read_text())
+
+
+@pytest.mark.parametrize(
+    ("case", "method", "pattern", "ownership"),
+    [(c["case"], e["method"], e["pattern"], e["ownership"]) for c in _CASES for e in c["expect"]],
+)
+def test_holes_a_review_found_stay_closed(
+    tmp_path: Path, case: str, method: str, pattern: str, ownership: str
+) -> None:
+    files = next(c["files"] for c in _CASES if c["case"] == case)
+    assert _row(_tree(tmp_path, files), method, pattern)["ownership"] == ownership
+
+
+@pytest.mark.parametrize(
+    ("route", "ownership"),
+    [
+        # a condition of a thousand terms
+        (
+            'app.delete("/a/:id", requireAuth, async (req, res) => {\n'
+            "  const post = await Post.findById(req.params.id);\n"
+            "  if (!post || "
+            + " || ".join(f"post.user !== req.user.id{k}" for k in range(1200))
+            + ") return res.sendStatus(403);\n"
+            "  await Post.deleteOne({ _id: req.params.id });\n});\n",
+            "checked",
+        ),
+        # a member chain a thousand deep
+        (
+            'app.get("/a/:id", requireAuth, async (req, res) => {\n'
+            "  res.json(await Post.findById(req.params.id."
+            + ".".join(f"p{k}" for k in range(1200))
+            + "));\n});\n",
+            "caller-blind",
+        ),
+        # schema names bound to each other
+        (
+            "function a() { const schema = opts; }\nfunction b() { const opts = schema; }\n"
+            'const Loop = mongoose.model("Loop", schema);\n'
+            'app.get("/a/:id", requireAuth, async (req, res) => {\n'
+            "  res.json(await Loop.findById(req.params.id));\n});\n",
+            "caller-blind",
+        ),
+    ],
+)
+def test_pathological_code_neither_crashes_nor_credits(
+    tmp_path: Path, route: str, ownership: str
+) -> None:
+    app = (
+        'import express from "express";\nimport mongoose from "mongoose";\n'
+        'import { requireAuth } from "./auth";\nimport { Post } from "./models";\n'
+        f"const app = express();\n{route}"
+    )
+    result = _tree(tmp_path, {"auth.ts": AUTH, "models.ts": MODELS, "app.ts": app})
+    assert (
+        _row(result, "GET" if "app.get" in route else "DELETE", "/a/:id")["ownership"] == ownership
+    )
