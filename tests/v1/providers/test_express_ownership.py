@@ -653,7 +653,7 @@ def resolved(tmp_path_factory: pytest.TempPathFactory) -> dict:
         ("GET", "/by-model/:id", "caller-blind", "Post"),  # `mongoose.model("Post")`
         ("GET", "/cached/:id", "caller-blind", None),  # a subscript by the id
         ("GET", "/exported/:id", "unknown", None),  # a checkout class built with the id
-        ("GET", "/nested/:id", "unknown", None),  # a local function closing over the id
+        ("GET", "/nested/:id", "caller-blind", "Task"),  # a local function read in place
         ("DELETE", "/each/:id", "unknown", None),  # the id handed to a callback
     ],
 )

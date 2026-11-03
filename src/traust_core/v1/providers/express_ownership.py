@@ -12,6 +12,7 @@ from traust_core.v1.models.common import CodeSpan, RepoPath
 from traust_core.v1.providers.route_ownership import (
     OWNER_CHECK_RX,
     OWNER_FIELD_RX,
+    PRIVILEGED_RX,
     HandlerFacts,
     Lookup,
 )
@@ -91,7 +92,7 @@ _CONVERSIONS = {
     "ObjectId",
     "Types.ObjectId",
 }
-_CONVERSION_METHODS = {"toString", "trim", "toLowerCase", "toUpperCase", "valueOf"}
+_CONVERSION_METHODS = {"toString", "valueOf"}
 _INERT_ROOTS = re.compile(r"^(console|logger|log|JSON|Math|Object\.keys|debug)$")
 _THROWN = re.compile(r"(Error|Exception)$")
 _ID_TYPES = re.compile(r"^(\w+\.)*(ObjectId|ObjectID|Number|String|BigInt|Date)$")
@@ -103,7 +104,7 @@ _WRITES_FIRST = re.compile(
     r"defaults\w*|set\w*))$"
 )
 # library calls that only read the request they are handed
-_READS_REQUEST = {"validationResult", "matchedData"}
+_READS_REQUEST = {"validationResult"}
 # request members that may carry a path id another way
 _OPAQUE_REQUEST = {"param", "path", "url", "originalUrl", "baseUrl", "route", "_parsedUrl"}
 _MAX_DEPTH = 64
@@ -302,6 +303,20 @@ class JsCode:
             self._prisma(text)
         self.fields = self._fields()
         self.scans: dict[tuple, _Scan] = {}
+        self._impersonated: bool | None = None
+
+    def impersonated(self) -> bool:
+        """Whether any checkout function makes the caller from request data: then `req.user`
+        is nobody's credential, on any route (a wrapper, `app.use`, a helper may run it)."""
+        if self._impersonated is None:
+            self._impersonated = any(
+                impersonates(f.src, n)
+                for f in self.files.values()
+                for n in walk(f.src.root)
+                if n.type in _FUNCTION_VALUES
+                or n.type in ("function_declaration", "method_definition")
+            )
+        return self._impersonated
 
     # -- indexing
     def _resolve_module(self, rel: str, spec: str | None) -> str | None:
@@ -539,18 +554,37 @@ class JsCode:
                 fields.append(src.text(p))
             elif p.type == "pair" and p.child_by_field_name("key").type != "computed_property_name":
                 fields.append(src.text(p.child_by_field_name("key")).strip("'\""))
-                value = src.text(p.child_by_field_name("value"))
-                if re.search(r"\bref\s*:|ObjectId|references\s*:", value):
-                    self.linked.add(record)
+                value = unwrap(p.child_by_field_name("value"))
+                text = src.text(value) if value is not None else ""
+                if re.search(r"\bref\s*:|ObjectId|references\s*:", text):
+                    self.linked.add(record)  # a reference to another model
+                elif (
+                    value is not None
+                    and value.type == "object"
+                    and not any(
+                        c.type == "pair" and src.text(c.child_by_field_name("key")) == "type"
+                        for c in value.named_children
+                    )
+                ):
+                    self._record(src, record, value)  # a nested path: `meta: { owner: String }`
             elif p.type != "comment":
                 self.linked.add(record)
 
     def _class_fields(self, src: Parsed, name: str, cls: Node) -> None:
         body = cls.child_by_field_name("body")
+        members = body.named_children if body is not None else []
         fields = [
             src.text(m.child_by_field_name("name") or m.child_by_field_name("property"))
-            for m in (body.named_children if body is not None else [])
+            for m in members
             if m.type in ("public_field_definition", "field_definition")
+        ] + [  # `constructor(public ownerId: string)`
+            src.text(q.child_by_field_name("pattern"))
+            for m in members
+            if m.type == "method_definition"
+            and src.text(m.child_by_field_name("name")) == "constructor"
+            for q in (m.child_by_field_name("parameters") or m).named_children
+            if q.type in ("required_parameter", "optional_parameter")
+            and any(c.type == "accessibility_modifier" for c in q.named_children)
         ]
         if fields:
             if any(c.type == "class_heritage" for c in cls.named_children):
@@ -840,8 +874,7 @@ class JsCode:
                         continue
                     body = sub.child_by_field_name("body")
                     if any(
-                        m.type == "method_definition"
-                        and f.src.text(m.child_by_field_name("name")) == name
+                        _defines(f.src, m, name)
                         for m in (body.named_children if body is not None else [])
                     ):
                         return True
@@ -868,10 +901,13 @@ class JsCode:
             found = [
                 m
                 for m in (body.named_children if body is not None else [])
-                if m.type == "method_definition" and src.text(m.child_by_field_name("name")) == name
+                if _defines(src, m, name)
             ]
-            if len(found) > 1:
-                return None
+            label = current.child_by_field_name("name")
+            if len(found) > 1 or (
+                label is not None and src.text(label) in self.files[where].rebound
+            ):
+                return None  # two definitions, or `Ctrl.prototype.m = …`
             if found:
                 return [Target(where, found[0], current, instance)]
             heritage = next((c for c in current.named_children if c.type == "class_heritage"), None)
@@ -937,12 +973,6 @@ class _Walk:
         self.path_ids = path_ids if self.req else set()
         self.root: dict[str, str] = {i: i for i in ids}
         self.callers = set(callers)
-        self.nested = {
-            self.src.text(n.child_by_field_name("name")): n
-            for n in own(self.fn)
-            if n.type in ("function_declaration", "class_declaration")
-            and n.child_by_field_name("name")
-        }
         self._bind()
         self.lookups: list[Lookup] = []
         self.cover: list[set[_Key] | None] = []
@@ -1126,6 +1156,19 @@ class _Walk:
             for p in self.caller_paths
             if not any(w == p or w.startswith(p + ".") or p.startswith(w + ".") for w in written)
         }
+        if caller_writes(src, self.fn, self.req, self.res) or any(
+            caller_writes(
+                self.code.files[t.rel].src, t.fn, *_request_names(self.code.files[t.rel].src, t.fn)
+            )
+            for n in (walk(body) if body is not None and self.req else [])
+            if n.type == "call_expression"
+            and any(src.text(unwrap(x) or x) == self.req for x in args(n))
+            for t in self.code.functions(
+                self.rel, n.child_by_field_name("function"), self.cls, self.instance
+            )
+            or []
+        ):
+            self.caller_paths = set()  # `const { user } = req; user.id = …`, a helper rewriting it
         self.callers -= {n for n, c in bindings.items() if c > 1}
         self.callers -= {w.split(".", 1)[0] for w in written}
         # ids and caller locals, bound once
@@ -1210,13 +1253,27 @@ class _Walk:
         self.lookups.append(lookup)
         self.cover.append(cover)
         self.asynchronous.append(asynchronous)
-        self.starts.append(node.start_byte)
+        self.starts.append(self.at(node))
         self.reads.append(read)
         self.made.setdefault(self.key(node), []).append(k)
         return k
 
     def handoff(self, node: Node, cover: set[_Key] | None) -> None:
-        self.handoffs.append((self.span(node), cover, node.start_byte))
+        self.handoffs.append((self.span(node), cover, self.at(node)))
+
+    def at(self, node: Node) -> _Pos:
+        """Where code can first run: a closure's from its definition on, a hoisted function's
+        or a class's from the start."""
+        scope, parent = None, node.parent
+        while parent is not None and parent != self.fn:
+            if parent.type in _SCOPES:
+                scope = parent
+            parent = parent.parent
+        if scope is None:
+            return node.start_byte
+        if scope.type in _FUNCTION_VALUES or scope.type == "method_definition":
+            return scope.start_byte
+        return self.fn.start_byte
 
     def verify(self, keys: set[_Key], at: _Pos) -> None:
         for key in keys:
@@ -1229,10 +1286,11 @@ class _Walk:
 
     # -- the walk
     def run(self) -> _Scan:
+        body_node = self.fn.child_by_field_name("body")
         calls = sorted(
             (
                 n
-                for n in own(self.fn)
+                for n in (walk(body_node) if body_node is not None else [])
                 if n.type in ("call_expression", "new_expression", "subscript_expression")
             ),
             key=lambda n: (n.start_byte, -n.end_byte),
@@ -1245,16 +1303,7 @@ class _Walk:
             else:
                 self.call(n)
         self.opaque()
-        body_node = self.fn.child_by_field_name("body")
-        self.seen = (
-            self.seen
-            or any(
-                self.path_id(m) is not None
-                for m in (walk(body_node) if body_node is not None else [])
-                if m.type in ("member_expression", "subscript_expression")
-            )
-            or any(r in self.path_ids for r in self.root.values())
-        )
+        self.seen = self.seen or bool(self.lookups) or bool(self.handoffs)
         body = statements(self.fn)
         if body and body[-1].type == "try_statement":
             # `try { … } catch (err) { next(err) }` closing the body: its block runs in order, and
@@ -1265,9 +1314,10 @@ class _Walk:
                     self.uncovered.append((part.start_byte, part.end_byte))
             handler = last.child_by_field_name("handler")
             caught = statements(handler) if handler is not None else []
-            self.swallows = handler is not None and not (
-                caught and caught[-1].type == "throw_statement"
-            )
+            final = last.child_by_field_name("finalizer")
+            self.swallows = (
+                handler is not None and not (caught and caught[-1].type == "throw_statement")
+            ) or (final is not None and any(n.type == "return_statement" for n in walk(final)))
             block = last.child_by_field_name("body")
             body = body[:-1] + [
                 s
@@ -1303,16 +1353,6 @@ class _Walk:
         body = self.fn.child_by_field_name("body")
         for n in own(self.fn):
             if (
-                n != body
-                and n.type in _SCOPES
-                and any(
-                    m.type in ("call_expression", "new_expression", "subscript_expression")
-                    and self.mentions(m)
-                    for m in walk(n)
-                )
-            ):
-                self.handoff(n, self.carried(n))
-            elif (
                 n.type == "variable_declarator"
                 and (value := n.child_by_field_name("value")) is not None
                 and self.mentions(value)
@@ -1322,15 +1362,18 @@ class _Walk:
                 self.handoff(n, None)  # `const [id] = [req.params.id]`: the id under another name
             elif (
                 n.type == "assignment_expression"
-                and (left := n.child_by_field_name("left")) is not None
-                and left.type != "identifier"
                 and self.mentions(n.child_by_field_name("right"))
                 and not self.loads(n.child_by_field_name("right"))
             ):
-                self.handoff(n, None)  # `ctx.id = req.params.id`
+                self.handoff(n, None)  # `ctx.id = req.params.id`, `id = req.params.id`
+            elif n.type == "for_in_statement" and self.mentions(n.child_by_field_name("right")):
+                self.handoff(n, None)  # `for (const id of [req.params.id])`
         if not self.req or body is None:
             return
         for n in walk(body):
+            if n.type == "shorthand_property_identifier" and self.src.text(n) == self.req:
+                self.handoff(n, None)  # `show({ req })`
+                continue
             if n.type != "identifier" or self.src.text(n) != self.req or self.declares(n):
                 continue
             node = n
@@ -1347,29 +1390,11 @@ class _Walk:
                 continue
             self.handoff(n, None)
 
-    def carried(self, node: Node) -> set[_Key] | None:
-        """The ids a closure uses, when each use is one exactly."""
-        uses = [
-            m
-            for m in walk(node)
-            if (
-                m.type == "member_expression"
-                and self.mentions(m)
-                and m.parent is not None
-                and not (
-                    m.parent.type == "member_expression"
-                    and m.parent.child_by_field_name("object") == m
-                )
-            )
-            or (m.type == "identifier" and self.src.text(m) in self.root)
-        ]
-        return self.exact_ids(uses)
-
     def binds(self, decl: Node) -> bool:
         """A declaration `_bind` reads: one name, or `{ id } = req.params`."""
         pattern = decl.child_by_field_name("name")
         if pattern is not None and pattern.type == "identifier":
-            return True
+            return self.src.text(pattern) in self.root  # bound once, as the id
         value = chain_text(self.src, decl.child_by_field_name("value"))
         return bool(self.req) and value == f"{self.req}.params" and self.destructures(decl, None)
 
@@ -1448,7 +1473,9 @@ class _Walk:
             out.append(grand)
             node = grand
 
-    def filters(self, value: Node | None) -> list[tuple[str, Node]] | None:
+    def filters(
+        self, value: Node | None, *, mongoose: bool = False
+    ) -> list[tuple[str, Node]] | None:
         """The (field, value) equalities a query narrows by (`{ _id: id, owner: me }`, or its
         `where`); None when any is something else (an operator, `$or`, a spread, a computed key)."""
         value = unwrap(value)
@@ -1471,7 +1498,7 @@ class _Walk:
         ]
         if spreads and (not wheres or max(spreads) > wheres[-1]):
             return None  # `{ where, ...req.query }`: the spread may replace it
-        if where is not None:
+        if where is not None and not mongoose:
             return self.filters(where)  # the rest are options (`include`, Prisma's `data`)
         pairs: list[tuple[str, Node]] = []
         for p in value.named_children:
@@ -1514,7 +1541,9 @@ class _Walk:
         span = self.span(call)
         links = self.chain(call)
         self.consumed |= {self.key(c) for c in links}
-        raising = name in _OR_FAIL or any(callee_name(self.src, c) == "orFail" for c in links[1:])
+        names = [callee_name(self.src, c) for c in links]
+        raised = [k for k, n in enumerate(names) if n == "orFail" or (k == 0 and n in _OR_FAIL)]
+        raising = bool(raised) and not any(n in ("catch", "then") for n in names[raised[0] :])
         if not any(self.mentions(x) for x in a):
             return  # not a load of the path's object (`findById(req.user.id)`)
         objects = [x for x in (unwrap(y) for y in a) if x is not None and x.type == "object"]
@@ -1533,7 +1562,7 @@ class _Walk:
                 and self.keyed(second, "where")
                 else first
             )
-            pairs = self.filters(query)
+            pairs = self.filters(query, mongoose=model.record in self.code.mongoose)
             known = (
                 self.code.fields_by_record.get(model.record or "")
                 if model.record in self.code.mongoose
@@ -1587,6 +1616,9 @@ class _Walk:
 
     def creation(self, node: Node) -> None:
         a = args(node)
+        if self.req and any(self.src.text(unwrap(x) or x) == self.req for x in a):
+            self.handoff(node, None)  # `new Loader(req)`
+            return
         if not any(self.mentions(x) for x in a):
             return
         ctor = self.src.text(node.child_by_field_name("constructor"))
@@ -1614,19 +1646,6 @@ class _Walk:
         ):
             self.store_call(call, model)
             return
-        refs = (
-            {src.text(n) for n in walk(fn) if n.type == "identifier"} & self.nested.keys()
-            if fn
-            else set()
-        )
-        handed = {src.text(x) for x in a if x.type == "identifier"} & self.nested.keys()
-        if refs or handed:
-            if any(self.mentions(self.nested[n]) for n in refs | handed) or (
-                refs and any(self.mentions(x) for x in a)
-            ):
-                self.handoff(call, None)
-            if refs:
-                return
         used = [x for x in a if self.mentions(x)]
         passes = bool(self.req) and any(
             (x := unwrap(y)) is not None and x.type == "identifier" and src.text(x) == self.req
@@ -2096,10 +2115,11 @@ class _Walk:
                     any(
                         v[0] == r
                         and pos <= at
+                        and s != "*"
                         and (
-                            (s in ("*", v[1]) and f in ("*", v[2]))
+                            (s == v[1] and f in ("*", v[2]))
                             # `Comment.deleteMany({ post: id })` once the post is the caller's
-                            or (s != v[1] and f != "pk" and v[2] == "pk")
+                            or (s != v[1] and f not in ("pk", "*") and v[2] == "pk")
                         )
                         for v, pos in verified.items()
                     )
@@ -2142,6 +2162,22 @@ class _Walk:
         )
 
 
+def _defines(src: Parsed, member: Node, name: str) -> bool:
+    """A class member defining method `name`: `m() {}` or a field `m = () => {}`."""
+    if member.type == "method_definition":
+        return src.text(member.child_by_field_name("name")) == name
+    if member.type in ("public_field_definition", "field_definition"):
+        label = member.child_by_field_name("name") or member.child_by_field_name("property")
+        value = unwrap(member.child_by_field_name("value"))
+        return (
+            label is not None
+            and src.text(label) == name
+            and value is not None
+            and (value.type in _FUNCTION_VALUES)
+        )
+    return False
+
+
 def _passes_on(code: JsCode, wrapper: Target, made: Target) -> bool:
     """`fn => (req, res, next) => fn(req, res, next).catch(next)`: the wrapper's handler only
     calls the function it wraps (and catches)."""
@@ -2151,7 +2187,13 @@ def _passes_on(code: JsCode, wrapper: Target, made: Target) -> bool:
         return False
     wrapped = src.text(params[0])
     for n in walk(made.fn):
-        if n.type in ("new_expression", "subscript_expression"):
+        if n.type in (
+            "new_expression",
+            "subscript_expression",
+            "assignment_expression",
+            "augmented_assignment_expression",
+            "update_expression",
+        ):
             return False
         if n.type == "call_expression":
             fn = unwrap(n.child_by_field_name("function"))
@@ -2237,27 +2279,127 @@ def _refuses(src: Parsed, fn: Node) -> bool:
     return False
 
 
-def _sets_caller(src: Parsed, fn: Node) -> bool:
-    """Whether a middleware writes who is calling (`req.user`, `req.auth`, `res.locals.user`)."""
-    params = param_patterns(fn)
-    names = [src.text(p) if p.type == "identifier" else "" for p in params[:2]]
+def _request_names(src: Parsed, fn: Node) -> tuple[str, str]:
+    names = [src.text(p) if p.type == "identifier" else "" for p in param_patterns(fn)[:2]]
     req, res = [*names, "", ""][:2]
+    return req, res
+
+
+def caller_writes(src: Parsed, fn: Node, req: str, res: str) -> list[Node | None]:
+    """The values written under `req.user`, `req.auth` or `res.locals` anywhere in `fn` (its
+    closures too), directly or through locals naming them (`const { user } = req`)."""
     paths = {f"{req}.user", f"{req}.auth"} if req else set()
     if res:
         paths.add(f"{res}.locals")
-    for n in walk(fn):
-        written = ""
+    body = fn.child_by_field_name("body") or fn
+    aliases: dict[str, str] = {}
+
+    def expand(path: str) -> str:
+        head, _, rest = path.partition(".")
+        return f"{aliases[head]}.{rest}".rstrip(".") if head in aliases else path
+
+    for _ in range(4):  # aliases of aliases
+        for n in walk(body):
+            if n.type != "variable_declarator":
+                continue
+            pattern = n.child_by_field_name("name")
+            chain = expand(chain_text(src, n.child_by_field_name("value")))
+            if pattern is None or not chain or chain.split(".", 1)[0] not in {req, res} - {""}:
+                continue
+            if pattern.type == "identifier":
+                aliases[src.text(pattern)] = chain
+            for c in pattern.named_children if pattern.type == "object_pattern" else []:
+                if c.type == "shorthand_property_identifier_pattern":
+                    aliases[src.text(c)] = f"{chain}.{src.text(c)}"
+                elif (
+                    c.type == "pair_pattern" and c.child_by_field_name("value").type == "identifier"
+                ):
+                    key = src.text(c.child_by_field_name("key"))
+                    aliases[src.text(c.child_by_field_name("value"))] = f"{chain}.{key}"
+    out: list[Node | None] = []
+    for n in walk(body):
+        targets: list[Node] = []
+        value: Node | None = None
         if n.type in ("assignment_expression", "augmented_assignment_expression"):
-            written = written_path(src, n.child_by_field_name("left"))
-        elif (
-            n.type == "call_expression"
-            and _WRITES_FIRST.match(chain_text(src, n.child_by_field_name("function")))
-            and args(n)
-        ):
-            written = written_path(src, args(n)[0])
-        if written and any(
-            written == p or written.startswith(p + ".") or p.startswith(written + ".")
-            for p in paths
+            left, value = n.child_by_field_name("left"), n.child_by_field_name("right")
+            if left is not None and left.type in ("object_pattern", "array_pattern"):
+                targets = [
+                    m for m in walk(left) if m.type in ("member_expression", "subscript_expression")
+                ]
+            elif left is not None:
+                targets = [left]
+        elif n.type == "update_expression":
+            targets = [n.child_by_field_name("argument")]
+        elif n.type == "call_expression":
+            fn_ = unwrap(n.child_by_field_name("function"))
+            value = n
+            if (
+                fn_ is not None
+                and fn_.type == "member_expression"
+                and _MUTATORS.match(src.text(fn_.child_by_field_name("property")))
+            ):
+                targets = [fn_.child_by_field_name("object")]
+            elif _WRITES_FIRST.match(chain_text(src, fn_)) and args(n):
+                targets = [args(n)[0]]
+        for target in targets:
+            written = expand(written_path(src, target))
+            if written and any(
+                written == q or written.startswith(q + ".") or q.startswith(written + ".")
+                for q in paths
+            ):
+                out.append(value)
+    return out
+
+
+def impersonates(src: Parsed, fn: Node) -> bool:
+    """Whether `fn` makes the caller from the request's own data (`req.user = { id:
+    req.query.as }`), not a credential."""
+    req, res = _request_names(src, fn)
+    params = param_patterns(fn)
+    following = src.text(params[2]) if len(params) > 2 and params[2].type == "identifier" else ""
+    body = fn.child_by_field_name("body") or fn
+    # only code that runs before other code: middleware calling `next`, or handing `req` on
+    if not req or not any(
+        n.type == "call_expression"
+        and (
+            src.text(n.child_by_field_name("function")) == following
+            or any(src.text(unwrap(x) or x) == req for x in args(n))
+        )
+        for n in walk(body)
+    ):
+        return False
+    data = re.compile(rf"\b{re.escape(req)}\s*\.\s*(body|query|params|param)\b")
+    tainted: set[str] = set()
+    for _ in range(3):
+        for n in walk(body):
+            if n.type == "variable_declarator" and (value := n.child_by_field_name("value")):
+                text = src.text(value)
+                if data.search(text) or any(
+                    re.search(rf"\b{re.escape(x)}\b", text) for x in tainted
+                ):
+                    tainted.update(bound_names(src, n.child_by_field_name("name")))
+    for value in caller_writes(src, fn, req, res):
+        text = src.text(value) if value is not None else ""
+        if data.search(text) or any(re.search(rf"\b{re.escape(x)}\b", text) for x in tainted):
+            return True
+    return False
+
+
+def _sets_caller(src: Parsed, fn: Node) -> bool:
+    """Whether a middleware writes who is calling (`req.user`, `req.auth`, `res.locals.user`)."""
+    return bool(caller_writes(src, fn, *_request_names(src, fn)))
+
+
+def _admin_only(src: Parsed, fn: Node) -> bool:
+    """Whether middleware refuses a caller without a privileged role: a refusal under a condition
+    naming one (`if (!req.user.isAdmin) return res.sendStatus(403)`)."""
+    for n in walk(fn):
+        if n.type == "if_statement" or n.type == "ternary_expression":
+            branches = [n.child_by_field_name("consequence"), n.child_by_field_name("alternative")]
+        else:
+            continue
+        if PRIVILEGED_RX.search(src.text(n.child_by_field_name("condition"))) and any(
+            b is not None and _refuses(src, b) for b in branches
         ):
             return True
     return False
@@ -2284,7 +2426,7 @@ class ExpressOwnership:
     ) -> HandlerFacts:
         """`unguarded`: the chain's middleware that isn't a guard: one writing `req.user` makes
         it no caller."""
-        if any(
+        if self.code.impersonated() or any(
             (m := self._target(rel, node)) is not None
             and _sets_caller(self.code.files[m.rel].src, m.fn)
             for node in _flat(unguarded)
@@ -2323,10 +2465,11 @@ class ExpressOwnership:
             takes_id=bool(path_ids),
         )
 
-    def refuses(self, rel: str, node: Node) -> bool | None:
-        """Whether checkout middleware can refuse a request; None when it isn't checkout code."""
+    def admin_only(self, rel: str, node: Node) -> bool | None:
+        """Whether checkout middleware refuses an unprivileged caller; None when it isn't
+        checkout code."""
         target = self._target(rel, node)
-        return None if target is None else _refuses(self.code.files[target.rel].src, target.fn)
+        return None if target is None else _admin_only(self.code.files[target.rel].src, target.fn)
 
     def _target(self, rel: str, node: Node) -> Target | None:
         node = unwrap(node)

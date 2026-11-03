@@ -19,7 +19,7 @@ from traust_core.v1.providers.route_guards import (
     _unguards_in,
     _unique,
 )
-from traust_core.v1.providers.route_ownership import path_params
+from traust_core.v1.providers.route_ownership import path_params, privileged_only
 from traust_core.v1.providers.syntax import Node, Parsed
 from traust_core.v1.providers.syntax import js_parsers as parsers
 from traust_core.v1.providers.syntax import walk as _walk
@@ -359,7 +359,7 @@ class _Express:
             if parent is None or prop != "use":
                 continue
             args = _args(call)
-            prefix = src.string(args[0]) if args else None
+            prefix = self._prefix(src, args[0]) if args else None
             if prefix is not None:
                 args = args[1:]
             guards: list[str] = []
@@ -382,6 +382,28 @@ class _Express:
                 unguards += u
             if prefix is None and (guards or unguards):
                 self.uses.setdefault(parent, []).append((call.start_byte, guards, unguards))
+
+    def _prefix(self, src: _Source, node: Node) -> str | None:
+        """A `use` path: a string, a constant naming one, or the first of an array of them."""
+        node = _unwrap(node)
+        if node is None:
+            return None
+        if (text := src.string(node)) is not None:
+            return text
+        if node.type == "array":
+            first = next((src.string(c) for c in node.named_children), None)
+            return first if first is not None else "<dynamic>"
+        if node.type == "template_string":
+            return "<dynamic>"
+        if node.type == "identifier":
+            name = src.text(node)
+            for d in _walk(src.root):
+                if (
+                    d.type == "variable_declarator"
+                    and src.text(d.child_by_field_name("name")) == name
+                ):
+                    return src.string(d.child_by_field_name("value"))
+        return None
 
     def _backstage(self, src: _Source, call: Node, prop: str) -> None:
         root = (src.file.rel, _BACKSTAGE_ROOT)
@@ -508,7 +530,7 @@ class _Express:
                     guarded=bool(authenticating),
                     middleware=handlers[:-1],
                     preloaded=self._preloaded(key),
-                    unguarded=[h for h in handlers[:-1] if not self._names(src, h)[0]],
+                    unguarded=[h for h in _flat(handlers[:-1]) if not self._names(src, h)[0]],
                 )
                 row.own(facts, own.code.fields, guards=authenticating)
             rows.append(_mark(row, key[1], dynamic, src.file.rel))
@@ -556,17 +578,26 @@ class _Express:
         caller through (`auth.optional`); plus an admin-only middleware in its chain (`protect,
         admin`), or a guard's privileged-role argument (`authorize(ADMIN)`)."""
         guards = [g for g in [*row.guards, *row.scope_guards] if not _OPTIONAL.search(g)]
-        for h in handlers[:-1]:
-            node = _unwrap(h) or h
+        for node in _flat(handlers[:-1]):
             text = src.text(node)
-            if node.type == "call_expression":
+            admin = privileged_only(text) or _ADMIN_MIDDLEWARE.match(text.rsplit(".", 1)[-1])
+            # an admin-named middleware that, read, refuses no unprivileged caller is none
+            if admin and self.ownership().admin_only(src.file.rel, node) is False:
+                guards = [g for g in guards if g != text]
+            elif node.type == "call_expression":
                 if src.text(node.child_by_field_name("function")) in guards:
                     guards.append(text[:200])
-            elif _ADMIN_MIDDLEWARE.match(text.rsplit(".", 1)[-1]) and (
-                self.ownership().refuses(src.file.rel, node) is not False
-            ):
+            elif admin:
                 guards.append(text)  # read from its name when it isn't checkout code
         return guards
+
+
+def _flat(nodes: list[Node]) -> list[Node]:
+    out = []
+    for node in nodes:
+        node = _unwrap(node) or node
+        out += _flat(node.named_children) if node.type == "array" else [node]
+    return out
 
 
 def _identifiers(src: _Source, node: Node) -> list[str]:
