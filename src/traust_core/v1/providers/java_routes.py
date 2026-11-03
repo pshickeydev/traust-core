@@ -85,7 +85,12 @@ _QUARKUS_PERMISSION = re.compile(
 )
 _QUARKUS_REST_PATH = ("quarkus.rest.path", "quarkus.resteasy.path")
 _JAXRS = "quarkus.security.jaxrs"
-_TYPE_DECLS = ("class_declaration", "interface_declaration")
+_TYPE_DECLS = (
+    "class_declaration",
+    "interface_declaration",
+    "record_declaration",
+    "enum_declaration",
+)
 _PATH_ANNOTATIONS = ("PathVariable", "PathParam")
 _CALLER_TYPES = re.compile(
     r"^(Principal|Authentication|\w*AuthenticationToken|Jwt|OAuth2User|OidcUser|UserDetails|"
@@ -221,6 +226,16 @@ class _Type:
     supers: list[str]
     annotations: dict[str, Node]
     methods: dict[str, Node]
+
+    @property
+    def qualified(self) -> str:
+        names = [self.name]
+        parent = self.node.parent
+        while parent is not None:
+            if parent.type in _TYPE_DECLS:
+                names.append(self.src.text(parent.child_by_field_name("name")))
+            parent = parent.parent
+        return ".".join(part for part in (_package(self.src), *reversed(names)) if part)
 
 
 def _types(src: Parsed) -> list[_Type]:
@@ -570,6 +585,7 @@ class _Java:
         self.field_decls: dict[tuple[str, str], list[tuple[_Type, Node]]] = {}
         self.scans: dict[tuple[str, int, frozenset[str], frozenset[str], int], _Scan] = {}
         self.helpers: dict[tuple[str, str], frozenset[str]] = {}
+        self.resolver_fields: dict[tuple[str, str], frozenset[str]] = {}
 
     def _application_path(self) -> str:
         paths = {
@@ -602,19 +618,39 @@ class _Java:
         return self.hierarchies[key]
 
     def resolve(self, src: Parsed, kind: str) -> list[_Type]:
-        """The checkout types a simple name refers to from `src`: by import, then package."""
+        """Resolve checkout types by qualified name, explicit import, then package. A qualified
+        name honors the imports of its outer segments too (`import other.Dto` makes
+        `Dto.HttpServletRequest` a checkout type when `other.Dto.HttpServletRequest` is one)."""
         key = (src.file.rel, kind)
         if key not in self.resolved:
-            candidates = self.types.get(kind, [])
-            found = candidates
-            if len(candidates) > 1:
+            simple = kind.rsplit(".", 1)[-1]
+            candidates = self.types.get(simple, [])
+            names = {kind, f"{_package(src)}.{kind}"}
+            if "." in kind:
+                head = kind.split(".", 1)[0]
+                # an imported outer (`import other.Dto`) qualifies its nested types
+                names |= {
+                    f"{prefix}.{kind}"
+                    for prefix in re.findall(
+                        rf"^\s*import\s+([\w.]+)\.{re.escape(head)}\s*;", src.file.text, re.M
+                    )
+                }
+                # `Outer.Inner` whose outer is another checkout type can only be that type's
+                # nested one; matching every such candidate keeps lookalikes checkout types
+                outer = self.types.get(head, []) and [
+                    c for c in candidates if c.qualified.endswith(f".{kind}")
+                ]
+                found = [c for c in candidates if c.qualified in names] or outer
+            else:
                 imported = re.findall(
-                    rf"^\s*import\s+([\w.]+)\.{re.escape(kind)}\s*;", src.file.text, re.M
+                    rf"^\s*import\s+([\w.]+\.{re.escape(kind)})\s*;", src.file.text, re.M
                 )
-                for wanted in [*imported, _package(src)]:
-                    if matching := [c for c in candidates if _package(c.src) == wanted]:
-                        found = matching
-                        break
+                local = [c for c in candidates if _package(c.src) == _package(src)]
+                found = (
+                    [c for c in candidates if c.qualified in imported]
+                    if imported
+                    else local or candidates
+                )
             self.resolved[key] = found
         return self.resolved[key]
 
@@ -1027,7 +1063,7 @@ class _Ownership:
             params = [(n, k, {**m[2], **a}) for (n, k, a), m in zip(params, mapped, strict=True)]
         ids = {n for n, _, anns in params if any(a in anns for a in _PATH_ANNOTATIONS)}
         ids |= self._path_fields(self.type)
-        callers = {n for n, kind, anns in params if self._caller(kind, anns, param=True)}
+        callers = {n for n, kind, anns in params if self._caller(src, kind, anns, param=True)}
         callers |= self._caller_fields(self.type) - {n for n, _, _ in params}
         # shape 3: the most specific @PreAuthorize (implementation, then declaration, then class)
 
@@ -1045,8 +1081,8 @@ class _Ownership:
         # a command object Spring binds from the request may carry a path id we don't follow
         bound = any(
             (not anns or "ModelAttribute" in anns)
-            and kind in self.java.types
-            and not _ID_TYPE.match(kind)
+            and bool(self.java.resolve(src, kind))
+            and not _ID_TYPE.match(kind.rsplit(".", 1)[-1])
             and n not in callers
             for n, kind, anns in params
         )
@@ -1062,13 +1098,12 @@ class _Ownership:
     def _span(self, src: Parsed, node: Node) -> CodeSpan:
         return CodeSpan(path=RepoPath(src.file.rel), line=src.line(node))
 
-    def _caller(self, kind: str, annotations: dict[str, Node], *, param: bool) -> bool:
-        """Spring resolves only a `Principal` parameter from the authentication unannotated; any
-        other parameter, or a checkout type sharing a framework name, is request data."""
+    def _caller(self, src: Parsed, kind: str, annotations: dict[str, Node], *, param: bool) -> bool:
         if any(a in annotations for a in _CALLER_ANNOTATIONS):
             return True
-        if kind in self.java.types:
+        if self.java.resolve(src, kind):
             return False
+        kind = kind.rsplit(".", 1)[-1]
         if param and "Context" not in annotations:
             return bool(_PARAM_CALLER_TYPES.match(kind))
         return bool(_CALLER_TYPES.match(kind))
@@ -1096,7 +1131,7 @@ class _Ownership:
         return {
             n
             for h, f in self._fields(t)
-            if self._caller(_type_name(h.src, f), _annotations(h.src, f), param=False)
+            if self._caller(h.src, _type_name(h.src, f), _annotations(h.src, f), param=False)
             for n in self._field_names(h, f)
         }
 
@@ -1109,11 +1144,183 @@ class _Ownership:
             for n in self._field_names(h, f)
         }
 
-    def _field_type(self, t: _Type, name: str) -> str | None:
+    def _field_site(self, t: _Type, name: str) -> tuple[Parsed, str] | None:
+        """A field's declared type and the file that declares it: request-ness is resolved by
+        that file's imports, not the handler's (a subclass may import the framework type)."""
         for h, f in self._fields(t):
             if name in self._field_names(h, f):
-                return _type_name(h.src, f)
+                return h.src, _type_name(h.src, f)
         return None
+
+    def _field_type(self, t: _Type, name: str) -> str | None:
+        site = self._field_site(t, name)
+        return site[1] if site else None
+
+    def _resolver_fields(self, t: _Type) -> frozenset[str]:
+        key = (t.src.file.rel, t.name)
+        if key in self.java.resolver_fields:
+            return self.java.resolver_fields[key]
+        declarations: dict[str, tuple[_Type, Node, Node]] = {}
+        for owner, declaration in self._fields(t):
+            for variable in declaration.named_children:
+                if variable.type == "variable_declarator":
+                    declarations.setdefault(
+                        owner.src.text(variable.child_by_field_name("name")),
+                        (owner, declaration, variable),
+                    )
+        trusted = set()
+        for name, (owner, declaration, variable) in declarations.items():
+            if variable.child_by_field_name("value") is not None:
+                continue
+            injected = bool(
+                {"Autowired", "Inject", "Resource"} & _annotations(owner.src, declaration).keys()
+            )
+            constructors = [
+                n
+                for n in owner.node.child_by_field_name("body").named_children
+                if n.type == "constructor_declaration"
+            ]
+            modifiers = next((n for n in declaration.named_children if n.type == "modifiers"), None)
+            final = modifiers is not None and "final" in owner.src.text(modifiers).split()
+            bean = bool(
+                {*_CONTROLLERS, "Component", "Service", "Repository", "Configuration"}
+                & owner.annotations.keys()
+            )
+            injected |= (
+                bean
+                and not constructors
+                and (
+                    "AllArgsConstructor" in owner.annotations
+                    or (final and "RequiredArgsConstructor" in owner.annotations)
+                )
+            )
+            stable = True
+            for ancestor in self.java._hierarchy(t):
+                for member in ancestor.node.child_by_field_name("body").named_children:
+                    if member.type == "field_declaration":
+                        continue
+                    parameters = {n: kind for n, kind, _ in _params(ancestor.src, member)}
+                    writes = 0
+                    for node in walk(member):
+                        setter = node.type == "method_invocation" and ancestor.src.text(
+                            node.child_by_field_name("name")
+                        ).startswith("set")
+                        if (
+                            node.type not in ("assignment_expression", "update_expression")
+                            and not setter
+                        ):
+                            continue
+                        left = (
+                            node.child_by_field_name("object")
+                            if setter
+                            else node.child_by_field_name("left")
+                            or (node.named_children[0] if node.named_children else None)
+                        )
+                        target = ancestor.src.text(left)
+                        roots = {name, f"this.{name}", f"super.{name}"}
+                        if not any(
+                            target == root or target.startswith(root + ".") for root in roots
+                        ):
+                            continue
+                        if (target == name or target.startswith(name + ".")) and (
+                            name in parameters
+                            or any(
+                                local.type == "variable_declarator"
+                                and ancestor.src.text(local.child_by_field_name("name")) == name
+                                and local.parent.type == "local_variable_declaration"
+                                and local.start_byte <= node.start_byte
+                                and local.parent.parent.start_byte
+                                <= node.start_byte
+                                < local.parent.parent.end_byte
+                                for local in walk(member)
+                            )
+                        ):
+                            continue
+                        if setter or target not in roots:
+                            stable = False
+                            continue
+                        writes += 1
+                        right = node.child_by_field_name("right")
+                        constructor = (
+                            ancestor is owner
+                            and member.type == "constructor_declaration"
+                            and (
+                                bool(
+                                    {"Autowired", "Inject"}
+                                    & _annotations(ancestor.src, member).keys()
+                                )
+                                or (bean and len(constructors) == 1)
+                            )
+                            and node.type == "assignment_expression"
+                            and _operator(ancestor.src, node) == "="
+                            and right is not None
+                            and right.type == "identifier"
+                            and parameters.get(ancestor.src.text(right))
+                            == _type_name(owner.src, declaration)
+                            and node.parent.parent == member.child_by_field_name("body")
+                            and writes == 1
+                        )
+                        injected |= constructor
+                        stable &= constructor
+            if injected and stable and not self._aliasing(t, name):
+                trusted.add(name)
+        result = frozenset(trusted)
+        self.java.resolver_fields[key] = result
+        return result
+
+    def _aliasing(self, t: _Type, name: str) -> bool:
+        """A local of `t`'s hierarchy reads field `name` into a name the request may reach: once
+        the field's value is aliased, its setter can be called from anywhere, so the field's own
+        writes no longer prove where it came from."""
+        for ancestor in self.java._hierarchy(t):
+            for member in ancestor.node.child_by_field_name("body").named_children:
+                if member.type == "field_declaration":
+                    continue
+                parameters = {n for n, _, _ in _params(ancestor.src, member)}
+                for node in walk(member):
+                    if node.type == "variable_declarator":
+                        value = node.child_by_field_name("value")
+                        if (
+                            ancestor.src.text(node.child_by_field_name("name")) != name
+                            and value is not None
+                            and ancestor.src.text(value).removeprefix("this.") == name
+                            and node.parent.type == "local_variable_declaration"
+                        ):
+                            return True
+                    if (
+                        node.type == "method_reference"
+                        and node.named_children
+                        and ancestor.src.text(node.named_children[0]).removeprefix("this.") == name
+                    ):
+                        return True
+                    if node.type == "assignment_expression":
+                        right = node.child_by_field_name("right")
+                        target = ancestor.src.text(node.child_by_field_name("left"))
+                        if (
+                            right is not None
+                            and right.type == "identifier"
+                            and ancestor.src.text(right) == name
+                            and target.removeprefix("this.") != name
+                            and target not in parameters
+                        ):
+                            return True
+                    # an argument or return that is the field itself hands it to unseen code
+                    if node.type in ("method_invocation", "return_statement"):
+                        args = (
+                            node.child_by_field_name("arguments").named_children
+                            if node.type == "method_invocation"
+                            and node.child_by_field_name("arguments") is not None
+                            else node.named_children
+                        )
+                        for arg in args:
+                            if (
+                                arg.type in ("identifier", "field_access")
+                                and ancestor.src.text(arg).removeprefix("this.") == name
+                            ):
+                                return True
+
+    def _request(self, src: Parsed, kind: str) -> bool:
+        return bool(_REQUEST_TYPES.fullmatch(kind)) and not self.java.resolve(src, kind)
 
     def _caller_helpers(self, t: _Type) -> frozenset[str]:
         """No-argument methods of `t`'s own hierarchy whose every return is the caller alone."""
@@ -1136,7 +1343,15 @@ class _Ownership:
             for n, (h, m) in nearest.items()
             if n not in found
             and _Values(
-                h.src, fields, found, kinds=lambda n, h=h: self._field_type(h, n)
+                h.src,
+                fields,
+                found,
+                kinds=lambda n, h=h: self._field_type(h, n),
+                # a field's type is judged by the file declaring it, not this helper's
+                request=lambda kind, n=None, h=h: self._request(
+                    site[0] if (site := self._field_site(h, n)) else h.src, kind
+                ),
+                resolvers=self._resolver_fields(h),
             ).returns_caller(m.child_by_field_name("body"))
         }:
             found |= more
@@ -1158,7 +1373,7 @@ class _Ownership:
             kind = text  # a static call on a checkout class
         else:
             kind = local_types.get(text) or self._field_type(t, text) or ""
-        return self._resolve(src, kind.rsplit(".", 1)[-1]) if kind else []
+        return self._resolve(src, kind) if kind else []
 
     def _callees(
         self, src: Parsed, t: _Type, call: Node, local_types: dict[str, str]
@@ -1304,9 +1519,15 @@ class _Values:
         helpers: frozenset[str],
         params: frozenset[str] = frozenset(),
         kinds: Callable[[str], str | None] = lambda _: None,
+        *,
+        request: Callable[..., bool],
+        resolvers: frozenset[str],
     ) -> None:
         self.src, self.callers, self.helpers, self.params = src, set(callers), helpers, params
         self.kinds = kinds  # the declared type of a parameter, local or field
+        # request(kind, name?): is `kind` a framework request type — for a field, judged by the
+        # file declaring it (its name is passed so the caller can find that file)
+        self.request, self.resolvers = request, resolvers
         self.locals: set[str] = set()
 
     def bind(self, body: Node) -> set[str]:
@@ -1381,10 +1602,25 @@ class _Values:
             return True
         # `request.getUserPrincipal()`: only on the caller or a framework request or context
         text = self.src.text(receiver).removeprefix("this.")
+        # a bare receiver may be a field; a parameter or local of that name shadows it
+        field = receiver.type == "field_access" or text not in self.params | self.locals
         return (
             bool(_CALLER_CALLS.match(name))
             and not _arguments(n)
-            and (text in self.callers or bool(_REQUEST_TYPES.match(self.kinds(text) or "")))
+            and (
+                text in self.callers
+                or self.request(self.kinds(text) or "", text if field else None)
+            )
+        )
+
+    def _resolver(self, node: Node) -> bool:
+        text = self.src.text(node)
+        if node.type == "identifier":
+            return text in self.resolvers and text not in self.params | self.locals
+        return (
+            node.type == "field_access"
+            and self.src.text(node.child_by_field_name("object")) == "this"
+            and self.src.text(node.child_by_field_name("field")) in self.resolvers
         )
 
     def derived(self, node: Node | None, depth: int = 0) -> bool:
@@ -1412,7 +1648,10 @@ class _Values:
             args = _arguments(node)
             obj = node.child_by_field_name("object") if kind == "method_invocation" else None
             if kind == "object_creation_expression" or (
-                obj is not None and obj.type == "identifier" and self.src.text(obj)[:1].isupper()
+                obj is not None
+                and obj.type == "identifier"
+                and self.src.text(obj)[:1].isupper()
+                and self.kinds(self.src.text(obj)) is None
             ):
                 # a static conversion or a value type of the caller's values
                 return bool(args) and all(self.derived(a, depth + 1) for a in args)
@@ -1421,10 +1660,7 @@ class _Values:
             # a resolver handed only the caller (`tenants.of(auth)`): trusted (owner decision)
             return (
                 obj is not None
-                and obj.type == "identifier"
-                and self.src.text(obj)[:1].islower()
-                # an injected field, never a local or parameter the request may have chosen
-                and self.src.text(obj) not in self.params | self.locals
+                and self._resolver(obj)
                 and bool(args)
                 and all(self.derived(a, depth + 1) for a in args)
             )
@@ -1465,6 +1701,11 @@ class _Walk:
             o._caller_helpers(t),
             frozenset(self.params),
             kinds=lambda n: kinds.get(n) or self.local_types.get(n) or o._field_type(t, n),
+            # a field's type is judged by the file declaring it, not the handler's
+            request=lambda kind, n=None: o._request(
+                site[0] if n is not None and (site := o._field_site(t, n)) else src, kind
+            ),
+            resolvers=o._resolver_fields(t),
         )
         assigned = self.v.bind(body)
         # each id name, and the path id it holds exactly (`Long key = Long.valueOf(raw)`); a value
@@ -1518,8 +1759,9 @@ class _Walk:
         self.owned_or_null: dict[str, int] = {}
         # `@PathVariable("id") Item item`: Spring loads the entity by the path id itself
         for n, kind, _ in params:
-            if n in ids and kind in o.java.entities:
-                self.add(method, Lookup(o._span(src, method), record_type=kind), cover={n})
+            entity = kind.rsplit(".", 1)[-1]
+            if n in ids and entity in o.java.entities:
+                self.add(method, Lookup(o._span(src, method), record_type=entity), cover={n})
 
     # ---- small helpers
     def names(self, node: Node | None) -> set[str]:
@@ -2155,7 +2397,7 @@ def _params(src: Parsed, method: Node) -> list[tuple[str, str, dict[str, Node]]]
     return [
         (
             src.text(p.child_by_field_name("name")),
-            src.text(p.child_by_field_name("type")).split("<", 1)[0].rsplit(".", 1)[-1],
+            src.text(p.child_by_field_name("type")).split("<", 1)[0],
             _annotations(src, p),
         )
         for p in (params.named_children if params else [])
