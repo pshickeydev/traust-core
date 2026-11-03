@@ -7,6 +7,7 @@ from __future__ import annotations
 import posixpath
 import re
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from traust_core.v1.models.code_facts import RouteFamily
 from traust_core.v1.providers.route_guards import (
@@ -18,6 +19,7 @@ from traust_core.v1.providers.route_guards import (
     _unguards_in,
     _unique,
 )
+from traust_core.v1.providers.route_ownership import path_params
 from traust_core.v1.providers.syntax import Node, Parsed
 from traust_core.v1.providers.syntax import js_parsers as parsers
 from traust_core.v1.providers.syntax import walk as _walk
@@ -38,16 +40,24 @@ GRAMMARS = {
 }
 EXPRESS_VERBS = ("get", "post", "put", "patch", "delete", "head", "options", "all")
 _ROUTER_TYPES = re.compile(r"^(?:express\.)?(Router|Application|Express)\b")
-# Middleware that loads state or sets headers (a session, passport's user, helmet): it never
-# refuses a request, whatever its name says.
+# Middleware that loads state, sets headers or limits rates (a session, passport's user, helmet,
+# lusca, a login rate limiter): it never authenticates a request, whatever its name says.
 _NON_ENFORCING = re.compile(
     r"^(session|expressSession|cookieSession|passport\.(initialize|session)|helmet(\.\w+)?|"
-    r"cookieParser|cors)$"
+    r"lusca(\.\w+)?|cookieParser|cors|\w*[lL]imiter|rateLimit|slowDown)$"
 )
 _BACKSTAGE_ROOT = "<backstage:httpRouter>"
 BACKSTAGE_GUARD = "backstage:httpRouter"
 _OPEN_POLICIES = ("unauthenticated", "user-cookie")
 _MAX_MOUNTS = 8
+_OPTIONAL = re.compile(r"(?i)optional")
+_ADMIN_MIDDLEWARE = re.compile(
+    r"^(?:(?:is|require|ensure|check|verify|must|only)_?)?(?i:admin|superuser|staff)(?:s)?"
+    r"(?:_?(?i:only|required))?$"
+)
+
+if TYPE_CHECKING:
+    from traust_core.v1.providers.express_ownership import ExpressOwnership
 
 _Key = tuple[str, str]
 
@@ -115,6 +125,17 @@ class _Express:
     aliases: dict[_Key, _Key] = field(default_factory=dict)
     by_path: dict[str, _Source] = field(default_factory=dict)
     backstage: dict[str, set[str]] = field(default_factory=dict)
+    prisma: list[str] = field(default_factory=list)
+    _ownership: ExpressOwnership | None = None
+    _params: dict[_Key, set[str]] | None = None
+
+    def ownership(self) -> ExpressOwnership:
+        """The handlers' ownership reader, built on first use over the same parsed sources."""
+        if self._ownership is None:
+            from traust_core.v1.providers.express_ownership import ExpressOwnership, JsCode
+
+            self._ownership = ExpressOwnership(JsCode(list(self.sources), self.prisma))
+        return self._ownership
 
     def __post_init__(self) -> None:
         self.by_path = {s.file.rel: s for s in self.sources}
@@ -477,8 +498,66 @@ class _Express:
                 sorted({*unguards, *scope.unguards, *(x for u in before for x in u[2]), *opened}),
             )
             row.handler_line = src.line(last)
+            if (ids := set(path_params(full))) or dynamic:
+                own = self.ownership()
+                authenticating = [] if row.unguards else self._authenticating(src, row, handlers)
+                facts = own.handler(
+                    src.file.rel,
+                    last,
+                    ids,
+                    guarded=bool(authenticating),
+                    middleware=handlers[:-1],
+                    preloaded=self._preloaded(key),
+                )
+                row.own(facts, own.code.fields, guards=authenticating)
             rows.append(_mark(row, key[1], dynamic, src.file.rel))
         return rows
+
+    def _preloaded(self, key: _Key) -> set[str]:
+        """The path params a `router.param(name, …)` callback loads before the route runs: on its
+        router or one it is mounted under."""
+        if self._params is None:
+            self._params = {}
+            for src in self.sources:
+                for call in _walk(src.root):
+                    fn = (
+                        call.child_by_field_name("function")
+                        if call.type == "call_expression"
+                        else None
+                    )
+                    if fn is None or fn.type != "member_expression":
+                        continue
+                    if src.text(fn.child_by_field_name("property")) != "param":
+                        continue
+                    receiver = self._receiver(src, fn.child_by_field_name("object"))
+                    name = src.string((_args(call) or [None])[0])
+                    if receiver is not None and name is not None:
+                        self._params.setdefault(receiver, set()).add(name)
+        names: set[str] = set()
+        seen: set[_Key] = set()
+        pending = [key]
+        while pending:
+            k = pending.pop()
+            if k not in seen:
+                seen.add(k)
+                names |= self._params.get(k, set())
+                pending += [m.parent for m in self.mounts.get(k, [])]
+        return names
+
+    def _authenticating(self, src: _Source, row: _Row, handlers: list[Node]) -> list[str]:
+        """The guards that authenticate a route for its ownership: not one that lets an anonymous
+        caller through (`auth.optional`); plus an admin-only middleware in its chain (`protect,
+        admin`), or a guard's privileged-role argument (`authorize(ADMIN)`)."""
+        guards = [g for g in [*row.guards, *row.scope_guards] if not _OPTIONAL.search(g)]
+        for h in handlers[:-1]:
+            node = _unwrap(h) or h
+            text = src.text(node)
+            if node.type == "call_expression":
+                if src.text(node.child_by_field_name("function")) in guards:
+                    guards.append(text[:200])
+            elif _ADMIN_MIDDLEWARE.match(text.rsplit(".", 1)[-1]):
+                guards.append(text)
+        return guards
 
 
 def _identifiers(src: _Source, node: Node) -> list[str]:
@@ -525,4 +604,5 @@ def express_rows(files: list[TreeFile]) -> tuple[list[_Row], str | None, bool]:
     for f in candidates:
         data = f.text.encode("utf-8")
         sources.append(_Source(f, available[GRAMMARS[f.path.suffix]].parse(data).root_node, data))
-    return _Express(sources).rows(), evidence, True
+    prisma = [f.text for f in files if f.path.suffix == ".prisma"]
+    return _Express(sources, prisma=prisma).rows(), evidence, True
