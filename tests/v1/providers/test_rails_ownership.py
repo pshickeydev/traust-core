@@ -3,6 +3,7 @@ protected but isn't, which must stay judged."""
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from textwrap import dedent
 
@@ -616,12 +617,12 @@ def app(tmp_path_factory: pytest.TempPathFactory) -> dict:
         ("DELETE", "/p/policy/:id", "checked"),  # Pundit: the policy compares the owner (D15)
         ("PATCH", "/p/lenient/:id", "caller-blind"),  # a policy that allows everyone
         ("GET", "/p/admin_policy/:id", "checked"),  # `user.admin? || record.user_id == user.id`
-        ("DELETE", "/p/unread/:id", "caller-blind"),  # no TaskPolicy to read
+        ("DELETE", "/p/unread/:id", "unknown"),  # no TaskPolicy to read (D15)
         ("GET", "/p/scope/:id", "scoped"),  # `policy_scope` narrowing by the user
         ("GET", "/p/open_scope/:id", "caller-blind"),  # `scope.all`
         ("DELETE", "/chores/:id", "checked"),  # CanCanCan: `can :destroy, Chore, user_id: …`
         ("PATCH", "/chores/:id", "caller-blind"),  # `can :update, Chore` for anyone
-        ("DELETE", "/errands/:id", "caller-blind"),  # a model we can't name: its Ability unread
+        ("DELETE", "/errands/:id", "unknown"),  # a model we can't name: its Ability unread (D15)
         ("GET", "/who/open/:id", "n/a"),  # no authenticating callback
         ("GET", "/who/forged/:id", "caller-blind"),  # `@current_user` set from params
         ("GET", "/who/session_ivar/:id", "scoped"),  # an ivar set from the session (D17)
@@ -643,3 +644,99 @@ def test_only_the_allowed_shapes_count_as_protection(
 def test_the_evidence_names_the_record_and_its_owner(app: dict) -> None:
     evidence = _row(app, "DELETE", "/notes/:id")["ownership_evidence"]
     assert (evidence["record_type"], evidence["owner_field"]) == ("Note", "user_id")
+
+
+# Invented Rails apps from an independent review: code credited as protected while another
+# user's record stays reachable (each must stay judged or unknown), beside protected twins.
+_REVIEW = Path(__file__).parents[2] / "fixtures/code_facts/rails_ownership_review.json"
+_CASES = json.loads(_REVIEW.read_text())
+
+
+@pytest.mark.parametrize(
+    ("case", "method", "pattern", "ownership"),
+    [(c["case"], e["method"], e["pattern"], e["ownership"]) for c in _CASES for e in c["expect"]],
+)
+def test_holes_a_review_found_stay_closed(
+    tmp_path: Path, case: str, method: str, pattern: str, ownership: str
+) -> None:
+    files = next(c["files"] for c in _CASES if c["case"] == case)
+    assert _row(_tree(tmp_path, files), method, pattern)["ownership"] == ownership
+
+
+AUTH = {
+    **MODELS,
+    "db/schema.rb": SCHEMA,
+    "config/routes.rb": """
+        Rails.application.routes.draw do
+          resources :sessions, only: [:show, :destroy]
+          resources :tokens, only: [:show]
+        end
+    """,
+    "app/controllers/concerns/token_auth.rb": """
+        module TokenAuth
+          def authenticate_token!
+            token = request.headers[:api_access_token]
+            @access_token = AccessToken.find_by(token: token)
+            head :unauthorized and return if @access_token.blank?
+            @resource = @access_token.owner
+            Current.user = @resource
+          end
+        end
+    """,
+    "app/controllers/application_controller.rb": """
+        class ApplicationController < ActionController::Base
+          before_action :authenticate_user!
+          before_action :set_current_user
+          before_action :current_account
+
+          private
+
+          def set_current_user
+            @user ||= current_user
+            Current.user = @user
+          end
+
+          def current_account
+            @current_account ||= Account.find(params[:account_id])
+          end
+        end
+    """,
+    "app/controllers/sessions_controller.rb": """
+        class SessionsController < ApplicationController
+          def destroy
+            current_user.notes.find(params[:id]).destroy
+          end
+
+          def show
+            Current.user.notes.find(params[:id])
+          end
+        end
+    """,
+    "app/controllers/tokens_controller.rb": """
+        class TokensController < ActionController::Base
+          include TokenAuth
+          before_action :authenticate_token!
+
+          def show
+            Current.user.notes.find(params[:id])
+          end
+        end
+    """,
+}
+
+
+@pytest.mark.parametrize(
+    ("method", "pattern"),
+    [
+        # callbacks setting `Current.user` from the signed-in user and `@current_account`
+        # from params: only the account is the request's choice (D17)
+        ("DELETE", "/sessions/:id"),
+        ("GET", "/sessions/:id"),
+        # `Current.user` from a looked-up token (D20)
+        ("GET", "/tokens/:id"),
+    ],
+)
+def test_callbacks_that_set_the_caller_from_a_credential_keep_it(
+    tmp_path: Path, method: str, pattern: str
+) -> None:
+    assert _row(_tree(tmp_path, AUTH), method, pattern)["ownership"] == "scoped"

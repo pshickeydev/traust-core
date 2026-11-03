@@ -204,3 +204,91 @@ def test_actions_missing_a_callback_their_siblings_run_are_an_asymmetry(tmp_path
     assert index["asymmetry"] and index["judgement_required"]
     [asym] = [a for a in result["asymmetries"] if a["family"] == "rails"]
     assert asym["group"] == "ArticlesController" and asym["unguarded"] == ["GET /articles"]
+
+
+def test_percent_literal_arrays_name_actions_and_callbacks(tmp_path):
+    _write(
+        tmp_path,
+        "config/routes.rb",
+        "Rails.application.routes.draw do\n  resources :posts, only: %i[show destroy]\n"
+        "  resources :tags, except: %w[index show new edit create update]\nend\n",
+    )
+    _write(tmp_path, "app/controllers/application_controller.rb", APP)
+    _write(
+        tmp_path,
+        "app/controllers/posts_controller.rb",
+        "class PostsController < ApplicationController\n"
+        "  skip_before_action :authenticate_user!, only: %i[show]\nend\n",
+    )
+    result = _enum(tmp_path)
+    assert _patterns(result, "rails") == {
+        ("GET", "/posts/:id"),
+        ("DELETE", "/posts/:id"),
+        ("DELETE", "/tags/:id"),
+    }
+    assert _route(result, "GET", "/posts/:id")["guards"] == []
+    assert _route(result, "DELETE", "/posts/:id")["guards"] == ["authenticate_user!"]
+
+
+def test_a_resources_module_option_names_the_controller(tmp_path):
+    _write(
+        tmp_path,
+        "config/routes.rb",
+        "Rails.application.routes.draw do\n  resources :posts, only: [:show], module: 'v2'\nend\n",
+    )
+    _write(tmp_path, "app/controllers/posts_controller.rb", "class PostsController; end\n")
+    _write(
+        tmp_path,
+        "app/controllers/v2/posts_controller.rb",
+        "module V2\n  class PostsController < ActionController::Base\n    def show; end\n"
+        "  end\nend\n",
+    )
+    row = _route(_enum(tmp_path), "GET", "/posts/:id")
+    assert row["handler"]["path"] == "app/controllers/v2/posts_controller.rb"
+
+
+def test_a_superclass_resolves_where_ruby_looks_it_up(tmp_path):
+    # `class A::B < Base` looks `Base` up at the top level, `module A; class B < Base` inside
+    # `A` first; a superclass the checkout doesn't define is never another by its short name
+    _write(
+        tmp_path,
+        "config/routes.rb",
+        "Rails.application.routes.draw do\n"
+        "  get 'pub/:slug', to: 'pub/pages#show'\n  get 'api/:id', to: 'api/notes#show'\n"
+        "  get 'shop/:id', to: 'shop/items#show'\nend\n",
+    )
+    _write(
+        tmp_path,
+        "app/controllers/base_controller.rb",
+        "class BaseController < ActionController::Base\nend\n",
+    )
+    _write(
+        tmp_path,
+        "app/controllers/admin/base_controller.rb",
+        "module Admin\n  class BaseController < ActionController::Base\n"
+        "    before_action :authenticate_admin!\n  end\nend\n",
+    )
+    _write(
+        tmp_path,
+        "app/controllers/pub/pages/base_controller.rb",
+        "class Pub::Pages::BaseController < BaseController\nend\n",
+    )
+    _write(
+        tmp_path,
+        "app/controllers/pub/pages_controller.rb",
+        "class Pub::PagesController < Pub::Pages::BaseController\n  def show; end\nend\n",
+    )
+    _write(
+        tmp_path,
+        "app/controllers/api/notes_controller.rb",
+        "class Api::NotesController < BaseController\n  def show; end\nend\n",
+    )
+    _write(
+        tmp_path,
+        "app/controllers/shop/items_controller.rb",
+        "class Shop::ItemsController < Storefront::BaseController\n  def show; end\nend\n",
+    )
+    result = _enum(tmp_path)
+    assert _route(result, "GET", "/pub/:slug")["guards"] == []
+    assert _route(result, "GET", "/api/:id")["guards"] == []
+    assert _route(result, "GET", "/shop/:id")["guards"] == []

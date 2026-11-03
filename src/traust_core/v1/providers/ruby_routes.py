@@ -39,6 +39,21 @@ _ACTIONS = {
 _SINGULAR_ACTIONS = ("create", "new", "edit", "show", "update", "destroy")
 _BEFORE = ("before_action", "prepend_before_action", "append_before_action", "before_filter")
 _SKIP = ("skip_before_action", "skip_before_filter")
+_AFTER = ("after_action", "append_after_action", "prepend_after_action", "after_filter")
+_SKIP_AFTER = ("skip_after_action", "skip_after_filter")
+_LITERAL_NAMES = ("array", "symbol_array", "string_array", "simple_symbol", "string")
+# `unless: -> { current_user.admin? }`: skipped only for an admin (D10)
+_ADMIN_ONLY = re.compile(
+    r"^->\s*(\(\s*\))?\s*\{\s*(current_user|Current\.user|@current_user)\.(is_)?"
+    r"(admin|administrator|superuser|super_admin|staff|moderator)\?\s*\}$"
+)
+# what's left of `load_and_authorize_resource` once one half is skipped
+_SPLIT = {"authorize_resource": "load_resource", "load_resource": "authorize_resource"}
+_CANCAN_SKIPS = {
+    "skip_authorize_resource": "authorize_resource",
+    "skip_load_resource": "load_resource",
+    "skip_load_and_authorize_resource": "load_and_authorize_resource",
+}
 # callbacks that guard whatever their name says
 _GUARD_CALLBACKS = (
     "http_basic_authenticate_with",
@@ -60,6 +75,8 @@ class _Source(Parsed):
             return None
         if node.type in ("simple_symbol", "hash_key_symbol"):
             return self.text(node).lstrip(":")
+        if node.type in ("bare_symbol", "bare_string") and node.named_children:
+            return "".join(self.text(c) for c in node.named_children if c.type == "string_content")
         interpolated = any(c.type == "interpolation" for c in node.named_children)
         if node.type == "string" and not interpolated:
             return "".join(self.text(c) for c in node.named_children if c.type == "string_content")
@@ -101,7 +118,8 @@ def _names(src: _Source, node: Node | None) -> list[str]:
     """Symbol or string values, one or an array of them."""
     if node is None:
         return []
-    items = node.named_children if node.type == "array" else [node]
+    arrays = ("array", "symbol_array", "string_array")
+    items = node.named_children if node.type in arrays else [node]
     return [v for i in items if (v := src.string(i)) is not None]
 
 
@@ -150,6 +168,7 @@ class _RailsRoutes:
     def __init__(self, sources: dict[str, _Source]) -> None:
         self.sources = sources
         self.routes: list[_Route] = []
+        self.drawn: set[str] = set()  # `draw :api` files, read once
         for rel, src in sources.items():
             if rel.endswith("config/routes.rb"):
                 for n in walk(src.root):
@@ -213,8 +232,10 @@ class _RailsRoutes:
             path = _join(scope.path, at or "")
             self.routes.append(_Route("ALL", path, src.text(mounted), "", src, call, scope.guards))
         elif name == "draw" and first:
-            included = self.sources.get(f"{config}routes/{first}.rb")
-            if included is not None:
+            rel = f"{config}routes/{first}.rb"
+            included = self.sources.get(rel)
+            if included is not None and rel not in self.drawn:
+                self.drawn.add(rel)
                 self._block(included, list(included.root.named_children), scope, config)
 
     def _resource(
@@ -228,6 +249,8 @@ class _RailsRoutes:
         opts: dict[str, Node],
     ) -> None:
         path = _join(scope.path, src.string(opts.get("path")) or name)
+        if module := src.string(opts.get("module")):
+            scope = replace(scope, module=f"{scope.module}{module}/")
         named = src.string(opts.get("controller")) or (_plural(name) if singular else name)
         controller = self._controller(scope, named)
         actions = list(_SINGULAR_ACTIONS if singular else _ACTIONS)
@@ -260,6 +283,15 @@ class _RailsRoutes:
         opts: dict[str, Node],
     ) -> None:
         target = src.string(opts.get("to")) or src.string(opts.get("=>"))
+        if first is None:  # `get "a/:id" => "notes#show"`
+            first = next(
+                (
+                    src.string(a.child_by_field_name("key"))
+                    for a in _args(call)
+                    if a.type == "pair" and a.child_by_field_name("key").type == "string"  # type: ignore[union-attr]
+                ),
+                None,
+            )
         if target is None and "controller" in opts:
             target = f"{src.string(opts['controller'])}#{src.string(opts.get('action')) or first}"
         if target is None and first and scope.controller:
@@ -288,6 +320,10 @@ class _Callback:
     only: list[str] | None
     skip: bool
     except_: list[str] = field(default_factory=list)
+    conditional: bool = False  # `if:`/`unless:`: may not run
+    prepend: bool = False  # `prepend_before_action`: runs before those declared earlier
+    after: bool = False  # an `after_action`
+    body: Node | None = None  # `before_action { … }`, `before_action -> { … }`
 
     def applies(self, action: str) -> bool:
         return (self.only is None or action in self.only) and action not in self.except_
@@ -303,6 +339,9 @@ class _Controller:
     # the qualified names the superclass may be, innermost namespace first
     # (`BaseController` inside `module Admin`: `Admin::BaseController`, then `BaseController`)
     parents: tuple[str, ...] = ()
+    includes: tuple[str, ...] = ()  # the modules it includes, the last one looked up first
+    prepends: tuple[str, ...] = ()  # the modules it prepends, looked up before the class
+    aliases: dict[str, str] = field(default_factory=dict)  # `alias_method :new, :old`
 
 
 def _controllers(sources: dict[str, _Source]) -> dict[str, _Controller]:
@@ -318,25 +357,48 @@ def _controllers(sources: dict[str, _Source]) -> dict[str, _Controller]:
             sup = n.child_by_field_name("superclass")
             base = sup.named_children[0] if sup is not None and sup.named_children else None
             parent = src.text(base).rsplit("::", 1)[-1] if base is not None else None
-            namespace = _namespace(src, n)
-            qualified = "::".join([*namespace, name])
+            # a superclass resolves in the lexical scope: `class Api::X < Base` looks up `::Base`
+            lexical = _lexical(src, n)
+            qualified = "::".join([*lexical, name])
             written = src.text(base).removeprefix("::") if base is not None else ""
             parents = (
-                tuple("::".join([*namespace[:k], written]) for k in range(len(namespace), -1, -1))
+                tuple("::".join([*lexical[:k], written]) for k in range(len(lexical), -1, -1))
                 if base is not None and not src.text(base).startswith("::")
                 else (written,)
             )
             callbacks: list[_Callback] = []
             actions: dict[str, Node] = {}
+            includes: list[str] = []
+            prepends: list[str] = []
+            aliases: dict[str, str] = {}
             body = n.child_by_field_name("body")
             for stmt in body.named_children if body is not None else []:
                 if stmt.type == "method":
                     actions[src.text(stmt.child_by_field_name("name"))] = stmt
+                    aliases.pop(src.text(stmt.child_by_field_name("name")), None)
                 elif stmt.type in ("call", "identifier"):
                     method = _method(src, stmt) if stmt.type == "call" else src.text(stmt)
                     callbacks += _callbacks(src, stmt, method)
-            controller = _Controller(name, parent, callbacks, actions, src, parents)
-            found.setdefault(name.rsplit("::", 1)[-1], controller)
+                    modules = [src.text(a).rsplit("::", 1)[-1] for a in _args(stmt)]
+                    # `include A, B` puts A first in the lookup, like `include B; include A`
+                    if method == "include" and stmt.type == "call":
+                        includes += reversed(modules)
+                    if method == "prepend" and stmt.type == "call":
+                        prepends += reversed(modules)
+                    names = [src.string(a) for a in _args(stmt)]
+                    if method == "alias_method" and len(names) == 2 and None not in names:
+                        aliases[names[0]] = names[1]  # type: ignore[index]
+            controller = _Controller(
+                name,
+                parent,
+                callbacks,
+                actions,
+                src,
+                parents,
+                tuple(includes),
+                tuple(prepends),
+                aliases,
+            )
             found[qualified] = controller
             if m := re.search(r"app/controllers/(.+)_controller\.rb$", rel):
                 found[m.group(1)] = controller
@@ -344,16 +406,42 @@ def _controllers(sources: dict[str, _Source]) -> dict[str, _Controller]:
 
 
 def _callbacks(src: _Source, stmt: Node, method: str) -> list[_Callback]:
-    if method not in (*_BEFORE, *_SKIP, *_GUARD_CALLBACKS):
+    kinds = (*_BEFORE, *_SKIP, *_AFTER, *_SKIP_AFTER, *_GUARD_CALLBACKS, *_CANCAN_SKIPS)
+    if method not in (*kinds, "skip_callback"):
+        return []
+    args = _args(stmt) if stmt.type == "call" else []
+    if method == "skip_callback":  # `skip_callback :process_action, :before, :require_owner`
+        names = [src.string(a) for a in args if a.type != "pair"]
+        if len(names) >= 3 and names[0] == "process_action" and names[1] in ("before", "after"):
+            return [_Callback(n, None, True, after=names[1] == "after") for n in names[2:] if n]
         return []
     opts = _options(src, stmt) if stmt.type == "call" else {}
-    only = _names(src, opts.get("only")) if "only" in opts else None
-    except_ = _names(src, opts.get("except"))
+    # `only: SHARED_ACTIONS`: a list we can't read may or may not name the action
+    unread = any(k in opts and opts[k].type not in _LITERAL_NAMES for k in ("only", "except"))
+    only = _names(src, opts.get("only")) if "only" in opts and not unread else None
+    except_ = _names(src, opts.get("except")) if not unread else []
+    conditional = (
+        unread
+        or "if" in opts
+        or ("unless" in opts and not _ADMIN_ONLY.match(src.text(opts["unless"]).strip()))
+    )
     if method in _GUARD_CALLBACKS:
-        return [_Callback(method, only, False, except_)]
-    args = _args(stmt) if stmt.type == "call" else []
+        return [_Callback(method, only, False, except_, conditional)]
+    if method in _CANCAN_SKIPS:
+        return [_Callback(_CANCAN_SKIPS[method], only, True, except_, conditional)]
+    after = method in (*_AFTER, *_SKIP_AFTER)
+    skip = method in (*_SKIP, *_SKIP_AFTER)
+    prepend = method in ("prepend_before_action", "prepend_after_action") or (
+        "prepend" in opts and src.text(opts["prepend"]) == "true"
+    )
+    block = stmt.child_by_field_name("block") if stmt.type == "call" else None
+    lambdas = [a for a in args if a.type == "lambda"]
+    if not skip and (block is not None or lambdas):
+        body = block if block is not None else lambdas[0]
+        name = f"<block:{src.line(stmt)}>"
+        return [_Callback(name, only, False, except_, conditional, prepend, after, body)]
     names = [v for a in args if a.type != "pair" and (v := src.string(a))]
-    return [_Callback(n, only, method in _SKIP, except_) for n in names]
+    return [_Callback(n, only, skip, except_, conditional, prepend, after) for n in names]
 
 
 def _chain(controllers: dict[str, _Controller], c: _Controller) -> list[_Controller]:
@@ -361,8 +449,6 @@ def _chain(controllers: dict[str, _Controller], c: _Controller) -> list[_Control
     while True:
         last = chain[-1]
         found = next((controllers[q] for q in last.parents if q in controllers), None)
-        if found is None and last.parent in controllers:
-            found = controllers[last.parent]  # type: ignore[index]
         if found is None or id(found) in seen:
             break
         chain.append(found)
@@ -370,16 +456,28 @@ def _chain(controllers: dict[str, _Controller], c: _Controller) -> list[_Control
     return chain[::-1]
 
 
-def _namespace(src: _Source, node: Node) -> list[str]:
+def _callback_body(node: Node) -> list[Node]:
+    """A callback method's statements, or a callback block's (`before_action { … }`)."""
+    from traust_core.v1.providers.ruby_ownership import method_body, statements
+
+    if node.type == "method":
+        return method_body(node)
+    block = node if node.type != "lambda" else node.child_by_field_name("body") or node
+    body = block.child_by_field_name("body") or next(
+        (c for c in block.named_children if c.type in ("block_body", "body_statement")), None
+    )
+    return statements(body)
+
+
+def _lexical(src: _Source, node: Node) -> list[str]:
     """The modules and classes a class is written inside (`module Admin; class X`)."""
     out = []
     parent = node.parent
     while parent is not None:
         if parent.type in ("module", "class"):
-            out.append(src.text(parent.child_by_field_name("name")))
+            out[:0] = src.text(parent.child_by_field_name("name")).split("::")
         parent = parent.parent
-    written = src.text(node.child_by_field_name("name"))
-    return [*reversed(out), *written.split("::")[:-1]]
+    return out
 
 
 def _rails_guards(
@@ -391,7 +489,7 @@ def _rails_guards(
     skipped: list[str] = []
     for ctrl in _chain(controllers, c):
         for cb in ctrl.callbacks:
-            if not cb.applies(action):
+            if not cb.applies(action) or cb.after:
                 continue
             if cb.skip:
                 if cb.name in active:
@@ -456,28 +554,95 @@ class _Ownership:
         self.controllers = controllers
         self.code = RubyCode(dict(sources))
         self.concern_methods: dict[str, list[tuple[Parsed, Node]]] = {}
-        for src, module in self.code.modules.values():
-            for m in walk(module):
-                if m.type == "method":
-                    name = src.text(m.child_by_field_name("name"))
+        for found in self.code.modules.values():
+            for src, module in found:
+                if "/concerns/" not in f"/{src.file.rel}":
+                    continue  # elsewhere, a module counts only where it's included
+                for name, m in self.code.module_methods(src, module).items():
                     self.concern_methods.setdefault(name, []).append((src, m))
 
     def methods(self, c: _Controller) -> Callable[[str], tuple[Parsed, Node] | None]:
         chain = _chain(self.controllers, c)
 
-        def find(name: str) -> tuple[Parsed, Node] | None:
+        def module(name: str, method: str) -> tuple[Parsed, Node] | None:
+            found = self.code.modules.get(name, [])
+            if len(found) == 1 and method in (ms := self.code.module_methods(*found[0])):
+                return found[0][0], ms[method]
+            return None
+
+        def find(name: str, depth: int = 0) -> tuple[Parsed, Node] | None:
+            # Ruby's lookup: prepended modules, the class, its modules (the last included
+            # first), then its parent
             for ctrl in reversed(chain):
+                for m in reversed(ctrl.prepends):
+                    if (found := module(m, name)) is not None:
+                        return found
+                if name in ctrl.aliases and depth < 4:
+                    return find(ctrl.aliases[name], depth + 1)
                 if name in ctrl.actions:
                     return ctrl.src, ctrl.actions[name]
-            found = self.concern_methods.get(name, [])
-            return found[0] if len(found) == 1 else None
+                for m in reversed(ctrl.includes):
+                    if (found := module(m, name)) is not None:
+                        return found
+            candidates = self.concern_methods.get(name, [])
+            return candidates[0] if len(candidates) == 1 else None
 
         return find
+
+    def included(self, ctrl: _Controller) -> list[_Callback]:
+        """Callbacks its modules declare in `included do … end`."""
+        out: list[_Callback] = []
+        for name in reversed(ctrl.includes):
+            found = self.code.modules.get(name, [])
+            if len(found) != 1:
+                continue
+            src, module = found[0]
+            for n in walk(module):
+                if n.type == "call" and _method(src, n) == "included":  # type: ignore[arg-type]
+                    for stmt in _body(n):
+                        if stmt.type in ("call", "identifier"):
+                            method = _method(src, stmt) if stmt.type == "call" else src.text(stmt)  # type: ignore[arg-type]
+                            out += _callbacks(src, stmt, method)  # type: ignore[arg-type]
+        return out
+
+    def callbacks(self, c: _Controller, action: str) -> list[_Callback]:
+        """The callbacks that run for an action, in the order Rails runs them."""
+        out: list[_Callback] = []
+        for ctrl in _chain(self.controllers, c):
+            for cb in [*self.included(ctrl), *ctrl.callbacks]:
+                if not cb.applies(action):
+                    continue
+                if not cb.skip:
+                    out = [x for x in out if x.name != cb.name]  # declared again: moves
+                if cb.skip:
+                    kept = []
+                    for x in out:
+                        if x.name == cb.name and cb.conditional:
+                            kept.append(replace(x, conditional=True))
+                        elif x.name == "load_and_authorize_resource" and cb.name in _SPLIT:
+                            kept.append(replace(x, name=_SPLIT[cb.name]))
+                        elif x.name != cb.name:
+                            kept.append(x)
+                    out = kept
+                elif cb.prepend:
+                    out.insert(0, cb)
+                else:
+                    out.append(cb)
+        return out
 
     def own(self, row: _Row, c: _Controller | None, r: _Route) -> None:
         from traust_core.v1.models.common import CodeSpan
         from traust_core.v1.providers.route_ownership import HandlerFacts, privileged_only
-        from traust_core.v1.providers.ruby_ownership import action_facts, admin_gate
+        from traust_core.v1.providers.ruby_ownership import (
+            Kind,
+            action_facts,
+            admin_gate,
+            caller_forged,
+            early_return,
+            method_body,
+            rescues,
+            swallows,
+        )
 
         ids = set(path_params(row.pattern))
         span = CodeSpan(path=RepoPath(r.src.file.rel), line=r.src.line(r.node))
@@ -485,38 +650,51 @@ class _Ownership:
             row.own(HandlerFacts(handoff=span, takes_id=True), self.code.fields)
             return
         find = self.methods(c)
-        guards = [] if row.unguards else [*row.guards, *row.scope_guards]
-        # an admin-named callback that, read, refuses no unprivileged caller is no admin gate
-        for g in list(guards):
-            if privileged_only(g) and (found := find(g)) is not None and not admin_gate(*found):
-                guards.remove(g)
+        callbacks = self.callbacks(c, r.action)
+        guards = [*row.guards, *row.scope_guards]
+        steps: list[tuple[Parsed, Node, Kind]] = []
+        load = authorize = False
+        gates: list[str] = []
+        afters = [cb for cb in callbacks if cb.after]
+        for cb in [cb for cb in callbacks if not cb.after]:
+            if cb.name in ("load_and_authorize_resource", "load_resource"):
+                load = True
+            if cb.name in ("load_and_authorize_resource", "authorize_resource"):
+                authorize = authorize or not cb.conditional
+            if cb.body is not None:
+                found = (c.src, cb.body)
+            elif cb.name in _GUARD_CALLBACKS or (found := find(cb.name)) is None:  # type: ignore[assignment]
+                continue
+            if cb.body is None and admin_gate(*found) and not cb.conditional:
+                gates.append(cb.name)
+            kind = Kind.CONDITIONAL if cb.conditional or swallows(*found) else Kind.CALLBACK
+            for s in _callback_body(found[1]):
+                steps.append((found[0], s, kind))
+                if early_return(found[0], s):
+                    kind = Kind.CONDITIONAL  # the rest of this callback may not run
+            steps += [(found[0], s, Kind.CONDITIONAL) for s in rescues(found[1])]
         action = find(r.action)
+        forged = caller_forged(self.code, steps, find, action)
+        # an admin-named callback that, read, refuses no unprivileged caller is no admin gate;
+        # nor is one that trusts a caller the app builds from the request
+        for g in list(guards):
+            if privileged_only(g) and (
+                forged or ((found := find(g)) is not None and g not in gates)
+            ):
+                guards.remove(g)
+        if gates and not forged and not any(privileged_only(g) for g in guards):
+            guards.append(f"admin_gate:{gates[0]}")  # refuses every non-admin caller
         if action is None:
             row.own(HandlerFacts(handoff=span, takes_id=True), self.code.fields, guards=guards)
             return
-        steps: list[tuple[Parsed, Node, bool]] = []
-        cancan = False
-        for ctrl in _chain(self.controllers, c):
-            for cb in ctrl.callbacks:
-                if cb.skip or not cb.applies(r.action):
-                    continue
-                if cb.name in ("load_and_authorize_resource", "load_resource"):
-                    cancan = True
-                elif (found := find(cb.name)) is not None:
-                    if admin_gate(*found) and not any(privileged_only(g) for g in guards):
-                        guards.append(f"admin_gate:{cb.name}")  # refuses every non-admin caller
-                    cb_body = found[1].child_by_field_name("body")
-                    steps += [
-                        (found[0], s, True)
-                        for s in (cb_body.named_children if cb_body is not None else [])
-                        if s.type != "comment"
-                    ]
-        body = action[1].child_by_field_name("body")
-        steps += [
-            (action[0], s, False)
-            for s in (body.named_children if body is not None else [])
-            if s.type != "comment"
-        ]
+        # an action's own `rescue` may swallow the raise that refused
+        kind = Kind.CONDITIONAL if swallows(*action) else Kind.ACTION
+        steps += [(action[0], s, kind) for s in method_body(action[1])]
+        steps += [(action[0], s, Kind.CONDITIONAL) for s in rescues(action[1])]
+        for cb in afters:
+            found = (c.src, cb.body) if cb.body is not None else find(cb.name)
+            if found is not None:
+                steps += [(found[0], s, Kind.AFTER) for s in _callback_body(found[1])]
         snake = re.sub(r"(?<!^)(?=[A-Z])", "_", c.name.removesuffix("Controller").split("::")[-1])
         model = "".join(p.capitalize() for p in _singular(snake.lower()).split("_"))
         facts = action_facts(
@@ -527,7 +705,7 @@ class _Ownership:
             methods=find,
             action=r.action,
             model=model,
-            load_and_authorize=cancan,
+            cancan=(load, authorize),
         )
         row.own(facts, self.code.fields, guards=guards)
 
