@@ -1457,7 +1457,7 @@ QODO = (
     "  private CardRepository cards;\n"
     "  private NoteRepository notes;\n"
     "  private Registry registry;\n"
-    "  private Owners owners;\n"
+    "  @Autowired private Owners owners;\n"
     '  @GetMapping("/selected/{id}")\n'
     "  Card selected(@PathVariable Long id, @RequestParam String tenant, Principal me) {\n"
     "    Resolver resolver = registry.forTenant(tenant);\n"
@@ -1543,3 +1543,254 @@ def test_method_security_enabled_in_the_application_is_seen(
         tmp_path, {"pom.xml": POM, rel: config, "src/main/java/app/Api.java": BEAN_CHECKED}
     )
     assert _row(result, "GET", "/cards/{id}")["ownership"] == "checked"
+
+
+@pytest.mark.parametrize(
+    ("field", "constructor", "mutation", "receiver", "protected"),
+    [
+        ("private Owners owners;", "", "", "owners", False),
+        ("@Autowired private Owners owners;", "", "", "owners", True),
+        ("@Inject private Owners owners;", "", "", "owners", True),
+        ("@Resource private Owners owners;", "", "", "this.owners", True),
+        (
+            "@Autowired private Owners owners;",
+            "",
+            "owners = registry.forTenant(tenant);",
+            "owners",
+            False,
+        ),
+        (
+            "@Autowired private Owners owners;",
+            "",
+            "this.owners = registry.forTenant(tenant);",
+            "owners",
+            False,
+        ),
+        (
+            "@Autowired private Owners owners;",
+            "",
+            "owners.tenant = tenant;",
+            "owners",
+            False,
+        ),
+        (
+            "@Autowired private Owners owners;",
+            "",
+            "this.owners.setTenant(tenant);",
+            "this.owners",
+            False,
+        ),
+        (
+            "private final Owners owners;",
+            "Api(Owners owners) { this.owners = owners; }",
+            "",
+            "owners",
+            True,
+        ),
+        (
+            "private Owners owners;",
+            "Api(Owners supplied) { this.owners = supplied; }",
+            "this.owners = registry.forTenant(tenant);",
+            "owners",
+            False,
+        ),
+        (
+            "private Owners owners;",
+            "Api(String tenant) { this.owners = registry.forTenant(tenant); }",
+            "",
+            "owners",
+            False,
+        ),
+        (
+            "@Autowired private Owners owners = new Owners();",
+            "",
+            "",
+            "owners",
+            False,
+        ),
+        (
+            "@Autowired private Owners owners;",
+            "",
+            "Owners owners = registry.forTenant(tenant); owners = new Owners();",
+            "owners",
+            True,
+        ),
+        (
+            "@Autowired private Owners owners;",
+            "",
+            "owners = registry.forTenant(tenant); { Owners owners = null; }",
+            "owners",
+            False,
+        ),
+        (
+            "@Autowired private Owners Owners;",
+            "",
+            "Owners = registry.forTenant(tenant);",
+            "Owners",
+            False,
+        ),
+        (
+            "private final Owners owners;",
+            "Api(Owners owners) { this.owners = owners; this.owners = owners; }",
+            "",
+            "owners",
+            False,
+        ),
+    ],
+)
+def test_resolver_field_needs_injection_and_checkout_wide_stability(
+    tmp_path, field, constructor, mutation, receiver, protected
+) -> None:
+    source = (
+        "package provenance;\n"
+        "import org.springframework.web.bind.annotation.*;\n"
+        "import java.security.Principal;\n"
+        "class Card { Long id; String ownerEmail; }\n"
+        "class Owners { String tenant; String resolve(String caller) { return tenant; }"
+        " void setTenant(String tenant) { this.tenant = tenant; } }\n"
+        "class Registry { Owners forTenant(String tenant) { return null; } }\n"
+        "interface CardRepository extends JpaRepository<Card, Long> {\n"
+        " Optional<Card> findByIdAndOwnerEmail(Long id, String ownerEmail);\n}\n"
+        "@RestController class Api {\n"
+        " private CardRepository cards;\n"
+        " private Registry registry;\n"
+        f" {field}\n {constructor}\n"
+        ' @PostMapping("/select") void select(@RequestParam String tenant) {\n'
+        f"  {mutation}\n }}\n"
+        ' @GetMapping("/cards/{id}") Card get(@PathVariable Long id, Principal me) {\n'
+        f"  return cards.findByIdAndOwnerEmail(id, {receiver}.resolve(me.getName()))"
+        ".orElseThrow();\n }\n}\n"
+    )
+    result = _tree(
+        tmp_path,
+        {
+            "pom.xml": POM,
+            "src/main/java/provenance/Api.java": source,
+            "src/main/java/provenance/Security.java": METHOD_SECURITY,
+        },
+    )
+    row = _row(result, "GET", "/cards/{id}")
+    if protected:
+        assert row["ownership"] == "scoped"
+        assert row["judgement_required"] is False
+    else:
+        assert row["ownership"] in {"caller-blind", "unchecked"}
+        assert row["judgement_required"] is True
+
+
+@pytest.mark.parametrize(
+    ("kind", "imports", "declaration", "extra", "protected"),
+    [
+        (
+            "HttpServletRequest",
+            "",
+            "class HttpServletRequest { String getRemoteUser() { return null; } }",
+            {},
+            False,
+        ),
+        (
+            "provenance.HttpServletRequest",
+            "",
+            "class HttpServletRequest { String getRemoteUser() { return null; } }",
+            {},
+            False,
+        ),
+        (
+            "Bodies.HttpServletRequest",
+            "",
+            "class Bodies { static class HttpServletRequest {"
+            " String getRemoteUser() { return null; } } }",
+            {},
+            False,
+        ),
+        (
+            "HttpServletRequest",
+            "",
+            "record HttpServletRequest(String owner) {"
+            " public String getRemoteUser() { return owner; } }",
+            {},
+            False,
+        ),
+        (
+            "HttpServletRequest",
+            "",
+            'enum HttpServletRequest { OTHER; public String getRemoteUser() { return "other"; } }',
+            {},
+            False,
+        ),
+        (
+            "HttpServletRequest",
+            "import other.HttpServletRequest;\n",
+            "",
+            {
+                "src/main/java/other/HttpServletRequest.java": "package other;"
+                " public class HttpServletRequest {"
+                " public String getRemoteUser() { return null; } }"
+            },
+            False,
+        ),
+        (
+            "jakarta.servlet.http.HttpServletRequest",
+            "",
+            "class HttpServletRequest { String getRemoteUser() { return null; } }",
+            {},
+            True,
+        ),
+        (
+            "HttpServletRequest",
+            "import jakarta.servlet.http.HttpServletRequest;\n",
+            "",
+            {
+                "src/main/java/other/HttpServletRequest.java": "package other;"
+                " public class HttpServletRequest {"
+                " public String getRemoteUser() { return null; } }"
+            },
+            True,
+        ),
+        (
+            "jakarta.servlet.http.HttpServletRequest",
+            "",
+            "",
+            {
+                "src/main/java/jakarta/servlet/http/HttpServletRequest.java": (
+                    "package jakarta.servlet.http; public class HttpServletRequest {"
+                    " public String getRemoteUser() { return null; } }"
+                )
+            },
+            False,
+        ),
+    ],
+)
+def test_request_getter_identity_excludes_checkout_lookalikes(
+    tmp_path, kind, imports, declaration, extra, protected
+) -> None:
+    binding = "" if protected else "@RequestBody "
+    source = (
+        "package provenance;\n"
+        "import org.springframework.web.bind.annotation.*;\n"
+        f"{imports}{declaration}\n"
+        "class Card { Long id; String ownerEmail; }\n"
+        "interface CardRepository extends JpaRepository<Card, Long> {\n"
+        " Optional<Card> findByIdAndOwnerEmail(Long id, String ownerEmail);\n}\n"
+        "@RestController class Api {\n private CardRepository cards;\n"
+        ' @GetMapping("/requests/{id}") Card get(@PathVariable Long id,'
+        f" {binding}{kind} body) {{\n"
+        "  return cards.findByIdAndOwnerEmail(id, body.getRemoteUser()).orElseThrow();\n"
+        " }\n}\n"
+    )
+    result = _tree(
+        tmp_path,
+        {
+            "pom.xml": POM,
+            "src/main/java/provenance/Api.java": source,
+            "src/main/java/provenance/Security.java": METHOD_SECURITY,
+            **extra,
+        },
+    )
+    row = _row(result, "GET", "/requests/{id}")
+    if protected:
+        assert row["ownership"] == "scoped"
+        assert row["judgement_required"] is False
+    else:
+        assert row["ownership"] in {"caller-blind", "unchecked"}
+        assert row["judgement_required"] is True
