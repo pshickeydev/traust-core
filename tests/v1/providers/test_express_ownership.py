@@ -504,3 +504,139 @@ def test_what_authenticates_an_express_route(
     result = _tree(tmp_path, {"app.js": code})
     row = _row(result, "GET", "/things/:id")
     assert bool(row["guards"] or row["scope_guards"]) is guarded
+
+
+SEQUELIZE = """
+const { DataTypes, Model } = require("sequelize");
+const sequelize = require("./db");
+
+const Task = sequelize.define("Task", { userId: DataTypes.INTEGER, title: DataTypes.STRING });
+class Project extends Model {}
+Project.init({ ownerId: DataTypes.INTEGER, name: DataTypes.STRING }, { sequelize });
+module.exports = { Task, Project };
+"""
+
+TYPEORM = """
+import { Entity, Column } from "typeorm";
+import { AppDataSource } from "./source";
+
+@Entity()
+export class Order {
+  @Column() id: number;
+  @Column() ownerId: number;
+}
+export const orders = AppDataSource.getRepository(Order);
+"""
+
+SERVICES = """
+import mongoose from "mongoose";
+import { Post } from "./models";
+
+export function loadOwned(me, id) {
+  return Post.findOne({ _id: id, user: me });
+}
+
+class PostService {
+  find(id, me) {
+    return Post.findOne({ _id: id, user: me });
+  }
+}
+export const postService = new PostService();
+export default new PostService();
+export const byModel = (id) => mongoose.model("Post").findById(id);
+"""
+
+RESOLVED = """
+import express from "express";
+import * as svc from "./services";
+import defaultService, { postService, byModel } from "./services";
+import { orders } from "./typeorm";
+import { requireAuth } from "./auth";
+import { Exporter } from "./exporter";
+const { Task, Project } = require("./sequelize");
+
+const app = express();
+const cache = {};
+
+app.get("/tasks/:id", requireAuth, async (req, res) => {
+  const task = await Task.findOne({ where: { id: req.params.id, userId: req.user.id } });
+  if (!task) return res.sendStatus(404);
+  res.json(task);
+});
+app.get("/projects/:id", requireAuth, async (req, res) => {
+  res.json(await Project.findByPk(req.params.id));
+});
+app.get("/orders/:id", requireAuth, async (req, res) => {
+  const order = await orders.findOneBy({ id: Number(req.params.id), ownerId: req.user.id });
+  if (!order) return res.sendStatus(404);
+  res.json(order);
+});
+app.get("/namespaced/:id", requireAuth, async (req, res) => {
+  const post = await svc.loadOwned(req.user.id, req.params.id);
+  if (!post) return res.sendStatus(404);
+  res.json(post);
+});
+app.get("/instance/:id", requireAuth, async (req, res) => {
+  const post = await postService.find(req.params.id, req.user.id);
+  if (!post) return res.sendStatus(404);
+  res.json(post);
+});
+app.get("/default-instance/:id", requireAuth, async (req, res) => {
+  const post = await defaultService.find(req.params.id, req.user.id);
+  if (!post) return res.sendStatus(404);
+  res.json(post);
+});
+app.get("/by-model/:id", requireAuth, async (req, res) => res.json(await byModel(req.params.id)));
+app.get("/cached/:id", requireAuth, (req, res) => res.json(cache[req.params.id]));
+app.get("/exported/:id", requireAuth, (req, res) => res.json(new Exporter(req.params.id).run()));
+app.get("/nested/:id", requireAuth, async (req, res) => {
+  function load() {
+    return Task.findByPk(req.params.id);
+  }
+  res.json(await load());
+});
+app.delete("/each/:id", requireAuth, async (req, res) => {
+  [req.params.id].forEach(drop);
+  res.sendStatus(204);
+});
+"""
+
+
+@pytest.fixture(scope="module")
+def resolved(tmp_path_factory: pytest.TempPathFactory) -> dict:
+    return _tree(
+        tmp_path_factory.mktemp("resolved"),
+        {
+            "src/auth.ts": AUTH,
+            "src/models.ts": MODELS,
+            "src/sequelize.js": SEQUELIZE,
+            "src/typeorm.ts": TYPEORM,
+            "src/services.ts": SERVICES,
+            "src/exporter.ts": "export class Exporter { constructor(id) {} run() {} }\n",
+            "src/routes.ts": RESOLVED,
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    ("method", "pattern", "ownership", "record"),
+    [
+        ("GET", "/tasks/:id", "scoped", "Task"),  # `sequelize.define`
+        ("GET", "/projects/:id", "caller-blind", "Project"),  # `Model.init({ … }, { sequelize })`
+        ("GET", "/orders/:id", "scoped", "Order"),  # TypeORM `getRepository(Order)`
+        ("GET", "/namespaced/:id", "scoped", "Post"),  # `import * as svc`
+        ("GET", "/instance/:id", "scoped", "Post"),  # a class instance's method
+        ("GET", "/default-instance/:id", "scoped", "Post"),  # `export default new …`
+        ("GET", "/by-model/:id", "caller-blind", "Post"),  # `mongoose.model("Post")`
+        ("GET", "/cached/:id", "caller-blind", None),  # a subscript by the id
+        ("GET", "/exported/:id", "unknown", None),  # a checkout class built with the id
+        ("GET", "/nested/:id", "unknown", None),  # a local function closing over the id
+        ("DELETE", "/each/:id", "unknown", None),  # the id handed to a callback
+    ],
+)
+def test_the_code_a_handler_reaches_is_resolved(
+    resolved: dict, method: str, pattern: str, ownership: str, record: str | None
+) -> None:
+    row = _row(resolved, method, pattern)
+    assert row["ownership"] == ownership
+    assert (row["ownership_evidence"] or {}).get("record_type") == record

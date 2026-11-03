@@ -346,6 +346,8 @@ class JsCode:
                 self._export(f, n)
             elif t == "assignment_expression":
                 self._commonjs_export(f, n)
+            elif t == "call_expression":
+                self._sequelize_init(src, n)
 
     def _declarator(self, f: _File, n: Node) -> None:
         src = f.src
@@ -436,6 +438,25 @@ class JsCode:
         if name == "getRepository" and a:
             return src.text(a[0])
         return False
+
+    def _sequelize_init(self, src: Parsed, call: Node) -> None:
+        """`Item.init({ … }, { sequelize })`: a Sequelize model class's fields."""
+        fn = unwrap(call.child_by_field_name("function"))
+        a = [unwrap(x) for x in args(call)]
+        if (
+            fn is not None
+            and fn.type == "member_expression"
+            and src.text(fn.child_by_field_name("property")) == "init"
+            and len(a) == 2
+            and all(x is not None and x.type == "object" for x in a)
+            and any(
+                (c.type == "shorthand_property_identifier" and src.text(c) == "sequelize")
+                or (c.type == "pair" and src.text(c.child_by_field_name("key")) == "sequelize")
+                for c in a[1].named_children  # type: ignore[union-attr]
+            )
+        ):
+            name = src.text(fn.child_by_field_name("object"))
+            self.fields_by_record.setdefault(name, []).extend(self._keys(src, a[0]))
 
     def _schema_fields(self, f: _File, node: Node) -> list[str]:
         src = f.src
@@ -677,10 +698,11 @@ class JsCode:
         module = f.namespaces.get(name)
         if found is None and name in f.imports and f.imports[name][1] == "default":
             module = f.imports[name][0]  # `const c = require("./c")` with `exports.handler = …`
+        exported_object = self.files[found[0]].objects.get(found[1]) if found else None
         if found is None or (
-            found[1] == "<default>"
-            and prop not in self.files[found[0]].objects.get("<default>", {})
+            found[1] == "<default>" and exported_object is not None and prop not in exported_object
         ):
+            # `module.exports = { show }`, `show` defined beside it
             module = found[0] if found is not None else module
             exported = self.files[module].exports.get(prop) if module is not None else None
             return self._named(module, exported) if module is not None and exported else []
