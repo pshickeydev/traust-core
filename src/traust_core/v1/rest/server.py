@@ -31,6 +31,7 @@ def main(argv: list[str] | None = None) -> None:
 
     context = Context(config)
     context.configure_logging()
+    context.register_feeds()
     uvicorn.run(create_app(context), host=args.host, port=args.port, log_config=None)
 
 

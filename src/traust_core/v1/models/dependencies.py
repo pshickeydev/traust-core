@@ -323,6 +323,7 @@ class AdvisoryRecord(Model):
     fix_references: tuple[str, ...] = ()
     fixed_commits: tuple[str, ...] = ()  # commit URLs of GIT ranges' `fixed` events
     source: str
+    package_sources: tuple[str, ...] = ()  # alias records that filled an empty `affected`
 
     @property
     def severity(self) -> ScannerSeverity:
@@ -773,7 +774,11 @@ class ImpactInput(SkillInput):
                     "vulnerable_symbols": [s.symbol for s in found.symbols],
                     "vulnerable_packages": list(self.package.imports),
                     "feature_description": feature_description,
-                    "advisory_sources": [self.advisory.source, *found.fix_commits],
+                    "advisory_sources": [
+                        self.advisory.source,
+                        *self.advisory.package_sources,
+                        *found.fix_commits,
+                    ],
                     "portfolio_graph_db": None,
                     "portfolio_graph_version": None,
                     "harness_version": harness_version,

@@ -34,6 +34,14 @@ GRPC = parse_osv(
 )
 
 
+def osv(identifier: str) -> AdvisoryRecord:
+    raw = (Path(__file__).parents[2] / f"fixtures/dependencies/osv-{identifier}.json").read_bytes()
+    return parse_osv(raw, f"https://osv.test/v1/vulns/{identifier}")
+
+
+CVE, GO, GHSA = osv("CVE-2023-39325"), osv("GO-2023-2102"), osv("GHSA-4374-p667-p6c8")
+
+
 class FakeLookup:
     name = "osv"
 
@@ -128,6 +136,49 @@ def test_records_for_several_packages_link_each_one(engine: Engine) -> None:
     with SqlTraustUnitOfWork(engine) as uow:
         assert uow.packages.find("npm", "example-lib") is not None
         assert len(uow.advisory_packages.list_for_advisory(record.advisory_id)) == 2
+
+
+def test_a_cve_record_naming_no_package_takes_its_aliases_packages(engine: Engine) -> None:
+    assert not CVE.affected
+    lookup = FakeLookup(CVE, GO, GHSA)
+    record = service(engine, lookup).find_advisory(CVE.identifier)
+    assert record is not None and record.advisory_id is not None
+    assert {(p.ecosystem, p.name) for p in record.affected} == {
+        (Ecosystem.GO, "stdlib"),
+        (Ecosystem.GO, "golang.org/x/net"),
+    }
+    # GO- and GHSA- both name x/net; the entry carrying symbols is kept
+    assert record.package(Ecosystem.GO, "golang.org/x/net") == GO.package(
+        Ecosystem.GO, "golang.org/x/net"
+    )
+    assert record.package_sources == (GHSA.source, GO.source)
+    assert lookup.asked == ["CVE-2023-39325", *CVE.aliases]
+    with SqlTraustUnitOfWork(engine) as uow:
+        assert len(uow.advisory_packages.list_for_advisory(record.advisory_id)) == 2
+
+
+@pytest.mark.parametrize("first", [CVE, GO, GHSA], ids=lambda r: r.identifier)
+def test_whichever_id_is_asked_first_every_alias_names_the_packages(
+    engine: Engine, first: AdvisoryRecord
+) -> None:
+    exposure = service(engine, FakeLookup(CVE, GO, GHSA))
+    found = [exposure.find_advisory(r.identifier) for r in (first, CVE, GO, GHSA)]
+    assert all(r is not None and "golang.org/x/net" in {p.name for p in r.affected} for r in found)
+    [canonical] = {r.advisory_id for r in found if r is not None}
+    assert canonical is not None and len(exposure.packages_affected(canonical)) == 2
+
+
+def test_a_record_naming_packages_never_asks_its_aliases(engine: Engine) -> None:
+    lookup = FakeLookup(CVE, GO, GHSA)
+    record = service(engine, lookup).find_advisory(GO.identifier)
+    assert record is not None and record.package_sources == ()
+    assert lookup.asked == ["GO-2023-2102"]
+
+
+def test_withdrawn_or_unknown_aliases_add_no_package(engine: Engine) -> None:
+    withdrawn = GHSA.model_copy(update={"withdrawn": True})
+    record = service(engine, FakeLookup(CVE, withdrawn)).find_advisory(CVE.identifier)
+    assert record is not None and record.affected == () and record.package_sources == ()
 
 
 def test_an_unknown_advisory_is_none_and_writes_nothing(engine: Engine) -> None:

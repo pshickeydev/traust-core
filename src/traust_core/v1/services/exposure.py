@@ -900,10 +900,33 @@ class ExposureService:
         record = self._require_lookup().record(parse_advisory_identifier(identifier)).data
         if record is None:
             return None
+        if not record.affected:
+            record = self._with_alias_packages(record)
         with self._uow as uow:
             advisory = self._keep_advisory(uow, record)
             uow.commit()
         return record.model_copy(update={"advisory_id": advisory.id})
+
+    def _with_alias_packages(self, record: AdvisoryRecord) -> AdvisoryRecord:
+        # OSV's CVE records name no package; their GHSA / GO- / PYSEC- aliases state the same
+        # vulnerability per ecosystem. Without this, which id is asked first decides the analysis.
+        lookup = self._require_lookup()
+        named = [
+            alias
+            for name in record.aliases
+            if (alias := lookup.record(name).data) and alias.affected and not alias.withdrawn
+        ]
+        packages: dict[tuple[Ecosystem, str], AffectedPackage] = {}
+        for p in (p for alias in named for p in alias.affected):
+            kept = packages.get((p.ecosystem, p.name))
+            if kept is None or (p.symbols and not kept.symbols):
+                packages[(p.ecosystem, p.name)] = p
+        return record.model_copy(
+            update={
+                "affected": tuple(packages.values()),
+                "package_sources": tuple(alias.source for alias in named),
+            }
+        )
 
     def _keep_advisory(self, uow: TraustUnitOfWork, record: AdvisoryRecord) -> Advisory:
         # Aliases join the first one already known, so one vulnerability keeps one canonical row.
