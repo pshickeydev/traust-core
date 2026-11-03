@@ -109,10 +109,19 @@ _READS_REQUEST = {"validationResult"}
 _OPAQUE_REQUEST = {"param", "path", "url", "originalUrl", "baseUrl", "route", "_parsedUrl"}
 _MAX_DEPTH = 64
 _FUNCTION_VALUES = ("arrow_function", "function_expression", "function")
+_DECLARED_FUNCTIONS = (
+    "function_declaration",
+    "generator_function_declaration",
+    "method_definition",
+)
 # library wrappers that only forward a handler's rejection to `next` (express-async-handler, …)
 _ASYNC_WRAPPER = re.compile(
     r"^(asyncHandler|expressAsyncHandler|catchAsync|catchAsyncErrors|asyncMiddleware|asyncWrap|"
     r"asyncWrapper|wrapAsync|asyncRoute|asyncify)$"
+)
+# text without which a function can't write the caller
+_MAY_WRITE = re.compile(
+    r"\.(user|auth|locals)\b|assign|merge|extend|defaults|\bset\w*\(|defineProperty"
 )
 _Pos = int
 # what a check verifies and a lookup needs verified: (the id, the model, the field); "*" is any
@@ -285,6 +294,16 @@ class Target:
 
 
 @dataclass(frozen=True)
+class Writer:
+    """A checkout function that writes the caller: its file, node and name ('' if anonymous)."""
+
+    rel: str
+    fn: Node
+    name: str
+    built: bool = False  # named for the factory that returns it (`impersonation()`)
+
+
+@dataclass(frozen=True)
 class _Model:
     record: str | None  # the record type a model or store holds, when known
     key: str  # which model or store it is
@@ -309,6 +328,80 @@ class JsCode:
             self._prisma(text)
         self.fields = self._fields()
         self.scans: dict[tuple, _Scan] = {}
+        self._writers: list[Writer] | None = None
+
+    def writers(self) -> list[Writer]:
+        """The checkout functions that may forge who is calling for what runs after them: they
+        write `req.user`, `req.auth` or `res.locals.user` from the request's own data (its body,
+        query, params, a raw header or cookie), or with a value we can't read; and those that
+        hand their request to one."""
+        if self._writers is None:
+            self._writers = []
+            functions = {
+                rel: [
+                    n
+                    for n in walk(f.src.root)
+                    if n.type in _FUNCTION_VALUES or n.type in _DECLARED_FUNCTIONS
+                ]
+                for rel, f in self.files.items()
+                if _MAY_WRITE.search(f.src.file.text) and not _minified(rel, f.src.file.text)
+            }
+            for rel, nodes in functions.items():
+                src = self.files[rel].src
+                for n in nodes:
+                    if not _MAY_WRITE.search(src.text(n)):
+                        continue
+                    req, res = _request_names(src, n)
+                    if not req or not _handles_request(src, n, req, res):
+                        continue
+                    written = caller_writes(src, n, req, res)
+                    if req and _hands_caller(src, n, req):
+                        written = [*written, None]  # `applyOverrides(req.user, req.query)`
+                    if not written:
+                        continue
+                    if not any(_from_request(src, n, req, v) for v in written):
+                        continue  # set from a credential, the session or the caller itself
+                    self._writers.append(Writer(rel, n, *_function_name(src, n)))
+            # a function handing its request to a writer writes through it (`attach(req)`)
+            every = (
+                {
+                    rel: [
+                        n
+                        for n in walk(f.src.root)
+                        if n.type in _FUNCTION_VALUES or n.type in _DECLARED_FUNCTIONS
+                    ]
+                    for rel, f in self.files.items()
+                }
+                if self._writers
+                else {}
+            )
+            for _ in range(4):
+                names = {w.name for w in self._writers if w.name}
+                if not names:
+                    break
+                pattern = re.compile(r"\b(" + "|".join(map(re.escape, sorted(names))) + r")\s*\(")
+                known = {(w.rel, w.fn.start_byte) for w in self._writers}
+                added = False
+                for rel, nodes in every.items():
+                    src = self.files[rel].src
+                    if not pattern.search(src.file.text):
+                        continue
+                    for n in nodes:
+                        if (rel, n.start_byte) in known or not pattern.search(src.text(n)):
+                            continue
+                        req = _request_names(src, n)[0]
+                        if req and any(
+                            c.type == "call_expression"
+                            and callee_name(src, c) in names
+                            and any(src.text(unwrap(x) or x) == req for x in args(c))
+                            for c in walk(n)
+                        ):
+                            self._writers.append(Writer(rel, n, *_function_name(src, n)))
+                            known.add((rel, n.start_byte))
+                            added = True
+                if not added:
+                    break
+        return self._writers
 
     # -- indexing
     def _resolve_module(self, rel: str, spec: str | None) -> str | None:
@@ -1769,7 +1862,7 @@ class _Walk:
                     if self.mentions(v)
                 ]
                 cover = None if not keys or None in keys else set().union(*keys)  # type: ignore[arg-type]
-            raising = raising or any(self.keyed(o, "rejectOnEmpty") for o in objects)
+            raising = raising or any(self.rejects_empty(o) for o in objects)
         read = name in _READS
         k = self.add(
             links[-1],
@@ -1790,6 +1883,17 @@ class _Walk:
             c.type == "pair" and self.src.text(c.child_by_field_name("key")).strip("'\"") == key
             for c in obj.named_children
         )
+
+    def rejects_empty(self, obj: Node) -> bool:
+        """Sequelize's `rejectOnEmpty: true` (or an error to throw); `false` or a value we can't
+        read lets a missing record through as null."""
+        for c in obj.named_children:
+            if c.type == "pair" and self.src.text(c.child_by_field_name("key")).strip("'\"") == (
+                "rejectOnEmpty"
+            ):
+                value = unwrap(c.child_by_field_name("value"))
+                return value is not None and value.type in ("true", "new_expression")
+        return False
 
     def subscript(self, node: Node) -> None:
         if self.key(node) in self.consumed or not self.mentions(node.child_by_field_name("index")):
@@ -2533,6 +2637,188 @@ def _request_names(src: Parsed, fn: Node) -> tuple[str, str]:
     return req, res
 
 
+def _function_name(src: Parsed, fn: Node) -> tuple[str, bool]:
+    """The name a function is known by: its own, the binding or key it is assigned to (through
+    wrappers like `asyncHandler(…)`), or the enclosing factory's (then `built`); '' when
+    anonymous."""
+    node: Node | None = fn
+    built = False
+    for _ in range(_MAX_DEPTH):
+        if node is None:
+            return "", built
+        if (
+            node.type in _DECLARED_FUNCTIONS or node.type in _FUNCTION_VALUES
+        ) and node.child_by_field_name("name") is not None:
+            return src.text(node.child_by_field_name("name")), built
+        parent = node.parent
+        if parent is None:
+            return "", built
+        if parent.type == "variable_declarator":
+            return src.text(parent.child_by_field_name("name")), built
+        if parent.type == "pair":
+            return src.text(parent.child_by_field_name("key")).strip("'\""), built
+        if parent.type in ("assignment_expression", "public_field_definition", "field_definition"):
+            label = parent.child_by_field_name("left") or parent.child_by_field_name("name")
+            return (chain_text(src, label).rsplit(".", 1)[-1] if label is not None else ""), built
+        if parent.type in ("arguments", "call_expression"):
+            node = parent  # `asyncHandler(…)`
+            continue
+        if (
+            parent.type in ("return_statement", "statement_block")
+            or parent.type in _FUNCTION_VALUES
+        ):
+            node, built = parent, True  # `(opts) => (req, res, next) => …`
+            continue
+        if parent.type in ("parenthesized_expression", "await_expression"):
+            node = parent
+            continue
+        return "", built
+    return "", built
+
+
+def _minified(rel: str, text: str) -> bool:
+    """A bundled or minified file (`static/libs/htmx.min.js`): vendored, not the app's code."""
+    lines = text.count("\n") + 1
+    return ".min." in rel.rsplit("/", 1)[-1] or len(text) / lines > 500
+
+
+def _handles_request(src: Parsed, fn: Node, req: str, res: str) -> bool:
+    """Whether a function reads its first parameter as a request (or its second as a
+    response): not any function whose first parameter has a `user` field."""
+    text = src.text(fn)
+    members = r"(params|body|query|headers|header|get|user|auth|session|cookies|ip|method|path|url)"
+    if re.search(rf"\b{re.escape(req)}\s*(\?\.|\.)\s*{members}\b", text):
+        return True
+    for alias in re.findall(rf"\b(\w+)\s*=\s*{re.escape(req)}\s*[;,\n)]", text):
+        if re.search(rf"\b{re.escape(alias)}\s*(\?\.|\.)\s*{members}\b", text):
+            return True  # `const r = req; r.user = …`
+    return bool(res) and bool(
+        re.search(
+            rf"\b{re.escape(res)}\s*(\?\.|\.)\s*(locals|status|json|send|redirect|render)\b", text
+        )
+    )
+
+
+def _hands_caller(src: Parsed, fn: Node, req: str) -> bool:
+    """Whether a function hands the caller and request data to the same call, which may write
+    one into the other (`applyOverrides(req.user, req.query)`)."""
+    caller = {f"{req}.user", f"{req}.auth"}
+    data = re.compile(rf"\b{re.escape(req)}\s*\.\s*(body|query|params|param|get|header|headers)\b")
+    for n in walk(fn.child_by_field_name("body") or fn):
+        if n.type == "call_expression":
+            given = [src.text(unwrap(x) or x) for x in args(n)]
+            if any(g in caller for g in given) and any(data.search(g) for g in given):
+                return True
+    return False
+
+
+def _from_request(src: Parsed, fn: Node, req: str, value: Node | None) -> bool:
+    """Whether a value written as the caller is built from the request's own data: its body,
+    query, params or a header read raw, directly or through locals, aliases of the request,
+    or a helper handed the request (`req.user = fromRequest(req)`). A credential checked by a
+    verifying call (`jwt.verify(req.headers.authorization)`) is not."""
+    if value is None:
+        return True
+    body = fn.child_by_field_name("body") or fn
+    requests = {req}
+    tainted: set[str] = set()
+    data = (
+        "body",
+        "query",
+        "params",
+        "param",
+        "get",
+        "header",
+        "headers",
+        "cookies",
+    )
+
+    def reads(node: Node) -> bool:
+        for m in walk(node):
+            if m.type == "identifier" and src.text(m) in tainted and not _verified(src, m, body):
+                return True
+            if m.type in ("member_expression", "subscript_expression"):
+                base = m.child_by_field_name("object")
+                prop = m.child_by_field_name("property") or m.child_by_field_name("index")
+                key = (
+                    string_value(src, prop)
+                    if prop is not None and prop.type == "string"
+                    else (src.text(prop) if prop is not None else "")
+                )
+                if (
+                    chain_text(src, base) in requests
+                    and key in data
+                    and not _verified(src, m, body)
+                ):
+                    return True
+            if (
+                m.type == "call_expression"
+                and any(src.text(unwrap(x) or x) in requests for x in args(m))
+                and not _VERIFYING.search(callee_name(src, m))
+            ):
+                return True  # a helper reading the request
+        return False
+
+    for _ in range(4):
+        for n in walk(body):
+            if n.type != "variable_declarator":
+                continue
+            pattern, bound = n.child_by_field_name("name"), n.child_by_field_name("value")
+            if pattern is None or bound is None:
+                continue
+            chain = chain_text(src, bound)
+            if pattern.type == "identifier" and chain in requests:
+                requests.add(src.text(pattern))  # `const r = req`
+            elif (
+                pattern.type == "object_pattern"
+                and chain in requests
+                and any(k in data for k in bound_names(src, pattern))
+            ):
+                tainted.update(bound_names(src, pattern))  # `const { query } = req`
+            elif reads(bound):
+                tainted.update(bound_names(src, pattern))
+        for n in walk(body):
+            if n.type != "call_expression":
+                continue
+            fn_ = unwrap(n.child_by_field_name("function"))
+            receiver = (
+                fn_.child_by_field_name("object")
+                if fn_ is not None and fn_.type == "member_expression"
+                else None
+            )
+            callbacks = [
+                unwrap(x)
+                for x in args(n)
+                if unwrap(x) is not None and unwrap(x).type in _FUNCTION_VALUES
+            ]
+            plain = [
+                x for x in args(n) if unwrap(x) is None or unwrap(x).type not in _FUNCTION_VALUES
+            ]
+            if callbacks and (
+                (receiver is not None and reads(receiver)) or any(reads(x) for x in plain)
+            ):
+                for cb in callbacks:
+                    tainted.update(x for q in param_patterns(cb) for x in bound_names(src, q))
+
+    return reads(value)
+
+
+# calls that check a credential, not echo request data (`jwt.verify`, `getApiKeyInfo(req)`)
+_VERIFYING = re.compile(
+    r"(?i)(verify|decode|authenticat|introspect|jwt|token|api_?key|credential|bearer|signature|hmac)"
+)
+
+
+def _verified(src: Parsed, node: Node, stop: Node) -> bool:
+    """Whether a request read sits in a verifying call's arguments (`jwt.verify(token)`)."""
+    parent = node.parent
+    while parent is not None and parent != stop:
+        if parent.type == "call_expression" and _VERIFYING.search(callee_name(src, parent)):
+            return True
+        parent = parent.parent
+    return False
+
+
 def caller_writes(src: Parsed, fn: Node, req: str, res: str) -> list[Node | None]:
     """The values written under `req.user`, `req.auth` or `res.locals.user` anywhere in `fn` (its
     closures too), directly or through locals naming them (`const { user } = req`)."""
@@ -2582,15 +2868,15 @@ def caller_writes(src: Parsed, fn: Node, req: str, res: str) -> list[Node | None
         elif n.type == "call_expression":
             fn_ = unwrap(n.child_by_field_name("function"))
             value = n
-            if (
+            if _WRITES_FIRST.match(chain_text(src, fn_)) and args(n):
+                targets = [args(n)[0]]  # `Object.assign(req, { user })` may write any of it
+            elif (
                 fn_ is not None
                 and fn_.type == "member_expression"
                 and _MUTATORS.match(src.text(fn_.child_by_field_name("property")))
             ):
                 targets = [fn_.child_by_field_name("object")]
                 whole = False  # `res.setHeader(…)` writes the response, not `res.locals`
-            elif _WRITES_FIRST.match(chain_text(src, fn_)) and args(n):
-                targets = [args(n)[0]]  # `Object.assign(req, { user })` may write any of it
         for target in targets:
             written = expand(written_path(src, target))
             if written and any(

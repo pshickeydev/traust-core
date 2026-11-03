@@ -57,7 +57,7 @@ _ADMIN_MIDDLEWARE = re.compile(
 )
 
 if TYPE_CHECKING:
-    from traust_core.v1.providers.express_ownership import ExpressOwnership
+    from traust_core.v1.providers.express_ownership import ExpressOwnership, JsCode, Writer
 
 _Key = tuple[str, str]
 
@@ -130,6 +130,7 @@ class _Express:
     prisma: list[str] = field(default_factory=list)
     _ownership: ExpressOwnership | None = None
     _params: dict[_Key, set[str]] | None = None
+    _placement: tuple[bool, set[tuple[str, int]]] | None = None
 
     def ownership(self) -> ExpressOwnership:
         """The handlers' ownership reader, built on first use over the same parsed sources."""
@@ -579,13 +580,81 @@ class _Express:
                     src.file.rel,
                     last,
                     ids,
-                    guarded=bool(authenticating),
+                    guarded=bool(authenticating) and not self._forged(src, handlers),
                     middleware=self._in_order(src, row, handlers, authenticating),
                     preloaded=self._preloaded(key),
                 )
                 row.own(facts, own.code.fields, guards=authenticating)
             rows.append(_mark(row, key[1], dynamic, src.file.rel))
         return rows
+
+    def _forged(self, src: _Source, handlers: list[Node]) -> bool:
+        """Whether code that may forge the caller runs before this route's handler: a writer
+        placed in its chain, or one registered anywhere we can't place (`use`, `all`, a wrapper
+        list, an alias), which may run before any route."""
+        anywhere, placed = self._writers_placed()
+        return anywhere or any((src.file.rel, n.start_byte) in placed for n in _flat(handlers[:-1]))
+
+    def _writers_placed(self) -> tuple[bool, set[tuple[str, int]]]:
+        """(whether a caller writer runs from somewhere we can't place, the route-chain
+        arguments that run one)."""
+        if self._placement is not None:
+            return self._placement
+        chain: set[tuple[str, int]] = set()  # every middleware argument of a verb registration
+        for src in self.sources:
+            for call in _walk(src.root):
+                fn = (
+                    call.child_by_field_name("function") if call.type == "call_expression" else None
+                )
+                if fn is None or fn.type != "member_expression":
+                    continue
+                verb = src.text(fn.child_by_field_name("property"))
+                if verb not in EXPRESS_VERBS or verb == "all":
+                    continue
+                args = _args(call)
+                obj = fn.child_by_field_name("object")
+                routed = _unwrap(obj) is not None and _unwrap(obj).type == "call_expression"
+                handlers = args if routed else args[1:]
+                if not routed and self._receiver(src, obj) is None:
+                    continue
+                chain |= {(src.file.rel, n.start_byte) for n in _flat(handlers)}
+        anywhere = False
+        placed: set[tuple[str, int]] = set()
+        by_rel = {s.file.rel: s for s in self.sources}
+        writers = self.ownership().code.writers()
+        names = {w.name for w in writers if w.name}
+        uses: dict[str, list[tuple[str, Node]]] = {}  # each writer name's references, in one pass
+        for s in self.sources:
+            if names and any(name in s.file.text for name in names):
+                for name, n in _references(s, names):
+                    uses.setdefault(name, []).append((s.file.rel, n))
+        code = self.ownership().code
+        for writer in writers:
+            sites = [(writer.rel, writer.fn)] + [
+                (rel, n)
+                for rel, n in uses.get(writer.name, [])
+                if _names_writer(code, rel, n, writer)
+            ]
+            for rel, node in sites:
+                call = node.parent
+                direct = (
+                    call is not None
+                    and call.type == "call_expression"
+                    and call.child_by_field_name("function") == node
+                )
+                if direct and not writer.built:
+                    continue  # called directly: its caller is a writer too, placed itself
+                if direct:
+                    node = call  # `impersonation()` builds it: it runs where the call is
+                where = _placement(by_rel[rel], node, chain)
+                if where is None:
+                    if node == writer.fn and writer.name:
+                        continue  # its definition: it runs where it is referenced
+                    anywhere = True
+                else:
+                    placed.add(where)
+        self._placement = (anywhere, placed)
+        return self._placement
 
     def _in_order(
         self, src: _Source, row: _Row, handlers: list[Node], authenticating: list[str]
@@ -657,6 +726,102 @@ class _Express:
             elif admin:
                 guards.append(text)  # read from its name when it isn't checkout code
         return guards
+
+
+def _references(src: _Source, names: set[str]) -> list[tuple[str, Node]]:
+    """Where the names are used as values (not where declared, imported or exported)."""
+    out = []
+    for n in _walk(src.root):
+        if n.type == "member_expression":
+            name = src.text(n.child_by_field_name("property"))
+            parent = n.parent
+            if name in names and not (
+                parent is not None
+                and parent.type == "assignment_expression"
+                and parent.child_by_field_name("left") == n
+            ):
+                out.append((name, n))
+        elif n.type in ("identifier", "shorthand_property_identifier"):
+            name = src.text(n)
+            parent = n.parent
+            if (
+                name not in names
+                or parent is None
+                or parent.type
+                in (
+                    "import_specifier",
+                    "import_clause",
+                    "namespace_import",
+                    "export_specifier",
+                    "function_declaration",
+                    "formal_parameters",
+                    "required_parameter",
+                    "optional_parameter",
+                    "member_expression",
+                )
+            ):
+                continue
+            if parent.type == "variable_declarator" and parent.child_by_field_name("name") == n:
+                continue
+            if n.type == "shorthand_property_identifier" and _exported(src, parent):
+                continue  # `module.exports = { actAs }`
+            if parent.type == "pair" and parent.child_by_field_name("key") == n:
+                continue
+            out.append((name, n))
+    return out
+
+
+def _names_writer(code: JsCode, rel: str, node: Node, writer: Writer) -> bool:
+    """Whether a reference by the writer's name is to it (or to the factory that builds it): an
+    ambiguous name may be; another function, or code outside the checkout, isn't."""
+    found = code.functions(rel, node, None)
+    if found is None:
+        return True
+    return any(
+        t.rel == writer.rel
+        and t.fn.start_byte <= writer.fn.start_byte
+        and writer.fn.end_byte <= t.fn.end_byte
+        for t in found
+    )
+
+
+def _exported(src: _Source, obj: Node | None) -> bool:
+    parent = obj.parent if obj is not None else None
+    if parent is None:
+        return False
+    if parent.type == "export_statement":
+        return True
+    return parent.type == "assignment_expression" and src.text(
+        parent.child_by_field_name("left")
+    ).startswith(("module.exports", "exports"))
+
+
+def _placement(src: _Source, node: Node, chain: set[tuple[str, int]]) -> tuple[str, int] | None:
+    """The route-chain argument a writer (or a reference to it) runs as: itself, or through
+    the calls, arrays and conditionals around it (`asyncHandler(actAs)`, `[auth, actAs]`)."""
+    current: Node | None = node
+    for _ in range(64):
+        if current is None:
+            return None
+        if (
+            (src.file.rel, current.start_byte) in chain
+            and current.parent is not None
+            and (current.parent.type in ("arguments", "array"))
+        ):
+            return src.file.rel, current.start_byte
+        parent = current.parent
+        if parent is None or parent.type not in (
+            "arguments",
+            "call_expression",
+            "array",
+            "parenthesized_expression",
+            "ternary_expression",
+            "await_expression",
+            "member_expression",
+        ):
+            return None
+        current = parent
+    return None
 
 
 def _under(path: str, prefixes: tuple[str, ...] | None) -> bool:

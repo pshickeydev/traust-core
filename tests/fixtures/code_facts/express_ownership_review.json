@@ -2108,8 +2108,8 @@
    {
     "method": "GET",
     "pattern": "/api/a/:id",
-    "ownership": "scoped",
-    "why": "a parent router's use() after the mount, or under another prefix (/debug), never runs for /api/a; every parent `used` entry is counted regardless of position and prefix"
+    "ownership": "caller-blind",
+    "why": "a parent router's use() after the mount, or under another prefix (/debug), never runs for /api/a; every parent `used` entry is counted regardless of position and prefix (stands as caller-blind: a caller writer registered through use() may run before any route)"
    }
   ],
   "files": {
@@ -2301,5 +2301,672 @@
    "models.ts": "import mongoose from \"mongoose\";\nconst postSchema = new mongoose.Schema({ user: String, title: String });\nexport const Post = mongoose.model(\"Post\", postSchema);\nconst commentSchema = new mongoose.Schema({ post: String, body: String, user: String });\nexport const Comment = mongoose.model(\"Comment\", commentSchema);\nconst replySchema = new mongoose.Schema({ parent: { type: mongoose.Schema.Types.ObjectId, ref: \"Post\" }, body: String });\nexport const Reply = mongoose.model(\"Reply\", replySchema);\n",
    "app.ts": "import express from \"express\";\nimport { requireAuth } from \"./auth\";\nimport { Post, Comment, Reply } from \"./models\";\nconst app = express();\napp.delete(\"/a/:id\", requireAuth, async (req, res) => {\n  const post = await Post.findById(req.params.id);\n  if (!post || post.user !== req.user.id) return res.sendStatus(403);\n  await Reply.deleteMany({ parent: req.params.id });\n  res.sendStatus(204);\n});\napp.delete(\"/b/:id\", requireAuth, async (req, res) => {\n  const post = await Post.findById(req.params.id);\n  if (!post || post.user !== req.user.id) return res.sendStatus(403);\n  await Comment.deleteMany({ post: req.params.id });\n  res.sendStatus(204);\n});\n"
   }
+ },
+ {
+  "case": "p18-mw",
+  "files": {
+   "auth.ts": "import jwt from \"jsonwebtoken\";\nexport const requireAuth = (req, res, next) => {\n  req.user = jwt.verify(req.headers.authorization, \"k\");\n  next();\n};\n",
+   "models.ts": "import mongoose from \"mongoose\";\nconst postSchema = new mongoose.Schema({ user: String, title: String });\nexport const Post = mongoose.model(\"Post\", postSchema);\n",
+   "app.ts": "import express from \"express\";\nimport { requireAuth } from \"./auth\";\nimport { Post } from \"./models\";\nconst app = express();\n\nconst actAs = (req, res, next) => {\n  if (req.query.as) req.user = { id: req.query.as };\n  next();\n};\nconst audit = (req, res, next) => { console.log(req.user.id); next(); };\napp.get(\"/a/:id\", requireAuth, actAs, async (req, res) => {\n  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n  if (!post) return res.sendStatus(404);\n  res.json(post);\n});\napp.get(\"/b/:id\", requireAuth, audit, async (req, res) => {\n  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n  if (!post) return res.sendStatus(404);\n  res.json(post);\n});\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "caller-blind",
+    "why": "a checkout middleware in the route's chain sets req.user from req.query.as; the handler itself never writes req.user so it is still trusted"
+   },
+   {
+    "method": "GET",
+    "pattern": "/b/:id",
+    "ownership": "scoped",
+    "why": "twin: middleware that only reads req.user"
+   }
+  ]
+ },
+ {
+  "case": "e9-mw",
+  "files": {
+   "auth.ts": "import jwt from \"jsonwebtoken\";\nexport const requireAuth = (req, res, next) => {\n  req.user = jwt.verify(req.headers.authorization, \"k\");\n  next();\n};\n",
+   "models.ts": "import mongoose from \"mongoose\";\nconst postSchema = new mongoose.Schema({ user: String, title: String });\nexport const Post = mongoose.model(\"Post\", postSchema);\n",
+   "app.ts": "import express from \"express\";\nimport { requireAuth } from \"./auth\";\nimport { Post } from \"./models\";\nconst app = express();\n\nconst actAs = (req, res, next) => {\n  const u = req.user;\n  if (req.query.as) u.id = req.query.as;\n  next();\n};\nconst actAs2 = (req, res, next) => {\n  if (req.query.as) req.user = { id: req.query.as };\n  next();\n};\nconst audit = (req, res, next) => { console.log(req.user.id); next(); };\nconst show = async (req, res) => {\n  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n  if (!post) return res.sendStatus(404);\n  res.json(post);\n};\napp.get(\"/a/:id\", requireAuth, actAs, show);\napp.get(\"/b/:id\", [requireAuth, actAs2], show);\napp.get(\"/c/:id\", [requireAuth, audit], show);\napp.get(\"/d/:id\", requireAuth, actAs2, show);\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "caller-blind",
+    "why": "_sets_caller has no alias expansion: chain middleware writing `const u = req.user; u.id = req.query.as` is not a caller write"
+   },
+   {
+    "method": "GET",
+    "pattern": "/b/:id",
+    "ownership": "caller-blind",
+    "why": "`[requireAuth, actAs2]`: `unguarded` drops any handler whose names include a guard, so the whole array (with the impersonating middleware) is never checked by _sets_caller"
+   },
+   {
+    "method": "GET",
+    "pattern": "/c/:id",
+    "ownership": "scoped",
+    "why": "twin: array with a read-only middleware"
+   },
+   {
+    "method": "GET",
+    "pattern": "/d/:id",
+    "ownership": "caller-blind",
+    "why": "reference: the same middleware outside an array is caught"
+   }
+  ]
+ },
+ {
+  "case": "e10-mw",
+  "files": {
+   "auth.ts": "import jwt from \"jsonwebtoken\";\nexport const requireAuth = (req, res, next) => {\n  req.user = jwt.verify(req.headers.authorization, \"k\");\n  next();\n};\n",
+   "models.ts": "import mongoose from \"mongoose\";\nconst postSchema = new mongoose.Schema({ user: String, title: String });\nexport const Post = mongoose.model(\"Post\", postSchema);\n",
+   "app.ts": "import express from \"express\";\nimport { requireAuth } from \"./auth\";\nimport { Post } from \"./models\";\nconst app = express();\n\napp.use(requireAuth);\napp.use((req, res, next) => {\n  if (req.query.as) req.user = { id: req.query.as };\n  next();\n});\nconst show = async (req, res) => {\n  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n  if (!post) return res.sendStatus(404);\n  res.json(post);\n};\napp.get(\"/a/:id\", show);\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "caller-blind",
+    "why": "an app-level `app.use` middleware after the guard sets req.user from the query; only the route's own chain is checked for caller writes"
+   }
+  ]
+ },
+ {
+  "case": "e10t-mw",
+  "files": {
+   "auth.ts": "import jwt from \"jsonwebtoken\";\nexport const requireAuth = (req, res, next) => {\n  req.user = jwt.verify(req.headers.authorization, \"k\");\n  next();\n};\n",
+   "models.ts": "import mongoose from \"mongoose\";\nconst postSchema = new mongoose.Schema({ user: String, title: String });\nexport const Post = mongoose.model(\"Post\", postSchema);\n",
+   "app.ts": "import express from \"express\";\nimport { requireAuth } from \"./auth\";\nimport { Post } from \"./models\";\nconst app = express();\n\napp.use(requireAuth);\napp.use((req, res, next) => {\n  console.log(req.user.id);\n  next();\n});\nconst show = async (req, res) => {\n  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n  if (!post) return res.sendStatus(404);\n  res.json(post);\n};\napp.get(\"/a/:id\", show);\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "scoped",
+    "why": "twin of e10: app-level middleware only reads req.user"
+   }
+  ]
+ },
+ {
+  "case": "r3-i1",
+  "files": {
+   "auth.ts": "import jwt from \"jsonwebtoken\";\nimport { User } from \"./models\";\nexport const requireAuth = (req, res, next) => {\n  const { query } = req;\n  req.user = { id: query.as };\n  next();\n};\n",
+   "models.ts": "import mongoose from \"mongoose\";\nconst postSchema = new mongoose.Schema({ user: String, title: String });\nexport const Post = mongoose.model(\"Post\", postSchema);\nexport const User = mongoose.model(\"User\", new mongoose.Schema({ name: String }));\n",
+   "app.ts": "import express from \"express\";\nimport { requireAuth } from \"./auth\";\nimport { Post } from \"./models\";\nconst app = express();\n\napp.get(\"/a/:id\", requireAuth, async (req, res) => {\n  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n  if (!post) return res.sendStatus(404);\n  res.json(post);\n});\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "caller-blind",
+    "why": "`const { query } = req` hides the taint: `req.user = { id: query.as }` is impersonation"
+   }
+  ]
+ },
+ {
+  "case": "r3-i2",
+  "files": {
+   "auth.ts": "import jwt from \"jsonwebtoken\";\nimport { User } from \"./models\";\nexport const requireAuth = (req, res, next) => {\n  const r = req;\n  r.user = { id: r.query.as };\n  next();\n};\n",
+   "models.ts": "import mongoose from \"mongoose\";\nconst postSchema = new mongoose.Schema({ user: String, title: String });\nexport const Post = mongoose.model(\"Post\", postSchema);\nexport const User = mongoose.model(\"User\", new mongoose.Schema({ name: String }));\n",
+   "app.ts": "import express from \"express\";\nimport { requireAuth } from \"./auth\";\nimport { Post } from \"./models\";\nconst app = express();\n\napp.get(\"/a/:id\", requireAuth, async (req, res) => {\n  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n  if (!post) return res.sendStatus(404);\n  res.json(post);\n});\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "caller-blind",
+    "why": "an alias of req: the written value `r.query.as` is never matched by the req-named regex"
+   }
+  ]
+ },
+ {
+  "case": "r3-i3",
+  "files": {
+   "auth.ts": "import jwt from \"jsonwebtoken\";\nimport { User } from \"./models\";\nexport const requireAuth = (req, res, next) => {\n  req.user = { id: req[\"query\"].as };\n  next();\n};\n",
+   "models.ts": "import mongoose from \"mongoose\";\nconst postSchema = new mongoose.Schema({ user: String, title: String });\nexport const Post = mongoose.model(\"Post\", postSchema);\nexport const User = mongoose.model(\"User\", new mongoose.Schema({ name: String }));\n",
+   "app.ts": "import express from \"express\";\nimport { requireAuth } from \"./auth\";\nimport { Post } from \"./models\";\nconst app = express();\n\napp.get(\"/a/:id\", requireAuth, async (req, res) => {\n  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n  if (!post) return res.sendStatus(404);\n  res.json(post);\n});\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "caller-blind",
+    "why": "subscript access `req[\\\"query\\\"]` escapes the `req.query` regex"
+   }
+  ]
+ },
+ {
+  "case": "r3-i4",
+  "files": {
+   "auth.ts": "import jwt from \"jsonwebtoken\";\nimport { User } from \"./models\";\nexport const requireAuth = (req, res, next) => {\n  User.findById(req.query.as).then((u) => {\n    req.user = u;\n    next();\n  });\n};\n",
+   "models.ts": "import mongoose from \"mongoose\";\nconst postSchema = new mongoose.Schema({ user: String, title: String });\nexport const Post = mongoose.model(\"Post\", postSchema);\nexport const User = mongoose.model(\"User\", new mongoose.Schema({ name: String }));\n",
+   "app.ts": "import express from \"express\";\nimport { requireAuth } from \"./auth\";\nimport { Post } from \"./models\";\nconst app = express();\n\napp.get(\"/a/:id\", requireAuth, async (req, res) => {\n  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n  if (!post) return res.sendStatus(404);\n  res.json(post);\n});\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "caller-blind",
+    "why": "the impersonated user arrives as a callback parameter, never a tainted declarator"
+   }
+  ]
+ },
+ {
+  "case": "r3-i5",
+  "files": {
+   "auth.ts": "import jwt from \"jsonwebtoken\";\nimport { User } from \"./models\";\nexport const requireAuth = (req, res, next) => {\n  req.user = { id: req.query.as };\n  setImmediate(next);\n};\n",
+   "models.ts": "import mongoose from \"mongoose\";\nconst postSchema = new mongoose.Schema({ user: String, title: String });\nexport const Post = mongoose.model(\"Post\", postSchema);\nexport const User = mongoose.model(\"User\", new mongoose.Schema({ name: String }));\n",
+   "app.ts": "import express from \"express\";\nimport { requireAuth } from \"./auth\";\nimport { Post } from \"./models\";\nconst app = express();\n\napp.get(\"/a/:id\", requireAuth, async (req, res) => {\n  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n  if (!post) return res.sendStatus(404);\n  res.json(post);\n});\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "caller-blind",
+    "why": "`next` handed on rather than called: the middleware isn't read as running before other code"
+   }
+  ]
+ },
+ {
+  "case": "r3-i6",
+  "files": {
+   "auth.ts": "import jwt from \"jsonwebtoken\";\nimport { User } from \"./models\";\nexport const requireAuth = (req, res, next) => {\n  req.user = fromRequest(req);\n  next();\n};\nfunction fromRequest(r) {\n  return { id: r.query.as };\n}\n",
+   "models.ts": "import mongoose from \"mongoose\";\nconst postSchema = new mongoose.Schema({ user: String, title: String });\nexport const Post = mongoose.model(\"Post\", postSchema);\nexport const User = mongoose.model(\"User\", new mongoose.Schema({ name: String }));\n",
+   "app.ts": "import express from \"express\";\nimport { requireAuth } from \"./auth\";\nimport { Post } from \"./models\";\nconst app = express();\n\napp.get(\"/a/:id\", requireAuth, async (req, res) => {\n  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n  if (!post) return res.sendStatus(404);\n  res.json(post);\n});\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "caller-blind",
+    "why": "taint through a function call: the helper builds the caller from the query"
+   }
+  ]
+ },
+ {
+  "case": "r3-i7",
+  "files": {
+   "auth.ts": "import jwt from \"jsonwebtoken\";\nimport { User } from \"./models\";\nexport const requireAuth = (req, res, next) => {\n  req.user = { id: req.get(\"x-user-id\") };\n  next();\n};\n",
+   "models.ts": "import mongoose from \"mongoose\";\nconst postSchema = new mongoose.Schema({ user: String, title: String });\nexport const Post = mongoose.model(\"Post\", postSchema);\nexport const User = mongoose.model(\"User\", new mongoose.Schema({ name: String }));\n",
+   "app.ts": "import express from \"express\";\nimport { requireAuth } from \"./auth\";\nimport { Post } from \"./models\";\nconst app = express();\n\napp.get(\"/a/:id\", requireAuth, async (req, res) => {\n  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n  if (!post) return res.sendStatus(404);\n  res.json(post);\n});\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "caller-blind",
+    "why": "the caller taken from a plain request header"
+   }
+  ]
+ },
+ {
+  "case": "r3-i8",
+  "files": {
+   "auth.ts": "import jwt from \"jsonwebtoken\";\nimport { User } from \"./models\";\nexport const requireAuth = (req, res, next) => {\n  req.user = jwt.verify(req.headers.authorization, \"k\");\n  applyOverrides(req.user, req.query);\n  next();\n};\nfunction applyOverrides(target, src) {\n  if (src.as) target.id = src.as;\n}\n",
+   "models.ts": "import mongoose from \"mongoose\";\nconst postSchema = new mongoose.Schema({ user: String, title: String });\nexport const Post = mongoose.model(\"Post\", postSchema);\nexport const User = mongoose.model(\"User\", new mongoose.Schema({ name: String }));\n",
+   "app.ts": "import express from \"express\";\nimport { requireAuth } from \"./auth\";\nimport { Post } from \"./models\";\nconst app = express();\n\napp.get(\"/a/:id\", requireAuth, async (req, res) => {\n  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n  if (!post) return res.sendStatus(404);\n  res.json(post);\n});\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "caller-blind",
+    "why": "a helper handed `req.user` rewrites its id from the query"
+   }
+  ]
+ },
+ {
+  "case": "r3-i0",
+  "files": {
+   "auth.ts": "import jwt from \"jsonwebtoken\";\nimport { User } from \"./models\";\nexport const requireAuth = (req, res, next) => {\n  req.user = jwt.verify(req.headers.authorization, \"k\");\n  next();\n};\n",
+   "models.ts": "import mongoose from \"mongoose\";\nconst postSchema = new mongoose.Schema({ user: String, title: String });\nexport const Post = mongoose.model(\"Post\", postSchema);\nexport const User = mongoose.model(\"User\", new mongoose.Schema({ name: String }));\n",
+   "app.ts": "import express from \"express\";\nimport { requireAuth } from \"./auth\";\nimport { Post } from \"./models\";\nconst app = express();\n\napp.get(\"/a/:id\", requireAuth, async (req, res) => {\n  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n  if (!post) return res.sendStatus(404);\n  res.json(post);\n});\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "scoped",
+    "why": "twin: a real credential"
+   }
+  ]
+ },
+ {
+  "case": "r3-i9",
+  "files": {
+   "auth.ts": "import jwt from \"jsonwebtoken\";\nimport { User } from \"./models\";\nexport const requireAuth = (req, res, next) => {\n  req.user = { id: req.query.as };\n  next();\n};\n",
+   "models.ts": "import mongoose from \"mongoose\";\nconst postSchema = new mongoose.Schema({ user: String, title: String });\nexport const Post = mongoose.model(\"Post\", postSchema);\nexport const User = mongoose.model(\"User\", new mongoose.Schema({ name: String }));\n",
+   "app.ts": "import express from \"express\";\nimport { requireAuth } from \"./auth\";\nimport { Post } from \"./models\";\nconst app = express();\n\napp.get(\"/a/:id\", requireAuth, async (req, res) => {\n  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n  if (!post) return res.sendStatus(404);\n  res.json(post);\n});\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "caller-blind",
+    "why": "sanity: the direct form the rule targets"
+   }
+  ]
+ },
+ {
+  "case": "r3-i10",
+  "files": {
+   "auth.ts": "import jwt from \"jsonwebtoken\";\nimport { User } from \"./models\";\nexport const requireAuth = (req, res, next) => {\n  attachUser(req);\n  next();\n};\nfunction attachUser(r) {\n  r.user = { id: r.query.as };\n}\n",
+   "models.ts": "import mongoose from \"mongoose\";\nconst postSchema = new mongoose.Schema({ user: String, title: String });\nexport const Post = mongoose.model(\"Post\", postSchema);\nexport const User = mongoose.model(\"User\", new mongoose.Schema({ name: String }));\n",
+   "app.ts": "import express from \"express\";\nimport { requireAuth } from \"./auth\";\nimport { Post } from \"./models\";\nconst app = express();\n\napp.get(\"/a/:id\", requireAuth, async (req, res) => {\n  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n  if (!post) return res.sendStatus(404);\n  res.json(post);\n});\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "caller-blind",
+    "why": "the middleware hands req to a helper that builds the caller from the query; the helper neither calls next nor hands req on, and the middleware writes nothing itself"
+   }
+  ]
+ },
+ {
+  "case": "r4-u_array_prefix",
+  "files": {
+   "auth.ts": "import jwt from \"jsonwebtoken\";\nexport const requireAuth = (req, res, next) => {\n  req.user = jwt.verify(req.headers.authorization, \"k\");\n  next();\n};\n",
+   "models.ts": "import mongoose from \"mongoose\";\nconst postSchema = new mongoose.Schema({ user: String, title: String });\nexport const Post = mongoose.model(\"Post\", postSchema);\nconst commentSchema = new mongoose.Schema({ post: String, body: String, user: String });\nexport const Comment = mongoose.model(\"Comment\", commentSchema);\n",
+   "app.ts": "import express from \"express\";\nimport { requireAuth } from \"./auth\";\nimport { Post, Comment } from \"./models\";\nconst app = express();\nimport { impersonate } from \"./imp\";\n\napp.use(requireAuth);\napp.use([\"/public\", \"/api\"], impersonate);\napp.get(\"/api/a/:id\", async (req, res) => {\n  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n  if (!post) return res.sendStatus(404);\n  res.json(post);\n});\napp.get(\"/other/b/:id\", async (req, res) => {\n  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n  if (!post) return res.sendStatus(404);\n  res.json(post);\n});\n",
+   "imp.ts": "export const impersonate = (req, res, next) => {\n  if (req.query.as) req.user = { id: req.query.as };\n  next();\n};\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/api/a/:id",
+    "ownership": "caller-blind",
+    "why": "use([\"/public\",\"/api\"], impersonate) runs for /api/*; only the first array prefix is read"
+   },
+   {
+    "method": "GET",
+    "pattern": "/other/b/:id",
+    "ownership": "caller-blind",
+    "why": "twin: not under either prefix (stands as caller-blind: read conservatively)"
+   }
+  ]
+ },
+ {
+  "case": "r4-u_wildcard_prefix",
+  "files": {
+   "auth.ts": "import jwt from \"jsonwebtoken\";\nexport const requireAuth = (req, res, next) => {\n  req.user = jwt.verify(req.headers.authorization, \"k\");\n  next();\n};\n",
+   "models.ts": "import mongoose from \"mongoose\";\nconst postSchema = new mongoose.Schema({ user: String, title: String });\nexport const Post = mongoose.model(\"Post\", postSchema);\nconst commentSchema = new mongoose.Schema({ post: String, body: String, user: String });\nexport const Comment = mongoose.model(\"Comment\", commentSchema);\n",
+   "app.ts": "import express from \"express\";\nimport { requireAuth } from \"./auth\";\nimport { Post, Comment } from \"./models\";\nconst app = express();\nimport { impersonate } from \"./imp\";\n\napp.use(requireAuth);\napp.use(\"/api/*\", impersonate);\napp.get(\"/api/a/:id\", async (req, res) => {\n  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n  if (!post) return res.sendStatus(404);\n  res.json(post);\n});\n",
+   "imp.ts": "export const impersonate = (req, res, next) => {\n  if (req.query.as) req.user = { id: req.query.as };\n  next();\n};\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/api/a/:id",
+    "ownership": "caller-blind",
+    "why": "Express runs use('/api/*') for /api/a/1; string-prefix compare misses it"
+   }
+  ]
+ },
+ {
+  "case": "r4-u_param_prefix",
+  "files": {
+   "auth.ts": "import jwt from \"jsonwebtoken\";\nexport const requireAuth = (req, res, next) => {\n  req.user = jwt.verify(req.headers.authorization, \"k\");\n  next();\n};\n",
+   "models.ts": "import mongoose from \"mongoose\";\nconst postSchema = new mongoose.Schema({ user: String, title: String });\nexport const Post = mongoose.model(\"Post\", postSchema);\nconst commentSchema = new mongoose.Schema({ post: String, body: String, user: String });\nexport const Comment = mongoose.model(\"Comment\", commentSchema);\n",
+   "app.ts": "import express from \"express\";\nimport { requireAuth } from \"./auth\";\nimport { Post, Comment } from \"./models\";\nconst app = express();\nimport { impersonate } from \"./imp\";\n\napp.use(requireAuth);\napp.use(\"/:tenant\", impersonate);\napp.get(\"/acme/a/:id\", async (req, res) => {\n  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n  if (!post) return res.sendStatus(404);\n  res.json(post);\n});\n",
+   "imp.ts": "export const impersonate = (req, res, next) => {\n  if (req.query.as) req.user = { id: req.query.as };\n  next();\n};\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/acme/a/:id",
+    "ownership": "caller-blind",
+    "why": "use('/:tenant') matches every first segment"
+   }
+  ]
+ },
+ {
+  "case": "r4-u_case_prefix",
+  "files": {
+   "auth.ts": "import jwt from \"jsonwebtoken\";\nexport const requireAuth = (req, res, next) => {\n  req.user = jwt.verify(req.headers.authorization, \"k\");\n  next();\n};\n",
+   "models.ts": "import mongoose from \"mongoose\";\nconst postSchema = new mongoose.Schema({ user: String, title: String });\nexport const Post = mongoose.model(\"Post\", postSchema);\nconst commentSchema = new mongoose.Schema({ post: String, body: String, user: String });\nexport const Comment = mongoose.model(\"Comment\", commentSchema);\n",
+   "app.ts": "import express from \"express\";\nimport { requireAuth } from \"./auth\";\nimport { Post, Comment } from \"./models\";\nconst app = express();\nimport { impersonate } from \"./imp\";\n\napp.use(requireAuth);\napp.use(\"/API\", impersonate);\napp.get(\"/api/a/:id\", async (req, res) => {\n  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n  if (!post) return res.sendStatus(404);\n  res.json(post);\n});\n",
+   "imp.ts": "export const impersonate = (req, res, next) => {\n  if (req.query.as) req.user = { id: req.query.as };\n  next();\n};\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/api/a/:id",
+    "ownership": "caller-blind",
+    "why": "Express paths are case-insensitive by default"
+   }
+  ]
+ },
+ {
+  "case": "r4-u_use_array_only",
+  "files": {
+   "auth.ts": "import jwt from \"jsonwebtoken\";\nexport const requireAuth = (req, res, next) => {\n  req.user = jwt.verify(req.headers.authorization, \"k\");\n  next();\n};\n",
+   "models.ts": "import mongoose from \"mongoose\";\nconst postSchema = new mongoose.Schema({ user: String, title: String });\nexport const Post = mongoose.model(\"Post\", postSchema);\nconst commentSchema = new mongoose.Schema({ post: String, body: String, user: String });\nexport const Comment = mongoose.model(\"Comment\", commentSchema);\n",
+   "app.ts": "import express from \"express\";\nimport { requireAuth } from \"./auth\";\nimport { Post, Comment } from \"./models\";\nconst app = express();\nimport { impersonate } from \"./imp\";\n\napp.use(requireAuth);\napp.use([impersonate]);\napp.get(\"/a/:id\", async (req, res) => {\n  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n  if (!post) return res.sendStatus(404);\n  res.json(post);\n});\n",
+   "imp.ts": "export const impersonate = (req, res, next) => {\n  if (req.query.as) req.user = { id: req.query.as };\n  next();\n};\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "caller-blind",
+    "why": "use([impersonate]): the array node has no target, so _sets_caller never runs"
+   }
+  ]
+ },
+ {
+  "case": "r4-u_app_all",
+  "files": {
+   "auth.ts": "import jwt from \"jsonwebtoken\";\nexport const requireAuth = (req, res, next) => {\n  req.user = jwt.verify(req.headers.authorization, \"k\");\n  next();\n};\n",
+   "models.ts": "import mongoose from \"mongoose\";\nconst postSchema = new mongoose.Schema({ user: String, title: String });\nexport const Post = mongoose.model(\"Post\", postSchema);\nconst commentSchema = new mongoose.Schema({ post: String, body: String, user: String });\nexport const Comment = mongoose.model(\"Comment\", commentSchema);\n",
+   "app.ts": "import express from \"express\";\nimport { requireAuth } from \"./auth\";\nimport { Post, Comment } from \"./models\";\nconst app = express();\nimport { impersonate } from \"./imp\";\n\napp.use(requireAuth);\napp.all(\"*\", impersonate);\napp.get(\"/a/:id\", async (req, res) => {\n  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n  if (!post) return res.sendStatus(404);\n  res.json(post);\n});\n",
+   "imp.ts": "export const impersonate = (req, res, next) => {\n  if (req.query.as) req.user = { id: req.query.as };\n  next();\n};\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "caller-blind",
+    "why": "app.all('*', impersonate) runs before every later route; only use() feeds `used`"
+   }
+  ]
+ },
+ {
+  "case": "r4-u_route_all",
+  "files": {
+   "auth.ts": "import jwt from \"jsonwebtoken\";\nexport const requireAuth = (req, res, next) => {\n  req.user = jwt.verify(req.headers.authorization, \"k\");\n  next();\n};\n",
+   "models.ts": "import mongoose from \"mongoose\";\nconst postSchema = new mongoose.Schema({ user: String, title: String });\nexport const Post = mongoose.model(\"Post\", postSchema);\nconst commentSchema = new mongoose.Schema({ post: String, body: String, user: String });\nexport const Comment = mongoose.model(\"Comment\", commentSchema);\n",
+   "app.ts": "import express from \"express\";\nimport { requireAuth } from \"./auth\";\nimport { Post, Comment } from \"./models\";\nconst app = express();\nimport { impersonate } from \"./imp\";\n\napp.use(requireAuth);\napp.route(\"/a/:id\").all(impersonate).get(async (req, res) => {\n  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n  if (!post) return res.sendStatus(404);\n  res.json(post);\n});\n",
+   "imp.ts": "export const impersonate = (req, res, next) => {\n  if (req.query.as) req.user = { id: req.query.as };\n  next();\n};\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "caller-blind",
+    "why": "route().all(impersonate) runs before .get"
+   }
+  ]
+ },
+ {
+  "case": "r4-u_sub_router_use",
+  "files": {
+   "auth.ts": "import jwt from \"jsonwebtoken\";\nexport const requireAuth = (req, res, next) => {\n  req.user = jwt.verify(req.headers.authorization, \"k\");\n  next();\n};\n",
+   "models.ts": "import mongoose from \"mongoose\";\nconst postSchema = new mongoose.Schema({ user: String, title: String });\nexport const Post = mongoose.model(\"Post\", postSchema);\nconst commentSchema = new mongoose.Schema({ post: String, body: String, user: String });\nexport const Comment = mongoose.model(\"Comment\", commentSchema);\n",
+   "app.ts": "import express from \"express\";\nimport { requireAuth } from \"./auth\";\nimport { Post, Comment } from \"./models\";\nconst app = express();\nimport { impersonate } from \"./imp\";\n\nconst dev = express.Router();\ndev.use(impersonate);\napp.use(requireAuth);\napp.use(dev);\napp.get(\"/a/:id\", async (req, res) => {\n  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n  if (!post) return res.sendStatus(404);\n  res.json(post);\n});\n",
+   "imp.ts": "export const impersonate = (req, res, next) => {\n  if (req.query.as) req.user = { id: req.query.as };\n  next();\n};\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "caller-blind",
+    "why": "a pathless router mounted before the route runs its use() middleware for every request, then falls through"
+   }
+  ]
+ },
+ {
+  "case": "r4-u_twins_plain_use",
+  "files": {
+   "auth.ts": "import jwt from \"jsonwebtoken\";\nexport const requireAuth = (req, res, next) => {\n  req.user = jwt.verify(req.headers.authorization, \"k\");\n  next();\n};\n",
+   "models.ts": "import mongoose from \"mongoose\";\nconst postSchema = new mongoose.Schema({ user: String, title: String });\nexport const Post = mongoose.model(\"Post\", postSchema);\nconst commentSchema = new mongoose.Schema({ post: String, body: String, user: String });\nexport const Comment = mongoose.model(\"Comment\", commentSchema);\n",
+   "app.ts": "import express from \"express\";\nimport { requireAuth } from \"./auth\";\nimport { Post, Comment } from \"./models\";\nconst app = express();\nimport { impersonate } from \"./imp\";\n\napp.use(requireAuth);\napp.use(\"/api\", impersonate);\napp.get(\"/api/a/:id\", async (req, res) => {\n  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n  if (!post) return res.sendStatus(404);\n  res.json(post);\n});\napp.get(\"/other/b/:id\", async (req, res) => {\n  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n  if (!post) return res.sendStatus(404);\n  res.json(post);\n});\n",
+   "imp.ts": "export const impersonate = (req, res, next) => {\n  if (req.query.as) req.user = { id: req.query.as };\n  next();\n};\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/api/a/:id",
+    "ownership": "caller-blind",
+    "why": "twin of u_array_prefix/u_wildcard_prefix/u_case_prefix/u_param_prefix: a plain string prefix covers"
+   },
+   {
+    "method": "GET",
+    "pattern": "/other/b/:id",
+    "ownership": "caller-blind",
+    "why": "twin: outside the prefix the caller stays trusted (stands as caller-blind: read conservatively)"
+   }
+  ]
+ },
+ {
+  "case": "r4-u_twins_flat",
+  "files": {
+   "auth.ts": "import jwt from \"jsonwebtoken\";\nexport const requireAuth = (req, res, next) => {\n  req.user = jwt.verify(req.headers.authorization, \"k\");\n  next();\n};\n",
+   "models.ts": "import mongoose from \"mongoose\";\nconst postSchema = new mongoose.Schema({ user: String, title: String });\nexport const Post = mongoose.model(\"Post\", postSchema);\nconst commentSchema = new mongoose.Schema({ post: String, body: String, user: String });\nexport const Comment = mongoose.model(\"Comment\", commentSchema);\n",
+   "app.ts": "import express from \"express\";\nimport { requireAuth } from \"./auth\";\nimport { Post, Comment } from \"./models\";\nconst app = express();\nimport { impersonate } from \"./imp\";\n\napp.use(requireAuth);\napp.use(impersonate);\napp.get(\"/a/:id\", async (req, res) => {\n  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n  if (!post) return res.sendStatus(404);\n  res.json(post);\n});\n",
+   "imp.ts": "export const impersonate = (req, res, next) => {\n  if (req.query.as) req.user = { id: req.query.as };\n  next();\n};\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "caller-blind",
+    "why": "twin of u_use_array_only/u_app_all/u_route_all/u_sub_router_use: impersonate passed flat to use() is read"
+   }
+  ]
+ },
+ {
+  "case": "r4-w_ternary_use",
+  "files": {
+   "auth.ts": "import jwt from \"jsonwebtoken\";\nexport const requireAuth = (req, res, next) => {\n  req.user = jwt.verify(req.headers.authorization, \"k\");\n  next();\n};\n",
+   "models.ts": "import mongoose from \"mongoose\";\nconst postSchema = new mongoose.Schema({ user: String, title: String });\nexport const Post = mongoose.model(\"Post\", postSchema);\nconst commentSchema = new mongoose.Schema({ post: String, body: String, user: String });\nexport const Comment = mongoose.model(\"Comment\", commentSchema);\n",
+   "app.ts": "import express from \"express\";\nimport { requireAuth } from \"./auth\";\nimport { Post, Comment } from \"./models\";\nconst app = express();\nimport compose from \"compose-middleware\";\nimport { impersonate, impersonation, asyncHandler } from \"./imp\";\napp.use(requireAuth);\napp.use(process.env.DEV ? impersonate : (req, res, next) => next());\napp.get(\"/a/:id\", async (req, res) => {\n  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n  if (!post) return res.sendStatus(404);\n  res.json(post);\n});\n",
+   "imp.ts": "export const impersonate = (req, res, next) => {\n  if (req.query.as) req.user = { id: req.query.as };\n  next();\n};\nexport const impersonation = () => (req, res, next) => {\n  if (req.query.as) req.user = { id: req.query.as };\n  next();\n};\nexport const asyncHandler = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "caller-blind",
+    "why": "a dev-only impersonation chosen by a ternary: the use() entry has no target, so it is never read"
+   }
+  ]
+ },
+ {
+  "case": "r4-w_asynchandler_use",
+  "files": {
+   "auth.ts": "import jwt from \"jsonwebtoken\";\nexport const requireAuth = (req, res, next) => {\n  req.user = jwt.verify(req.headers.authorization, \"k\");\n  next();\n};\n",
+   "models.ts": "import mongoose from \"mongoose\";\nconst postSchema = new mongoose.Schema({ user: String, title: String });\nexport const Post = mongoose.model(\"Post\", postSchema);\nconst commentSchema = new mongoose.Schema({ post: String, body: String, user: String });\nexport const Comment = mongoose.model(\"Comment\", commentSchema);\n",
+   "app.ts": "import express from \"express\";\nimport { requireAuth } from \"./auth\";\nimport { Post, Comment } from \"./models\";\nconst app = express();\nimport compose from \"compose-middleware\";\nimport { impersonate, impersonation, asyncHandler } from \"./imp\";\napp.use(requireAuth);\napp.use(asyncHandler(impersonate));\napp.get(\"/a/:id\", async (req, res) => {\n  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n  if (!post) return res.sendStatus(404);\n  res.json(post);\n});\n",
+   "imp.ts": "export const impersonate = (req, res, next) => {\n  if (req.query.as) req.user = { id: req.query.as };\n  next();\n};\nexport const impersonation = () => (req, res, next) => {\n  if (req.query.as) req.user = { id: req.query.as };\n  next();\n};\nexport const asyncHandler = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "caller-blind",
+    "why": "the impersonating middleware wrapped in a checkout pass-through; the target read is the wrapper's handler, which writes nothing"
+   }
+  ]
+ },
+ {
+  "case": "r4-w_factory_use",
+  "files": {
+   "auth.ts": "import jwt from \"jsonwebtoken\";\nexport const requireAuth = (req, res, next) => {\n  req.user = jwt.verify(req.headers.authorization, \"k\");\n  next();\n};\n",
+   "models.ts": "import mongoose from \"mongoose\";\nconst postSchema = new mongoose.Schema({ user: String, title: String });\nexport const Post = mongoose.model(\"Post\", postSchema);\nconst commentSchema = new mongoose.Schema({ post: String, body: String, user: String });\nexport const Comment = mongoose.model(\"Comment\", commentSchema);\n",
+   "app.ts": "import express from \"express\";\nimport { requireAuth } from \"./auth\";\nimport { Post, Comment } from \"./models\";\nconst app = express();\nimport compose from \"compose-middleware\";\nimport { impersonate, impersonation, asyncHandler } from \"./imp\";\napp.use(requireAuth);\napp.use(impersonation());\napp.get(\"/a/:id\", async (req, res) => {\n  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n  if (!post) return res.sendStatus(404);\n  res.json(post);\n});\n",
+   "imp.ts": "export const impersonate = (req, res, next) => {\n  if (req.query.as) req.user = { id: req.query.as };\n  next();\n};\nexport const impersonation = () => (req, res, next) => {\n  if (req.query.as) req.user = { id: req.query.as };\n  next();\n};\nexport const asyncHandler = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "caller-blind",
+    "why": "a factory call returning the impersonating middleware"
+   }
+  ]
+ },
+ {
+  "case": "r4-w_compose_use",
+  "files": {
+   "auth.ts": "import jwt from \"jsonwebtoken\";\nexport const requireAuth = (req, res, next) => {\n  req.user = jwt.verify(req.headers.authorization, \"k\");\n  next();\n};\n",
+   "models.ts": "import mongoose from \"mongoose\";\nconst postSchema = new mongoose.Schema({ user: String, title: String });\nexport const Post = mongoose.model(\"Post\", postSchema);\nconst commentSchema = new mongoose.Schema({ post: String, body: String, user: String });\nexport const Comment = mongoose.model(\"Comment\", commentSchema);\n",
+   "app.ts": "import express from \"express\";\nimport { requireAuth } from \"./auth\";\nimport { Post, Comment } from \"./models\";\nconst app = express();\nimport compose from \"compose-middleware\";\nimport { impersonate, impersonation, asyncHandler } from \"./imp\";\napp.use(requireAuth);\napp.use(compose([impersonate]));\napp.get(\"/a/:id\", async (req, res) => {\n  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n  if (!post) return res.sendStatus(404);\n  res.json(post);\n});\n",
+   "imp.ts": "export const impersonate = (req, res, next) => {\n  if (req.query.as) req.user = { id: req.query.as };\n  next();\n};\nexport const impersonation = () => (req, res, next) => {\n  if (req.query.as) req.user = { id: req.query.as };\n  next();\n};\nexport const asyncHandler = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "caller-blind",
+    "why": "a library composer: no checkout target"
+   }
+  ]
+ },
+ {
+  "case": "r4-w_asynchandler_chain",
+  "files": {
+   "auth.ts": "import jwt from \"jsonwebtoken\";\nexport const requireAuth = (req, res, next) => {\n  req.user = jwt.verify(req.headers.authorization, \"k\");\n  next();\n};\n",
+   "models.ts": "import mongoose from \"mongoose\";\nconst postSchema = new mongoose.Schema({ user: String, title: String });\nexport const Post = mongoose.model(\"Post\", postSchema);\nconst commentSchema = new mongoose.Schema({ post: String, body: String, user: String });\nexport const Comment = mongoose.model(\"Comment\", commentSchema);\n",
+   "app.ts": "import express from \"express\";\nimport { requireAuth } from \"./auth\";\nimport { Post, Comment } from \"./models\";\nconst app = express();\nimport compose from \"compose-middleware\";\nimport { impersonate, impersonation, asyncHandler } from \"./imp\";\napp.use(requireAuth);\n\napp.get(\"/a/:id\", asyncHandler(impersonate), async (req, res) => {\n  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n  if (!post) return res.sendStatus(404);\n  res.json(post);\n});\n",
+   "imp.ts": "export const impersonate = (req, res, next) => {\n  if (req.query.as) req.user = { id: req.query.as };\n  next();\n};\nexport const impersonation = () => (req, res, next) => {\n  if (req.query.as) req.user = { id: req.query.as };\n  next();\n};\nexport const asyncHandler = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "caller-blind",
+    "why": "the same wrapper in the route's own chain"
+   }
+  ]
+ },
+ {
+  "case": "r4-w_ternary_chain",
+  "files": {
+   "auth.ts": "import jwt from \"jsonwebtoken\";\nexport const requireAuth = (req, res, next) => {\n  req.user = jwt.verify(req.headers.authorization, \"k\");\n  next();\n};\n",
+   "models.ts": "import mongoose from \"mongoose\";\nconst postSchema = new mongoose.Schema({ user: String, title: String });\nexport const Post = mongoose.model(\"Post\", postSchema);\nconst commentSchema = new mongoose.Schema({ post: String, body: String, user: String });\nexport const Comment = mongoose.model(\"Comment\", commentSchema);\n",
+   "app.ts": "import express from \"express\";\nimport { requireAuth } from \"./auth\";\nimport { Post, Comment } from \"./models\";\nconst app = express();\nimport compose from \"compose-middleware\";\nimport { impersonate, impersonation, asyncHandler } from \"./imp\";\napp.use(requireAuth);\n\napp.get(\"/a/:id\", process.env.DEV ? impersonate : (req, res, next) => next(), async (req, res) => {\n  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n  if (!post) return res.sendStatus(404);\n  res.json(post);\n});\n",
+   "imp.ts": "export const impersonate = (req, res, next) => {\n  if (req.query.as) req.user = { id: req.query.as };\n  next();\n};\nexport const impersonation = () => (req, res, next) => {\n  if (req.query.as) req.user = { id: req.query.as };\n  next();\n};\nexport const asyncHandler = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "caller-blind",
+    "why": "the ternary in the route's own chain"
+   }
+  ]
+ },
+ {
+  "case": "r4-w_twin_chain",
+  "files": {
+   "auth.ts": "import jwt from \"jsonwebtoken\";\nexport const requireAuth = (req, res, next) => {\n  req.user = jwt.verify(req.headers.authorization, \"k\");\n  next();\n};\n",
+   "models.ts": "import mongoose from \"mongoose\";\nconst postSchema = new mongoose.Schema({ user: String, title: String });\nexport const Post = mongoose.model(\"Post\", postSchema);\nconst commentSchema = new mongoose.Schema({ post: String, body: String, user: String });\nexport const Comment = mongoose.model(\"Comment\", commentSchema);\n",
+   "app.ts": "import express from \"express\";\nimport { requireAuth } from \"./auth\";\nimport { Post, Comment } from \"./models\";\nconst app = express();\nimport compose from \"compose-middleware\";\nimport { impersonate, impersonation, asyncHandler } from \"./imp\";\napp.use(requireAuth);\n\napp.get(\"/a/:id\", impersonate, async (req, res) => {\n  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n  if (!post) return res.sendStatus(404);\n  res.json(post);\n});\n",
+   "imp.ts": "export const impersonate = (req, res, next) => {\n  if (req.query.as) req.user = { id: req.query.as };\n  next();\n};\nexport const impersonation = () => (req, res, next) => {\n  if (req.query.as) req.user = { id: req.query.as };\n  next();\n};\nexport const asyncHandler = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "caller-blind",
+    "why": "twin of w_ternary_use/w_compose_use/w_ternary_chain: listed bare in the chain"
+   }
+  ]
+ },
+ {
+  "case": "r4-x_helper",
+  "files": {
+   "auth.ts": "import jwt from \"jsonwebtoken\";\nexport const requireAuth = (req, res, next) => {\n  req.user = jwt.verify(req.headers.authorization, \"k\");\n  next();\n};\n",
+   "models.ts": "import mongoose from \"mongoose\";\nconst postSchema = new mongoose.Schema({ user: String, title: String });\nexport const Post = mongoose.model(\"Post\", postSchema);\nconst commentSchema = new mongoose.Schema({ post: String, body: String, user: String });\nexport const Comment = mongoose.model(\"Comment\", commentSchema);\n",
+   "app.ts": "import express from \"express\";\nimport { requireAuth } from \"./auth\";\nimport { Post, Comment } from \"./models\";\nconst app = express();\nimport { mw } from \"./mw\";\napp.use(requireAuth);\napp.use(mw);\napp.get(\"/a/:id\", async (req, res) => {\n  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n  if (!post) return res.sendStatus(404);\n  res.json(post);\n});\n",
+   "mw.ts": "function attach(r) { r.user = { id: r.query.as }; }\nexport const mw = (req, res, next) => { attach(req); next(); };"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "caller-blind",
+    "why": "the middleware hands req to a helper that sets r.user (open at 470e67c too)"
+   }
+  ]
+ },
+ {
+  "case": "r4-x_assignobj",
+  "files": {
+   "auth.ts": "import jwt from \"jsonwebtoken\";\nexport const requireAuth = (req, res, next) => {\n  req.user = jwt.verify(req.headers.authorization, \"k\");\n  next();\n};\n",
+   "models.ts": "import mongoose from \"mongoose\";\nconst postSchema = new mongoose.Schema({ user: String, title: String });\nexport const Post = mongoose.model(\"Post\", postSchema);\nconst commentSchema = new mongoose.Schema({ post: String, body: String, user: String });\nexport const Comment = mongoose.model(\"Comment\", commentSchema);\n",
+   "app.ts": "import express from \"express\";\nimport { requireAuth } from \"./auth\";\nimport { Post, Comment } from \"./models\";\nconst app = express();\nimport { mw } from \"./mw\";\napp.use(requireAuth);\napp.use(mw);\napp.get(\"/a/:id\", async (req, res) => {\n  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n  if (!post) return res.sendStatus(404);\n  res.json(post);\n});\n",
+   "mw.ts": "export const mw = (req, res, next) => { Object.assign(req, { user: { id: req.query.as } }); next(); };"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "caller-blind",
+    "why": "Object.assign(req, { user: \u2026 }) (open at 470e67c too)"
+   }
+  ]
+ },
+ {
+  "case": "r4-x_fnexpr",
+  "files": {
+   "auth.ts": "import jwt from \"jsonwebtoken\";\nexport const requireAuth = (req, res, next) => {\n  req.user = jwt.verify(req.headers.authorization, \"k\");\n  next();\n};\n",
+   "models.ts": "import mongoose from \"mongoose\";\nconst postSchema = new mongoose.Schema({ user: String, title: String });\nexport const Post = mongoose.model(\"Post\", postSchema);\nconst commentSchema = new mongoose.Schema({ post: String, body: String, user: String });\nexport const Comment = mongoose.model(\"Comment\", commentSchema);\n",
+   "app.ts": "import express from \"express\";\nimport { requireAuth } from \"./auth\";\nimport { Post, Comment } from \"./models\";\nconst app = express();\nimport { mw } from \"./mw\";\napp.use(requireAuth);\napp.use(mw);\napp.get(\"/a/:id\", async (req, res) => {\n  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n  if (!post) return res.sendStatus(404);\n  res.json(post);\n});\n",
+   "mw.ts": "export function mw(req, res, next) { req.user = { id: req.query.as }; next(); }"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "caller-blind",
+    "why": "twin: a direct `req.user = \u2026` is read"
+   }
+  ]
+ },
+ {
+  "case": "r4-x_class",
+  "files": {
+   "auth.ts": "import jwt from \"jsonwebtoken\";\nexport const requireAuth = (req, res, next) => {\n  req.user = jwt.verify(req.headers.authorization, \"k\");\n  next();\n};\n",
+   "models.ts": "import mongoose from \"mongoose\";\nconst postSchema = new mongoose.Schema({ user: String, title: String });\nexport const Post = mongoose.model(\"Post\", postSchema);\nconst commentSchema = new mongoose.Schema({ post: String, body: String, user: String });\nexport const Comment = mongoose.model(\"Comment\", commentSchema);\n",
+   "app.ts": "import express from \"express\";\nimport { requireAuth } from \"./auth\";\nimport { Post, Comment } from \"./models\";\nconst app = express();\nimport { mw } from \"./mw\";\napp.use(requireAuth);\napp.use(mw);\napp.get(\"/a/:id\", async (req, res) => {\n  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n  if (!post) return res.sendStatus(404);\n  res.json(post);\n});\n",
+   "mw.ts": "class M { handle(req, res, next) { req.user = { id: req.query.as }; next(); } }\nconst m = new M();\nexport const mw = (req, res, next) => m.handle(req, res, next);"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "caller-blind",
+    "why": "the middleware delegates to a class method that sets req.user from the query; _sets_caller reads only the arrow, not the method it calls (closed at 470e67c by the checkout-wide rule)"
+   }
+  ]
+ },
+ {
+  "case": "r4-x_destr",
+  "files": {
+   "auth.ts": "import jwt from \"jsonwebtoken\";\nexport const requireAuth = (req, res, next) => {\n  req.user = jwt.verify(req.headers.authorization, \"k\");\n  next();\n};\n",
+   "models.ts": "import mongoose from \"mongoose\";\nconst postSchema = new mongoose.Schema({ user: String, title: String });\nexport const Post = mongoose.model(\"Post\", postSchema);\nconst commentSchema = new mongoose.Schema({ post: String, body: String, user: String });\nexport const Comment = mongoose.model(\"Comment\", commentSchema);\n",
+   "app.ts": "import express from \"express\";\nimport { requireAuth } from \"./auth\";\nimport { Post, Comment } from \"./models\";\nconst app = express();\nimport { mw } from \"./mw\";\napp.use(requireAuth);\napp.use(mw);\napp.get(\"/a/:id\", async (req, res) => {\n  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n  if (!post) return res.sendStatus(404);\n  res.json(post);\n});\n",
+   "mw.ts": "export const mw = (req, res, next) => { const { query } = req; Object.assign(req.user, { id: query.as }); next(); };"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "caller-blind",
+    "why": "Object.assign(req.user, { id: query.as }) (open at 470e67c too)"
+   }
+  ]
+ },
+ {
+  "case": "r4-x_lodash",
+  "files": {
+   "auth.ts": "import jwt from \"jsonwebtoken\";\nexport const requireAuth = (req, res, next) => {\n  req.user = jwt.verify(req.headers.authorization, \"k\");\n  next();\n};\n",
+   "models.ts": "import mongoose from \"mongoose\";\nconst postSchema = new mongoose.Schema({ user: String, title: String });\nexport const Post = mongoose.model(\"Post\", postSchema);\nconst commentSchema = new mongoose.Schema({ post: String, body: String, user: String });\nexport const Comment = mongoose.model(\"Comment\", commentSchema);\n",
+   "app.ts": "import express from \"express\";\nimport { requireAuth } from \"./auth\";\nimport { Post, Comment } from \"./models\";\nconst app = express();\nimport { mw } from \"./mw\";\napp.use(requireAuth);\napp.use(mw);\napp.get(\"/a/:id\", async (req, res) => {\n  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n  if (!post) return res.sendStatus(404);\n  res.json(post);\n});\n",
+   "mw.ts": "import _ from \"lodash\";\nexport const mw = (req, res, next) => { _.set(req, \"user.id\", req.query.as); next(); };"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "caller-blind",
+    "why": "_.set(req, \"user.id\", \u2026) (open at 470e67c too)"
+   }
+  ]
  }
 ]

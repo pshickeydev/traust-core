@@ -117,6 +117,7 @@ import { Comment, Holidays } from "./store";
 import { loadOwnPost, loadAnyPost, showPost, checkId, loadBy } from "./loaders";
 import wrap from "some-router-kit";
 import expressAsyncHandler from "express-async-handler";
+const { Task } = require("./sequelize");
 const posts = require("./controller");
 
 const prisma = new PrismaClient();
@@ -288,6 +289,21 @@ app.delete("/comments/:id", requireAuth, (req, res) => {
   res.sendStatus(204);
 });
 app.get("/holidays/:id", requireAuth, (req, res) => res.json(Holidays.get(req.params.id)));
+
+// Sequelize's `rejectOnEmpty`
+app.delete("/tasks-reject/:id", requireAuth, async (req, res) => {
+  await Task.findOne({ where: { id: req.params.id, userId: req.user.id }, rejectOnEmpty: true });
+  await Task.destroy({ where: { id: req.params.id } });
+});
+app.delete("/tasks-no-reject/:id", requireAuth, async (req, res) => {
+  await Task.findOne({ where: { id: req.params.id, userId: req.user.id }, rejectOnEmpty: false });
+  await Task.destroy({ where: { id: req.params.id } });
+});
+app.delete("/tasks-unread-reject/:id", requireAuth, async (req, res) => {
+  const strict = process.env.STRICT === "1";
+  await Task.findOne({ where: { id: req.params.id, userId: req.user.id }, rejectOnEmpty: strict });
+  await Task.destroy({ where: { id: req.params.id } });
+});
 
 // Prisma
 app.get("/notes/:id", requireAuth, async (req, res) => {
@@ -483,6 +499,7 @@ def app(tmp_path_factory: pytest.TempPathFactory) -> dict:
             "src/store.ts": STORE,
             "src/loaders.ts": LOADERS,
             "src/controller.js": CONTROLLER,
+            "src/sequelize.js": SEQUELIZE,
             "src/routes.ts": ROUTES,
             "src/preloaded.ts": PRELOADED,
         },
@@ -520,6 +537,9 @@ def app(tmp_path_factory: pytest.TempPathFactory) -> dict:
         ("GET", "/any-comments/:id", "unknown"),  # `||`: returned whenever present
         ("DELETE", "/comments/:id", "unknown"),  # the owned result is ignored
         ("GET", "/holidays/:id", "none"),  # a typed store of ownerless records
+        ("DELETE", "/tasks-reject/:id", "checked"),  # `rejectOnEmpty: true` refuses the missing
+        ("DELETE", "/tasks-no-reject/:id", "unchecked"),  # `rejectOnEmpty: false` returns null
+        ("DELETE", "/tasks-unread-reject/:id", "unchecked"),  # a value we can't read
         ("GET", "/notes/:id", "scoped"),  # Prisma `where`
         ("GET", "/notes-or-throw/:id", "scoped"),  # `findUniqueOrThrow`
         ("GET", "/related-notes/:id", "scoped"),  # a relation filter `owner: { id: me }`
@@ -893,3 +913,79 @@ def test_pathological_code_neither_crashes_nor_credits(
     assert (
         _row(result, "GET" if "app.get" in route else "DELETE", "/a/:id")["ownership"] == ownership
     )
+
+
+FORGING = """
+import express from "express";
+import session from "express-session";
+import { requireAuth } from "./auth";
+import { Post, User } from "./models";
+
+const app = express();
+const actAs = (req, res, next) => {
+  req.user = { id: req.body.owner };
+  next();
+};
+const loadUser = async (req, res, next) => {
+  req.user = await User.findById(req.session.userId);
+  next();
+};
+const shareUser = (req, res, next) => {
+  res.locals.user = req.user;
+  next();
+};
+const signup = async (req, res, next) => {
+  req.user = await User.create(req.body);
+  next();
+};
+const show = async (req, res) => {
+  const post = await Post.findById(req.params.id);
+  if (!post || post.user !== req.user.id) return res.sendStatus(403);
+  res.json(post);
+};
+app.get("/forged/:id", requireAuth, actAs, show);
+app.get("/sessioned/:id", requireAuth, loadUser, show);
+app.get("/shared/:id", requireAuth, shareUser, show);
+app.post("/signup/:invite", signup, (req, res) => res.json(req.user));
+app.get("/plain/:id", requireAuth, show);
+"""
+
+FORGING_USE = """
+import express from "express";
+import { requireAuth } from "./auth";
+import { Post } from "./models";
+
+const app = express();
+app.use(requireAuth);
+app.use((req, res, next) => {
+  if (req.query.as) req.user = { id: req.query.as };
+  next();
+});
+app.get("/everywhere/:id", async (req, res) => {
+  const post = await Post.findById(req.params.id);
+  if (!post || post.user !== req.user.id) return res.sendStatus(403);
+  res.json(post);
+});
+"""
+
+
+@pytest.mark.parametrize(
+    ("app_code", "method", "pattern", "ownership"),
+    [
+        (FORGING, "GET", "/forged/:id", "caller-blind"),  # `req.user = req.body.owner` before it
+        (FORGING, "GET", "/sessioned/:id", "checked"),  # a caller loaded from the session
+        (FORGING, "GET", "/shared/:id", "checked"),  # the caller copied into `res.locals`
+        (FORGING, "GET", "/plain/:id", "checked"),  # a writer elsewhere runs on its own route
+        (FORGING_USE, "GET", "/everywhere/:id", "caller-blind"),  # `app.use` forging every route
+    ],
+    ids=["forged", "sessioned", "shared", "plain", "use"],
+)
+def test_middleware_building_the_caller_from_request_data_forges_it(
+    tmp_path: Path, app_code: str, method: str, pattern: str, ownership: str
+) -> None:
+    models = (
+        MODELS
+        + 'export const User = mongoose.model("User", new mongoose.Schema({ name: String }));\n'
+    )
+    result = _tree(tmp_path, {"auth.ts": AUTH, "models.ts": models, "app.ts": app_code})
+    assert _row(result, method, pattern)["ownership"] == ownership
