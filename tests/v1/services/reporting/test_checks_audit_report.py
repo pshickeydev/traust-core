@@ -404,6 +404,47 @@ def test_metadata_repository_is_the_fingerprint_root(repository: str | None, err
     assert [error in e for e in result.errors] == ([True] if error else [])
 
 
+@pytest.mark.parametrize("strict", [False, True])
+@pytest.mark.parametrize(
+    "repository", ["file:///fixtures/canaries/example-app", "file:///fixtures/canaries/my%20app"]
+)
+def test_local_fixture_repository_has_one_warning_and_keeps_its_identity(
+    reporting: ReportingService, tmp_path: Path, repository: str, strict: bool
+) -> None:
+    report = valid_report()
+    report["metadata"]["repository"] = repository
+    path = write(tmp_path, "fixture-security-audit.json", report)
+    original = path.read_bytes()
+
+    (result,) = reporting.validate_reports(path, strict=strict)
+
+    assert result.passed, result.errors
+    warnings = [w for w in result.warnings if "metadata.repository" in w]
+    assert len(warnings) == 1 and "local fixture checkout" in warnings[0]
+    assert path.read_bytes() == original
+
+
+@pytest.mark.parametrize(
+    "repository",
+    [
+        "file:///",
+        "file:///fixtures/canaries/",
+        "file://remote.example/fixtures/repo",
+        "file:relative/repo",
+        "file:///fixtures/two repos",
+        "<file:///fixtures/repo>",
+    ],
+)
+def test_malformed_local_fixture_repositories_still_fail(
+    reporting: ReportingService, tmp_path: Path, repository: str
+) -> None:
+    report = valid_report()
+    report["metadata"]["repository"] = repository
+    (result,) = reporting.validate_reports(write(tmp_path, "bad-security-audit.json", report))
+    assert not result.passed
+    assert any("metadata.repository" in error for error in result.errors)
+
+
 def test_disposition_blocks_reconcile() -> None:
     assert _cross(cumulative_report()).errors == []
     cases: list[tuple[Callable[[Doc], Any], str]] = [
