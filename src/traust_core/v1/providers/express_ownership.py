@@ -109,6 +109,11 @@ _READS_REQUEST = {"validationResult"}
 _OPAQUE_REQUEST = {"param", "path", "url", "originalUrl", "baseUrl", "route", "_parsedUrl"}
 _MAX_DEPTH = 64
 _FUNCTION_VALUES = ("arrow_function", "function_expression", "function")
+# library wrappers that only forward a handler's rejection to `next` (express-async-handler, …)
+_ASYNC_WRAPPER = re.compile(
+    r"^(asyncHandler|expressAsyncHandler|catchAsync|catchAsyncErrors|asyncMiddleware|asyncWrap|"
+    r"asyncWrapper|wrapAsync|asyncRoute|asyncify)$"
+)
 _Pos = int
 # what a check verifies and a lookup needs verified: (the id, the model, the field); "*" is any
 _Key = tuple[str, str, str]
@@ -464,6 +469,14 @@ class JsCode:
                     out[key] = value
             elif p.type == "method_definition" and (name := p.child_by_field_name("name")):
                 out[src.text(name)] = p
+            elif (
+                p.type == "pair"
+                and (value := unwrap(p.child_by_field_name("value"))) is not None
+                and (value.type == "identifier")
+            ):
+                out[src.text(p.child_by_field_name("key"))] = value  # resolved where it's called
+            elif p.type == "shorthand_property_identifier":
+                out[src.text(p)] = p  # `export default { wrap }`
             elif p.type == "spread_element":
                 out = dict.fromkeys(out)  # `{ show, ...legacy }`: `legacy.show` may win
                 out["..."] = None
@@ -865,6 +878,8 @@ class JsCode:
             if "..." in functions and functions.get(prop) is None:
                 return None
             fn = functions.get(prop)
+            if fn is not None and fn.type in ("identifier", "shorthand_property_identifier"):
+                return self._named(where, g.src.text(fn))  # `{ wrap: awaitMiddleware }`, `{ wrap }`
             return [Target(where, fn)] if fn is not None else []
         if local in g.instances:
             cls_found = self._class(where, g.instances[local])
@@ -1040,6 +1055,7 @@ class _Walk:
         self.verified: dict[_Key, _Pos] = {}
         self.owned_or_null: dict[_Key, _Pos] = {}
         self.swallows = False  # a closing `try` whose `catch` doesn't rethrow
+        self.leaky_try: list[tuple[_Pos, _Pos]] = []  # a `try` whose `var` records `catch` can send
 
         self.uncovered: list[tuple[_Pos, _Pos]] = []  # a closing `try`'s `catch` and `finally`
 
@@ -1176,8 +1192,10 @@ class _Walk:
                 fn = unwrap(n.child_by_field_name("function"))
                 if fn is not None and fn.type == "member_expression":
                     prop = src.text(fn.child_by_field_name("property"))
-                    if _MUTATORS.match(prop):
-                        written.add(written_path(src, fn.child_by_field_name("object")))
+                    target = written_path(src, fn.child_by_field_name("object"))
+                    # `res.setHeader(…)` writes the response, not what it holds (`res.locals`)
+                    if _MUTATORS.match(prop) and target not in (self.req, self.res):
+                        written.add(target)
                 if _WRITES_FIRST.match(chain_text(src, fn)) and args(n):
                     written.add(written_path(src, args(n)[0]))
             elif n.type in ("for_in_statement",):
@@ -1450,6 +1468,24 @@ class _Walk:
                 handler is not None and not (caught and caught[-1].type == "throw_statement")
             ) or (final is not None and any(n.type == "return_statement" for n in walk(final)))
             block = last.child_by_field_name("body")
+            leaked = {
+                x
+                for d in (walk(block) if block is not None else [])
+                if d.type == "variable_declaration"
+                for v in d.named_children
+                if v.type == "variable_declarator"
+                for x in bound_names(self.src, v.child_by_field_name("name"))
+            }
+            if (
+                block is not None
+                and handler is not None
+                and any(
+                    n.type == "identifier" and self.src.text(n) in leaked for n in walk(handler)
+                )
+            ):
+                self.leaky_try.append(
+                    (block.start_byte, block.end_byte)
+                )  # `var item` sent by `catch`
             body = body[:-1] + [
                 s
                 for s in (block.named_children if block is not None else [])
@@ -1997,18 +2033,24 @@ class _Walk:
         return d is not None and d[0] in self.callers
 
     # refusals: a 4xx response then return, a throw, or `return next(err)` (owner decision)
-    def refusal(self, node: Node | None) -> bool:
-        if node is None:
+    def refusal(self, node: Node | None, record: str = "") -> bool:
+        """A 4xx response then return, a throw or `return next(err)`, sending nothing of the
+        record (`res.status(403).json(item)` is no refusal)."""
+        if node is None or (
+            record
+            and any(n.type == "identifier" and self.src.text(n) == record for n in walk(node))
+        ):
             return False
         if node.type == "statement_block":
             body = [s for s in node.named_children if s.type != "comment"]
             if len(body) == 1:
-                return self.refusal(body[0])
+                return self.refusal(body[0], record)
             if len(body) == 2 and body[1].type == "return_statement" and not body[1].named_children:
                 return self.responds_4xx(body[0]) or self.calls_next(body[0])
             return False
         if node.type == "throw_statement":
-            return True
+            # a `catch` that can see what the `try` declared with `var` may send it
+            return not any(start <= node.start_byte < end for start, end in self.leaky_try)
         if node.type == "return_statement" and node.named_children:
             value = unwrap(node.named_children[0])
             return self.responds_4xx(value) or self.calls_next(value)
@@ -2046,15 +2088,44 @@ class _Walk:
         return (
             self.src.text(node.child_by_field_name("function")) == "next"
             and len(a) == 1
-            and unwrap(a[0]) is not None
-            and unwrap(a[0]).type in ("identifier", "new_expression", "call_expression")
-            and self.src.text(unwrap(a[0])) != "undefined"
+            and self.error(a[0])
         )
 
-    def condition(self, stmt: Node) -> Node | None:
+    def error(self, node: Node | None) -> bool:
+        """An error value: `new Error(…)`, `createError(403)`, a `catch` parameter, or a name
+        bound once to one (`next(null)` and `const err = null` are none)."""
+        node = unwrap(node)
+        if node is None:
+            return False
+        if node.type in ("new_expression", "call_expression"):
+            return True
+        if node.type != "identifier":
+            return False
+        name = self.src.text(node)
+        body = self.fn.child_by_field_name("body")
+        if any(
+            c.type == "catch_clause" and self.src.text(c.child_by_field_name("parameter")) == name
+            for c in (walk(body) if body is not None else [])
+            if c.child_by_field_name("parameter") is not None
+        ):
+            return True
+        bound = [
+            d.child_by_field_name("value")
+            for d in (walk(body) if body is not None else [])
+            if d.type == "variable_declarator"
+            and self.src.text(d.child_by_field_name("name")) == name
+        ]
+        return (
+            len(bound) == 1
+            and name not in self.unstable
+            and unwrap(bound[0]) is not None
+            and unwrap(bound[0]).type in ("new_expression", "call_expression")
+        )
+
+    def condition(self, stmt: Node, record: str = "") -> Node | None:
         if stmt.type != "if_statement" or stmt.child_by_field_name("alternative") is not None:
             return None
-        if not self.refusal(stmt.child_by_field_name("consequence")):
+        if not self.refusal(stmt.child_by_field_name("consequence"), record):
             return None
         return unwrap(stmt.child_by_field_name("condition"))
 
@@ -2099,13 +2170,13 @@ class _Walk:
         return False
 
     def refuses_absence(self, stmt: Node, record: str) -> bool:
-        test = self.condition(stmt)
+        test = self.condition(stmt, record)
         return test is not None and self.absence(test, record, present=False)
 
     def refuses_foreign(self, stmt: Node, record: str) -> bool:
         """`if (!item || item.owner !== req.user.id) { res.status(403)…; return; }`, also behind
         `!req.user.isAdmin &&` (owner decision 2026-11-02)."""
-        test = self.condition(stmt)
+        test = self.condition(stmt, record)
         if test is None:
             return False
         ands = self.parts(test, "&&")
@@ -2353,6 +2424,10 @@ def _passes_on(code: JsCode, wrapper: Target, made: Target) -> bool:
             and [src.text(x) for x in args(n)] != mine[: len(args(n))]
         ):
             return False  # `fn({ ...req, user }, res, next)`
+        if n.type == "subscript_expression" and src.text(n.child_by_field_name("object")) in {
+            m.removeprefix("...") for m in mine
+        }:
+            continue  # `.catch(args[2])`: its own arguments
         if n.type in (
             "new_expression",
             "subscript_expression",
@@ -2364,8 +2439,11 @@ def _passes_on(code: JsCode, wrapper: Target, made: Target) -> bool:
         if n.type == "call_expression":
             fn = unwrap(n.child_by_field_name("function"))
             name = callee_name(src, n)
+            # its own response or `next` (`return res.status(400).json(…)`) loads nothing
+            responds = _base(src, fn) in {m.removeprefix("...") for m in mine[1:3]}
             if not (
-                src.text(fn) in (wrapped, "Promise.resolve")
+                responds
+                or src.text(fn) in (wrapped, "Promise.resolve")
                 or (
                     fn is not None
                     and fn.type == "member_expression"
@@ -2374,6 +2452,23 @@ def _passes_on(code: JsCode, wrapper: Target, made: Target) -> bool:
             ):
                 return False
     return True
+
+
+def _base(src: Parsed, node: Node | None) -> str:
+    """The name a chain of members and calls starts from: `res` for `res.status(400).json`."""
+    for _ in range(_MAX_DEPTH):
+        node = unwrap(node)
+        if node is None:
+            return ""
+        if node.type == "identifier":
+            return src.text(node)
+        if node.type == "member_expression":
+            node = node.child_by_field_name("object")
+        elif node.type == "call_expression":
+            node = node.child_by_field_name("function")
+        else:
+            return ""
+    return ""
 
 
 def _references(field: str, store: str) -> bool:
@@ -2439,11 +2534,11 @@ def _request_names(src: Parsed, fn: Node) -> tuple[str, str]:
 
 
 def caller_writes(src: Parsed, fn: Node, req: str, res: str) -> list[Node | None]:
-    """The values written under `req.user`, `req.auth` or `res.locals` anywhere in `fn` (its
+    """The values written under `req.user`, `req.auth` or `res.locals.user` anywhere in `fn` (its
     closures too), directly or through locals naming them (`const { user } = req`)."""
     paths = {f"{req}.user", f"{req}.auth"} if req else set()
     if res:
-        paths.add(f"{res}.locals")
+        paths.add(f"{res}.locals.user")
     body = fn.child_by_field_name("body") or fn
     aliases: dict[str, str] = {}
 
@@ -2473,6 +2568,7 @@ def caller_writes(src: Parsed, fn: Node, req: str, res: str) -> list[Node | None
     for n in walk(body):
         targets: list[Node] = []
         value: Node | None = None
+        whole = True
         if n.type in ("assignment_expression", "augmented_assignment_expression"):
             left, value = n.child_by_field_name("left"), n.child_by_field_name("right")
             if left is not None and left.type in ("object_pattern", "array_pattern"):
@@ -2492,12 +2588,15 @@ def caller_writes(src: Parsed, fn: Node, req: str, res: str) -> list[Node | None
                 and _MUTATORS.match(src.text(fn_.child_by_field_name("property")))
             ):
                 targets = [fn_.child_by_field_name("object")]
+                whole = False  # `res.setHeader(…)` writes the response, not `res.locals`
             elif _WRITES_FIRST.match(chain_text(src, fn_)) and args(n):
-                targets = [args(n)[0]]
+                targets = [args(n)[0]]  # `Object.assign(req, { user })` may write any of it
         for target in targets:
             written = expand(written_path(src, target))
             if written and any(
-                written == q or written.startswith(q + ".") or q.startswith(written + ".")
+                written == q
+                or written.startswith(q + ".")
+                or (whole and q.startswith(written + "."))
                 for q in paths
             ):
                 out.append(value)
@@ -2731,7 +2830,7 @@ class ExpressOwnership:
         path_ids: set[str],
         *,
         guarded: bool,
-        middleware: list[Node] = (),  # type: ignore[assignment]
+        middleware: list[tuple[Node, bool]] = (),  # type: ignore[assignment]
         preloaded: set[str] = frozenset(),  # type: ignore[assignment]
     ) -> HandlerFacts:
         target = self._target(rel, fn_node)
@@ -2747,13 +2846,17 @@ class ExpressOwnership:
         scan = self.scan(target, set(), path_ids, 0)
         # checkout middleware in the route's chain that reads the path (`loadPost, update`): its
         # own lookups count, but nothing it checks covers the handler's
-        loaders = [
-            self.scan(m, set(), path_ids, 0)
-            for node in _flat(middleware)
-            if (m := self._target(rel, node)) is not None
-            and ".params" in self.code.files[m.rel].src.text(m.fn)
-            and _plain_request(self.code.files[m.rel].src, m.fn)
-        ]
+        loaders = []
+        for node, before in middleware:  # each with the guards that ran before it
+            m = self._target(rel, node)
+            if (
+                m is not None
+                and ".params" in self.code.files[m.rel].src.text(m.fn)
+                and (_plain_request(self.code.files[m.rel].src, m.fn))
+            ):
+                self.guarded = before
+                loaders.append(self.scan(m, set(), path_ids, 0))
+        self.guarded = guarded
         seen = scan.seen.union(*(s.seen for s in loaders))
         if path_ids and "*" not in seen and not path_ids <= seen:
             # the path id is read nowhere we can see: by middleware, `req.param`, `req.path`, …
@@ -2792,6 +2895,9 @@ class ExpressOwnership:
                 )
         return _admin_only(src, target.fn, roles)
 
+    def files_src(self, rel: str) -> Parsed:
+        return self.code.files[rel].src
+
     def _target(self, rel: str, node: Node) -> Target | None:
         node = unwrap(node)
         if node is None:
@@ -2802,11 +2908,14 @@ class ExpressOwnership:
             a = args(node)
             inner = unwrap(a[0]) if len(a) == 1 else None
             found = self.code.functions(rel, node.child_by_field_name("function"), None)
+            if found is None:
+                return None  # an ambiguous wrapper
             made_by = self._made(found[0]) if found and len(found) == 1 else None
             if (
                 inner is not None
                 and (
-                    not found or (made_by is not None and _passes_on(self.code, found[0], made_by))
+                    (not found and _ASYNC_WRAPPER.match(callee_name(self.files_src(rel), node)))
+                    or (made_by is not None and _passes_on(self.code, found[0], made_by))
                 )
                 and (wrapped := self._target(rel, inner)) is not None
             ):

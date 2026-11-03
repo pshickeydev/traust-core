@@ -115,7 +115,7 @@ class _Scope:
 class _Express:
     sources: list[_Source]
     receivers: set[_Key] = field(default_factory=set)
-    uses: dict[_Key, list[tuple[int, list[str], list[str], str | None]]] = field(
+    uses: dict[_Key, list[tuple[int, list[str], list[str], tuple[str, ...] | None]]] = field(
         default_factory=dict
     )
     mounts: dict[_Key, list[_Mount]] = field(default_factory=dict)
@@ -361,44 +361,60 @@ class _Express:
             if parent is None or prop != "use":
                 continue
             args = _args(call)
-            prefix = self._prefix(src, args[0]) if args else None
-            if prefix is not None:
+            prefixes = self._prefixes(src, args[0]) if args else None
+            if prefixes is not None:
                 args = args[1:]
             guards: list[str] = []
             unguards: list[str] = []
             for arg in args:
                 child = self._key(rel, arg)
                 if child is not None:
-                    before = [
-                        u
-                        for u in self.uses.get(parent, [])
-                        if u[0] < call.start_byte and _under(prefix or "/", u[3])
-                    ]
-                    self.mounts.setdefault(child, []).append(
-                        _Mount(
-                            parent,
-                            prefix or "",
-                            _unique([*(g for u in before for g in u[1]), *guards]),
-                            sorted({*(x for u in before for x in u[2]), *unguards}),
+                    for prefix in prefixes or ("",):
+                        before = [
+                            u
+                            for u in self.uses.get(parent, [])
+                            if u[0] < call.start_byte and _under(prefix or "/", u[3])
+                        ]
+                        self.mounts.setdefault(child, []).append(
+                            _Mount(
+                                parent,
+                                prefix,
+                                _unique([*(g for u in before for g in u[1]), *guards]),
+                                sorted({*(x for u in before for x in u[2]), *unguards}),
+                            )
                         )
-                    )
                     continue
                 g, u = self._names(src, arg)
                 guards += g
                 unguards += u
             if guards or unguards:
-                self.uses.setdefault(parent, []).append((call.start_byte, guards, unguards, prefix))
+                self.uses.setdefault(parent, []).append(
+                    (call.start_byte, guards, unguards, prefixes)
+                )
+
+    def _prefixes(self, src: _Source, node: Node) -> tuple[str, ...] | None:
+        """A `use` path's values: a string, a constant naming one, or an array of them; None
+        when the argument is middleware."""
+        node = _unwrap(node)
+        if node is not None and node.type == "array":
+            items = [self._prefix(src, c) for c in node.named_children]
+            if items and all(isinstance(x, str) for x in items):
+                return tuple(items)  # type: ignore[arg-type]
+            return (
+                ("<dynamic>",)
+                if any(src.string(c) is not None for c in node.named_children)
+                else None
+            )
+        prefix = self._prefix(src, node)
+        return None if prefix is None else (prefix,)
 
     def _prefix(self, src: _Source, node: Node) -> str | None:
-        """A `use` path: a string, a constant naming one, or the first of an array of them."""
+        """A path: a string, or a constant naming one; `<dynamic>` for another string binding."""
         node = _unwrap(node)
         if node is None:
             return None
         if (text := src.string(node)) is not None:
             return text
-        if node.type == "array":
-            first = next((src.string(c) for c in node.named_children), None)
-            return first if first is not None else "<dynamic>"
         if node.type == "template_string":
             return "<dynamic>"
         if node.type == "identifier":
@@ -513,7 +529,8 @@ class _Express:
     def _rows(
         self, src: _Source, call: Node, key: _Key, verb: str, path: Node, handlers: list[Node]
     ) -> list[_Row]:
-        literal = src.string(path)
+        literal = self._prefix(src, path)  # a string, or a constant naming one
+        literal = None if literal == "<dynamic>" else literal
         pattern, dynamic = (literal, False) if literal is not None else (src.text(path)[:160], True)
         guards: list[str] = []
         unguards: list[str] = []
@@ -531,7 +548,7 @@ class _Express:
         before = [
             u
             for u in self.uses.get(key, [])
-            if u[0] < call.start_byte and _under(src.string(path) or "", u[3])
+            if u[0] < call.start_byte and (literal is not None and _under(literal, u[3]))
         ]
         rows = []
         for scope in self.chains(key):
@@ -563,12 +580,28 @@ class _Express:
                     last,
                     ids,
                     guarded=bool(authenticating),
-                    middleware=handlers[:-1],
+                    middleware=self._in_order(src, row, handlers, authenticating),
                     preloaded=self._preloaded(key),
                 )
                 row.own(facts, own.code.fields, guards=authenticating)
             rows.append(_mark(row, key[1], dynamic, src.file.rel))
         return rows
+
+    def _in_order(
+        self, src: _Source, row: _Row, handlers: list[Node], authenticating: list[str]
+    ) -> list[tuple[Node, bool]]:
+        """The route's middleware, each with whether an authenticating guard has run before it
+        (the router's own guards run first)."""
+        guarded = any(g in authenticating for g in row.scope_guards)
+        out = []
+        for node in _flat(handlers[:-1]):
+            out.append((node, guarded))
+            guarded = (
+                guarded
+                or src.text(node) in authenticating
+                or any(g in authenticating for g in self._names(src, node)[0])
+            )
+        return out
 
     def _preloaded(self, key: _Key) -> set[str]:
         """The path params a `router.param(name, …)` callback loads before the route runs: on its
@@ -626,14 +659,15 @@ class _Express:
         return guards
 
 
-def _under(path: str, prefix: str | None) -> bool:
+def _under(path: str, prefixes: tuple[str, ...] | None) -> bool:
     """Whether a `use(prefix, …)` runs for `path` (relative to its router)."""
-    if prefix is None:
+    if prefixes is None:
         return True
-    if prefix == "<dynamic>":
-        return False
-    base = prefix.rstrip("/")
-    return not base or path == base or path.startswith(base + "/")
+    for prefix in prefixes:
+        base = prefix.rstrip("/")
+        if prefix != "<dynamic>" and (not base or path == base or path.startswith(base + "/")):
+            return True
+    return False
 
 
 def _flat(nodes: list[Node]) -> list[Node]:

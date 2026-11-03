@@ -115,6 +115,8 @@ import { requireAuth, admin, auth } from "./auth";
 import { Post } from "./models";
 import { Comment, Holidays } from "./store";
 import { loadOwnPost, loadAnyPost, showPost, checkId, loadBy } from "./loaders";
+import wrap from "some-router-kit";
+import expressAsyncHandler from "express-async-handler";
 const posts = require("./controller");
 
 const prisma = new PrismaClient();
@@ -386,6 +388,55 @@ app.delete("/coded/:id", requireAuth, async (req, res) => {
   if (post.user !== req.user.id) return res.status(code).json({});
   await Post.deleteOne({ _id: req.params.id });
 });
+app.delete("/early/:id", loadOwnPost, requireAuth, async (req, res) => {
+  await req.post.remove();
+  res.sendStatus(204);
+});
+app.get("/sends-it/:id", requireAuth, async (req, res) => {
+  const post = await Post.findById(req.params.id);
+  if (post.user !== req.user.id) return res.status(403).json(post);
+  res.json(post);
+});
+app.delete("/var-caught/:id", requireAuth, async (req, res) => {
+  try {
+    var post = await Post.findById(req.params.id);
+    if (post.user !== req.user.id) throw new Error("forbidden");
+    await Post.deleteOne({ _id: req.params.id });
+  } catch (err) {
+    res.json(post);
+  }
+});
+app.delete("/null-next/:id", requireAuth, async (req, res, next) => {
+  const err = null;
+  const post = await Post.findById(req.params.id);
+  if (post.user !== req.user.id) return next(err);
+  await Post.deleteOne({ _id: req.params.id });
+});
+app.delete("/error-next/:id", requireAuth, async (req, res, next) => {
+  const err = new Error("forbidden");
+  const post = await Post.findById(req.params.id);
+  if (post.user !== req.user.id) return next(err);
+  await Post.deleteOne({ _id: req.params.id });
+});
+app.get("/headers/:id", requireAuth, async (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  res.locals.errors = [];
+  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });
+  if (!post) return res.sendStatus(404);
+  res.json(post);
+});
+app.get("/locals-user/:id", requireAuth, async (req, res) => {
+  res.locals.user = { id: req.query.as };
+  const post = await Post.findOne({ _id: req.params.id, user: res.locals.user.id });
+  if (!post) return res.sendStatus(404);
+  res.json(post);
+});
+app.get("/unknown-wrapper/:id", requireAuth, wrap(async (req, res) => {
+  res.json(await Post.findOne({ _id: req.params.id, user: req.user.id }).orFail());
+}));
+app.get("/library-wrapper/:id", requireAuth, expressAsyncHandler(async (req, res) => {
+  res.json(await Post.findOne({ _id: req.params.id, user: req.user.id }).orFail());
+}));
 """
 
 PRELOADED = """
@@ -491,6 +542,19 @@ def app(tmp_path_factory: pytest.TempPathFactory) -> dict:
         ("GET", "/destructured/:id", "unknown"),  # `({ params }, res)` isn't read
         ("GET", "/validated/:id", "scoped"),  # a library reading `req` loads nothing of ours
         ("DELETE", "/coded/:id", "unchecked"),  # a status we can't read isn't a refusal
+        ("DELETE", "/early/:id", "caller-blind"),  # a loader running before the guard
+        ("GET", "/sends-it/:id", "unchecked"),  # a 403 sending the record isn't a refusal
+        (
+            "DELETE",
+            "/var-caught/:id",
+            "unchecked",
+        ),  # `catch` sees the `var` record the try threw on
+        ("DELETE", "/null-next/:id", "unchecked"),  # `next(null)` through a name
+        ("DELETE", "/error-next/:id", "checked"),  # `next(err)` with an error
+        ("GET", "/headers/:id", "scoped"),  # headers and other locals aren't the caller
+        ("GET", "/locals-user/:id", "caller-blind"),  # `res.locals.user` written by the handler
+        ("GET", "/unknown-wrapper/:id", "unknown"),  # a library wrapper we can't read
+        ("GET", "/library-wrapper/:id", "scoped"),  # express-async-handler only forwards errors
     ],
 )
 def test_only_the_allowed_shapes_count_as_protection(
@@ -506,6 +570,40 @@ def test_the_evidence_names_the_record_and_its_owner(app: dict) -> None:
     evidence = _row(app, "DELETE", "/public-flag/:id")["ownership_evidence"]
     assert (evidence["record_type"], evidence["owner_field"]) == ("Post", "user")
     assert _row(app, "GET", "/other-notes/:id")["ownership_evidence"]["owner_field"] == "ownerId"
+
+
+@pytest.mark.parametrize(
+    ("code", "pattern", "guarded"),
+    [
+        (
+            'app.use(["/api", "/admin"], requireAuth);\napp.get("/admin/x/:id", h);\n',
+            "/admin/x/:id",
+            True,
+        ),
+        (
+            'app.use(["/api", "/admin"], requireAuth);\napp.get("/open/x/:id", h);\n',
+            "/open/x/:id",
+            False,
+        ),
+        (
+            'const ROUTE = "/api/x/:id";\napp.use("/api", requireAuth);\napp.get(ROUTE, h);\n',
+            "/api/x/:id",
+            True,
+        ),
+        ('app.use("/api", requireAuth);\napp.get("/apix/:id", h);\n', "/apix/:id", False),
+    ],
+    ids=["array-prefix", "array-prefix-elsewhere", "constant-route-path", "prefix-boundary"],
+)
+def test_prefixed_guards_cover_the_paths_under_them(
+    tmp_path: Path, code: str, pattern: str, guarded: bool
+) -> None:
+    app = (
+        'import express from "express";\nconst app = express();\n'
+        "const requireAuth = (req, res, next) => next();\nconst h = (req, res) => res.json({});\n"
+        + code
+    )
+    row = _row(_tree(tmp_path, {"app.js": app}), "GET", pattern)
+    assert bool(row["guards"] or row["scope_guards"]) is guarded
 
 
 @pytest.mark.parametrize(
