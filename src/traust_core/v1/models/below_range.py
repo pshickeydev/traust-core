@@ -20,6 +20,7 @@ from traust_core.v1.models.dependencies import (
     AdvisoryRecord,
     AffectedPackage,
     Version,
+    VersionKey,
     version_key,
 )
 from traust_core.v1.models.vocabulary import Ecosystem
@@ -280,6 +281,10 @@ class BelowRangeOutcome(Model):
     coverage_gaps: int
 
 
+def _major_distance(start: VersionKey | tuple[()], have: VersionKey) -> int | None:
+    return start.release[0] - have.release[0] if isinstance(start, VersionKey) else None
+
+
 def stated_gap(affected: AffectedPackage, version: Version) -> StatedGap | None:
     """Where `version` sits outside the stated spans, or None: affected as stated (a span or the
     `versions` list), above every fix, no spans, or a version or bound that can't be ordered."""
@@ -300,7 +305,7 @@ def stated_gap(affected: AffectedPackage, version: Version) -> StatedGap | None:
         return StatedGap(
             kind=CandidateKind.BELOW_RANGE,
             stated_start=lowest.introduced,
-            major_distance=lowest_key[0] - have[0] if lowest_key and have else None,
+            major_distance=_major_distance(lowest_key, have),
         )
     # A gap counts only after a span ending at `last_affected`: that line was left without a known
     # fix, so a later version below the next span's start may still carry the code.
@@ -320,7 +325,7 @@ def stated_gap(affected: AffectedPackage, version: Version) -> StatedGap | None:
             return StatedGap(
                 kind=CandidateKind.GAP,
                 stated_start=s.introduced,
-                major_distance=k[0] - have[0] if k and have else None,
+                major_distance=_major_distance(k, have),
             )
         break
     return None

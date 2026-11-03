@@ -12,7 +12,7 @@ from collections import Counter
 from collections.abc import Mapping, Sequence
 from datetime import date, datetime
 from enum import StrEnum
-from typing import Any, NewType, Self
+from typing import Any, NamedTuple, NewType, Self
 from uuid import UUID
 
 from pydantic import Field, computed_field
@@ -46,6 +46,17 @@ FeedName = NewType("FeedName", str)
 _ADVISORY_ID = re.compile(r"(?:CVE|GHSA|MAL|PYSEC|GO|RUSTSEC|OSV)-[A-Za-z0-9][A-Za-z0-9-]{0,63}")
 _SEMVER = re.compile(r"v?(\d+)\.(\d+)\.(\d+)")
 _LEADING_NUMERIC = re.compile(r"\d+(?:\.\d+)*")
+_SEMVER_PRERELEASE = re.compile(r"-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)(?:\+.*)?")
+_NUMERIC_ID = re.compile(r"[0-9]+")
+# PEP 440's pre, post and dev segments, in their spellings and separators.
+_PEP440_SUFFIX = re.compile(
+    r"(?:[-_.]?(?P<pre>a|b|c|rc|alpha|beta|pre|preview)[-_.]?(?P<pre_n>[0-9]+)?)?"
+    r"(?:-(?P<post_implicit>[0-9]+)|[-_.]?(?P<post>post|rev|r)[-_.]?(?P<post_n>[0-9]+)?)?"
+    r"(?:[-_.]?(?P<dev>dev)[-_.]?(?P<dev_n>[0-9]+)?)?"
+    r"(?:\+[a-z0-9.]*)?"
+)
+_PEP440_PRE_RANK = {"a": 0, "alpha": 0, "b": 1, "beta": 1}
+_SEMVER_ECOSYSTEMS = frozenset({Ecosystem.GO, Ecosystem.NPM, Ecosystem.CARGO, Ecosystem.NUGET})
 
 
 _PYPI_SEPARATORS = re.compile(r"[-_.]+")
@@ -71,8 +82,41 @@ def parse_advisory_identifier(raw: str) -> AdvisoryIdentifier:
     return AdvisoryIdentifier(raw)
 
 
-def version_key(version: str, ecosystem: Ecosystem) -> tuple[int, ...] | None:
-    """Comparable release numbers, or None when the version can't be ordered (never guessed)."""
+class VersionKey(NamedTuple):
+    """A version's release numbers, then where it sits among that release's pre- and
+    post-releases (`stage`); compares as a tuple, and `()` sorts below every key."""
+
+    release: tuple[int, ...]
+    stage: tuple[int | tuple[int, int | str], ...] = (0,)
+
+
+def _semver_stage(rest: str) -> tuple[int | tuple[int, int | str], ...]:
+    """SemVer 2 precedence: a pre-release sorts below its release, identifiers compare
+    numerically when numeric, else lexically, numeric first; build metadata is ignored."""
+    m = _SEMVER_PRERELEASE.fullmatch(rest)
+    if not m:
+        return (0,)
+    ids = m.group(1).split(".")
+    return (-1, *((0, int(i)) if _NUMERIC_ID.fullmatch(i) else (1, i) for i in ids))
+
+
+def _pep440_stage(rest: str) -> tuple[int, ...]:
+    """PEP 440 order within one release: dev < pre (a < b < rc) < final < post."""
+    m = _PEP440_SUFFIX.fullmatch(rest.lower())
+    if not m:
+        return (0,)
+    dev = (0,) if m["dev"] is None else (-1, int(m["dev_n"] or 0))
+    if m["pre"]:
+        return (-1, _PEP440_PRE_RANK.get(m["pre"], 2), int(m["pre_n"] or 0), *dev)
+    if m["post_implicit"] or m["post"]:
+        return (1, int(m["post_implicit"] or m["post_n"] or 0), *dev)
+    return (-2, int(m["dev_n"] or 0)) if m["dev"] else (0,)
+
+
+def version_key(version: str, ecosystem: Ecosystem) -> VersionKey | None:
+    """A comparable key, or None when the version can't be ordered (never guessed). Pre- and
+    post-releases order per SemVer (Go, npm, Cargo, NuGet) and PEP 440 (PyPI); other
+    ecosystems order by their leading release numbers only."""
     v = version.strip()
     if ecosystem == Ecosystem.GO:
         m = _SEMVER.match(v)
@@ -86,9 +130,16 @@ def version_key(version: str, ecosystem: Ecosystem) -> tuple[int, ...] | None:
         parts = tuple(int(x) for x in m.group().split(".")) if m else None
         if parts and ecosystem in (Ecosystem.NPM, Ecosystem.CARGO):
             parts = parts[:3]
-    while parts and len(parts) > 1 and parts[-1] == 0:
+    if not m or not parts:
+        return None
+    while len(parts) > 1 and parts[-1] == 0:
         parts = parts[:-1]
-    return parts
+    rest = v[m.end() :]
+    if ecosystem in _SEMVER_ECOSYSTEMS:
+        return VersionKey(parts, _semver_stage(rest))
+    if ecosystem == Ecosystem.PYPI:
+        return VersionKey(parts, _pep440_stage(rest))
+    return VersionKey(parts)
 
 
 class Package(Entity):
@@ -185,7 +236,7 @@ class AffectedSpan(Model):
     fixed: Version | None = None
     last_affected: Version | None = None
 
-    def contains(self, key: tuple[int, ...], ecosystem: Ecosystem) -> bool | None:
+    def contains(self, key: VersionKey, ecosystem: Ecosystem) -> bool | None:
         low = () if self.introduced == "0" else version_key(self.introduced, ecosystem)
         if low is None:
             return None
@@ -241,8 +292,8 @@ class AffectedPackage(Model):
             return fixes[0]
 
         def above(
-            pairs: list[tuple[tuple[int, ...] | None, Version]],
-        ) -> list[tuple[tuple[int, ...], Version]]:
+            pairs: list[tuple[VersionKey | None, Version]],
+        ) -> list[tuple[VersionKey, Version]]:
             return sorted((k, f) for k, f in pairs if k is not None and k > have)
 
         own = above(
