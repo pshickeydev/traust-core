@@ -445,6 +445,31 @@ def test_malformed_local_fixture_repositories_still_fail(
     assert any("metadata.repository" in error for error in result.errors)
 
 
+@pytest.mark.parametrize("strict", [False, True])
+@pytest.mark.parametrize(
+    "repository",
+    [
+        "file:///fixtures/one;file:///fixtures/two",
+        "file:///fixtures/one;https://example.com/org/repo",
+        "file:///fixtures/one file:///fixtures/two",
+        "file:///fixtures/one\nfile:///fixtures/two",
+        "file:///fixtures/repo;name",
+    ],
+)
+def test_concatenated_fixture_repositories_fail_without_a_fixture_warning(
+    reporting: ReportingService, tmp_path: Path, repository: str, strict: bool
+) -> None:
+    report = valid_report()
+    report["metadata"]["repository"] = repository
+    path = write(tmp_path, "bad-security-audit.json", report)
+
+    (result,) = reporting.validate_reports(path, strict=strict)
+
+    assert not result.passed
+    assert any("metadata.repository" in error for error in result.errors)
+    assert not any("local fixture checkout" in warning for warning in result.warnings)
+
+
 def test_disposition_blocks_reconcile() -> None:
     assert _cross(cumulative_report()).errors == []
     cases: list[tuple[Callable[[Doc], Any], str]] = [
