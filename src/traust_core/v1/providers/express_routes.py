@@ -115,7 +115,10 @@ class _Scope:
 class _Express:
     sources: list[_Source]
     receivers: set[_Key] = field(default_factory=set)
-    uses: dict[_Key, list[tuple[int, list[str], list[str]]]] = field(default_factory=dict)
+    uses: dict[_Key, list[tuple[int, list[str], list[str], str | None]]] = field(
+        default_factory=dict
+    )
+    used: dict[_Key, list[tuple[int, str | None, _Source, Node]]] = field(default_factory=dict)
     mounts: dict[_Key, list[_Mount]] = field(default_factory=dict)
     policies: dict[_Key, list[tuple[str, str]]] = field(default_factory=dict)
     exports: dict[str, dict[str, str]] = field(default_factory=dict)
@@ -367,7 +370,11 @@ class _Express:
             for arg in args:
                 child = self._key(rel, arg)
                 if child is not None:
-                    before = [u for u in self.uses.get(parent, []) if u[0] < call.start_byte]
+                    before = [
+                        u
+                        for u in self.uses.get(parent, [])
+                        if u[0] < call.start_byte and _under(prefix or "/", u[3])
+                    ]
                     self.mounts.setdefault(child, []).append(
                         _Mount(
                             parent,
@@ -380,8 +387,11 @@ class _Express:
                 g, u = self._names(src, arg)
                 guards += g
                 unguards += u
-            if prefix is None and (guards or unguards):
-                self.uses.setdefault(parent, []).append((call.start_byte, guards, unguards))
+            if guards or unguards:
+                self.uses.setdefault(parent, []).append((call.start_byte, guards, unguards, prefix))
+            self.used.setdefault(parent, []).extend(
+                (call.start_byte, prefix, src, a) for a in args if self._key(rel, a) is None
+            )
 
     def _prefix(self, src: _Source, node: Node) -> str | None:
         """A `use` path: a string, a constant naming one, or the first of an array of them."""
@@ -397,12 +407,16 @@ class _Express:
             return "<dynamic>"
         if node.type == "identifier":
             name = src.text(node)
-            for d in _walk(src.root):
-                if (
-                    d.type == "variable_declarator"
-                    and src.text(d.child_by_field_name("name")) == name
-                ):
-                    return src.string(d.child_by_field_name("value"))
+            for stmt in src.root.named_children:
+                stmt = stmt.child_by_field_name("declaration") or stmt  # `export const`
+                if stmt.type != "lexical_declaration" or not src.text(stmt).startswith("const"):
+                    continue
+                for d in stmt.named_children:
+                    if (
+                        d.type == "variable_declarator"
+                        and src.text(d.child_by_field_name("name")) == name
+                    ):
+                        return src.string(d.child_by_field_name("value"))
         return None
 
     def _backstage(self, src: _Source, call: Node, prop: str) -> None:
@@ -497,7 +511,11 @@ class _Express:
         elif last.type in ("arrow_function", "function_expression", "function"):
             g, u = _bare_guard_calls(src, last)
             guards, unguards = guards + g, unguards + u
-        before = [u for u in self.uses.get(key, []) if u[0] < call.start_byte]
+        before = [
+            u
+            for u in self.uses.get(key, [])
+            if u[0] < call.start_byte and _under(src.string(path) or "", u[3])
+        ]
         rows = []
         for scope in self.chains(key):
             full = scope.prefix + pattern
@@ -530,11 +548,31 @@ class _Express:
                     guarded=bool(authenticating),
                     middleware=handlers[:-1],
                     preloaded=self._preloaded(key),
-                    unguarded=[h for h in _flat(handlers[:-1]) if not self._names(src, h)[0]],
+                    unguarded=self._unguarded(src, call, key, path, handlers),
                 )
                 row.own(facts, own.code.fields, guards=authenticating)
             rows.append(_mark(row, key[1], dynamic, src.file.rel))
         return rows
+
+    def _unguarded(
+        self, src: _Source, call: Node, key: _Key, path: Node, handlers: list[Node]
+    ) -> list[tuple[str, Node]]:
+        """The middleware a route runs that isn't a guard: its chain, and each `use` that covers
+        it on its router (before it) or a router it is mounted under."""
+        out = [(src.file.rel, h) for h in _flat(handlers[:-1]) if not self._names(src, h)[0]]
+        relative = src.string(path) or ""
+        pending, seen = [key], set()
+        while pending:
+            k = pending.pop()
+            if k in seen:
+                continue
+            seen.add(k)
+            for pos, prefix, where, node in self.used.get(k, []):
+                covers = k != key or (pos < call.start_byte and _under(relative, prefix))
+                if covers and not self._names(where, node)[0]:
+                    out.append((where.file.rel, node))
+            pending += [m.parent for m in self.mounts.get(k, [])]
+        return out
 
     def _preloaded(self, key: _Key) -> set[str]:
         """The path params a `router.param(name, …)` callback loads before the route runs: on its
@@ -592,27 +630,40 @@ class _Express:
         return guards
 
 
+def _under(path: str, prefix: str | None) -> bool:
+    """Whether a `use(prefix, …)` runs for `path` (relative to its router)."""
+    if prefix is None:
+        return True
+    if prefix == "<dynamic>":
+        return False
+    base = prefix.rstrip("/")
+    return not base or path == base or path.startswith(base + "/")
+
+
 def _flat(nodes: list[Node]) -> list[Node]:
-    out = []
-    for node in nodes:
-        node = _unwrap(node) or node
-        out += _flat(node.named_children) if node.type == "array" else [node]
+    out, stack = [], list(reversed(nodes))
+    while stack:
+        popped = stack.pop()
+        node = _unwrap(popped) or popped
+        if node.type == "array":
+            stack += reversed(node.named_children)
+        else:
+            out.append(node)
     return out
 
 
 def _identifiers(src: _Source, node: Node) -> list[str]:
     """The dotted names an expression is made of (a callee and its name arguments)."""
-    node = _unwrap(node) or node
-    if node.type in ("identifier", "member_expression", "property_identifier"):
-        return [src.text(node)]
-    if node.type == "call_expression":
-        return [
-            *_identifiers(src, node.child_by_field_name("function")),
-            *(n for a in _args(node) for n in _identifiers(src, a)),
-        ]
-    if node.type in ("arguments", "array", "spread_element"):
-        return [n for c in node.named_children for n in _identifiers(src, c)]
-    return []
+    out, stack = [], [node]
+    while stack:
+        node = _unwrap(stack.pop()) or node
+        if node.type in ("identifier", "member_expression", "property_identifier"):
+            out.append(src.text(node))
+        elif node.type == "call_expression":
+            stack += reversed([node.child_by_field_name("function"), *_args(node)])
+        elif node.type in ("arguments", "array", "spread_element"):
+            stack += reversed(node.named_children)
+    return out
 
 
 def _bare_guard_calls(src: _Source, fn: Node) -> tuple[list[str], list[str]]:

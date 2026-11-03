@@ -703,6 +703,47 @@ def test_holes_a_review_found_stay_closed(
             + "));\n});\n",
             "caller-blind",
         ),
+        # a schema nested a thousand deep
+        (
+            'const Deep = mongoose.model("Deep", new mongoose.Schema('
+            + "{ a: " * 1200
+            + "String"
+            + " }" * 1200
+            + "));\n"
+            'app.get("/a/:id", requireAuth, async (req, res) => {\n'
+            "  res.json(await Deep.findById(req.params.id));\n});\n",
+            "caller-blind",
+        ),
+        # middleware arrays nested a thousand deep
+        (
+            'app.get("/a/:id", '
+            + "[" * 1200
+            + "requireAuth"
+            + "]" * 1200
+            + ", async (req, res) => {\n"
+            "  res.json(await Post.findById(req.params.id));\n});\n",
+            "caller-blind",
+        ),
+        # conversions nested a thousand deep
+        (
+            'app.get("/a/:id", requireAuth, async (req, res) => {\n'
+            "  res.json(await Post.findById("
+            + "String(" * 1200
+            + "req.params.id"
+            + ")" * 1200
+            + "));\n});\n",
+            "caller-blind",
+        ),
+        # `where` nested a thousand deep
+        (
+            'app.get("/a/:id", requireAuth, async (req, res) => {\n'
+            "  res.json(await Post.findOne("
+            + "{ where: " * 1200
+            + "{ _id: req.params.id }"
+            + " }" * 1200
+            + "));\n});\n",
+            "caller-blind",
+        ),
         # schema names bound to each other
         (
             "function a() { const schema = opts; }\nfunction b() { const opts = schema; }\n"
@@ -712,6 +753,7 @@ def test_holes_a_review_found_stay_closed(
             "caller-blind",
         ),
     ],
+    ids=["or-chain", "member-chain", "schema", "arrays", "conversions", "where", "schema-loop"],
 )
 def test_pathological_code_neither_crashes_nor_credits(
     tmp_path: Path, route: str, ownership: str
