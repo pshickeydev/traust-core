@@ -12,7 +12,7 @@ from collections import Counter
 from collections.abc import Mapping, Sequence
 from datetime import date, datetime
 from enum import StrEnum
-from typing import Any, NamedTuple, NewType, Self
+from typing import Any, Literal, NamedTuple, NewType, Self
 from uuid import UUID
 
 from pydantic import Field, computed_field
@@ -20,6 +20,7 @@ from pydantic import Field, computed_field
 from traust_core.v1.errors import NotFoundError, ValidationError
 from traust_core.v1.models.artifacts import ImpactAnalysisArtifact
 from traust_core.v1.models.base import AppendOnly, Entity, Model
+from traust_core.v1.models.common import RepoPath
 from traust_core.v1.models.findings import SkillInput
 from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.models.vocabulary import (
@@ -542,13 +543,24 @@ class ImpactEvidence(Model):
         return c.INCONCLUSIVE
 
 
+class UnresolvedManifest(Model):
+    """A dependency manifest the SBOM tool saw but could not resolve: its packages are missing
+    from the SBOM, so they are unknown, never absent."""
+
+    ecosystem: Ecosystem
+    path: RepoPath
+    reason: Literal["no-lockfile"] = "no-lockfile"
+
+
 class DependencyIngest(Model):
-    """A commit's manifest SBOM, read from its checkout by a standard tool and ingested."""
+    """A commit's manifest SBOM, read from its checkout by a standard tool and ingested, and
+    the manifests the tool could not resolve."""
 
     repository_ref_id: UUID
     sbom: Sbom
     tool: str
     tool_version: str | None = None
+    unresolved: tuple[UnresolvedManifest, ...] = ()
 
 
 class PackageVersion(Model):

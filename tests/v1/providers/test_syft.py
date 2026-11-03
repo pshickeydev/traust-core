@@ -9,11 +9,11 @@ from pathlib import Path
 
 import pytest
 
-from traust_core.v1.errors import ServiceError
+from traust_core.v1.errors import ServiceError, ValidationError
 from traust_core.v1.providers.base import argv_digest
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.process import ProcessResult, ProcessRunner
-from traust_core.v1.providers.syft import SyftSbom
+from traust_core.v1.providers.syft import SyftSbom, unresolved_manifests
 from traust_core.v1.providers.tools import NoDatabase, ToolProvider, ToolRequest
 
 AT = datetime(2026, 10, 26, tzinfo=UTC)
@@ -76,3 +76,57 @@ def test_syft_is_ready_only_when_the_allowlist_grants_it(
 ) -> None:
     monkeypatch.setattr("shutil.which", lambda _: "/bin/syft")
     assert SyftSbom(ProcessRunner(allowed), FixedClock(AT)).check().ready is ready
+
+
+def _tree(root: Path, files: dict[str, str]) -> Path:
+    for rel, text in files.items():
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        (root / rel).write_text(text)
+    return root
+
+
+PEP621 = '[project]\nname = "app"\ndependencies = ["requests>=2"]\n'
+PACKAGE = json.dumps({"dependencies": {"lodash": "^4"}})
+CSPROJ = '<Project><ItemGroup><PackageReference Include="X" Version="1" /></ItemGroup></Project>'
+
+
+@pytest.mark.parametrize(
+    ("files", "expected"),
+    [
+        ({}, []),
+        ({"pyproject.toml": PEP621}, [("pypi", "pyproject.toml")]),
+        ({"pyproject.toml": PEP621, "uv.lock": ""}, []),
+        ({"pyproject.toml": PEP621, "requirements.txt": "requests==2.32.0\n"}, []),
+        ({"pyproject.toml": '[project]\nname = "app"\n'}, []),  # declares nothing
+        ({"pyproject.toml": "not = = toml"}, [("pypi", "pyproject.toml")]),  # unreadable
+        ({"ui/package.json": PACKAGE}, [("npm", "ui/package.json")]),
+        ({"ui/package.json": PACKAGE, "yarn.lock": ""}, []),  # a workspace lock above
+        ({"ui/package.json": json.dumps({"name": "tool"})}, []),
+        ({"vendor/x/package.json": PACKAGE, "node_modules/y/package.json": PACKAGE}, []),
+        (
+            {"crates/a/Cargo.toml": '[dependencies]\nserde = "1"\n'},
+            [("cargo", "crates/a/Cargo.toml")],
+        ),
+        ({"crates/a/Cargo.toml": '[dependencies]\nserde = "1"\n', "Cargo.lock": ""}, []),
+        ({"Gemfile": "gem 'rails'\n"}, [("ruby", "Gemfile")]),
+        ({"Pipfile": "[packages]\n", "Pipfile.lock": "{}"}, []),
+        ({"src/App/App.csproj": CSPROJ}, [("nuget", "src/App/App.csproj")]),
+        # a project file's lock sits beside it, never above
+        (
+            {"src/App/App.csproj": CSPROJ, "packages.lock.json": "{}"},
+            [("nuget", "src/App/App.csproj")],
+        ),
+        ({"src/App/App.csproj": "<Project />"}, []),
+    ],
+)
+def test_manifests_with_nothing_to_pin_them_are_unresolved(
+    tmp_path: Path, files: dict[str, str], expected: list[tuple[str, str]]
+) -> None:
+    found = unresolved_manifests(_tree(tmp_path, files))
+    assert [(m.ecosystem, m.path) for m in found] == expected
+    assert all(m.reason == "no-lockfile" for m in found)
+
+
+def test_a_missing_workspace_is_refused(tmp_path: Path) -> None:
+    with pytest.raises(ValidationError):
+        unresolved_manifests(tmp_path / "missing")

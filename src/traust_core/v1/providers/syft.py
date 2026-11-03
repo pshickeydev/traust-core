@@ -4,12 +4,21 @@ manifest parser."""
 from __future__ import annotations
 
 import json
+import os
+import tomllib
+from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
 
-from traust_core.v1.errors import ServiceError
+from traust_core.v1.errors import ServiceError, ValidationError
+from traust_core.v1.models.common import RepoPath
+from traust_core.v1.models.dependencies import UnresolvedManifest
+from traust_core.v1.models.vocabulary import Ecosystem
 from traust_core.v1.providers.base import Acquisition, Readiness, Result, argv_digest
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.process import ProcessRunner
 from traust_core.v1.providers.tools import DatabaseStatus, NoDatabase, ToolRequest
+from traust_core.v1.providers.tree import SKIP_DIRS
 
 # npm devDependencies count, as the retired portfolio graph counted them: without this syft
 # drops them from package-lock (not from yarn.lock), measured 2026-10-28 (dependencies log).
@@ -148,3 +157,94 @@ def _tool_version(raw: bytes) -> str | None:
         raise ServiceError(f"syft wrote no CycloneDX metadata: {e}") from e
     listed = tools.get("components", []) if isinstance(tools, dict) else tools
     return next((str(t["version"]) for t in listed if t.get("name") == "syft"), None)
+
+
+def _json_deps(text: str) -> bool:
+    doc = json.loads(text)
+    keys = ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies")
+    return isinstance(doc, dict) and any(doc.get(k) for k in keys)
+
+
+def _pyproject_deps(text: str) -> bool:
+    doc = tomllib.loads(text)
+    poetry = doc.get("tool", {}).get("poetry", {}).get("dependencies", {})
+    return bool(doc.get("project", {}).get("dependencies")) or bool(set(poetry) - {"python"})
+
+
+def _cargo_deps(text: str) -> bool:
+    doc = tomllib.loads(text)
+    tables = ("dependencies", "dev-dependencies", "build-dependencies")
+    return any(doc.get(t) for t in tables) or bool(doc.get("workspace", {}).get("dependencies"))
+
+
+def _requirements(name: str) -> bool:
+    return name.endswith(".txt") and "requirements" in name
+
+
+@dataclass(frozen=True)
+class _Locked:
+    """A manifest whose versions syft reads only from a lockfile (syft 1.51), the files that pin
+    it, and whether one above it counts (workspaces lock at their root; a project file's
+    packages.lock.json sits beside it). Measured gaps: dependencies log 2026-10-28."""
+
+    ecosystem: Ecosystem
+    manifest: Callable[[str], bool]
+    declares: Callable[[str], bool]
+    locks: frozenset[str]
+    above: bool = True
+    beside: Callable[[str], bool] = lambda _: False
+
+
+_LOCKED = (
+    _Locked(Ecosystem.NPM, lambda n: n == "package.json", _json_deps,
+            frozenset({"package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml",
+                       "bun.lock"})),
+    _Locked(Ecosystem.PYPI, lambda n: n == "pyproject.toml", _pyproject_deps,
+            frozenset({"poetry.lock", "uv.lock", "pdm.lock", "Pipfile.lock"}),
+            beside=_requirements),
+    _Locked(Ecosystem.PYPI, lambda n: n == "Pipfile", lambda _: True, frozenset({"Pipfile.lock"}),
+            above=False),
+    _Locked(Ecosystem.CARGO, lambda n: n == "Cargo.toml", _cargo_deps, frozenset({"Cargo.lock"})),
+    _Locked(Ecosystem.RUBY, lambda n: n == "Gemfile", lambda _: True, frozenset({"Gemfile.lock"})),
+    _Locked(Ecosystem.NUGET, lambda n: n.endswith((".csproj", ".fsproj", ".vbproj")),
+            lambda text: "<PackageReference" in text, frozenset({"packages.lock.json"}),
+            above=False),
+)  # fmt: skip
+
+
+def _declares(rule: _Locked, path: Path) -> bool:
+    try:
+        return rule.declares(path.read_text(encoding="utf-8", errors="replace"))
+    except (ValueError, tomllib.TOMLDecodeError):
+        return True  # syft can't read it either: whatever it declares is unknown
+    except OSError as e:
+        raise ServiceError(f"cannot read manifest {path.name}: {e}") from e
+
+
+def unresolved_manifests(workspace: Path) -> tuple[UnresolvedManifest, ...]:
+    """The checkout's dependency manifests that declare dependencies with nothing to pin them:
+    syft resolves them only through a lockfile, so their packages are missing from the SBOM.
+    Vendored and generated trees are skipped, as the profilers skip them."""
+    if not workspace.is_dir():
+        raise ValidationError(f"workspace is not a directory: {workspace}")
+    held: dict[PurePosixPath, set[str]] = {}
+    for top, dirs, names in os.walk(workspace, followlinks=False):
+        dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS)
+        held[PurePosixPath(Path(top).relative_to(workspace).as_posix())] = set(names)
+
+    def locked(rule: _Locked, directory: PurePosixPath) -> bool:
+        if any(n in rule.locks or rule.beside(n) for n in held[directory]):
+            return True
+        return rule.above and any(rule.locks & held.get(d, set()) for d in directory.parents)
+
+    found = []
+    for directory, names in sorted(held.items()):
+        for name in sorted(names):
+            path = workspace / directory / name
+            if path.is_symlink() or not path.is_file():
+                continue
+            for rule in _LOCKED:
+                if rule.manifest(name) and not locked(rule, directory) and _declares(rule, path):
+                    rel = RepoPath((directory / name).as_posix())
+                    found.append(UnresolvedManifest(ecosystem=rule.ecosystem, path=rel))
+    return tuple(found)
