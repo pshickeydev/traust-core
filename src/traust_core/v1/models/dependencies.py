@@ -90,13 +90,14 @@ class VersionKey(NamedTuple):
     stage: tuple[int | tuple[int, int | str], ...] = (0,)
 
 
-def _semver_stage(rest: str) -> tuple[int | tuple[int, int | str], ...]:
+def _semver_stage(rest: str, fold: bool) -> tuple[int | tuple[int, int | str], ...]:
     """SemVer 2 precedence: a pre-release sorts below its release, identifiers compare
-    numerically when numeric, else lexically, numeric first; build metadata is ignored."""
+    numerically when numeric, else lexically (case-insensitively when `fold`: NuGet), numeric
+    first; build metadata is ignored."""
     m = _SEMVER_PRERELEASE.fullmatch(rest)
     if not m:
         return (0,)
-    ids = m.group(1).split(".")
+    ids = (m.group(1).lower() if fold else m.group(1)).split(".")
     return (-1, *((0, int(i)) if _NUMERIC_ID.fullmatch(i) else (1, i) for i in ids))
 
 
@@ -136,7 +137,7 @@ def version_key(version: str, ecosystem: Ecosystem) -> VersionKey | None:
         parts = parts[:-1]
     rest = v[m.end() :]
     if ecosystem in _SEMVER_ECOSYSTEMS:
-        return VersionKey(parts, _semver_stage(rest))
+        return VersionKey(parts, _semver_stage(rest, ecosystem == Ecosystem.NUGET))
     if ecosystem == Ecosystem.PYPI:
         return VersionKey(parts, _pep440_stage(rest))
     return VersionKey(parts)

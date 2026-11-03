@@ -101,9 +101,14 @@ def test_pre_releases_sort_below_their_release(ecosystem: Ecosystem, ascending: 
 
 @pytest.mark.parametrize(
     ("version", "ecosystem", "same_as"),
-    [("2.0-1", PYPI, "2.0.post1"), ("2.0r1", PYPI, "2.0.post1"), ("2.0.0RC1", PYPI, "2.0rc1")],
+    [
+        ("2.0-1", PYPI, "2.0.post1"),
+        ("2.0r1", PYPI, "2.0.post1"),
+        ("2.0.0RC1", PYPI, "2.0rc1"),
+        ("1.0.0-RC1", Ecosystem.NUGET, "1.0.0-rc1"),  # NuGet compares pre-release case-blind
+    ],
 )
-def test_pep440_spellings_of_one_version_are_equal(
+def test_spellings_of_one_version_are_equal(
     version: str, ecosystem: Ecosystem, same_as: str
 ) -> None:
     assert version_key(version, ecosystem) == version_key(same_as, ecosystem)
@@ -113,6 +118,10 @@ def test_a_pre_release_of_the_fix_is_still_affected() -> None:
     fixed_in_2 = package(span("0", "2.0.0"), ecosystem=NPM)
     assert fixed_in_2.affects(Version("2.0.0-rc.1")) is True
     assert fixed_in_2.affects(Version("2.0.0")) is False
+
+
+def test_semver_pre_release_case_still_orders_outside_nuget() -> None:
+    assert version_key("1.0.0-RC1", NPM) < version_key("1.0.0-rc1", NPM)  # type: ignore[operator]
 
 
 def test_go_needs_three_components_and_orders_numerically() -> None:
