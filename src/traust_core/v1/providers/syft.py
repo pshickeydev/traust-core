@@ -228,8 +228,8 @@ def _requirements(name: str) -> bool:
 @dataclass(frozen=True)
 class _Rule:
     """A manifest syft can't fully resolve (syft 1.51) unless `locks` pin it, beside it or, with
-    `above`, higher in the tree (workspaces lock at their root; a project file's
-    packages.lock.json sits beside it). No locks: syft reads it directly and drops what
+    `above`, higher in the tree (npm, Python and Cargo workspaces lock at their root; a Gemfile,
+    Pipfile or project file locks beside itself). No locks: syft reads it directly and drops what
     `declares` finds. Measured gaps: dependencies log 2026-10-28."""
 
     ecosystem: Ecosystem
@@ -245,14 +245,14 @@ _RULES = (
           frozenset({"package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml",
                      "bun.lock"})),
     _Rule(Ecosystem.PYPI, lambda n: n == "pyproject.toml", _pyproject_deps,
-          frozenset({"poetry.lock", "uv.lock", "pdm.lock", "Pipfile.lock"})),
+          frozenset({"poetry.lock", "uv.lock", "pdm.lock"})),
     _Rule(Ecosystem.PYPI, lambda n: n == "Pipfile", _pipfile_deps, frozenset({"Pipfile.lock"}),
           above=False),
     _Rule(Ecosystem.PYPI, _requirements, _unpinned_requirements,
           reason=ManifestCoverageReason.UNPINNED),
     _Rule(Ecosystem.CARGO, lambda n: n == "Cargo.toml", _cargo_deps, frozenset({"Cargo.lock"})),
     _Rule(Ecosystem.RUBY, lambda n: n == "Gemfile", lambda text: bool(_GEM.search(text)),
-          frozenset({"Gemfile.lock"})),
+          frozenset({"Gemfile.lock"}), above=False),
     _Rule(Ecosystem.NUGET, lambda n: n.endswith((".csproj", ".fsproj", ".vbproj")),
           lambda text: "<PackageReference" in text, frozenset({"packages.lock.json"}),
           above=False),

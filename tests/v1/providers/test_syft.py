@@ -145,6 +145,13 @@ CARGO = '[dependencies]\nserde = "1"\n'
         ({"Cargo.toml": "workspace = []\n"}, []),
         ({"Gemfile": "gem 'rails'\n"}, [("ruby", "Gemfile")]),
         ({"Gemfile": "source 'https://rubygems.org'\n"}, []),
+        # a nested Gemfile locks beside itself, never at the root
+        ({"app/Gemfile": "gem 'rails'\n", "Gemfile.lock": "GEM\n"}, [("ruby", "app/Gemfile")]),
+        # a Pipfile.lock pins the Pipfile, not a pyproject beside it
+        (
+            {"pyproject.toml": PEP621, "Pipfile.lock": '{"default": {}}'},
+            [("pypi", "pyproject.toml")],
+        ),
         ({"src/App/App.csproj": CSPROJ}, [("nuget", "src/App/App.csproj")]),
         ({"src/App/App.fsproj": CSPROJ}, [("nuget", "src/App/App.fsproj")]),
         # a project file's lock sits beside it, never above
