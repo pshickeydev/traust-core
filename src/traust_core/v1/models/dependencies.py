@@ -65,8 +65,12 @@ def package_name(ecosystem: Ecosystem, name: str) -> str:
     return name.lower() if ecosystem == Ecosystem.NPM else name
 
 
+def is_advisory_identifier(raw: str) -> bool:
+    return _ADVISORY_ID.fullmatch(raw) is not None
+
+
 def parse_advisory_identifier(raw: str) -> AdvisoryIdentifier:
-    if not _ADVISORY_ID.fullmatch(raw):
+    if not is_advisory_identifier(raw):
         raise ValidationError(f"not an advisory id: {raw!r}")
     return AdvisoryIdentifier(raw)
 

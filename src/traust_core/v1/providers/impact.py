@@ -18,7 +18,7 @@ from traust_core.v1.models.vocabulary import (
     ImpactSymbolUsageScan,
     ImpactTier,
 )
-from traust_core.v1.providers.base import Acquisition, Readiness, Result, argv_digest, on_path
+from traust_core.v1.providers.base import Acquisition, Readiness, Result, argv_digest
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.process import ProcessRunner
 from traust_core.v1.providers.tools import ToolRequest
@@ -59,7 +59,7 @@ class GovulncheckAnalyzer:
         self._clock = clock
 
     def check(self) -> Readiness:
-        return on_path(self.name, missing=" not on PATH")
+        return self._process.readiness(self.name)
 
     def evidence(self, query: ImpactQuery, request: ToolRequest) -> Result[ImpactEvidence]:
         workspace = request.checkout()

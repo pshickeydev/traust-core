@@ -30,7 +30,7 @@ from traust_core.v1.providers.base import Acquisition, ProviderRegistry, Readine
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.feeds import FeedProvider
 from traust_core.v1.providers.osv import OsvAdvisoryLookup, parse_osv
-from traust_core.v1.providers.process import ProcessResult
+from traust_core.v1.providers.process import ProcessResult, ProcessRunner
 from traust_core.v1.providers.sources import CheckoutRequest, Workspace
 from traust_core.v1.providers.syft import MANIFESTS, SyftSbom
 from traust_core.v1.providers.tools import ToolRequest
@@ -491,7 +491,7 @@ def test_a_failed_syft_run_raises(tmp_path: Path, runner: FakeRunner, match: str
 
 def test_syft_is_ready_only_when_installed(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("shutil.which", lambda name: None)
-    assert not SyftSbom(FakeRunner(), FixedClock(AT)).check().ready  # type: ignore[arg-type]
+    assert not SyftSbom(ProcessRunner(["syft"]), FixedClock(AT)).check().ready
 
 
 # package_advisories: OSV by package and version (secure-rpm-audit's fetch_advisory.py osv)

@@ -81,6 +81,7 @@ from traust_core.v1.models.dependencies import (
     Version,
     VexStatus,
     VulnerableSymbol,
+    is_advisory_identifier,
     package_name,
     parse_advisory_identifier,
     repo_label,
@@ -910,11 +911,16 @@ class ExposureService:
     def _with_alias_packages(self, record: AdvisoryRecord) -> AdvisoryRecord:
         # OSV's CVE records name no package; their GHSA / GO- / PYSEC- aliases state the same
         # vulnerability per ecosystem. Without this, which id is asked first decides the analysis.
+        # Only ids the impact schema admits are asked: the rest (BIT-, distro ids) name packages
+        # in ecosystems core doesn't model.
         lookup = self._require_lookup()
         named = [
             alias
             for name in record.aliases
-            if (alias := lookup.record(name).data) and alias.affected and not alias.withdrawn
+            if is_advisory_identifier(name)
+            and (alias := lookup.record(name).data)
+            and alias.affected
+            and not alias.withdrawn
         ]
         packages: dict[tuple[Ecosystem, str], AffectedPackage] = {}
         for p in (p for alias in named for p in alias.affected):

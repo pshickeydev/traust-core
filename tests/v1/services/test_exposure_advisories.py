@@ -152,7 +152,8 @@ def test_a_cve_record_naming_no_package_takes_its_aliases_packages(engine: Engin
         Ecosystem.GO, "golang.org/x/net"
     )
     assert record.package_sources == (GHSA.source, GO.source)
-    assert lookup.asked == ["CVE-2023-39325", *CVE.aliases]
+    # BIT-golang-2023-39325 (Bitnami, unmodeled) is never asked
+    assert lookup.asked == ["CVE-2023-39325", "GHSA-4374-p667-p6c8", "GO-2023-2102"]
     with SqlTraustUnitOfWork(engine) as uow:
         assert len(uow.advisory_packages.list_for_advisory(record.advisory_id)) == 2
 
