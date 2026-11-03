@@ -406,7 +406,13 @@ def test_metadata_repository_is_the_fingerprint_root(repository: str | None, err
 
 @pytest.mark.parametrize("strict", [False, True])
 @pytest.mark.parametrize(
-    "repository", ["file:///fixtures/canaries/example-app", "file:///fixtures/canaries/my%20app"]
+    "repository",
+    [
+        "file:///fixtures/canaries/example-app",
+        "file:///fixtures/canaries/my%20app",
+        "file:///fixtures/canaries/my%3Fapp",
+        "file:///fixtures/canaries/my%23app",
+    ],
 )
 def test_local_fixture_repository_has_one_warning_and_keeps_its_identity(
     reporting: ReportingService, tmp_path: Path, repository: str, strict: bool
@@ -468,6 +474,39 @@ def test_concatenated_fixture_repositories_fail_without_a_fixture_warning(
     assert not result.passed
     assert any("metadata.repository" in error for error in result.errors)
     assert not any("local fixture checkout" in warning for warning in result.warnings)
+
+
+@pytest.mark.parametrize("strict", [False, True])
+@pytest.mark.parametrize(
+    "repository",
+    [
+        " file:///fixtures/repo",
+        "file:///fixtures/repo ",
+        "\tfile:///fixtures/repo\n",
+        "file:///fixtures/repo?ref=main",
+        "file:///fixtures/repo#section",
+        "file:///fixtures/repo?ref=main#section",
+        "file:///fixtures/repo?",
+        "file:///fixtures/repo#",
+    ],
+)
+def test_padded_or_suffixed_fixture_citations_fail_in_every_validation_path(
+    reporting: ReportingService, tmp_path: Path, repository: str, strict: bool
+) -> None:
+    report = valid_report()
+    report["metadata"]["repository"] = repository
+    path = write(tmp_path, "bad-security-audit.json", report)
+    original = path.read_bytes()
+
+    (result,) = reporting.validate_reports(path, strict=strict)
+
+    assert not result.passed
+    assert any("metadata.repository" in error for error in result.errors)
+    assert not any("local fixture checkout" in warning for warning in result.warnings)
+    assert any("is not a URL" in warning for warning in result.warnings)
+    if strict:
+        assert any("does not parse" in warning for warning in result.warnings)
+    assert path.read_bytes() == original
 
 
 def test_disposition_blocks_reconcile() -> None:
