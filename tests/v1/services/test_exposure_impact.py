@@ -34,6 +34,7 @@ from traust_core.v1.models.dependencies import (
     ImpactEvidence,
     ImpactInput,
     ImpactQuery,
+    NoManifestSbomError,
     SymbolResolution,
     Version,
 )
@@ -324,6 +325,7 @@ def test_a_commit_outside_the_blast_radius_does_not_import_it(engine: Engine) ->
     [app] = refs(engine, 1)
     assert app.id is not None
     exposure = service(engine)
+    exposure.ingest_sbom(sbom(("example.com/other", "v1.0.0")), app.id)
     prepared = exposure.prepare(advisory_id(exposure), app.id)
     assert prepared.evidence == ImpactEvidence(l1_depends_on=False)
     assert prepared.document("1").repos[0].classification == "not_imported"
@@ -355,7 +357,16 @@ def test_products_shipping_the_commit_are_named(engine: Engine) -> None:
         uow.commit()
     assert app.id is not None
     exposure = service(engine)
+    exposure.ingest_sbom(sbom(("example.com/other", "v1.0.0")), app.id)
     assert exposure.prepare(advisory_id(exposure), app.id).products == ("product-a", "product-b")
+
+
+def test_a_commit_with_no_manifest_sbom_is_unknown_not_unimported(engine: Engine) -> None:
+    [app] = refs(engine, 1)
+    assert app.id is not None
+    exposure = service(engine)
+    with pytest.raises(NoManifestSbomError):
+        exposure.prepare(advisory_id(exposure), app.id)
 
 
 def test_an_advisory_naming_no_package_cant_be_prepared(engine: Engine) -> None:
@@ -1182,6 +1193,7 @@ def test_judged_symbols_are_recorded_without_a_checkout(engine: Engine) -> None:
     [app] = refs(engine, 1)
     assert app.id is not None
     exposure = service(engine)
+    exposure.ingest_sbom(sbom(("example.com/other", "v1.0.0")), app.id)
     found = advisory_id(exposure)
     prepared = exposure.prepare(found, app.id, judged=("grpc.Server.Serve",))
     assert prepared.symbols is not None and prepared.symbols.status == "resolved"

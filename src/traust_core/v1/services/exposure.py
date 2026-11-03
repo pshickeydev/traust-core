@@ -479,11 +479,15 @@ class ExposureService:
         """One commit against one advisory: the advisory as its source states it now, what the
         commit's manifest and the images built from it hold of it, and the evidence that gives.
         Given the commit's checkout, the analysis tiers for the package's ecosystem run too,
-        unless its SBOMs already rule it out."""
+        unless its SBOMs already rule it out. A commit with no manifest SBOM raises: unknown is
+        never read as not imported."""
         advisory = self.get_advisory(advisory_id)
         record = self.find_advisory(AdvisoryIdentifier(advisory.identifier))
         if record is None or not record.affected:
             raise NotFoundError(f"advisory {advisory.identifier}: its source names no package")
+        with self._uow:
+            if self._inventory.get_ref(repository_ref_id).manifest_sbom_id is None:
+                raise NoManifestSbomError(repository_ref_id)
         rows = [r for r in self.affected(advisory_id) if r.repository_ref_id == repository_ref_id]
         portfolio = self._require_portfolio()
         with self._uow as uow:
