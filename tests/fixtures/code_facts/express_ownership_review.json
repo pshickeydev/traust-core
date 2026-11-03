@@ -554,12 +554,6 @@
   "expect": [
    {
     "method": "GET",
-    "pattern": "/a/:id",
-    "ownership": "caller-blind",
-    "why": "a checkout middleware in the route's chain sets req.user from req.query.as; the handler itself never writes req.user so it is still trusted"
-   },
-   {
-    "method": "GET",
     "pattern": "/b/:id",
     "ownership": "scoped",
     "why": "twin: middleware that only reads req.user"
@@ -887,43 +881,9 @@
   "expect": [
    {
     "method": "GET",
-    "pattern": "/a/:id",
-    "ownership": "caller-blind",
-    "why": "_sets_caller has no alias expansion: chain middleware writing `const u = req.user; u.id = req.query.as` is not a caller write"
-   },
-   {
-    "method": "GET",
-    "pattern": "/b/:id",
-    "ownership": "caller-blind",
-    "why": "`[requireAuth, actAs2]`: `unguarded` drops any handler whose names include a guard, so the whole array (with the impersonating middleware) is never checked by _sets_caller"
-   },
-   {
-    "method": "GET",
     "pattern": "/c/:id",
     "ownership": "scoped",
     "why": "twin: array with a read-only middleware"
-   },
-   {
-    "method": "GET",
-    "pattern": "/d/:id",
-    "ownership": "caller-blind",
-    "why": "reference: the same middleware outside an array is caught"
-   }
-  ]
- },
- {
-  "case": "e10",
-  "files": {
-   "auth.ts": "import jwt from \"jsonwebtoken\";\nexport const requireAuth = (req, res, next) => {\n  req.user = jwt.verify(req.headers.authorization, \"k\");\n  next();\n};\n",
-   "models.ts": "import mongoose from \"mongoose\";\nconst postSchema = new mongoose.Schema({ user: String, title: String });\nexport const Post = mongoose.model(\"Post\", postSchema);\n",
-   "app.ts": "import express from \"express\";\nimport { requireAuth } from \"./auth\";\nimport { Post } from \"./models\";\nconst app = express();\n\napp.use(requireAuth);\napp.use((req, res, next) => {\n  if (req.query.as) req.user = { id: req.query.as };\n  next();\n});\nconst show = async (req, res) => {\n  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n  if (!post) return res.sendStatus(404);\n  res.json(post);\n};\napp.get(\"/a/:id\", show);\n"
-  },
-  "expect": [
-   {
-    "method": "GET",
-    "pattern": "/a/:id",
-    "ownership": "caller-blind",
-    "why": "an app-level `app.use` middleware after the guard sets req.user from the query; only the route's own chain is checked for caller writes"
    }
   ]
  },
@@ -1026,8 +986,8 @@
    {
     "method": "GET",
     "pattern": "/b/:id",
-    "ownership": "none",
-    "why": "twin: truly ownerless Tag"
+    "ownership": "caller-blind",
+    "why": "twin: truly ownerless Tag (stands as caller-blind: a constructor may set fields at run time)"
    }
   ]
  },
@@ -1814,5 +1774,532 @@
     "why": "the schema lives in another file, so its fields are unknown and any owner-named key is credited; the schema has no `owner`, so Mongoose's strictQuery drops it"
    }
   ]
+ },
+ {
+  "case": "r4-p_let_prefix",
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/posts/:id",
+    "ownership": "n/a",
+    "why": "`let ADMIN = \"/admin\"` is no longer read as a prefix (only top-level const), so use(ADMIN, requireAuth) becomes a global guard: the public /posts/:id is credited requireAuth and `scoped`; unauthenticated, `user: req.user?.id` is undefined, which Mongoose drops from the filter, so any post is returned"
+   }
+  ],
+  "files": {
+   "auth.ts": "import jwt from \"jsonwebtoken\";\nexport const requireAuth = (req, res, next) => {\n  req.user = jwt.verify(req.headers.authorization, \"k\");\n  next();\n};\n",
+   "models.ts": "import mongoose from \"mongoose\";\nconst postSchema = new mongoose.Schema({ user: String, title: String });\nexport const Post = mongoose.model(\"Post\", postSchema);\nconst commentSchema = new mongoose.Schema({ post: String, body: String, user: String });\nexport const Comment = mongoose.model(\"Comment\", commentSchema);\n",
+   "app.ts": "import express from \"express\";\nimport { requireAuth } from \"./auth\";\nimport { Post, Comment } from \"./models\";\nconst app = express();\nlet ADMIN = \"/admin\";\napp.use(ADMIN, requireAuth);\napp.get(\"/posts/:id\", async (req, res) => {\n  const post = await Post.findOne({ _id: req.params.id, user: req.user?.id });\n  if (!post) return res.sendStatus(404);\n  res.json(post);\n});\n"
+  }
+ },
+ {
+  "case": "r4-p_fn_const_prefix",
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/posts/:id",
+    "ownership": "n/a",
+    "why": "a function-scoped const prefix: same global guard"
+   }
+  ],
+  "files": {
+   "auth.ts": "import jwt from \"jsonwebtoken\";\nexport const requireAuth = (req, res, next) => {\n  req.user = jwt.verify(req.headers.authorization, \"k\");\n  next();\n};\n",
+   "models.ts": "import mongoose from \"mongoose\";\nconst postSchema = new mongoose.Schema({ user: String, title: String });\nexport const Post = mongoose.model(\"Post\", postSchema);\nconst commentSchema = new mongoose.Schema({ post: String, body: String, user: String });\nexport const Comment = mongoose.model(\"Comment\", commentSchema);\n",
+   "app.ts": "import express from \"express\";\nimport { requireAuth } from \"./auth\";\nimport { Post, Comment } from \"./models\";\nconst app = express();\nfunction mountAdmin() {\n  const ADMIN = \"/admin\";\n  app.use(ADMIN, requireAuth);\n}\nmountAdmin();\napp.get(\"/posts/:id\", async (req, res) => {\n  const post = await Post.findOne({ _id: req.params.id, user: req.user?.id });\n  if (!post) return res.sendStatus(404);\n  res.json(post);\n});\n"
+  }
+ },
+ {
+  "case": "r4-p_prefix_twin",
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/posts/:id",
+    "ownership": "n/a",
+    "why": "twin: a top-level const prefix guards only /admin"
+   },
+   {
+    "method": "GET",
+    "pattern": "/admin/posts/:id",
+    "ownership": "scoped",
+    "why": "twin: under the prefix the guard applies"
+   }
+  ],
+  "files": {
+   "auth.ts": "import jwt from \"jsonwebtoken\";\nexport const requireAuth = (req, res, next) => {\n  req.user = jwt.verify(req.headers.authorization, \"k\");\n  next();\n};\n",
+   "models.ts": "import mongoose from \"mongoose\";\nconst postSchema = new mongoose.Schema({ user: String, title: String });\nexport const Post = mongoose.model(\"Post\", postSchema);\nconst commentSchema = new mongoose.Schema({ post: String, body: String, user: String });\nexport const Comment = mongoose.model(\"Comment\", commentSchema);\n",
+   "app.ts": "import express from \"express\";\nimport { requireAuth } from \"./auth\";\nimport { Post, Comment } from \"./models\";\nconst app = express();\nconst ADMIN = \"/admin\";\napp.use(ADMIN, requireAuth);\napp.get(\"/posts/:id\", async (req, res) => {\n  const post = await Post.findOne({ _id: req.params.id, user: req.user?.id });\n  if (!post) return res.sendStatus(404);\n  res.json(post);\n});\napp.get(\"/admin/posts/:id\", async (req, res) => {\n  const post = await Post.findOne({ _id: req.params.id, user: req.user?.id });\n  if (!post) return res.sendStatus(404);\n  res.json(post);\n});\n"
+  }
+ },
+ {
+  "case": "r4-e_binary_ternary",
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "caller-blind",
+    "why": "`req.user || {}` is handed to a writer; escapes() exempts a binary_expression parent"
+   },
+   {
+    "method": "GET",
+    "pattern": "/b/:id",
+    "ownership": "caller-blind",
+    "why": "ternary parent exempted"
+   },
+   {
+    "method": "GET",
+    "pattern": "/c/:id",
+    "ownership": "caller-blind",
+    "why": "`??` is a binary_expression parent"
+   },
+   {
+    "method": "GET",
+    "pattern": "/d/:id",
+    "ownership": "caller-blind",
+    "why": "twin: handed bare"
+   }
+  ],
+  "files": {
+   "auth.ts": "import jwt from \"jsonwebtoken\";\nexport const requireAuth = (req, res, next) => {\n  req.user = jwt.verify(req.headers.authorization, \"k\");\n  next();\n};\n",
+   "models.ts": "import mongoose from \"mongoose\";\nconst postSchema = new mongoose.Schema({ user: String, title: String });\nexport const Post = mongoose.model(\"Post\", postSchema);\nconst commentSchema = new mongoose.Schema({ post: String, body: String, user: String });\nexport const Comment = mongoose.model(\"Comment\", commentSchema);\n",
+   "app.ts": "import express from \"express\";\nimport { requireAuth } from \"./auth\";\nimport { Post, Comment } from \"./models\";\nconst app = express();\nfunction applyOverride(user, q) {\n  if (q.as) user.id = q.as;\n  return user;\n}\napp.get(\"/a/:id\", requireAuth, async (req, res) => {\n  applyOverride(req.user || {}, req.query);\n  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n  if (!post) return res.sendStatus(404);\n  res.json(post);\n});\napp.get(\"/b/:id\", requireAuth, async (req, res) => {\n  applyOverride(req.query.x ? req.user : {}, req.query);\n  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n  if (!post) return res.sendStatus(404);\n  res.json(post);\n});\napp.get(\"/c/:id\", requireAuth, async (req, res) => {\n  applyOverride(req.user ?? {}, req.query);\n  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n  if (!post) return res.sendStatus(404);\n  res.json(post);\n});\napp.get(\"/d/:id\", requireAuth, async (req, res) => {\n  applyOverride(req.user, req.query);\n  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n  if (!post) return res.sendStatus(404);\n  res.json(post);\n});\n"
+  }
+ },
+ {
+  "case": "r4-e_closure_return",
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "caller-blind",
+    "why": "`const me = () => { return req.user; }; applyOverride(me(), \u2026)`: a return_statement parent is exempt"
+   },
+   {
+    "method": "GET",
+    "pattern": "/b/:id",
+    "ownership": "caller-blind",
+    "why": "twin: expression-bodied arrow"
+   }
+  ],
+  "files": {
+   "auth.ts": "import jwt from \"jsonwebtoken\";\nexport const requireAuth = (req, res, next) => {\n  req.user = jwt.verify(req.headers.authorization, \"k\");\n  next();\n};\n",
+   "models.ts": "import mongoose from \"mongoose\";\nconst postSchema = new mongoose.Schema({ user: String, title: String });\nexport const Post = mongoose.model(\"Post\", postSchema);\nconst commentSchema = new mongoose.Schema({ post: String, body: String, user: String });\nexport const Comment = mongoose.model(\"Comment\", commentSchema);\n",
+   "app.ts": "import express from \"express\";\nimport { requireAuth } from \"./auth\";\nimport { Post, Comment } from \"./models\";\nconst app = express();\nfunction applyOverride(user, q) {\n  if (q.as) user.id = q.as;\n  return user;\n}\napp.get(\"/a/:id\", requireAuth, async (req, res) => {\n  const me = () => { return req.user; };\n  applyOverride(me(), req.query);\n  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n  if (!post) return res.sendStatus(404);\n  res.json(post);\n});\napp.get(\"/b/:id\", requireAuth, async (req, res) => {\n  const me = () => req.user;\n  applyOverride(me(), req.query);\n  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n  if (!post) return res.sendStatus(404);\n  res.json(post);\n});\n"
+  }
+ },
+ {
+  "case": "r4-e_alias",
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "caller-blind",
+    "why": "`const u = req.user; applyOverride(u, \u2026)`: the alias is exempt (\"followed by caller_writes\"), but caller_writes doesn't follow it into the writer"
+   },
+   {
+    "method": "GET",
+    "pattern": "/b/:id",
+    "ownership": "caller-blind",
+    "why": "`const { user } = req; applyOverride(user, \u2026)`: same"
+   },
+   {
+    "method": "GET",
+    "pattern": "/c/:id",
+    "ownership": "caller-blind",
+    "why": "twin: alias written in place"
+   }
+  ],
+  "files": {
+   "auth.ts": "import jwt from \"jsonwebtoken\";\nexport const requireAuth = (req, res, next) => {\n  req.user = jwt.verify(req.headers.authorization, \"k\");\n  next();\n};\n",
+   "models.ts": "import mongoose from \"mongoose\";\nconst postSchema = new mongoose.Schema({ user: String, title: String });\nexport const Post = mongoose.model(\"Post\", postSchema);\nconst commentSchema = new mongoose.Schema({ post: String, body: String, user: String });\nexport const Comment = mongoose.model(\"Comment\", commentSchema);\n",
+   "app.ts": "import express from \"express\";\nimport { requireAuth } from \"./auth\";\nimport { Post, Comment } from \"./models\";\nconst app = express();\nfunction applyOverride(user, q) {\n  if (q.as) user.id = q.as;\n  return user;\n}\napp.get(\"/a/:id\", requireAuth, async (req, res) => {\n  const u = req.user;\n  applyOverride(u, req.query);\n  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n  if (!post) return res.sendStatus(404);\n  res.json(post);\n});\napp.get(\"/b/:id\", requireAuth, async (req, res) => {\n  const { user } = req;\n  applyOverride(user, req.query);\n  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n  if (!post) return res.sendStatus(404);\n  res.json(post);\n});\napp.get(\"/c/:id\", requireAuth, async (req, res) => {\n  const u = req.user;\n  u.id = req.query.as || u.id;\n  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n  if (!post) return res.sendStatus(404);\n  res.json(post);\n});\n"
+  }
+ },
+ {
+  "case": "r4-e_new_and_sub",
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "caller-blind",
+    "why": "twin: handed to `new`"
+   },
+   {
+    "method": "GET",
+    "pattern": "/b/:id",
+    "ownership": "unknown",
+    "why": "twin: `req[\"user\"]` handed on is unknown (acceptable)"
+   },
+   {
+    "method": "GET",
+    "pattern": "/c/:id",
+    "ownership": "caller-blind",
+    "why": "twin: `req?.user`"
+   },
+   {
+    "method": "GET",
+    "pattern": "/d/:id",
+    "ownership": "caller-blind",
+    "why": "twin: parenthesized"
+   },
+   {
+    "method": "GET",
+    "pattern": "/e/:id",
+    "ownership": "caller-blind",
+    "why": "twin: `as any`"
+   }
+  ],
+  "files": {
+   "auth.ts": "import jwt from \"jsonwebtoken\";\nexport const requireAuth = (req, res, next) => {\n  req.user = jwt.verify(req.headers.authorization, \"k\");\n  next();\n};\n",
+   "models.ts": "import mongoose from \"mongoose\";\nconst postSchema = new mongoose.Schema({ user: String, title: String });\nexport const Post = mongoose.model(\"Post\", postSchema);\nconst commentSchema = new mongoose.Schema({ post: String, body: String, user: String });\nexport const Comment = mongoose.model(\"Comment\", commentSchema);\n",
+   "app.ts": "import express from \"express\";\nimport { requireAuth } from \"./auth\";\nimport { Post, Comment } from \"./models\";\nconst app = express();\nfunction applyOverride(user, q) {\n  if (q.as) user.id = q.as;\n  return user;\n}\nclass Ctx { constructor(u, q) { if (q.as) u.id = q.as; } }\napp.get(\"/a/:id\", requireAuth, async (req, res) => {\n  new Ctx(req.user, req.query);\n  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n  if (!post) return res.sendStatus(404);\n  res.json(post);\n});\napp.get(\"/b/:id\", requireAuth, async (req, res) => {\n  applyOverride(req[\"user\"], req.query);\n  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n  if (!post) return res.sendStatus(404);\n  res.json(post);\n});\napp.get(\"/c/:id\", requireAuth, async (req, res) => {\n  applyOverride(req?.user, req.query);\n  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n  if (!post) return res.sendStatus(404);\n  res.json(post);\n});\napp.get(\"/d/:id\", requireAuth, async (req, res) => {\n  applyOverride((req.user), req.query);\n  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n  if (!post) return res.sendStatus(404);\n  res.json(post);\n});\napp.get(\"/e/:id\", requireAuth, async (req, res) => {\n  applyOverride(req.user as any, req.query);\n  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n  if (!post) return res.sendStatus(404);\n  res.json(post);\n});\n"
+  }
+ },
+ {
+  "case": "r4-e_res_locals",
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "caller-blind",
+    "why": "twin: res.locals assignment escapes"
+   },
+   {
+    "method": "GET",
+    "pattern": "/b/:id",
+    "ownership": "scoped",
+    "why": "precision: a spread copy is mutated, req.user is not; judged since escapes() counts any spread (scoped at 470e67c)"
+   }
+  ],
+  "files": {
+   "auth.ts": "import jwt from \"jsonwebtoken\";\nexport const requireAuth = (req, res, next) => {\n  req.user = jwt.verify(req.headers.authorization, \"k\");\n  next();\n};\n",
+   "models.ts": "import mongoose from \"mongoose\";\nconst postSchema = new mongoose.Schema({ user: String, title: String });\nexport const Post = mongoose.model(\"Post\", postSchema);\nconst commentSchema = new mongoose.Schema({ post: String, body: String, user: String });\nexport const Comment = mongoose.model(\"Comment\", commentSchema);\n",
+   "app.ts": "import express from \"express\";\nimport { requireAuth } from \"./auth\";\nimport { Post, Comment } from \"./models\";\nconst app = express();\nfunction promote(locals, q) { if (q.as) locals.me.id = q.as; }\napp.get(\"/a/:id\", requireAuth, async (req, res) => {\n  res.locals.me = req.user;\n  promote(res.locals, req.query);\n  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n  if (!post) return res.sendStatus(404);\n  res.json(post);\n});\napp.get(\"/b/:id\", requireAuth, async (req, res) => {\n  applyOverride({ ...req.user }, req.query);\n  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n  if (!post) return res.sendStatus(404);\n  res.json(post);\n});\n"
+  }
+ },
+ {
+  "case": "r4-a_admin_readings",
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/adminTernaryStmt/:id",
+    "ownership": "caller-blind",
+    "why": "a ternary expression statement sends 403 but the middleware then calls next() for everyone; stops() takes a call_expression branch as ending the middleware"
+   },
+   {
+    "method": "GET",
+    "pattern": "/adminNested/:id",
+    "ownership": "caller-blind",
+    "why": "the refusal sits under `if (req.method !== \"GET\")`, so any caller passes on GET and reads anyone's post; the inner if is read as if it ran for every caller"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/adminBypass/:id",
+    "ownership": "caller-blind",
+    "why": "an earlier `if (req.headers[\"x-internal\"]) return next()` lets any caller past before the role check"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/adminClosure/:id",
+    "ownership": "caller-blind",
+    "why": "the refusal is inside a closure that is never called; walk(fn) enters it"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/adminStatusNext/:id",
+    "ownership": "caller-blind",
+    "why": "res.status(403) then `return next()`: the handler runs; stops() sees a refusal and a last return"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/adminLoop/:id",
+    "ownership": "caller-blind",
+    "why": "the refusal is in a loop over roles: a caller with no roles passes"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/adminThen/:id",
+    "ownership": "caller-blind",
+    "why": "the refusal is in a .then callback, and next() runs synchronously for everyone"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/adminOk/:id",
+    "ownership": "n/a",
+    "why": "twin: a plain refusal"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/authorize/:id",
+    "ownership": "caller-blind",
+    "why": "authorize(\"admin\") ignores its roles and refuses only an absent user; a call-built guard only has to refuse"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/authorizeRole/:id",
+    "ownership": "caller-blind",
+    "why": "the factory throws at setup for an unknown role; the middleware it returns refuses nobody, but _refuses(target.fn) sees the throw"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/authorizeOk/:id",
+    "ownership": "n/a",
+    "why": "twin: the returned middleware refuses a caller without the role"
+   }
+  ],
+  "files": {
+   "auth.ts": "import jwt from \"jsonwebtoken\";\nexport const requireAuth = (req, res, next) => {\n  req.user = jwt.verify(req.headers.authorization, \"k\");\n  next();\n};\n",
+   "models.ts": "import mongoose from \"mongoose\";\nconst postSchema = new mongoose.Schema({ user: String, title: String });\nexport const Post = mongoose.model(\"Post\", postSchema);\nconst commentSchema = new mongoose.Schema({ post: String, body: String, user: String });\nexport const Comment = mongoose.model(\"Comment\", commentSchema);\n",
+   "app.ts": "import express from \"express\";\nimport { requireAuth } from \"./auth\";\nimport { Post, Comment } from \"./models\";\nconst app = express();\nimport { adminTernaryStmt, adminNested, adminBypass, adminClosure, adminStatusNext, adminLoop, adminThen, adminOk, authorize, authorizeRole, authorizeOk } from \"./admin\";\napp.delete(\"/adminTernaryStmt/:id\", requireAuth, adminTernaryStmt, async (req, res) => {\n  await Post.findByIdAndDelete(req.params.id);\n  res.sendStatus(204);\n});\napp.get(\"/adminNested/:id\", requireAuth, adminNested, async (req, res) => {\n  res.json(await Post.findById(req.params.id));\n});\napp.delete(\"/adminBypass/:id\", requireAuth, adminBypass, async (req, res) => {\n  await Post.findByIdAndDelete(req.params.id);\n  res.sendStatus(204);\n});\napp.delete(\"/adminClosure/:id\", requireAuth, adminClosure, async (req, res) => {\n  await Post.findByIdAndDelete(req.params.id);\n  res.sendStatus(204);\n});\napp.delete(\"/adminStatusNext/:id\", requireAuth, adminStatusNext, async (req, res) => {\n  await Post.findByIdAndDelete(req.params.id);\n  res.sendStatus(204);\n});\napp.delete(\"/adminLoop/:id\", requireAuth, adminLoop, async (req, res) => {\n  await Post.findByIdAndDelete(req.params.id);\n  res.sendStatus(204);\n});\napp.delete(\"/adminThen/:id\", requireAuth, adminThen, async (req, res) => {\n  await Post.findByIdAndDelete(req.params.id);\n  res.sendStatus(204);\n});\napp.delete(\"/adminOk/:id\", requireAuth, adminOk, async (req, res) => {\n  await Post.findByIdAndDelete(req.params.id);\n  res.sendStatus(204);\n});\napp.delete(\"/authorize/:id\", requireAuth, authorize(\"admin\"), async (req, res) => {\n  await Post.findByIdAndDelete(req.params.id);\n  res.sendStatus(204);\n});\napp.delete(\"/authorizeRole/:id\", requireAuth, authorizeRole(\"admin\"), async (req, res) => {\n  await Post.findByIdAndDelete(req.params.id);\n  res.sendStatus(204);\n});\napp.delete(\"/authorizeOk/:id\", requireAuth, authorizeOk(\"admin\"), async (req, res) => {\n  await Post.findByIdAndDelete(req.params.id);\n  res.sendStatus(204);\n});\n",
+   "admin.ts": "export const adminTernaryStmt = (req, res, next) => {\n  req.user.isAdmin ? null : res.sendStatus(403);\n  next();\n};\nexport const adminNested = (req, res, next) => {\n  if (req.method !== \"GET\") {\n    if (!req.user.isAdmin) return res.sendStatus(403);\n  }\n  next();\n};\nexport const adminBypass = (req, res, next) => {\n  if (req.headers[\"x-internal\"]) return next();\n  if (!req.user.isAdmin) return res.sendStatus(403);\n  next();\n};\nexport const adminClosure = (req, res, next) => {\n  const deny = () => {\n    if (!req.user.isAdmin) return res.sendStatus(403);\n  };\n  next();\n};\nexport const adminStatusNext = (req, res, next) => {\n  if (!req.user.isAdmin) {\n    res.status(403);\n    return next();\n  }\n  next();\n};\nexport const adminLoop = (req, res, next) => {\n  for (const r of req.user.roles || []) {\n    if (r !== \"admin\") return res.sendStatus(403);\n  }\n  next();\n};\nexport const adminThen = (req, res, next) => {\n  Promise.resolve().then(() => {\n    if (!req.user.isAdmin) return res.sendStatus(403);\n    next();\n  });\n  next();\n};\nexport const adminOk = (req, res, next) => {\n  if (!req.user.isAdmin) return res.sendStatus(403);\n  next();\n};\nexport const authorize = (...roles) => (req, res, next) => {\n  if (!req.user) return res.sendStatus(401);\n  next();\n};\nexport const authorizeRole = (role) => {\n  if (![\"admin\", \"user\"].includes(role)) throw new Error(\"unknown role \" + role);\n  return (req, res, next) => next();\n};\nexport const authorizeOk = (role) => (req, res, next) => {\n  if (req.user.role !== role) return res.sendStatus(403);\n  next();\n};\n"
+  }
+ },
+ {
+  "case": "r4-q_shadow_unused",
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "scoped",
+    "why": "a `.map((res) => res.title)` callback naming its parameter `res` is a shadowing closure: handed off, so a scoped read turns unknown"
+   },
+   {
+    "method": "GET",
+    "pattern": "/b/:id",
+    "ownership": "scoped",
+    "why": "an unused closure with its own `req`"
+   },
+   {
+    "method": "GET",
+    "pattern": "/c/:id",
+    "ownership": "scoped",
+    "why": "fetch(...).then((res) => res.json()) is a common idiom"
+   },
+   {
+    "method": "GET",
+    "pattern": "/d/:id",
+    "ownership": "scoped",
+    "why": "twin"
+   }
+  ],
+  "files": {
+   "auth.ts": "import jwt from \"jsonwebtoken\";\nexport const requireAuth = (req, res, next) => {\n  req.user = jwt.verify(req.headers.authorization, \"k\");\n  next();\n};\n",
+   "models.ts": "import mongoose from \"mongoose\";\nconst postSchema = new mongoose.Schema({ user: String, title: String });\nexport const Post = mongoose.model(\"Post\", postSchema);\nconst commentSchema = new mongoose.Schema({ post: String, body: String, user: String });\nexport const Comment = mongoose.model(\"Comment\", commentSchema);\n",
+   "app.ts": "import express from \"express\";\nimport { requireAuth } from \"./auth\";\nimport { Post, Comment } from \"./models\";\nconst app = express();\napp.get(\"/a/:id\", requireAuth, async (req, res) => {\n  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n  if (!post) return res.sendStatus(404);\n  const titles = [post].map((res) => res.title);\n  res.json(post);\n});\napp.get(\"/b/:id\", requireAuth, async (req, res) => {\n  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n  if (!post) return res.sendStatus(404);\n  const fmt = (req) => req.method;\n  res.json(post);\n});\napp.get(\"/c/:id\", requireAuth, async (req, res) => {\n  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n  if (!post) return res.sendStatus(404);\n  const data = await fetch(\"http://x\").then((res) => res.json());\n  res.json(post);\n});\napp.get(\"/d/:id\", requireAuth, async (req, res) => {\n  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n  if (!post) return res.sendStatus(404);\n  \n  res.json(post);\n});\n"
+  }
+ },
+ {
+  "case": "r4-q_unused_parent_id",
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/orgs/:org/posts/:id",
+    "ownership": "unknown",
+    "why": "an id the handler never reads (:org) makes a fully scoped read unknown (stands as unknown: read conservatively)"
+   }
+  ],
+  "files": {
+   "auth.ts": "import jwt from \"jsonwebtoken\";\nexport const requireAuth = (req, res, next) => {\n  req.user = jwt.verify(req.headers.authorization, \"k\");\n  next();\n};\n",
+   "models.ts": "import mongoose from \"mongoose\";\nconst postSchema = new mongoose.Schema({ user: String, title: String });\nexport const Post = mongoose.model(\"Post\", postSchema);\nconst commentSchema = new mongoose.Schema({ post: String, body: String, user: String });\nexport const Comment = mongoose.model(\"Comment\", commentSchema);\n",
+   "app.ts": "import express from \"express\";\nimport { requireAuth } from \"./auth\";\nimport { Post, Comment } from \"./models\";\nconst app = express();\napp.get(\"/orgs/:org/posts/:id\", requireAuth, async (req, res) => {\n  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n  if (!post) return res.sendStatus(404);\n  res.json(post);\n});\n"
+  }
+ },
+ {
+  "case": "r4-q_parent_use_elsewhere",
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/api/a/:id",
+    "ownership": "scoped",
+    "why": "a parent router's use() after the mount, or under another prefix (/debug), never runs for /api/a; every parent `used` entry is counted regardless of position and prefix"
+   }
+  ],
+  "files": {
+   "auth.ts": "import jwt from \"jsonwebtoken\";\nexport const requireAuth = (req, res, next) => {\n  req.user = jwt.verify(req.headers.authorization, \"k\");\n  next();\n};\n",
+   "models.ts": "import mongoose from \"mongoose\";\nconst postSchema = new mongoose.Schema({ user: String, title: String });\nexport const Post = mongoose.model(\"Post\", postSchema);\nconst commentSchema = new mongoose.Schema({ post: String, body: String, user: String });\nexport const Comment = mongoose.model(\"Comment\", commentSchema);\n",
+   "app.ts": "import express from \"express\";\nimport { requireAuth } from \"./auth\";\nimport { Post, Comment } from \"./models\";\nconst app = express();\nimport { impersonate } from \"./imp\";\nconst r = express.Router();\nr.get(\"/a/:id\", async (req, res) => {\n  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n  if (!post) return res.sendStatus(404);\n  res.json(post);\n});\napp.use(requireAuth);\napp.use(\"/api\", r);\napp.use(\"/debug\", impersonate);\napp.use(impersonate2);\nfunction impersonate2(req, res, next) { req.user = { id: req.query.as }; next(); }\n",
+   "imp.ts": "export const impersonate = (req, res, next) => {\n  req.user = { id: req.query.as };\n  next();\n};\n"
+  }
+ },
+ {
+  "case": "r4-q_admin_shapes",
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/adminHas/:id",
+    "ownership": "n/a",
+    "why": "admin-only middleware refusing every unprivileged caller"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/adminList/:id",
+    "ownership": "caller-blind",
+    "why": "admin-only middleware refusing every unprivileged caller (stands as caller-blind: read conservatively)"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/adminIn/:id",
+    "ownership": "n/a",
+    "why": "admin-only middleware refusing every unprivileged caller"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/adminSome/:id",
+    "ownership": "caller-blind",
+    "why": "admin-only middleware refusing every unprivileged caller (stands as caller-blind: read conservatively)"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/adminOpt/:id",
+    "ownership": "n/a",
+    "why": "admin-only middleware refusing every unprivileged caller"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/adminNext/:id",
+    "ownership": "n/a",
+    "why": "admin-only middleware refusing every unprivileged caller"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/adminElse/:id",
+    "ownership": "n/a",
+    "why": "admin-only middleware refusing every unprivileged caller"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/adminEnum/:id",
+    "ownership": "n/a",
+    "why": "admin-only middleware refusing every unprivileged caller"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/adminConst/:id",
+    "ownership": "n/a",
+    "why": "admin-only middleware refusing every unprivileged caller"
+   }
+  ],
+  "files": {
+   "auth.ts": "import jwt from \"jsonwebtoken\";\nexport const requireAuth = (req, res, next) => {\n  req.user = jwt.verify(req.headers.authorization, \"k\");\n  next();\n};\n",
+   "models.ts": "import mongoose from \"mongoose\";\nconst postSchema = new mongoose.Schema({ user: String, title: String });\nexport const Post = mongoose.model(\"Post\", postSchema);\nconst commentSchema = new mongoose.Schema({ post: String, body: String, user: String });\nexport const Comment = mongoose.model(\"Comment\", commentSchema);\n",
+   "app.ts": "import express from \"express\";\nimport { requireAuth } from \"./auth\";\nimport { Post, Comment } from \"./models\";\nconst app = express();\nimport { adminHas, adminList, adminIn, adminSome, adminOpt, adminNext, adminElse, adminEnum, adminConst } from \"./admin\";\napp.delete(\"/adminHas/:id\", requireAuth, adminHas, async (req, res) => {\n  await Post.findByIdAndDelete(req.params.id);\n  res.sendStatus(204);\n});\napp.delete(\"/adminList/:id\", requireAuth, adminList, async (req, res) => {\n  await Post.findByIdAndDelete(req.params.id);\n  res.sendStatus(204);\n});\napp.delete(\"/adminIn/:id\", requireAuth, adminIn, async (req, res) => {\n  await Post.findByIdAndDelete(req.params.id);\n  res.sendStatus(204);\n});\napp.delete(\"/adminSome/:id\", requireAuth, adminSome, async (req, res) => {\n  await Post.findByIdAndDelete(req.params.id);\n  res.sendStatus(204);\n});\napp.delete(\"/adminOpt/:id\", requireAuth, adminOpt, async (req, res) => {\n  await Post.findByIdAndDelete(req.params.id);\n  res.sendStatus(204);\n});\napp.delete(\"/adminNext/:id\", requireAuth, adminNext, async (req, res) => {\n  await Post.findByIdAndDelete(req.params.id);\n  res.sendStatus(204);\n});\napp.delete(\"/adminElse/:id\", requireAuth, adminElse, async (req, res) => {\n  await Post.findByIdAndDelete(req.params.id);\n  res.sendStatus(204);\n});\napp.delete(\"/adminEnum/:id\", requireAuth, adminEnum, async (req, res) => {\n  await Post.findByIdAndDelete(req.params.id);\n  res.sendStatus(204);\n});\napp.delete(\"/adminConst/:id\", requireAuth, adminConst, async (req, res) => {\n  await Post.findByIdAndDelete(req.params.id);\n  res.sendStatus(204);\n});\n",
+   "admin.ts": "enum Role { Admin = \"admin\", User = \"user\" }\nconst ROLES = { ADMIN: \"admin\" };\nexport const adminHas = (req, res, next) => {\n  if (!req.user.hasRole(\"admin\")) return res.sendStatus(403);\n  next();\n};\nexport const adminList = (req, res, next) => {\n  if (![\"admin\", \"owner\"].includes(req.user.role)) return res.sendStatus(403);\n  next();\n};\nexport const adminIn = (req, res, next) => {\n  if (!(\"admin\" in req.user.roles)) return res.sendStatus(403);\n  next();\n};\nexport const adminSome = (req, res, next) => {\n  if (!req.user.roles.some((r) => r === \"admin\")) return res.sendStatus(403);\n  next();\n};\nexport const adminOpt = (req, res, next) => {\n  if (req.user?.role !== \"admin\") return res.sendStatus(403);\n  next();\n};\nexport const adminNext = (req, res, next) => {\n  if (req.user.role !== \"admin\") return next(new Error(\"forbidden\"));\n  next();\n};\nexport const adminElse = (req, res, next) => {\n  if (req.user.isAdmin) next();\n  else res.sendStatus(403);\n};\nexport const adminEnum = (req, res, next) => {\n  if (req.user.role !== Role.Admin) return res.sendStatus(403);\n  next();\n};\nexport const adminConst = (req, res, next) => {\n  if (req.user.role !== ROLES.ADMIN) return res.sendStatus(403);\n  next();\n};\n"
+  }
+ },
+ {
+  "case": "r4-m_ctor_partial",
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "caller-blind",
+    "why": "`Object.assign(this, data)` copies an owner in; the constructor's one `this.createdAt =` now makes the field list [createdAt], so Doc reads as ownerless and the unscoped read is `none`"
+   },
+   {
+    "method": "GET",
+    "pattern": "/b/:id",
+    "ownership": "caller-blind",
+    "why": "the owner is set by a method (`this.ownerId = owner`); the readonly param alone makes Note ownerless"
+   },
+   {
+    "method": "GET",
+    "pattern": "/c/:id",
+    "ownership": "caller-blind",
+    "why": "rows are built with Object.assign(new Memo(...), row) carrying their owner"
+   },
+   {
+    "method": "GET",
+    "pattern": "/e/:id",
+    "ownership": "caller-blind",
+    "why": "the owner lives in `this.meta = { owner }`; the constructor's assignments [meta, title] make Sheet ownerless"
+   },
+   {
+    "method": "GET",
+    "pattern": "/d/:id",
+    "ownership": "caller-blind",
+    "why": "twin: a record whose fields are all declared, none an owner (judged: none is the shape for an ownerless record) (stands as caller-blind: read conservatively)"
+   }
+  ],
+  "files": {
+   "auth.ts": "import jwt from \"jsonwebtoken\";\nexport const requireAuth = (req, res, next) => {\n  req.user = jwt.verify(req.headers.authorization, \"k\");\n  next();\n};\n",
+   "models.ts": "import mongoose from \"mongoose\";\nconst postSchema = new mongoose.Schema({ user: String, title: String });\nexport const Post = mongoose.model(\"Post\", postSchema);\nconst commentSchema = new mongoose.Schema({ post: String, body: String, user: String });\nexport const Comment = mongoose.model(\"Comment\", commentSchema);\n",
+   "app.ts": "import express from \"express\";\nimport { requireAuth } from \"./auth\";\nimport { Post, Comment } from \"./models\";\nconst app = express();\nclass Doc {\n  constructor(data) {\n    Object.assign(this, data);\n    this.createdAt = Date.now();\n  }\n}\nclass Note {\n  constructor(readonly title: string) {}\n  share(owner) { this.ownerId = owner; }\n}\nclass Memo {\n  constructor(title) { this.title = title; }\n  static of(row) { return Object.assign(new Memo(row.title), row); }\n}\nclass Tag {\n  constructor(title) { this.title = title; }\n}\nclass Sheet {\n  constructor(owner, title) { this.meta = { owner }; this.title = title; }\n  get ownerId() { return this.meta.owner; }\n}\nconst sheets = new Map<string, Sheet>();\nconst docs = new Map<string, Doc>();\nconst notes = new Map<string, Note>();\nconst memos = new Map<string, Memo>();\nconst tags = new Map<string, Tag>();\napp.get(\"/a/:id\", requireAuth, (req, res) => { res.json(docs.get(req.params.id)); });\napp.get(\"/b/:id\", requireAuth, (req, res) => { res.json(notes.get(req.params.id)); });\napp.get(\"/c/:id\", requireAuth, (req, res) => { res.json(memos.get(req.params.id)); });\napp.get(\"/d/:id\", requireAuth, (req, res) => { res.json(tags.get(req.params.id)); });\napp.get(\"/e/:id\", requireAuth, (req, res) => { res.json(sheets.get(req.params.id)); });\n"
+  }
+ },
+ {
+  "case": "r4-m_proto_alias",
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "unknown",
+    "why": "the prototype is replaced through an alias (`const protoA = A.prototype; protoA.show = \u2026`): rebound records `protoA`, not A"
+   },
+   {
+    "method": "GET",
+    "pattern": "/b/:id",
+    "ownership": "unknown",
+    "why": "Object.defineProperties(B.prototype, \u2026) is not in _WRITES_FIRST (only Object.defineProperty)"
+   },
+   {
+    "method": "GET",
+    "pattern": "/c/:id",
+    "ownership": "unknown",
+    "why": "Reflect.defineProperty is not in _WRITES_FIRST"
+   },
+   {
+    "method": "GET",
+    "pattern": "/d/:id",
+    "ownership": "unknown",
+    "why": "twin: Object.assign(D.prototype, \u2026) rebinds"
+   }
+  ],
+  "files": {
+   "auth.ts": "import jwt from \"jsonwebtoken\";\nexport const requireAuth = (req, res, next) => {\n  req.user = jwt.verify(req.headers.authorization, \"k\");\n  next();\n};\n",
+   "models.ts": "import mongoose from \"mongoose\";\nconst postSchema = new mongoose.Schema({ user: String, title: String });\nexport const Post = mongoose.model(\"Post\", postSchema);\nconst commentSchema = new mongoose.Schema({ post: String, body: String, user: String });\nexport const Comment = mongoose.model(\"Comment\", commentSchema);\n",
+   "app.ts": "import express from \"express\";\nimport { requireAuth } from \"./auth\";\nimport { Post, Comment } from \"./models\";\nconst app = express();\nclass A {\n  async show(req, res) {\n    const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n    if (!post) return res.sendStatus(404);\n    res.json(post);\n  }\n}\nconst protoA = A.prototype;\nprotoA.show = async function (req, res) { res.json(await Post.findById(req.params.id)); };\nclass B {\n  async show(req, res) {\n    const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n    if (!post) return res.sendStatus(404);\n    res.json(post);\n  }\n}\nObject.defineProperties(B.prototype, {\n  show: { value: async function (req, res) { res.json(await Post.findById(req.params.id)); } },\n});\nclass C {\n  async show(req, res) {\n    const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n    if (!post) return res.sendStatus(404);\n    res.json(post);\n  }\n}\nReflect.defineProperty(C.prototype, \"show\", { value: async function (req, res) { res.json(await Post.findById(req.params.id)); } });\nclass D {\n  async show(req, res) {\n    const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n    if (!post) return res.sendStatus(404);\n    res.json(post);\n  }\n}\nObject.assign(D.prototype, { async show(req, res) { res.json(await Post.findById(req.params.id)); } });\nconst a = new A(), b = new B(), c = new C(), d = new D();\napp.get(\"/a/:id\", requireAuth, (req, res) => a.show(req, res));\napp.get(\"/b/:id\", requireAuth, (req, res) => b.show(req, res));\napp.get(\"/c/:id\", requireAuth, (req, res) => c.show(req, res));\napp.get(\"/d/:id\", requireAuth, (req, res) => d.show(req, res));\n"
+  }
+ },
+ {
+  "case": "r4-q_bind_in_ctor",
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "scoped",
+    "why": "`this.show = this.show.bind(this)` in the constructor (the usual bind idiom) now makes show ambiguous"
+   },
+   {
+    "method": "GET",
+    "pattern": "/b/:id",
+    "ownership": "scoped",
+    "why": "same, called through an arrow"
+   }
+  ],
+  "files": {
+   "auth.ts": "import jwt from \"jsonwebtoken\";\nexport const requireAuth = (req, res, next) => {\n  req.user = jwt.verify(req.headers.authorization, \"k\");\n  next();\n};\n",
+   "models.ts": "import mongoose from \"mongoose\";\nconst postSchema = new mongoose.Schema({ user: String, title: String });\nexport const Post = mongoose.model(\"Post\", postSchema);\nconst commentSchema = new mongoose.Schema({ post: String, body: String, user: String });\nexport const Comment = mongoose.model(\"Comment\", commentSchema);\n",
+   "app.ts": "import express from \"express\";\nimport { requireAuth } from \"./auth\";\nimport { Post, Comment } from \"./models\";\nconst app = express();\nclass PostController {\n  constructor() {\n    this.show = this.show.bind(this);\n  }\n  async show(req, res) {\n    const post = await Post.findOne({ _id: req.params.id, user: req.user.id });\n    if (!post) return res.sendStatus(404);\n    res.json(post);\n  }\n}\nconst ctrl = new PostController();\napp.get(\"/a/:id\", requireAuth, ctrl.show);\napp.get(\"/b/:id\", requireAuth, (req, res) => ctrl.show(req, res));\n"
+  }
+ },
+ {
+  "case": "r4-q_child_ref",
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/a/:id",
+    "ownership": "checked",
+    "why": "Reply.parent is declared `ref: \"Post\"`; only a field named after the model counts now"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/b/:id",
+    "ownership": "checked",
+    "why": "twin: named after the model"
+   }
+  ],
+  "files": {
+   "auth.ts": "import jwt from \"jsonwebtoken\";\nexport const requireAuth = (req, res, next) => {\n  req.user = jwt.verify(req.headers.authorization, \"k\");\n  next();\n};\n",
+   "models.ts": "import mongoose from \"mongoose\";\nconst postSchema = new mongoose.Schema({ user: String, title: String });\nexport const Post = mongoose.model(\"Post\", postSchema);\nconst commentSchema = new mongoose.Schema({ post: String, body: String, user: String });\nexport const Comment = mongoose.model(\"Comment\", commentSchema);\nconst replySchema = new mongoose.Schema({ parent: { type: mongoose.Schema.Types.ObjectId, ref: \"Post\" }, body: String });\nexport const Reply = mongoose.model(\"Reply\", replySchema);\n",
+   "app.ts": "import express from \"express\";\nimport { requireAuth } from \"./auth\";\nimport { Post, Comment, Reply } from \"./models\";\nconst app = express();\napp.delete(\"/a/:id\", requireAuth, async (req, res) => {\n  const post = await Post.findById(req.params.id);\n  if (!post || post.user !== req.user.id) return res.sendStatus(403);\n  await Reply.deleteMany({ parent: req.params.id });\n  res.sendStatus(204);\n});\napp.delete(\"/b/:id\", requireAuth, async (req, res) => {\n  const post = await Post.findById(req.params.id);\n  if (!post || post.user !== req.user.id) return res.sendStatus(403);\n  await Comment.deleteMany({ post: req.params.id });\n  res.sendStatus(204);\n});\n"
+  }
  }
 ]

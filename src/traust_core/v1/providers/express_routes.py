@@ -118,7 +118,6 @@ class _Express:
     uses: dict[_Key, list[tuple[int, list[str], list[str], str | None]]] = field(
         default_factory=dict
     )
-    used: dict[_Key, list[tuple[int, str | None, _Source, Node]]] = field(default_factory=dict)
     mounts: dict[_Key, list[_Mount]] = field(default_factory=dict)
     policies: dict[_Key, list[tuple[str, str]]] = field(default_factory=dict)
     exports: dict[str, dict[str, str]] = field(default_factory=dict)
@@ -389,9 +388,6 @@ class _Express:
                 unguards += u
             if guards or unguards:
                 self.uses.setdefault(parent, []).append((call.start_byte, guards, unguards, prefix))
-            self.used.setdefault(parent, []).extend(
-                (call.start_byte, prefix, src, a) for a in args if self._key(rel, a) is None
-            )
 
     def _prefix(self, src: _Source, node: Node) -> str | None:
         """A `use` path: a string, a constant naming one, or the first of an array of them."""
@@ -406,17 +402,38 @@ class _Express:
         if node.type == "template_string":
             return "<dynamic>"
         if node.type == "identifier":
+            # a top-level `const` string is the prefix; another string binding of the name is an
+            # unknown one; an import or a function is middleware
             name = src.text(node)
             for stmt in src.root.named_children:
                 stmt = stmt.child_by_field_name("declaration") or stmt  # `export const`
-                if stmt.type != "lexical_declaration" or not src.text(stmt).startswith("const"):
-                    continue
-                for d in stmt.named_children:
+                if (
+                    stmt.type == "function_declaration"
+                    and src.text(stmt.child_by_field_name("name")) == name
+                ):
+                    return None
+                for d in (
+                    stmt.named_children
+                    if stmt.type in ("lexical_declaration", "variable_declaration")
+                    else []
+                ):
                     if (
                         d.type == "variable_declarator"
                         and src.text(d.child_by_field_name("name")) == name
                     ):
-                        return src.string(d.child_by_field_name("value"))
+                        value = src.string(d.child_by_field_name("value"))
+                        if value is None:
+                            return None
+                        return value if src.text(stmt).startswith("const") else "<dynamic>"
+            if name in self.imports.get(src.file.rel, {}):
+                return None
+            if any(
+                d.type == "variable_declarator"
+                and src.text(d.child_by_field_name("name")) == name
+                and src.string(d.child_by_field_name("value")) is not None
+                for d in _walk(src.root)
+            ):
+                return "<dynamic>"
         return None
 
     def _backstage(self, src: _Source, call: Node, prop: str) -> None:
@@ -548,31 +565,10 @@ class _Express:
                     guarded=bool(authenticating),
                     middleware=handlers[:-1],
                     preloaded=self._preloaded(key),
-                    unguarded=self._unguarded(src, call, key, path, handlers),
                 )
                 row.own(facts, own.code.fields, guards=authenticating)
             rows.append(_mark(row, key[1], dynamic, src.file.rel))
         return rows
-
-    def _unguarded(
-        self, src: _Source, call: Node, key: _Key, path: Node, handlers: list[Node]
-    ) -> list[tuple[str, Node]]:
-        """The middleware a route runs that isn't a guard: its chain, and each `use` that covers
-        it on its router (before it) or a router it is mounted under."""
-        out = [(src.file.rel, h) for h in _flat(handlers[:-1]) if not self._names(src, h)[0]]
-        relative = src.string(path) or ""
-        pending, seen = [key], set()
-        while pending:
-            k = pending.pop()
-            if k in seen:
-                continue
-            seen.add(k)
-            for pos, prefix, where, node in self.used.get(k, []):
-                covers = k != key or (pos < call.start_byte and _under(relative, prefix))
-                if covers and not self._names(where, node)[0]:
-                    out.append((where.file.rel, node))
-            pending += [m.parent for m in self.mounts.get(k, [])]
-        return out
 
     def _preloaded(self, key: _Key) -> set[str]:
         """The path params a `router.param(name, …)` callback loads before the route runs: on its

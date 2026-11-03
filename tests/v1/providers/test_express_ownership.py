@@ -744,6 +744,24 @@ def test_holes_a_review_found_stay_closed(
             + "));\n});\n",
             "caller-blind",
         ),
+        # an admin check of a thousand terms
+        (
+            "const requireAdmin = (req, res, next) => {\n  if (!req.user || "
+            + " || ".join(["!req.user.isAdmin"] * 1200)
+            + ") return res.sendStatus(403);\n  next();\n};\n"
+            'app.delete("/a/:id", requireAuth, requireAdmin, async (req, res) => {\n'
+            "  await Post.findByIdAndDelete(req.params.id);\n});\n",
+            "n/a",
+        ),
+        # an admin check under a thousand negations
+        (
+            "const isAdmin = (req, res, next) => {\n  if ("
+            + "!" * 2401
+            + "req.user.isAdmin) return res.sendStatus(403);\n  next();\n};\n"
+            'app.delete("/a/:id", requireAuth, isAdmin, async (req, res) => {\n'
+            "  await Post.findByIdAndDelete(req.params.id);\n});\n",
+            "caller-blind",
+        ),
         # schema names bound to each other
         (
             "function a() { const schema = opts; }\nfunction b() { const opts = schema; }\n"
@@ -753,7 +771,17 @@ def test_holes_a_review_found_stay_closed(
             "caller-blind",
         ),
     ],
-    ids=["or-chain", "member-chain", "schema", "arrays", "conversions", "where", "schema-loop"],
+    ids=[
+        "or-chain",
+        "member-chain",
+        "schema",
+        "arrays",
+        "conversions",
+        "where",
+        "admin-or-chain",
+        "admin-negations",
+        "schema-loop",
+    ],
 )
 def test_pathological_code_neither_crashes_nor_credits(
     tmp_path: Path, route: str, ownership: str
