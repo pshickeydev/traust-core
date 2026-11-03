@@ -26,6 +26,14 @@ _REFUSING_CODES = {"401", "402", "403", "404"}
 _RAISING = {"find", "find_by!", "first!", "take!", "last!", "sole", "find_sole_by", "find!"}
 _NIL_READS = {"find_by", "first", "take", "last", "find_by_id"}
 _WRITES = {
+    "update_attribute",
+    "update_attributes",
+    "update_attributes!",
+    "increment!",
+    "decrement!",
+    "toggle!",
+    "save",
+    "save!",
     "update",
     "update!",
     "update_all",
@@ -41,6 +49,8 @@ _WRITES = {
     "touch",
 }
 _READS = _RAISING | _NIL_READS | {"exists?", "find_each", "pluck", "count"}
+# reads and writes of the one record a key names
+_ONE = _RAISING | _NIL_READS | {"exists?"}
 # query methods that drop conditions, so a relation reaches past the caller's records
 _WIDENING = {
     "or",
@@ -52,6 +62,9 @@ _WIDENING = {
     "except",
     "only",
     "klass",  # `current_user.notes.klass`: the bare class
+    "find_by_sql",
+    "from",
+    "extending",
     "model",
     "base_class",
 }
@@ -94,13 +107,19 @@ _STRING = re.compile(r"\"(?:[^\"\\]|\\.)*\"|'(?:[^'\\]|\\.)*'")
 # the caller's own tenant (`current_user.account_id`); never another user it names
 _TENANT = re.compile(
     r"(?i)^(account|customer|org|organi[sz]ation|workspace|team|client|group|company|realm|"
-    r"tenant)(_?id)?$"
+    r"tenant|project)(_?id)?$"
 )
 _TOKEN_KEY = re.compile(r"(?i)token|api_key|digest|secret|jti")
 _PARAMS = {"params", "request.path_parameters", "request.params", "request.parameters"}
 # views that show the record (`render :show, status: :forbidden`)
 _RECORD_VIEWS = {"show", "edit", "index", "new"}
 _VIEW_KEYS = {"action", "template"}
+_ERROR_VIEW = re.compile(
+    r"(?i)^(forbidden|unauthori[sz]ed|not_found|denied|access_denied|error|errors|40[1-4]|"
+    r"blank|empty|nothing)$"
+)
+# `JWT.decode(token, nil, false)`: a token read without its signature
+_UNVERIFIED = re.compile(r"\bdecode\s*\([^)]*,\s*(false|nil)\s*(,|\))|verify(_signature)?:\s*false")
 _SIGN_IN = {"sign_in", "bypass_sign_in", "login", "log_in", "auto_login", "set_user"}
 _CONVERSIONS = {"to_i", "to_s", "to_param", "presence"}
 _INERT = {"logger", "Rails", "puts", "p", "pp", "flash", "notice", "alert", "t", "I18n"}
@@ -231,6 +250,7 @@ class RubyCode:
         self.policy_src: dict[str, Parsed] = {}
         self.modules: dict[str, list[tuple[Parsed, Node]]] = {}  # module name -> definitions
         self.ability: tuple[Parsed, Node] | None = None
+        self.qualified: dict[str, tuple[Parsed, Node]] = {}  # `Api::Relaxed` -> module
         for rel, src in sources.items():
             self._index(rel, src)
         self.fields = self._fields()
@@ -240,8 +260,9 @@ class RubyCode:
             self._schema(src)
         for n in walk(src.root):
             if n.type == "module":
-                name = src.text(n.child_by_field_name("name")).rsplit("::", 1)[-1]
-                self.modules.setdefault(name, []).append((src, n))
+                written = src.text(n.child_by_field_name("name"))
+                self.modules.setdefault(written.rsplit("::", 1)[-1], []).append((src, n))
+                self.qualified["::".join([*_lexical(src, n), written])] = (src, n)
             if n.type != "class":
                 continue
             name = src.text(n.child_by_field_name("name")).rsplit("::", 1)[-1]
@@ -273,7 +294,7 @@ class RubyCode:
                 }
                 for s in body:
                     if (
-                        s.type == "singleton_method"
+                        s.type in ("singleton_method", "method")
                         and src.text(s.child_by_field_name("name")) == "policy_class"
                     ):
                         found = method_body(s)
@@ -335,6 +356,27 @@ class RubyCode:
                 continue
             out[name] = fields
         return out
+
+    def descendants(self, model: str) -> list[str]:
+        """A model and every model that inherits from it (STI)."""
+        out, queue = [model], [model]
+        while queue:
+            base = queue.pop()
+            for m in self.models.values():
+                if m.base == base and m.name not in out:
+                    out.append(m.name)
+                    queue.append(m.name)
+        return out
+
+    def module(self, name: str) -> tuple[Parsed, Node] | object | None:
+        """A module by the name it's included as: its definition, None when the checkout
+        doesn't define it, or UNREAD when several share the name."""
+        if name in self.qualified:
+            return self.qualified[name]
+        found = self.modules.get(name.rsplit("::", 1)[-1], [])
+        if not found:
+            return None
+        return found[0] if len(found) == 1 else UNREAD
 
     def module_methods(self, src: Parsed, module: Node) -> dict[str, Node]:
         return {
@@ -419,6 +461,20 @@ class RubyCode:
                     if m.type == "method" and src.text(m.child_by_field_name("name")) == "resolve":
                         return src, m
         return None
+
+
+UNREAD = object()  # a module several definitions share a name with
+
+
+def _lexical(src: Parsed, node: Node) -> list[str]:
+    """The modules and classes a node is written inside."""
+    out: list[str] = []
+    parent = node.parent
+    while parent is not None:
+        if parent.type in ("module", "class"):
+            out[:0] = src.text(parent.child_by_field_name("name")).split("::")
+        parent = parent.parent
+    return out
 
 
 def _class_of(association: str) -> str:
@@ -637,7 +693,16 @@ class _Action:
                     )
         self.literals = {name for name, ok in literal.items() if ok}
         self.guarded = guarded
+        self.taint: dict[tuple[str, int, int], bool] = {}
+        self.credentials: dict[tuple[str, int, int, int], bool] = {}
         self.caller_ivars = self._caller_ivars()
+        # what each caller ivar stands for: the user, or the caller's tenant (`@account =
+        # current_user.account`)
+        self.ivar_kind = {
+            name: kinds.pop() if len(kinds) == 1 else "user"
+            for name in self.caller_ivars
+            if (kinds := self._ivar_kinds(name)) is not None
+        }
         self.forged = self._forged()
         self.cancan = cancan
         self.position = 0
@@ -660,36 +725,57 @@ class _Action:
 
     # -- the caller
     def _untrusted(self, src: Parsed, node: Node | None, depth: int = 0) -> bool:
-        """Built from the request's parameters, directly or through a local."""
+        """Built from the request's parameters, directly, through a local or an app helper, or
+        from a token decoded without its signature (`JWT.decode(t, nil, false)`)."""
         if node is None:
             return False
-        if _UNTRUSTED.search(code_text(src, node)):
-            return True
-        return depth < 3 and any(
-            self._untrusted(s, v, depth + 1)
-            for n in walk(node)
-            if n.type == "identifier"
-            for s, v in self.local_values.get(src.text(n), [])
-        )
+        key = (src.file.rel, node.start_byte, node.end_byte)
+        if key not in self.taint:
+            self.taint[key] = False  # a cycle through locals reads as clean until resolved
+            text = code_text(src, node)
+            self.taint[key] = bool(_UNTRUSTED.search(text) or _UNVERIFIED.search(text)) or (
+                depth < 3
+                and any(self._untrusted(s, v, depth + 1) for s, v in self._values(src, node))
+            )
+        return self.taint[key]
+
+    def _values(self, src: Parsed, node: Node) -> list[tuple[Parsed, Node | None]]:
+        """What the locals and the app's own argument-free helpers an expression names
+        return."""
+        out: list[tuple[Parsed, Node | None]] = []
+        for n in walk(node):
+            name = _helper_name(src, n) if n.type in ("identifier", "call") else ""
+            if not name:
+                continue
+            if name in self.local_values:
+                out += self.local_values[name]
+            elif name not in _CALLERS and (found := self.methods(name)) is not None:
+                body = method_body(found[1])
+                out += [(found[0], body[-1])] if body else []
+        return out
 
     def _credential(self, src: Parsed, node: Node | None, ivars: set[str], depth: int = 0) -> bool:
-        """From the session, a cookie, a verified token or the caller (D17, D20)."""
+        """From the session, a cookie, a verified token or the caller (D17, D20); an app
+        helper counts by what it returns, never by its name (`decoded_token`)."""
         if node is None or self._untrusted(src, node):
             return False
-        if _CREDENTIAL.search(self._words(src, node)) or _own_chain(chain_text(src, node)):
-            return True
-        names = {
-            src.text(n): n.type for n in walk(node) if n.type in ("identifier", "instance_variable")
-        }
-        return any(t == "instance_variable" and name in ivars for name, t in names.items()) or (
-            depth < 3
-            and any(
-                self._credential(s, v, ivars, depth + 1)
-                for name, t in names.items()
-                if t == "identifier"
-                for s, v in self.local_values.get(name, [])
+        key = (src.file.rel, node.start_byte, node.end_byte, len(ivars))
+        if key in self.credentials:
+            return self.credentials[key]
+        self.credentials[key] = False
+        found = (
+            bool(_CREDENTIAL.search(self._words(src, node)))
+            or _own_chain(chain_text(src, node)) is not None
+            or any(n.type == "instance_variable" and src.text(n) in ivars for n in walk(node))
+            or (
+                depth < 3
+                and any(
+                    self._credential(s, v, ivars, depth + 1) for s, v in self._values(src, node)
+                )
             )
         )
+        self.credentials[key] = found
+        return found
 
     def _words(self, src: Parsed, node: Node) -> str:
         """The names an expression calls or reads, not its locals, its strings or the keys it
@@ -706,9 +792,30 @@ class _Action:
                     and parent.type == "call"
                     and (parent.child_by_field_name("method") == n)
                 )
-                if named or src.text(n) not in self.local_values:
-                    out.append(src.text(n))
+                name = src.text(n)
+                bare = not named or parent.child_by_field_name("receiver") is None  # type: ignore[union-attr]
+                if bare and (name in self.local_values or self.methods(name) is not None):
+                    continue  # read through what it holds or returns
+                out.append(name)
         return " ".join(out)
+
+    def _ivar_kinds(self, name: str) -> set[str]:
+        kinds = set()
+        for step in self.reached:
+            for n in walk(step.node):
+                left = (
+                    n.child_by_field_name("left")
+                    if n.type
+                    in (
+                        "assignment",
+                        "operator_assignment",
+                    )
+                    else None
+                )
+                if left is not None and step.src.text(left) == name:
+                    right = n.child_by_field_name("right")
+                    kinds.add(_own_chain(chain_text(step.src, right)) or "user")
+        return kinds
 
     def _caller_ivars(self) -> set[str]:
         """Instance variables an authentication callback sets from a credential (`@user =
@@ -762,6 +869,16 @@ class _Action:
                         )
                     ):
                         out.add(group)
+                elif (
+                    n.type == "call"
+                    and call_name(step.src, n) == "instance_variable_set"
+                    and len(args(n)) == 2
+                    and _caller_group(step.src.text(args(n)[0]).lstrip(":"))
+                ):
+                    if step.kind is Kind.ACTION or not self._credential(
+                        step.src, args(n)[1], self.caller_ivars
+                    ):
+                        out.add(_caller_group(step.src.text(args(n)[0]).lstrip(":")))  # type: ignore[arg-type]
                 elif n.type == "call" and _signs_in(step.src, n):
                     if step.kind is Kind.ACTION or not all(
                         self._credential(step.src, a, self.caller_ivars) for a in args(n)
@@ -790,8 +907,14 @@ class _Action:
             if node is None:
                 return None
             if self.is_caller(src, node):
-                group = _caller_group(chain_text(src, node)) or "current_user"
-                kind = "user" if group in ("current_user", "current_admin") else group[8:]
+                group = _caller_group(chain_text(src, node))
+                kind = (
+                    self.ivar_kind.get(chain_text(src, node), "user")
+                    if group is None
+                    else "user"
+                    if group in ("current_user", "current_admin")
+                    else group[8:]
+                )
                 return tenant or kind
             name = call_name(src, node)
             if node.type != "call" or args(node) or src.text(node).endswith(f"&.{name}"):
@@ -906,7 +1029,9 @@ class _Action:
             if start >= len(chain):
                 return None, False
             assoc = call_name(src, chain[start])
-            model = self.code.association("User", assoc) or self.code.association("Account", assoc)
+            holder = chain[start - 1] if start else root
+            kind = self.caller_kind(src, holder) or "user"
+            model = self.code.association("".join(w.capitalize() for w in kind.split("_")), assoc)
             if model is None:
                 return None, False
             scoped, start = True, start + 1
@@ -1063,8 +1188,11 @@ class _Action:
             self.statement(step)
         verified = {k: at for k, at in self.verified.items() if k[0] not in self.unstable}
 
-        def held(keys: set[_Key] | None, at: int, after: bool = False) -> bool:
-            # an `after_action` runs even when the action refused: only a callback's check holds
+        def held(keys: set[_Key] | None, at: int, after: bool = False, one: bool = True) -> bool:
+            # an `after_action` runs even when the action refused: only a callback's check holds;
+            # a key other than the primary one pins only the record read by it
+            if not one and any(f != "pk" for _, _, f in keys or ()):
+                return False
             return bool(keys) and all(
                 any(
                     v[0] == r
@@ -1092,7 +1220,15 @@ class _Action:
                     x.span,
                     x.scoped,
                     x.checked
-                    or (not x.scoped and held(self.cover[k], self.starts[k], k in self.after)),
+                    or (
+                        not x.scoped
+                        and held(
+                            self.cover[k],
+                            self.starts[k],
+                            k in self.after,
+                            self.terminals[k] in _ONE,
+                        )
+                    ),
                     x.record_type,
                 )
                 for k, x in enumerate(self.lookups)
@@ -1119,8 +1255,8 @@ class _Action:
             return  # loaded, never authorized (`skip_authorize_resource`)
         verdict = (
             _ability(self.code, self.action, self.model)  # type: ignore[arg-type]
-            if self.model in self.code.models
-            else None  # a model we can't name: the Ability can't be read for it
+            if self.model in self.code.models and self.methods("current_ability") is None
+            else None  # a model we can't name, or an ability the controller picks
         )
         if verdict is None:
             self.deferred.add(k)
@@ -1195,7 +1331,7 @@ class _Action:
                         self.raised(k)
                 elif (alias := self.records.get(chain_text(src, right))) is not None:
                     self.records[name] = alias  # `note = @note`
-                elif self.foreign(src, right, bound=True):
+                elif self.foreign(src, right):
                     self.records.pop(name, None)  # `source = @note.original`
                 elif name in self.records and node.type == "assignment":
                     del self.records[name]  # `note = note.original`: another record
@@ -1255,19 +1391,11 @@ class _Action:
                 continue
             record = self.records.get(chain_text(src, n.child_by_field_name("receiver")))
             model = self.code.models.get(record.model or "") if record is not None else None
-            name = call_name(src, n)
+            name = call_name(src, n).removesuffix("_id")
             if model is None or name not in model.belongs or OWNER_CHECK_RX.match(name):
                 continue
-            parent = n.parent
-            written = (
-                parent is not None
-                and parent.type == "call"
-                and parent.child_by_field_name("receiver") == n
-                and (call_name(src, parent) in _WRITES or call_name(src, parent).endswith("!"))
-            )
-            if written or (bound and n == unwrap(node)):
-                self.handoff(src, n)
-                found = True
+            self.handoff(src, n)  # sent, written, bound or looked up by: may be anyone's
+            found = True
         return found
 
     def rebinds(self, src: Parsed, node: Node) -> None:
@@ -1542,13 +1670,26 @@ class _Action:
     ) -> str | None:
         """`note.user`, `note.user_id`, `note.user.id`: the record's owner field."""
         node = unwrap(node)
-        if node is None or node.type != "call" or args(node):
-            return None
-        name = call_name(src, node)
-        receiver = unwrap(node.child_by_field_name("receiver"))
-        if chain_text(src, receiver) == record:
-            return name if OWNER_CHECK_RX.match(name) else None
-        return self.owner_of(src, receiver, record, model) if name == "id" else None
+        for _ in range(2):
+            if node is None or node.type != "call" or args(node):
+                return None
+            name = call_name(src, node)
+            receiver = unwrap(node.child_by_field_name("receiver"))
+            if chain_text(src, receiver) == record:
+                return name if OWNER_CHECK_RX.match(name) else None
+            if name != "id":
+                return None
+            node = receiver
+        return None
+
+    def pundit_user_forged(self) -> bool:
+        found = self.methods("pundit_user")
+        return found is not None and any(
+            self._untrusted(s.src, s.node)
+            for s in _reachable(
+                [_Step(found[0], b, Kind.CALLBACK) for b in method_body(found[1])], self.methods
+            )
+        )
 
     def authorize(self, src: Parsed, call: Node) -> None:
         """`authorize note` (Pundit, D15): checked when the policy's query method refuses a
@@ -1571,14 +1712,27 @@ class _Action:
         policy = src.text(options["policy_class"]) if "policy_class" in options else None
         if cancan:
             action = symbol(src, a[0]) or ""
-            verdict = _ability(self.code, action, record.model) if record.model else None
+            verdict = (
+                _ability(self.code, action, record.model)
+                if record.model and self.methods("current_ability") is None
+                else None
+            )
         elif namespaced:
             verdict = None  # `authorize [:admin, note]`: `Admin::NotePolicy`, not read
+        elif self.pundit_user_forged():
+            verdict = False  # Pundit asks about a user the request names
         else:
-            verdict = (
-                _policy_refuses(self.code, record.model, query or "", policy)
+            # a row of an STI subclass is asked of its own policy (`Draft < Note`)
+            verdicts = (
+                [
+                    _policy_refuses(self.code, m, query or "", policy)
+                    for m in self.code.descendants(record.model)
+                ]
                 if record.model
-                else None
+                else [None]
+            )
+            verdict = (
+                None if None in verdicts else all(verdicts)  # type: ignore[arg-type]
             )
         if verdict is None:
             self.deferred.add(record.lookup)
@@ -1656,22 +1810,41 @@ def _reachable(
     return out
 
 
+def _policy_user_kind(text: str) -> str | None:
+    """In a policy or ability: `user`/`user.id` stands for the user, `user.account_id` for its
+    tenant."""
+    head, _, rest = text.removeprefix("@").partition(".")
+    if head != "user":
+        return None
+    parts = [p for p in rest.split(".") if p and p != "id"]
+    if not parts:
+        return "user"
+    return _owner_kind(parts[0]) if len(parts) == 1 and _TENANT.match(parts[0]) else None
+
+
 def _owner_kind(field_: str) -> str:
     """What an owner field holds: a tenant (`account_id`: "account") or a user."""
     base = re.sub(r"(?i)_?(id|uuid|key)$", "", field_) or field_
     return base.lower() if _TENANT.match(base) or base.lower() == "member" else "user"
 
 
-def _own_chain(text: str) -> bool:
-    """`current_user`, `current_user.id`, `current_user&.account`: the caller or its own
-    tenant, never another user it names."""
-    head, _, rest = text.partition(".")
+def _own_chain(text: str) -> str | None:
+    """What `current_user`, `current_user.id` or `current_user&.account` stands for: the user
+    or its own tenant ("account"); None for anything else, such as another user it names."""
+    head, _, rest = text.removeprefix("self.").partition(".")
     if head == "Current" and rest:
         head, _, rest = f"Current.{rest}".partition(".")
         head, rest = f"{head}.{rest.split('.', 1)[0]}", rest.partition(".")[2]
-    if _caller_group(head) is None:
-        return False
-    return all(p == "id" or p in _CONVERSIONS or _TENANT.match(p) for p in rest.split(".") if p)
+    group = _caller_group(head)
+    if group is None:
+        return None
+    kind = "user" if group in ("current_user", "current_admin") else group[8:]
+    for part in (p for p in rest.split(".") if p):
+        if _TENANT.match(part) and kind == "user":
+            kind = _owner_kind(part)
+        elif part != "id" and part not in _CONVERSIONS:
+            return None
+    return kind
 
 
 def _conditional_at(src: Parsed, node: Node, stop: Node) -> bool:
@@ -1691,6 +1864,13 @@ def _conditional_at(src: Parsed, node: Node, stop: Node) -> bool:
             "elsif",
             "else",
             "rescue_modifier",
+            "rescue",
+            "ensure",
+            "case_match",
+            "in_clause",
+            "while",
+            "until",
+            "for",
         ) and child != parent.child_by_field_name("condition"):
             return True
         if parent.type == "binary" and (
@@ -1706,7 +1886,7 @@ def _conditional_at(src: Parsed, node: Node, stop: Node) -> bool:
 
 def _caller_group(text: str) -> str | None:
     """`current_user` for `current_user`, `@current_user` and `Current.user`."""
-    name = text.removeprefix("@")
+    name = text.removeprefix("@").removeprefix("self.")
     if name.startswith("Current."):
         name = "current_" + name.removeprefix("Current.")
     return name if name in _CALLERS else None
@@ -1798,10 +1978,12 @@ def _render_leaks(src: Parsed, node: Node, safe: set[str], action: str = "") -> 
             view = (
                 symbol(src, p.child_by_field_name("value")) if p.type == "pair" else symbol(src, p)
             )
-            if (view or "").rsplit("/", 1)[-1] in (*_RECORD_VIEWS, action) and (
-                p.type != "pair" or symbol(src, p.child_by_field_name("key")) in _VIEW_KEYS
-            ):
-                return True
+            key = symbol(src, p.child_by_field_name("key")) if p.type == "pair" else None
+            if key in ("partial", "inline", "layout") and not (key == "layout" and view is None):
+                return True  # a partial or an ERB template may print the record
+            named = p.type != "pair" or key in _VIEW_KEYS
+            if named and view is not None and not _ERROR_VIEW.search(view.rsplit("/", 1)[-1]):
+                return True  # `render :show`, `render "notes/locked"`: a view that may show it
             if p.type != "pair":
                 if p.type not in _LITERAL and not (p.type == "identifier" and src.text(p) in safe):
                     return True
@@ -1840,7 +2022,14 @@ def _inert(src: Parsed, node: Node) -> bool:
         return not args(node) if node.type == "return" else True
     if node.type == "assignment":
         target = src.text(node.child_by_field_name("left"))
-        return target.startswith(("flash", "flash.now"))
+        right = node.child_by_field_name("right")
+        literal = _is_literal(right) or (
+            right is not None
+            and right.type == "call"
+            and call_name(src, right) in ("t", "translate")
+            and all(_is_literal(a) for a in args(right))
+        )
+        return target.startswith(("flash", "flash.now")) and literal
     return node.type == "call" and chain_text(src, node.child_by_field_name("receiver")).split(".")[
         0
     ] in (
@@ -1859,12 +2048,12 @@ def _raises(src: Parsed, node: Node | None) -> bool:
     )
 
 
-def _narrows(code: RubyCode, src: Parsed, expr: Node | None, model: str) -> bool:
+def _narrows(code: RubyCode, src: Parsed, expr: Node | None, model: str, depth: int = 0) -> bool:
     """A policy Scope's `resolve` narrows by the user: `scope.where(user: user)`,
     `scope.where(user_id: user.id)`, `user.notes`; under `user.admin? ? scope.all : …` the
     non-admin branch (D10)."""
     expr = unwrap(expr)
-    if expr is None:
+    if expr is None or depth > _MAX_NESTING:
         return False
     if expr.type in ("conditional", "if"):
         cond = expr.child_by_field_name("condition")
@@ -1876,8 +2065,10 @@ def _narrows(code: RubyCode, src: Parsed, expr: Node | None, model: str) -> bool
             return body[-1] if body else n
 
         if _privileged_test(src, cond, "user"):
-            return _narrows(code, src, last(no), model)
-        return _narrows(code, src, last(yes), model) and _narrows(code, src, last(no), model)
+            return _narrows(code, src, last(no), model, depth + 1)
+        return _narrows(code, src, last(yes), model, depth + 1) and _narrows(
+            code, src, last(no), model, depth + 1
+        )
     chain: list[Node] = []
     node: Node | None = expr
     while node is not None and node.type == "call":
@@ -1899,7 +2090,7 @@ def _narrows(code: RubyCode, src: Parsed, expr: Node | None, model: str) -> bool
         if call_name(src, c) == "where":
             for k, v in pairs(src, args(c)) or []:
                 text = src.text(v)
-                if OWNER_CHECK_RX.match(k) and text in ("user", "user.id"):
+                if OWNER_CHECK_RX.match(k) and _policy_user_kind(text) == _owner_kind(k):
                     return True
     return False
 
@@ -1923,7 +2114,7 @@ def _owner_atom(src: Parsed, node: Node | None, records: tuple[str, ...]) -> _At
             if (
                 head in records
                 and OWNER_CHECK_RX.match(rest.removesuffix(".id"))
-                and chain_text(src, b) in ("user", "@user", "user.id", "@user.id")
+                and _policy_user_kind(chain_text(src, b)) == _owner_kind(rest.split(".")[0])
                 and _same_kind(src, a, b)  # type: ignore[arg-type]
             ):
                 return "own" if op == "==" else "!own"
@@ -1977,8 +2168,13 @@ def _ability(code: RubyCode, action: str, model: str) -> bool | None:
     if code.ability is None:
         return None
     src, cls = code.ability
-    if any(n.type == "call" and call_name(src, n) == "merge" for n in walk(cls)):
-        return None  # `merge(OtherAbility.new(user))`: rules we don't read
+    if any(n.type == "call" and call_name(src, n) == "merge" for n in walk(cls)) or any(
+        s.type == "call"
+        and call_name(src, s) == "include"
+        and not all(src.text(a).startswith("CanCan::") for a in args(s))
+        for s in statements(cls.child_by_field_name("body"))
+    ):
+        return None  # `merge(OtherAbility.new(user))`, `include Shared`: rules we don't read
     rules = [n for n in walk(cls) if n.type == "call" and n.child_by_field_name("receiver") is None]
     aliases = {k: set(v) for k, v in _CANCAN_ALIASES.items()}
     for rule in rules:
@@ -2013,7 +2209,8 @@ def _ability(code: RubyCode, action: str, model: str) -> bool | None:
             continue
         conditions = pairs(src, a[2:]) if len(a) > 2 else []
         if conditions and any(
-            OWNER_CHECK_RX.match(k) and src.text(v) in ("user", "user.id") for k, v in conditions
+            OWNER_CHECK_RX.match(k) and _policy_user_kind(src.text(v)) == _owner_kind(k)
+            for k, v in conditions
         ):
             continue
         block = rule.child_by_field_name("block")
@@ -2161,6 +2358,21 @@ def swallows(src: Parsed, method: Node) -> bool:
             if not any(_raises(src, s) or _halts(src, s) for s in stmts):
                 return True
     return False
+
+
+def inert(src: Parsed, node: Node) -> bool:
+    return _inert(src, node)
+
+
+def keeps_going(src: Parsed, node: Node) -> bool:
+    """A conditional response in a callback with no `return` or raise after it: the callback
+    runs on after responding (`head :forbidden unless own`)."""
+    if node.type not in ("if_modifier", "unless_modifier", "if", "unless"):
+        return False
+    found = list(walk(node))
+    return any(_halts(src, n) for n in found) and not any(
+        n.type == "return" or _raises(src, n) for n in found
+    )
 
 
 def early_return(src: Parsed, node: Node) -> bool:

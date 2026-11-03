@@ -40,6 +40,7 @@ _SINGULAR_ACTIONS = ("create", "new", "edit", "show", "update", "destroy")
 _BEFORE = ("before_action", "prepend_before_action", "append_before_action", "before_filter")
 _SKIP = ("skip_before_action", "skip_before_filter")
 _AFTER = ("after_action", "append_after_action", "prepend_after_action", "after_filter")
+_AROUND = ("around_action", "append_around_action", "prepend_around_action", "around_filter")
 _SKIP_AFTER = ("skip_after_action", "skip_after_filter")
 _LITERAL_NAMES = ("array", "symbol_array", "string_array", "simple_symbol", "string")
 # `unless: -> { current_user.admin? }`: skipped only for an admin (D10)
@@ -324,6 +325,10 @@ class _Callback:
     prepend: bool = False  # `prepend_before_action`: runs before those declared earlier
     after: bool = False  # an `after_action`
     body: Node | None = None  # `before_action { … }`, `before_action -> { … }`
+    src: _Source | None = None  # where the block is written
+    around: bool = False  # an `around_action`
+    # a point in the chain, not a callback: `include:<M>`, `prepend:<M>`, `reset`
+    marker: str = ""
 
     def applies(self, action: str) -> bool:
         return (self.only is None or action in self.only) and action not in self.except_
@@ -373,18 +378,36 @@ def _controllers(sources: dict[str, _Source]) -> dict[str, _Controller]:
             aliases: dict[str, str] = {}
             body = n.child_by_field_name("body")
             for stmt in body.named_children if body is not None else []:
+                wrapped = False
+                if stmt.type in ("if_modifier", "unless_modifier"):
+                    # `skip_before_action :x unless ENV[…]`: declared on some boots only
+                    stmt, wrapped = stmt.child_by_field_name("body") or stmt, True
+                if stmt.type == "call" and _method(src, stmt) in ("private", "protected", "public"):
+                    defs = [a for a in _args(stmt) if a.type == "method"]
+                    stmt = defs[0] if defs else stmt  # `private def require_owner`
                 if stmt.type == "method":
                     actions[src.text(stmt.child_by_field_name("name"))] = stmt
                     aliases.pop(src.text(stmt.child_by_field_name("name")), None)
                 elif stmt.type in ("call", "identifier"):
                     method = _method(src, stmt) if stmt.type == "call" else src.text(stmt)
-                    callbacks += _callbacks(src, stmt, method)
-                    modules = [src.text(a).rsplit("::", 1)[-1] for a in _args(stmt)]
+                    declared = _callbacks(src, stmt, method)
+                    callbacks += (
+                        [replace(x, conditional=True) for x in declared] if wrapped else declared
+                    )
+                    modules = [src.text(a).removeprefix("::") for a in _args(stmt)]
                     # `include A, B` puts A first in the lookup, like `include B; include A`
                     if method == "include" and stmt.type == "call":
                         includes += reversed(modules)
+                        callbacks += [
+                            _Callback("", None, False, marker=f"include:{m}")
+                            for m in reversed(modules)
+                        ]
                     if method == "prepend" and stmt.type == "call":
                         prepends += reversed(modules)
+                        callbacks += [
+                            _Callback("", None, False, marker=f"include:{m}")
+                            for m in reversed(modules)
+                        ]
                     names = [src.string(a) for a in _args(stmt)]
                     if method == "alias_method" and len(names) == 2 and None not in names:
                         aliases[names[0]] = names[1]  # type: ignore[index]
@@ -406,18 +429,30 @@ def _controllers(sources: dict[str, _Source]) -> dict[str, _Controller]:
 
 
 def _callbacks(src: _Source, stmt: Node, method: str) -> list[_Callback]:
-    kinds = (*_BEFORE, *_SKIP, *_AFTER, *_SKIP_AFTER, *_GUARD_CALLBACKS, *_CANCAN_SKIPS)
-    if method not in (*kinds, "skip_callback"):
+    kinds = (*_BEFORE, *_SKIP, *_AFTER, *_SKIP_AFTER, *_AROUND, *_GUARD_CALLBACKS, *_CANCAN_SKIPS)
+    if method not in (*kinds, "skip_callback", "reset_callbacks"):
         return []
     args = _args(stmt) if stmt.type == "call" else []
+    if method == "reset_callbacks":
+        return [_Callback("", None, False, marker="reset")]
     if method == "skip_callback":  # `skip_callback :process_action, :before, :require_owner`
         names = [src.string(a) for a in args if a.type != "pair"]
         if len(names) >= 3 and names[0] == "process_action" and names[1] in ("before", "after"):
             return [_Callback(n, None, True, after=names[1] == "after") for n in names[2:] if n]
         return []
     opts = _options(src, stmt) if stmt.type == "call" else {}
-    # `only: SHARED_ACTIONS`: a list we can't read may or may not name the action
-    unread = any(k in opts and opts[k].type not in _LITERAL_NAMES for k in ("only", "except"))
+    # `only: SHARED`, `except: [:show, *OPEN]`: a list we can't read may name the action
+    unread = any(
+        k in opts
+        and (
+            opts[k].type not in _LITERAL_NAMES
+            or (
+                opts[k].type == "array"
+                and any(c.type not in ("simple_symbol", "string") for c in opts[k].named_children)
+            )
+        )
+        for k in ("only", "except")
+    )
     only = _names(src, opts.get("only")) if "only" in opts and not unread else None
     except_ = _names(src, opts.get("except")) if not unread else []
     conditional = (
@@ -430,6 +465,7 @@ def _callbacks(src: _Source, stmt: Node, method: str) -> list[_Callback]:
     if method in _CANCAN_SKIPS:
         return [_Callback(_CANCAN_SKIPS[method], only, True, except_, conditional)]
     after = method in (*_AFTER, *_SKIP_AFTER)
+    around = method in _AROUND
     skip = method in (*_SKIP, *_SKIP_AFTER)
     prepend = method in ("prepend_before_action", "prepend_after_action") or (
         "prepend" in opts and src.text(opts["prepend"]) == "true"
@@ -438,10 +474,14 @@ def _callbacks(src: _Source, stmt: Node, method: str) -> list[_Callback]:
     lambdas = [a for a in args if a.type == "lambda"]
     if not skip and (block is not None or lambdas):
         body = block if block is not None else lambdas[0]
-        name = f"<block:{src.line(stmt)}>"
-        return [_Callback(name, only, False, except_, conditional, prepend, after, body)]
+        name = f"<block:{src.file.rel}:{src.line(stmt)}>"
+        return [
+            _Callback(name, only, False, except_, conditional, prepend, after, body, src, around)
+        ]
     names = [v for a in args if a.type != "pair" and (v := src.string(a))]
-    return [_Callback(n, only, skip, except_, conditional, prepend, after) for n in names]
+    return [
+        _Callback(n, only, skip, except_, conditional, prepend, after, around=around) for n in names
+    ]
 
 
 def _chain(controllers: dict[str, _Controller], c: _Controller) -> list[_Controller]:
@@ -489,7 +529,7 @@ def _rails_guards(
     skipped: list[str] = []
     for ctrl in _chain(controllers, c):
         for cb in ctrl.callbacks:
-            if not cb.applies(action) or cb.after:
+            if not cb.applies(action) or cb.after or cb.around or cb.marker:
                 continue
             if cb.skip:
                 if cb.name in active:
@@ -564,70 +604,84 @@ class _Ownership:
     def methods(self, c: _Controller) -> Callable[[str], tuple[Parsed, Node] | None]:
         chain = _chain(self.controllers, c)
 
-        def module(name: str, method: str) -> tuple[Parsed, Node] | None:
-            found = self.code.modules.get(name, [])
-            if len(found) == 1 and method in (ms := self.code.module_methods(*found[0])):
-                return found[0][0], ms[method]
-            return None
+        unread = object()
 
-        def find(name: str, depth: int = 0) -> tuple[Parsed, Node] | None:
+        def module(name: str, method: str) -> tuple[Parsed, Node] | object | None:
+            found = self.code.module(name)
+            if found is None:
+                return None
+            if found is unread:
+                return unread
+            ms = self.code.module_methods(*found)  # type: ignore[misc]
+            return (found[0], ms[method]) if method in ms else None  # type: ignore[index]
+
+        def find(name: str, depth: int = 0, upto: int | None = None) -> tuple[Parsed, Node] | None:
             # Ruby's lookup: prepended modules, the class, its modules (the last included
-            # first), then its parent
-            for ctrl in reversed(chain):
-                for m in reversed(ctrl.prepends):
-                    if (found := module(m, name)) is not None:
-                        return found
-                if name in ctrl.aliases and depth < 4:
-                    return find(ctrl.aliases[name], depth + 1)
-                if name in ctrl.actions:
-                    return ctrl.src, ctrl.actions[name]
-                for m in reversed(ctrl.includes):
-                    if (found := module(m, name)) is not None:
-                        return found
+            # first), then its parent; an alias copies the method where it's declared
+            for i in reversed(range(len(chain) if upto is None else upto)):
+                ctrl = chain[i]
+                for m in [*reversed(ctrl.prepends), None, *reversed(ctrl.includes)]:
+                    if m is None:
+                        if name in ctrl.aliases and depth < 4:
+                            return find(ctrl.aliases[name], depth + 1, i + 1)
+                        if name in ctrl.actions:
+                            return ctrl.src, ctrl.actions[name]
+                        continue
+                    found = module(m, name)
+                    if found is unread:
+                        return None  # a module we can't name may define it: fail closed
+                    if found is not None:
+                        return found  # type: ignore[return-value]
             candidates = self.concern_methods.get(name, [])
             return candidates[0] if len(candidates) == 1 else None
 
         return find
 
-    def included(self, ctrl: _Controller) -> list[_Callback]:
-        """Callbacks its modules declare in `included do … end`."""
+    def included(self, name: str) -> list[_Callback]:
+        """Callbacks a module declares in `included do … end` or `prepended do … end`."""
         out: list[_Callback] = []
-        for name in reversed(ctrl.includes):
-            found = self.code.modules.get(name, [])
-            if len(found) != 1:
-                continue
-            src, module = found[0]
-            for n in walk(module):
-                if n.type == "call" and _method(src, n) == "included":  # type: ignore[arg-type]
-                    for stmt in _body(n):
-                        if stmt.type in ("call", "identifier"):
-                            method = _method(src, stmt) if stmt.type == "call" else src.text(stmt)  # type: ignore[arg-type]
-                            out += _callbacks(src, stmt, method)  # type: ignore[arg-type]
+        found = self.code.module(name)
+        if not isinstance(found, tuple):
+            return out
+        src, module = found
+        for n in walk(module):
+            if n.type == "call" and _method(src, n) in ("included", "prepended"):  # type: ignore[arg-type]
+                for stmt in _body(n):
+                    if stmt.type in ("call", "identifier"):
+                        method = _method(src, stmt) if stmt.type == "call" else src.text(stmt)  # type: ignore[arg-type]
+                        out += _callbacks(src, stmt, method)  # type: ignore[arg-type]
         return out
 
     def callbacks(self, c: _Controller, action: str) -> list[_Callback]:
         """The callbacks that run for an action, in the order Rails runs them."""
         out: list[_Callback] = []
-        for ctrl in _chain(self.controllers, c):
-            for cb in [*self.included(ctrl), *ctrl.callbacks]:
-                if not cb.applies(action):
-                    continue
-                if not cb.skip:
-                    out = [x for x in out if x.name != cb.name]  # declared again: moves
-                if cb.skip:
-                    kept = []
-                    for x in out:
-                        if x.name == cb.name and cb.conditional:
-                            kept.append(replace(x, conditional=True))
-                        elif x.name == "load_and_authorize_resource" and cb.name in _SPLIT:
-                            kept.append(replace(x, name=_SPLIT[cb.name]))
-                        elif x.name != cb.name:
-                            kept.append(x)
-                    out = kept
-                elif cb.prepend:
-                    out.insert(0, cb)
-                else:
-                    out.append(cb)
+        pending = [cb for ctrl in _chain(self.controllers, c) for cb in ctrl.callbacks]
+        while pending:
+            cb = pending.pop(0)
+            if cb.marker == "reset":
+                out = []
+                continue
+            if cb.marker:  # an included module's own callbacks, where it's included
+                pending[:0] = self.included(cb.marker.removeprefix("include:"))
+                continue
+            if not cb.skip:
+                out = [x for x in out if x.name != cb.name]  # declared again: replaced
+            if not cb.applies(action):
+                continue
+            if cb.skip:
+                kept = []
+                for x in out:
+                    if x.name == cb.name and cb.conditional:
+                        kept.append(replace(x, conditional=True))
+                    elif x.name == "load_and_authorize_resource" and cb.name in _SPLIT:
+                        kept.append(replace(x, name=_SPLIT[cb.name]))
+                    elif x.name != cb.name:
+                        kept.append(x)
+                out = kept
+            elif cb.prepend:
+                out.insert(0, cb)
+            else:
+                out.append(cb)
         return out
 
     def own(self, row: _Row, c: _Controller | None, r: _Route) -> None:
@@ -639,6 +693,8 @@ class _Ownership:
             admin_gate,
             caller_forged,
             early_return,
+            inert,
+            keeps_going,
             method_body,
             rescues,
             swallows,
@@ -662,14 +718,21 @@ class _Ownership:
             if cb.name in ("load_and_authorize_resource", "authorize_resource"):
                 authorize = authorize or not cb.conditional
             if cb.body is not None:
-                found = (c.src, cb.body)
+                found = (cb.src or c.src, cb.body)
             elif cb.name in _GUARD_CALLBACKS or (found := find(cb.name)) is None:  # type: ignore[assignment]
                 continue
-            if cb.body is None and admin_gate(*found) and not cb.conditional:
+            if cb.body is None and admin_gate(*found) and not cb.conditional and not cb.around:
                 gates.append(cb.name)
-            kind = Kind.CONDITIONAL if cb.conditional or swallows(*found) else Kind.CALLBACK
-            for s in _callback_body(found[1]):
-                steps.append((found[0], s, kind))
+            # an `around_action` wraps the action: read, but it refuses nothing
+            conditional = cb.conditional or cb.around or swallows(*found)
+            kind = Kind.CONDITIONAL if conditional else Kind.CALLBACK
+            body = _callback_body(found[1])
+            for i, s in enumerate(body):
+                # a response doesn't stop the callback: what it runs next still runs
+                rest = [x for x in body[i + 1 :] if not inert(found[0], x)]
+                steps.append(
+                    (found[0], s, Kind.CONDITIONAL if keeps_going(found[0], s) and rest else kind)
+                )
                 if early_return(found[0], s):
                     kind = Kind.CONDITIONAL  # the rest of this callback may not run
             steps += [(found[0], s, Kind.CONDITIONAL) for s in rescues(found[1])]
@@ -692,7 +755,7 @@ class _Ownership:
         steps += [(action[0], s, kind) for s in method_body(action[1])]
         steps += [(action[0], s, Kind.CONDITIONAL) for s in rescues(action[1])]
         for cb in afters:
-            found = (c.src, cb.body) if cb.body is not None else find(cb.name)
+            found = (cb.src or c.src, cb.body) if cb.body is not None else find(cb.name)
             if found is not None:
                 steps += [(found[0], s, Kind.AFTER) for s in _callback_body(found[1])]
         snake = re.sub(r"(?<!^)(?=[A-Z])", "_", c.name.removesuffix("Controller").split("::")[-1])

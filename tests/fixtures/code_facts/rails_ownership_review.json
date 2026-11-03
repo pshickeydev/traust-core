@@ -1754,7 +1754,7 @@
    {
     "method": "DELETE",
     "pattern": "/p/around/:id",
-    "ownership": "unknown",
+    "ownership": "scoped",
     "why": "PRECISION: an around_action loading through the caller's association"
    },
    {
@@ -1888,6 +1888,950 @@
     "pattern": "/b/:id",
     "ownership": "caller-blind",
     "why": "COVERAGE: the unguarded destroy is hidden the same way (row DELETE /, ownership null)"
+   }
+  ]
+ },
+ {
+  "case": "callback_continues_after_refusal",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  get \"a/:id\", to: \"cb_cont#show\"\n  get \"b/:id\", to: \"cb_cont_twin#show\"\nend\n",
+   "app/controllers/cb_cont_controller.rb": "\nclass CbContController < ApplicationController\n  before_action :load_and_check\n\n  def show\n    render json: @note\n  end\n\n  private\n\n  def load_and_check\n    @note = Note.find(params[:id])\n    head :forbidden unless @note.user == current_user\n    @note.update(body: params[:body]) if params[:body]\n  end\nend\n",
+   "app/controllers/cb_cont_twin_controller.rb": "\nclass CbContTwinController < ApplicationController\n  before_action :load_and_check\n\n  def show\n    render json: @note\n  end\n\n  private\n\n  def load_and_check\n    @note = Note.find(params[:id])\n    return head(:forbidden) unless @note.user == current_user\n    @note.update(body: params[:body]) if params[:body]\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "unchecked",
+    "why": "`head :forbidden unless \u2026` in a before_action halts the chain only after the callback returns; the next line still updates another user's note (the halt is checked after the method, not at `head`)"
+   },
+   {
+    "method": "GET",
+    "pattern": "/b/:id",
+    "ownership": "checked",
+    "why": "twin: `return head(:forbidden) unless \u2026` leaves the callback before the write"
+   }
+  ]
+ },
+ {
+  "case": "redeclared_callback_narrowed",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  delete \"a/:id\", to: \"narrowed#destroy\"\n  delete \"b/:id\", to: \"narrowed_twin#destroy\"\nend\n",
+   "app/controllers/owned_base_controller.rb": "\nclass OwnedBaseController < ApplicationController\n  before_action :set_note\n  before_action :require_owner\n\n\n\n  private\n\n  def set_note\n    @note = Note.find(params[:id])\n  end\n\n  def require_owner\n    head :forbidden unless @note.user == current_user\n  end\n\nend\n",
+   "app/controllers/narrowed_controller.rb": "\nclass NarrowedController < OwnedBaseController\n  before_action :require_owner, only: [:edit, :update]\n\n  def destroy\n    @note.destroy\n    head :no_content\n  end\nend\n",
+   "app/controllers/narrowed_twin_controller.rb": "\nclass NarrowedTwinController < OwnedBaseController\n  before_action :require_owner, only: [:edit, :update, :destroy]\n\n  def destroy\n    @note.destroy\n    head :no_content\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/a/:id",
+    "ownership": "caller-blind",
+    "why": "re-declaring `before_action :require_owner, only: [:edit, :update]` removes the inherited unconditional require_owner (CallbackChain#append_one deletes any callback with the same filter) and re-adds it for edit/update only; `callbacks` skips the re-declaration for destroy before dropping the original, so the inherited check is still credited"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/b/:id",
+    "ownership": "checked",
+    "why": "twin: the re-declaration names destroy"
+   }
+  ]
+ },
+ {
+  "case": "included_skip_after_declaration",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  delete \"a/:id\", to: \"late_incl#destroy\"\n  delete \"b/:id\", to: \"early_incl#destroy\"\nend\n",
+   "app/controllers/concerns/public_notes.rb": "\nmodule PublicNotes\n  extend ActiveSupport::Concern\n\n  included do\n    skip_before_action :require_owner\n  end\nend\n",
+   "app/controllers/late_incl_controller.rb": "\nclass LateInclController < ApplicationController\n  before_action :set_note\n  before_action :require_owner\n  include PublicNotes\n\n  def destroy\n    @note.destroy\n    head :no_content\n  end\n\n  private\n\n  def set_note\n    @note = Note.find(params[:id])\n  end\n\n  def require_owner\n    head :forbidden unless @note.user == current_user\n  end\n\nend\n",
+   "app/controllers/early_incl_controller.rb": "\nclass EarlyInclController < ApplicationController\n  include PublicNotes\n  before_action :set_note\n  before_action :require_owner\n\n  def destroy\n    @note.destroy\n    head :no_content\n  end\n\n  private\n\n  def set_note\n    @note = Note.find(params[:id])\n  end\n\n  def require_owner\n    head :forbidden unless @note.user == current_user\n  end\n\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/a/:id",
+    "ownership": "caller-blind",
+    "why": "`include PublicNotes` comes after `before_action :require_owner`, so its `included do skip_before_action :require_owner end` runs after the declaration and removes it; `callbacks` evaluates every included block before the class's own callbacks, so the skip finds nothing and the check is credited"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/b/:id",
+    "ownership": "checked",
+    "why": "twin: included first (the skip runs before require_owner is declared; with raise: true it would raise, but either way the check exists afterwards)"
+   }
+  ]
+ },
+ {
+  "case": "callback_option_splat",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  delete \"a/:id\", to: \"splat_except#destroy\"\n  delete \"b/:id\", to: \"splat_skip#destroy\"\n  delete \"c/:id\", to: \"splat_twin#destroy\"\nend\n",
+   "app/controllers/splat_except_controller.rb": "\nclass SplatExceptController < ApplicationController\n  OPEN = %i[destroy].freeze\n  before_action :set_note\n  before_action :require_owner, except: [:show, *OPEN]\n\n  def destroy\n    @note.destroy\n    head :no_content\n  end\n\n  private\n\n  def set_note\n    @note = Note.find(params[:id])\n  end\n\n  def require_owner\n    head :forbidden unless @note.user == current_user\n  end\n\nend\n",
+   "app/controllers/splat_base_controller.rb": "\nclass SplatBaseController < ApplicationController\n  before_action :set_note\n  before_action :require_owner\n\n\n\n  private\n\n  def set_note\n    @note = Note.find(params[:id])\n  end\n\n  def require_owner\n    head :forbidden unless @note.user == current_user\n  end\n\nend\n",
+   "app/controllers/splat_skip_controller.rb": "\nclass SplatSkipController < SplatBaseController\n  OPEN = %i[destroy].freeze\n  skip_before_action :require_owner, only: [:show, *OPEN]\n\n  def destroy\n    @note.destroy\n    head :no_content\n  end\nend\n",
+   "app/controllers/splat_twin_controller.rb": "\nclass SplatTwinController < ApplicationController\n  before_action :set_note\n  before_action :require_owner, except: [:show]\n\n  def destroy\n    @note.destroy\n    head :no_content\n  end\n\n  private\n\n  def set_note\n    @note = Note.find(params[:id])\n  end\n\n  def require_owner\n    head :forbidden unless @note.user == current_user\n  end\n\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/a/:id",
+    "ownership": "unchecked",
+    "why": "`except: [:show, *OPEN]` excludes destroy through the splat; _names keeps only the literal :show, so the check is credited for destroy (an array with a splat should be unread, like a constant)"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/b/:id",
+    "ownership": "unchecked",
+    "why": "`skip_before_action :require_owner, only: [:show, *OPEN]` skips the check for destroy through the splat; the skip is read as show-only"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/c/:id",
+    "ownership": "checked",
+    "why": "twin: a literal except list"
+   }
+  ]
+ },
+ {
+  "case": "private_def_methods",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  delete \"a/:id\", to: \"priv_override#destroy\"\n  delete \"b/:id\", to: \"priv_check#destroy\"\n  delete \"c/:id\", to: \"priv_twin#destroy\"\nend\n",
+   "app/controllers/priv_base_controller.rb": "\nclass PrivBaseController < ApplicationController\n  before_action :set_note\n  before_action :require_owner\n\n\n\n  private\n\n  def set_note\n    @note = Note.find(params[:id])\n  end\n\n  def require_owner\n    head :forbidden unless @note.user == current_user\n  end\n\nend\n",
+   "app/controllers/priv_override_controller.rb": "\nclass PrivOverrideController < PrivBaseController\n  def destroy\n    @note.destroy\n    head :no_content\n  end\n\n  private def require_owner\n    Rails.logger.info(\"ownership enforced upstream\")\n  end\nend\n",
+   "app/controllers/priv_check_controller.rb": "\nclass PrivCheckController < ApplicationController\n  before_action :set_note\n  before_action :require_owner\n\n  def destroy\n    @note.destroy\n    head :no_content\n  end\n\n  private def set_note\n    @note = Note.find(params[:id])\n  end\n\n  private def require_owner\n    head :forbidden unless @note.user == current_user\n  end\nend\n",
+   "app/controllers/priv_twin_controller.rb": "\nclass PrivTwinController < PrivBaseController\n  def destroy\n    @note.destroy\n    head :no_content\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/a/:id",
+    "ownership": "caller-blind",
+    "why": "`private def require_owner` (a no-op) overrides the inherited check; `_controllers` indexes only bare `method` statements, so the override is invisible and the parent's check is credited"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/b/:id",
+    "ownership": "checked",
+    "why": "PRECISION: the same `private def` style for the real callbacks; neither set_note nor require_owner is found"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/c/:id",
+    "ownership": "checked",
+    "why": "twin: inherits the parent's check"
+   }
+  ]
+ },
+ {
+  "case": "alias_captures_base_method",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  delete \"a/:id\", to: \"alias_sub#destroy\"\n  delete \"b/:id\", to: \"alias_sub_twin#destroy\"\nend\n",
+   "app/controllers/alias_base_controller.rb": "\nclass AliasBaseController < ApplicationController\n  before_action :set_note\n  before_action :require_owner\n\n  private\n\n  def set_note\n    @note = Note.find(params[:id])\n  end\n\n  def check_owner\n    true # subclasses override this\n  end\n  alias_method :require_owner, :check_owner\nend\n",
+   "app/controllers/alias_sub_controller.rb": "\nclass AliasSubController < AliasBaseController\n  def destroy\n    @note.destroy\n    head :no_content\n  end\n\n  private\n\n  def check_owner\n    head :forbidden unless @note.user == current_user\n  end\nend\n",
+   "app/controllers/alias_sub_twin_controller.rb": "\nclass AliasSubTwinController < AliasBaseController\n  def destroy\n    @note.destroy\n    head :no_content\n  end\n\n  private\n\n  def require_owner\n    head :forbidden unless @note.user == current_user\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/a/:id",
+    "ownership": "caller-blind",
+    "why": "`alias_method :require_owner, :check_owner` in the base copies the base's no-op; the subclass's check_owner override is never what require_owner runs. `find` resolves the alias by restarting the lookup from the subclass, landing on its check"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/b/:id",
+    "ownership": "checked",
+    "why": "twin: the subclass overrides require_owner itself"
+   }
+  ]
+ },
+ {
+  "case": "ambiguous_module_name",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  delete \"a/:id\", to: \"api/notes#destroy\"\n  delete \"b/:id\", to: \"unique_mod#destroy\"\nend\n",
+   "app/controllers/notes_base_controller.rb": "\nclass NotesBaseController < ApplicationController\n  before_action :set_note\n  before_action :require_owner\n\n\n\n  private\n\n  def set_note\n    @note = Note.find(params[:id])\n  end\n\n  def require_owner\n    head :forbidden unless @note.user == current_user\n  end\n\nend\n",
+   "app/controllers/concerns/api/relaxed.rb": "\nmodule Api\n  module Relaxed\n    def require_owner\n      Rails.logger.debug(\"api clients are trusted\")\n    end\n  end\nend\n",
+   "app/controllers/concerns/web/relaxed.rb": "\nmodule Web\n  module Relaxed\n    def require_owner\n      Rails.logger.debug(\"web preview\")\n    end\n  end\nend\n",
+   "app/controllers/api/notes_controller.rb": "\nmodule Api\n  class NotesController < NotesBaseController\n    include Api::Relaxed\n\n    def destroy\n      @note.destroy\n      head :no_content\n    end\n  end\nend\n",
+   "app/controllers/concerns/unique_relaxed.rb": "\nmodule UniqueRelaxed\n  def require_owner\n    Rails.logger.debug(\"trusted\")\n  end\nend\n",
+   "app/controllers/unique_mod_controller.rb": "\nclass UniqueModController < NotesBaseController\n  include UniqueRelaxed\n\n  def destroy\n    @note.destroy\n    head :no_content\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/a/:id",
+    "ownership": "caller-blind",
+    "why": "`include Api::Relaxed` overrides require_owner with a no-op; `module()` keys modules by short name and gives up when two share it, so lookup falls through to the parent's check (an unresolved include should fail closed, not resolve past it; unknown is acceptable)"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/b/:id",
+    "ownership": "caller-blind",
+    "why": "reference: with a unique module name the override is seen and the route is judged (caller-blind reported because the no-op names no caller)"
+   }
+  ]
+ },
+ {
+  "case": "foreign_record_escapes",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  get \"a/:id\", to: \"orig_leak#show\"\n  delete \"b/:id\", to: \"orig_leak#destroy\"\n  patch \"c/:id\", to: \"orig_leak#update\"\n  delete \"d/:id\", to: \"orig_leak#fallback\"\n  get \"e/:id\", to: \"orig_leak#twin\"\nend\n",
+   "app/controllers/orig_leak_controller.rb": "\nclass OrigLeakController < ApplicationController\n  before_action :set_note\n  before_action :require_owner\n\n  def show\n    render json: @note.original\n  end\n\n  def destroy\n    Note.find(@note.original_id).destroy\n    head :no_content\n  end\n\n  def update\n    @note.original.update_attribute(:public, true)\n    head :no_content\n  end\n\n  def fallback\n    target = @note.original || @note\n    target.destroy\n    head :no_content\n  end\n\n  def twin\n    render json: @note\n  end\n\n  private\n\n  def set_note\n    @note = Note.find(params[:id])\n  end\n\n  def require_owner\n    head :forbidden unless @note.user == current_user\n  end\n\nend\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "unknown",
+    "why": "`render json: @note.original` sends the note this one was copied from (anyone's); `foreign` hands off only a bound or written foreign record, not one rendered"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/b/:id",
+    "ownership": "unknown",
+    "why": "`Note.find(@note.original_id)` loads the original by its foreign key; it mentions no path id, so the query isn't a lookup and `foreign` only knows belongs_to names, not `<name>_id`"
+   },
+   {
+    "method": "PATCH",
+    "pattern": "/c/:id",
+    "ownership": "unknown",
+    "why": "`@note.original.update_attribute(...)` writes the original; `update_attribute` isn't in _WRITES (only in `_writes`), so the write isn't seen"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/d/:id",
+    "ownership": "unknown",
+    "why": "`target = @note.original || @note` binds a foreign record under an `||`; `foreign(bound=True)` hands off only when the whole right side is the call"
+   },
+   {
+    "method": "GET",
+    "pattern": "/e/:id",
+    "ownership": "checked",
+    "why": "twin: renders the checked note"
+   }
+  ]
+ },
+ {
+  "case": "refusal_body_shows_record",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  get \"a/:id\", to: \"leaky_refusal#inline\"\n  get \"b/:id\", to: \"leaky_refusal#partial\"\n  get \"c/:id\", to: \"leaky_refusal#template\"\n  get \"d/:id\", to: \"leaky_flash#show\"\n  get \"e/:id\", to: \"leaky_refusal#twin\"\nend\n",
+   "app/views/leaky_refusal/_note.html.erb": "<h1><%= @note.title %></h1>\n<p><%= @note.body %></p>\n",
+   "app/views/leaky_refusal/locked.html.erb": "<p>This note is locked.</p>\n<pre><%= @note.body %></pre>\n",
+   "app/controllers/leaky_refusal_controller.rb": "\nclass LeakyRefusalController < ApplicationController\n  before_action :set_note\n\n  def inline\n    if @note.user != current_user\n      render inline: \"<p>Not yours: <%= @note.body %></p>\", status: :forbidden\n      return\n    end\n    render json: @note\n  end\n\n  def partial\n    if @note.user != current_user\n      render partial: \"note\", status: :forbidden\n      return\n    end\n    render json: @note\n  end\n\n  def template\n    if @note.user != current_user\n      render :locked, status: :forbidden\n      return\n    end\n    render json: @note\n  end\n\n  def twin\n    if @note.user != current_user\n      render plain: \"Not yours\", status: :forbidden\n      return\n    end\n    render json: @note\n  end\n\n  private\n\n  def set_note\n    @note = Note.find(params[:id])\n  end\n\nend\n",
+   "app/controllers/leaky_flash_controller.rb": "\nclass LeakyFlashController < ApplicationController\n  before_action :set_note\n  before_action :require_owner\n\n  def show\n    render json: @note\n  end\n\n  private\n\n  def set_note\n    @note = Note.find(params[:id])\n  end\n\n  def require_owner\n    if @note.user != current_user\n      flash[:alert] = \"You can't open: #{@note.body}\"\n      redirect_to root_path\n    end\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "unchecked",
+    "why": "`render inline: \"<%= @note.body %>\"` renders the record in the 403 body; _render_leaks walks the ERB source as a plain string literal"
+   },
+   {
+    "method": "GET",
+    "pattern": "/b/:id",
+    "ownership": "unchecked",
+    "why": "`render partial: \"note\"` renders _note.html.erb, which shows @note; the `partial:` key isn't a view key and its value is a literal, so no leak is seen"
+   },
+   {
+    "method": "GET",
+    "pattern": "/c/:id",
+    "ownership": "unchecked",
+    "why": "`render :locked, status: :forbidden` renders locked.html.erb, which shows @note.body; only show/edit/index/new or the action's own name count as views that show the record (unknown also acceptable, since views aren't read)"
+   },
+   {
+    "method": "GET",
+    "pattern": "/d/:id",
+    "ownership": "unchecked",
+    "why": "the callback puts the note's body in the flash before redirecting; `_inert` accepts any flash assignment, so the redirect counts as a clean D19 refusal while the next page shows another user's note"
+   },
+   {
+    "method": "GET",
+    "pattern": "/e/:id",
+    "ownership": "checked",
+    "why": "twin: a plain-text refusal"
+   }
+  ]
+ },
+ {
+  "case": "tenant_column_against_user_id",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"team\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"project\"\n    t.text \"body\"\n  end\n  create_table \"tasks\" do |t|\n    t.references \"team\"\n    t.text \"body\"\n  end\n  create_table \"projects\" do |t|\n    t.string \"name\"\n  end\n  create_table \"teams\" do |t|\n    t.string \"name\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  belongs_to :team\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :project\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "app/models/task.rb": "class Task < ApplicationRecord\n  belongs_to :team\nend\n",
+   "app/models/project.rb": "class Project < ApplicationRecord\n  has_many :notes\nend\n",
+   "app/models/team.rb": "class Team < ApplicationRecord\n  has_many :tasks\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  get \"a/:id\", to: \"proj_key#show\"\n  get \"b/:id\", to: \"proj_key#compare\"\n  get \"c/:id\", to: \"proj_key#assoc\"\n  get \"d/:id\", to: \"proj_key#twin\"\nend\n",
+   "app/controllers/proj_key_controller.rb": "\nclass ProjKeyController < ApplicationController\n  def show\n    @note = Note.where(project_id: current_user.id).find(params[:id])\n    render json: @note\n  end\n\n  def compare\n    note = Note.find(params[:id])\n    head :forbidden and return unless note.project_id == current_user.id\n    render json: note\n  end\n\n  def assoc\n    @note = Note.find_by!(id: params[:id], project: current_user)\n    render json: @note\n  end\n\n  def twin\n    @task = Task.where(team_id: current_user.team_id).find(params[:id])\n    render json: @task\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "unchecked",
+    "why": "`project_id: current_user.id` keys a project column with the user's id: it selects the notes of whichever project has that id. _owner_kind maps `project` to \"user\" because _TENANT lacks project, so the kinds match"
+   },
+   {
+    "method": "GET",
+    "pattern": "/b/:id",
+    "ownership": "unchecked",
+    "why": "the same mismatch in a comparison (`note.project_id == current_user.id`)"
+   },
+   {
+    "method": "GET",
+    "pattern": "/c/:id",
+    "ownership": "unchecked",
+    "why": "`find_by!(project: current_user)`: Rails compares project_id with the user's id"
+   },
+   {
+    "method": "GET",
+    "pattern": "/d/:id",
+    "ownership": "scoped",
+    "why": "twin: a team column against the caller's team"
+   }
+  ]
+ },
+ {
+  "case": "tenant_ivar_as_user",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :account\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "app/models/account.rb": "class Account < ApplicationRecord\n  has_many :users\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  get \"a/:id\", to: \"acct_ivar#show\"\n  delete \"b/:id\", to: \"acct_ivar#destroy\"\n  delete \"c/:id\", to: \"acct_ivar#admin\"\n  get \"d/:id\", to: \"acct_ivar#twin\"\nend\n",
+   "app/controllers/acct_ivar_controller.rb": "\nclass AcctIvarController < ApplicationController\n  before_action :set_account\n\n  def show\n    @note = Note.where(user_id: @account.id).find(params[:id])\n    render json: @note\n  end\n\n  def destroy\n    note = Note.find(params[:id])\n    head :forbidden and return unless note.user_id == @account.id\n    note.destroy\n    head :no_content\n  end\n\n  def admin\n    note = Note.find(params[:id])\n    head :forbidden and return unless @account.admin? || note.user == current_user\n    note.destroy\n    head :no_content\n  end\n\n  def twin\n    @note = Note.where(user_id: @me.id).find(params[:id])\n    render json: @note\n  end\n\n  private\n\n  def set_account\n    @account = current_user.account\n    @me = current_user\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "unchecked",
+    "why": "`@account = current_user.account` is the caller's tenant, but caller_kind returns \"user\" for every caller ivar, so `user_id: @account.id` (a user column against an account id) reads as scoped"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/b/:id",
+    "ownership": "unchecked",
+    "why": "the same in a comparison: `note.user_id == @account.id`"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/c/:id",
+    "ownership": "unchecked",
+    "why": "`@account.admin?` is the account's flag, not the user's; it's taken as the D10 admin bypass (D21: a tenant's flag is no bypass)"
+   },
+   {
+    "method": "GET",
+    "pattern": "/d/:id",
+    "ownership": "scoped",
+    "why": "twin: `@me = current_user`"
+   }
+  ]
+ },
+ {
+  "case": "caller_forged_unread_shapes",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  get \"a/:id\", to: \"around_forge#show\"\n  get \"b/:id\", to: \"self_assign#show\"\n  get \"c/:id\", to: \"ivar_set#show\"\n  get \"d/:id\", to: \"forge_twin#show\"\nend\n",
+   "app/controllers/around_forge_controller.rb": "\nclass AroundForgeController < ApplicationController\n  around_action :act_as\n\n  def show\n    @note = current_user.notes.find(params[:id])\n    render json: @note\n  end\n\n  private\n\n  def act_as\n    @current_user = User.find(params[:as]) if params[:as]\n    yield\n  end\nend\n",
+   "app/controllers/self_assign_controller.rb": "\nclass SelfAssignController < ApplicationController\n  attr_accessor :current_user\n  before_action :pick_user\n\n  def show\n    @note = current_user.notes.find(params[:id])\n    render json: @note\n  end\n\n  private\n\n  def pick_user\n    self.current_user = User.find_by(id: params[:user_id])\n  end\nend\n",
+   "app/controllers/ivar_set_controller.rb": "\nclass IvarSetController < ApplicationController\n  before_action :pick_user\n\n  def show\n    @note = current_user.notes.find(params[:id])\n    render json: @note\n  end\n\n  private\n\n  def pick_user\n    instance_variable_set(:@current_user, User.find_by(id: params[:user_id])) if params[:user_id]\n  end\nend\n",
+   "app/controllers/forge_twin_controller.rb": "\nclass ForgeTwinController < ApplicationController\n  before_action :pick_user\n\n  def show\n    @note = current_user.notes.find(params[:id])\n    render json: @note\n  end\n\n  private\n\n  def pick_user\n    @current_user = User.find_by(id: params[:user_id]) if params[:user_id]\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "caller-blind",
+    "why": "`around_action :act_as` sets @current_user from params[:as] (Devise's current_user returns @current_user when set); around_action isn't read, so the forged caller is trusted"
+   },
+   {
+    "method": "GET",
+    "pattern": "/b/:id",
+    "ownership": "caller-blind",
+    "why": "`self.current_user = User.find_by(id: params[:user_id])` (attr_accessor): the assignment's left side is `self.current_user`, which _caller_group doesn't map to the caller"
+   },
+   {
+    "method": "GET",
+    "pattern": "/c/:id",
+    "ownership": "caller-blind",
+    "why": "`instance_variable_set(:@current_user, \u2026params\u2026)` isn't an assignment, so the forged caller is never seen"
+   },
+   {
+    "method": "GET",
+    "pattern": "/d/:id",
+    "ownership": "caller-blind",
+    "why": "twin: the plain `@current_user = \u2026params\u2026` is caught as forged"
+   }
+  ]
+ },
+ {
+  "case": "credential_named_not_verified",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  get \"a/:id\", to: \"jwt_noverify#show\"\n  get \"b/:id\", to: \"verified_hdr#show\"\n  get \"c/:id\", to: \"jwt_twin#show\"\nend\n",
+   "app/controllers/jwt_noverify_controller.rb": "\nclass JwtNoverifyController < ActionController::API\n  before_action :authenticate\n\n  def show\n    @note = @viewer.notes.find(params[:id])\n    render json: @note\n  end\n\n  private\n\n  def authenticate\n    @viewer = User.find_by(id: decoded_token[\"sub\"])\n    head :unauthorized unless @viewer\n  end\n\n  def decoded_token\n    JWT.decode(request.headers[\"Authorization\"].to_s.split.last, nil, false).first\n  end\nend\n",
+   "app/controllers/verified_hdr_controller.rb": "\nclass VerifiedHdrController < ActionController::API\n  before_action :authenticate\n\n  def show\n    @note = @viewer.notes.find(params[:id])\n    render json: @note\n  end\n\n  private\n\n  def authenticate\n    @viewer = User.find_by(id: verified_user_id)\n    head :unauthorized unless @viewer\n  end\n\n  def verified_user_id\n    request.headers[\"X-User-Id\"]\n  end\nend\n",
+   "app/controllers/jwt_twin_controller.rb": "\nclass JwtTwinController < ActionController::API\n  before_action :authenticate\n\n  def show\n    @note = @viewer.notes.find(params[:id])\n    render json: @note\n  end\n\n  private\n\n  def authenticate\n    @viewer = User.find_by(api_token: request.headers[\"X-Api-Token\"])\n    head :unauthorized unless @viewer\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "caller-blind",
+    "why": "`JWT.decode(token, nil, false)` decodes without verifying the signature, so any client picks `sub`; `decoded_token` matches _CREDENTIAL's decode\\w* and the helper isn't read (\"a verified token\" only)"
+   },
+   {
+    "method": "GET",
+    "pattern": "/b/:id",
+    "ownership": "caller-blind",
+    "why": "`verified_user_id` is a helper returning the X-User-Id header (header-chosen identity is forged per the earlier hdr cases); its name matches verif\\w* and _credential never reads the helper body"
+   },
+   {
+    "method": "GET",
+    "pattern": "/c/:id",
+    "ownership": "scoped",
+    "why": "twin: the user is found by its API token"
+   }
+  ]
+ },
+ {
+  "case": "pundit_policy_misresolved",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.boolean \"admin\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.string \"type\"\n    t.text \"body\"\n  end\n  create_table \"memos\" do |t|\n    t.references \"user\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\nend\n",
+   "app/models/note.rb": "\nclass Note < ApplicationRecord\n  belongs_to :user\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "app/models/memo.rb": "\nclass Memo < ApplicationRecord\n  belongs_to :user\n\n  def policy_class\n    OpenPolicy\n  end\nend\n",
+   "app/models/draft.rb": "class Draft < Note\nend\n",
+   "app/policies/note_policy.rb": "\nclass NotePolicy < ApplicationPolicy\n  def destroy?\n    record.user == user\n  end\nend\n",
+   "app/policies/memo_policy.rb": "\nclass MemoPolicy < ApplicationPolicy\n  def destroy?\n    record.user == user\n  end\nend\n",
+   "app/policies/open_policy.rb": "\nclass OpenPolicy < ApplicationPolicy\n  def destroy?\n    true\n  end\nend\n",
+   "app/policies/draft_policy.rb": "\nclass DraftPolicy < NotePolicy\n  def destroy?\n    user.present?\n  end\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  delete \"a/:id\", to: \"memo_inst#destroy\"\n  delete \"b/:id\", to: \"sti_note#destroy\"\n  delete \"c/:id\", to: \"pundit_user_forged#destroy\"\n  delete \"d/:id\", to: \"pundit_twin#destroy\"\nend\n",
+   "app/controllers/memo_inst_controller.rb": "\nclass MemoInstController < ApplicationController\n  def destroy\n    memo = Memo.find(params[:id])\n    authorize memo\n    memo.destroy\n    head :no_content\n  end\nend\n",
+   "app/controllers/sti_note_controller.rb": "\nclass StiNoteController < ApplicationController\n  def destroy\n    note = Note.find(params[:id])\n    authorize note\n    note.destroy\n    head :no_content\n  end\nend\n",
+   "app/controllers/pundit_user_forged_controller.rb": "\nclass PunditUserForgedController < ApplicationController\n  def destroy\n    note = Note.find(params[:id])\n    authorize note\n    note.destroy\n    head :no_content\n  end\n\n  private\n\n  def pundit_user\n    User.find_by(id: params[:acting_user_id]) || current_user\n  end\nend\n",
+   "app/controllers/pundit_twin_controller.rb": "\nclass PunditTwinController < ApplicationController\n  def destroy\n    memo = Memo.find(params[:id])\n    authorize memo, policy_class: MemoPolicy\n    memo.destroy\n    head :no_content\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/a/:id",
+    "ownership": "caller-blind",
+    "why": "Memo defines an instance `policy_class` (Pundit's PolicyFinder checks `record.policy_class` first) returning OpenPolicy (destroy? true); only `def self.policy_class` is read, so MemoPolicy is used"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/b/:id",
+    "ownership": "caller-blind",
+    "why": "Note has an STI subclass Draft with its own DraftPolicy (destroy? = user.present?); a Draft row loaded through Note.find is authorized by DraftPolicy at runtime. The analyzer reads only NotePolicy (unchecked is also correct)"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/c/:id",
+    "ownership": "caller-blind",
+    "why": "the controller's `pundit_user` takes the user from params[:acting_user_id], so `authorize note` checks the record against a user the request picks; pundit_user isn't read (caller-blind equally correct: judged either way)"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/d/:id",
+    "ownership": "checked",
+    "why": "twin: explicit policy_class: MemoPolicy"
+   }
+  ]
+ },
+ {
+  "case": "policy_tenant_column_user_id",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"team\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"project\"\n    t.text \"body\"\n  end\n  create_table \"tasks\" do |t|\n    t.references \"team\"\n    t.text \"body\"\n  end\n  create_table \"projects\" do |t|\n    t.string \"name\"\n  end\n  create_table \"teams\" do |t|\n    t.string \"name\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  belongs_to :team\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :project\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "app/models/task.rb": "class Task < ApplicationRecord\n  belongs_to :team\nend\n",
+   "app/policies/task_policy.rb": "\nclass TaskPolicy < ApplicationPolicy\n  def destroy?\n    record.team_id == user.id\n  end\n\n  class Scope\n    attr_reader :user, :scope\n    def initialize(user, scope)\n      @user, @scope = user, scope\n    end\n\n    def resolve\n      scope.where(team_id: user.id)\n    end\n  end\nend\n",
+   "app/models/ability.rb": "\nclass Ability\n  include CanCan::Ability\n\n  def initialize(user)\n    can :destroy, Note, project_id: user.id\n  end\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  delete \"a/:id\", to: \"team_pol#destroy\"\n  get \"b/:id\", to: \"team_pol#show\"\n  delete \"c/:id\", to: \"notes#destroy\"\n  get \"d/:id\", to: \"team_pol#twin\"\nend\n",
+   "app/controllers/team_pol_controller.rb": "\nclass TeamPolController < ApplicationController\n  def destroy\n    task = Task.find(params[:id])\n    authorize task\n    task.destroy\n    head :no_content\n  end\n\n  def show\n    @task = policy_scope(Task).find(params[:id])\n    render json: @task\n  end\n\n  def twin\n    @task = Task.where(team: current_user.team).find(params[:id])\n    render json: @task\n  end\nend\n",
+   "app/controllers/notes_controller.rb": "\nclass NotesController < ApplicationController\n  load_and_authorize_resource\n\n  def destroy\n    @note.destroy\n    head :no_content\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/a/:id",
+    "ownership": "caller-blind",
+    "why": "TaskPolicy#destroy? compares team_id with user.id; _owner_atom accepts any OWNER_CHECK_RX field against `user.id`, with no kind check"
+   },
+   {
+    "method": "GET",
+    "pattern": "/b/:id",
+    "ownership": "caller-blind",
+    "why": "Scope#resolve `scope.where(team_id: user.id)`: _narrows accepts any owner-shaped key against user/user.id"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/c/:id",
+    "ownership": "caller-blind",
+    "why": "`can :destroy, Note, project_id: user.id`: _ability accepts any owner-shaped key against user.id"
+   },
+   {
+    "method": "GET",
+    "pattern": "/d/:id",
+    "ownership": "scoped",
+    "why": "twin: the team against the caller's team"
+   }
+  ]
+ },
+ {
+  "case": "cancan_ability_unseen",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.boolean \"admin\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n  end\n  create_table \"memos\" do |t|\n    t.references \"user\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "app/models/ability.rb": "\nclass Ability\n  include CanCan::Ability\n  include SharedRules\n\n  def initialize(user)\n    can :destroy, Note, user_id: user.id\n    can :destroy, Memo, user_id: user.id\n    shared_rules(user)\n  end\nend\n",
+   "app/models/shared_rules.rb": "\nmodule SharedRules\n  def shared_rules(user)\n    can :destroy, Note if user.persisted?\n  end\nend\n",
+   "app/models/api_ability.rb": "\nclass ApiAbility\n  include CanCan::Ability\n\n  def initialize(user)\n    can :manage, :all\n  end\nend\n",
+   "app/models/strict_ability.rb": "\nclass StrictAbility\n  include CanCan::Ability\n\n  def initialize(user)\n    can :destroy, Memo, user_id: user.id\n  end\nend\n",
+   "app/models/memo.rb": "class Memo < ApplicationRecord\n  belongs_to :user\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  delete \"notes/:id\", to: \"notes#destroy\"\n  delete \"memos/:id\", to: \"memos#destroy\"\nend\n",
+   "app/controllers/notes_controller.rb": "\nclass NotesController < ApplicationController\n  load_and_authorize_resource\n\n  def destroy\n    @note.destroy\n    head :no_content\n  end\nend\n",
+   "app/controllers/memos_controller.rb": "\nclass MemosController < ApplicationController\n  load_and_authorize_resource\n\n  def destroy\n    @memo.destroy\n    head :no_content\n  end\n\n  private\n\n  def current_ability\n    @current_ability ||= ApiAbility.new(current_user)\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/notes/:id",
+    "ownership": "unknown",
+    "why": "Ability includes SharedRules, whose `shared_rules` grants `can :destroy, Note` to every signed-in user; _ability reads only the Ability class body (unknown also acceptable: rules it can't read)"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/memos/:id",
+    "ownership": "unknown",
+    "why": "the controller's `current_ability` returns ApiAbility (`can :manage, :all`), which CanCanCan uses instead of Ability; the analyzer always reads `Ability` (owner-only for Memo). unknown also acceptable"
+   }
+  ]
+ },
+ {
+  "case": "non_unique_key_verified",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  delete \"a/:id\", to: \"by_original#destroy\"\n  delete \"b/:id\", to: \"by_original#purge\"\n  delete \"c/:id\", to: \"by_original#twin\"\nend\n",
+   "app/controllers/by_original_controller.rb": "\nclass ByOriginalController < ApplicationController\n  def destroy\n    copy = Note.find_by(original_id: params[:id])\n    head :forbidden and return unless copy && copy.user == current_user\n    Note.where(original_id: params[:id]).destroy_all\n    head :no_content\n  end\n\n  def purge\n    current_user.notes.find_by!(original_id: params[:id])\n    Note.where(original_id: params[:id]).delete_all\n    head :no_content\n  end\n\n  def twin\n    current_user.notes.where(original_id: params[:id]).destroy_all\n    head :no_content\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/a/:id",
+    "ownership": "unchecked",
+    "why": "checking one copy (`find_by(original_id: id)`) verifies the key (id, Note, original_id); `Note.where(original_id: id).destroy_all` then deletes every copy, other users' included. Only a primary-key check pins one record"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/b/:id",
+    "ownership": "unchecked",
+    "why": "the same through a scoped `find_by!` that raises when the caller has no copy: it proves the caller has one, not that all are theirs"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/c/:id",
+    "ownership": "scoped",
+    "why": "twin: the bulk delete itself is scoped"
+   }
+  ]
+ },
+ {
+  "case": "conditional_shapes_unlisted",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  delete \"a/:id\", to: \"cond_shapes#destroy\"\n  delete \"b/:id\", to: \"cond_shapes#purge\"\n  delete \"c/:id\", to: \"cond_shapes#loop_check\"\n  delete \"d/:id\", to: \"cond_shapes#twin\"\nend\n",
+   "app/controllers/cond_shapes_controller.rb": "\nclass CondShapesController < ApplicationController\n  before_action :set_note\n\n  def destroy\n    begin\n      @note.archive!\n    rescue Archive::Error\n      require_owner!\n    end\n    @note.destroy\n    head :no_content\n  end\n\n  def purge\n    case @note.status\n    in \"locked\" then require_owner!\n    in _ then nil\n    end\n    @note.destroy\n    head :no_content\n  end\n\n  def loop_check\n    while params[:confirm] == \"yes\"\n      require_owner!\n      break\n    end\n    @note.destroy\n    head :no_content\n  end\n\n  def twin\n    require_owner!\n    @note.destroy\n    head :no_content\n  end\n\n  private\n\n  def set_note\n    @note = Note.find(params[:id])\n  end\n\n  def require_owner!\n    raise ActiveRecord::RecordNotFound unless @note.user == current_user\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/a/:id",
+    "ownership": "unchecked",
+    "why": "the check runs only in a `rescue` clause of a `begin` block (when archiving fails); `rescue` isn't in _conditional_at's list, so the inlined raise reads as unconditional"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/b/:id",
+    "ownership": "unchecked",
+    "why": "pattern matching: `case \u2026 in \"locked\" then require_owner!` checks only locked notes; `case_match`/`in_clause` aren't in the list"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/c/:id",
+    "ownership": "unchecked",
+    "why": "a `while` loop body runs only while the condition holds; only the modifier forms are listed"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/d/:id",
+    "ownership": "checked",
+    "why": "twin: the check runs unconditionally"
+   }
+  ]
+ },
+ {
+  "case": "callback_under_class_modifier",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  delete \"a/:id\", to: \"flag_skip#destroy\"\n  delete \"c/:id\", to: \"flag_twin#destroy\"\nend\n",
+   "app/controllers/flag_base_controller.rb": "\nclass FlagBaseController < ApplicationController\n  before_action :set_note\n  before_action :require_owner\n\n\n\n  private\n\n  def set_note\n    @note = Note.find(params[:id])\n  end\n\n  def require_owner\n    head :forbidden unless @note.user == current_user\n  end\n\nend\n",
+   "app/controllers/flag_skip_controller.rb": "\nclass FlagSkipController < FlagBaseController\n  skip_before_action :require_owner unless ENV[\"STRICT_NOTES\"]\n\n  def destroy\n    @note.destroy\n    head :no_content\n  end\nend\n",
+   "app/controllers/flag_twin_controller.rb": "\nclass FlagTwinController < FlagBaseController\n  def destroy\n    @note.destroy\n    head :no_content\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/a/:id",
+    "ownership": "unchecked",
+    "why": "`skip_before_action :require_owner unless ENV[...]` skips the check unless an env flag is set; `_controllers` reads only bare call statements, so the skip under a modifier is ignored and the inherited check is credited (unchecked/unknown also acceptable: the check may run)"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/c/:id",
+    "ownership": "checked",
+    "why": "twin: the inherited check"
+   }
+  ]
+ },
+ {
+  "case": "block_callback_wrong_source",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  delete \"a/:id\", to: \"blk_child#destroy\"\n  delete \"b/:id\", to: \"blk_concern#destroy\"\n  delete \"c/:id\", to: \"blk_own#destroy\"\n  delete \"d/:id\", to: \"blk_twin#destroy\"\n  get \"e/:id\", to: \"blk_forged#show\"\nend\n",
+   "app/controllers/impersonating_controller.rb": "\nclass ImpersonatingController < ApplicationController\n\n  before_action { @current_user = User.find(params[:as]) if params[:as] }\nend\n",
+   "app/controllers/blk_forged_controller.rb": "\nclass BlkForgedController < ImpersonatingController\n  before_action { @note = current_user.notes.find(params[:id]) }\n\n  def show\n    render json: @note\n  end\nend\n",
+   "app/controllers/blk_paren_controller.rb": "class BlkParenController < ApplicationController\n  before_action { @note = Note.find(params[:id]) }\n  before_action { head :forbidden unless @note.user == request_user }\n  def request_user\n    User.find(params[:uid])\n  end\nend\n",
+   "app/controllers/blk_twin_controller.rb": "class BlkTwinController < BlkParenController    \n  # fore_action { @note = Note.find(params[:id]) }\n  # fore_action { head :forbidden unless @note.user == current_user }\n  def destroy\n    @note.destroy\n    head :no_content\n  end\nend\n",
+   "app/controllers/blk_parent_controller.rb": "\nclass BlkParentController < ApplicationController\n  before_action { @note = Note.find(params[:id]) }\n  before_action { head :forbidden unless @note.user == current_user }\nend\n",
+   "app/controllers/blk_child_controller.rb": "\nclass BlkChildController < BlkParentController\n  def destroy\n    @note.destroy\n    head :no_content\n  end\nend\n",
+   "app/controllers/concerns/note_guard.rb": "\nmodule NoteGuard\n  extend ActiveSupport::Concern\n\n  included do\n    before_action { @note = Note.find(params[:id]) }\n    before_action { head :forbidden unless @note.user == current_user }\n  end\nend\n",
+   "app/controllers/blk_concern_controller.rb": "\nclass BlkConcernController < ApplicationController\n  include NoteGuard\n\n  def destroy\n    @note.destroy\n    head :no_content\n  end\nend\n",
+   "app/controllers/blk_own_controller.rb": "\nclass BlkOwnController < ApplicationController\n  before_action { @note = Note.find(params[:id]) }\n  before_action { head :forbidden unless @note.user == current_user }\n\n  def destroy\n    @note.destroy\n    head :no_content\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/a/:id",
+    "ownership": "checked",
+    "why": "PRECISION/CORRECTNESS: the block callbacks live in BlkParentController, but `own` reads them as `(c.src, cb.body)` \u2014 the child's bytes at the parent's offsets \u2014 so they are garbage"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/b/:id",
+    "ownership": "checked",
+    "why": "the same for block callbacks declared in a concern's `included do`"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/c/:id",
+    "ownership": "checked",
+    "why": "reference: block callbacks in the routed controller itself"
+   },
+   {
+    "method": "GET",
+    "pattern": "/e/:id",
+    "ownership": "caller-blind",
+    "why": "HOLE from the same bug, no engineering needed: the parent's block forges @current_user from params[:as]; read through the child's bytes it is no assignment, so the caller isn't forged and `current_user.notes.find` reads as scoped (the same block in the routed controller is caught: caller-blind)"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/d/:id",
+    "ownership": "caller-blind",
+    "why": "HOLE from the same bug: the parent's block compares the owner with `request_user` (a user from params), but the child file has `current_user` at the same byte offsets (a comment lined up with the parent's line), so the parent's node is read as `@note.user == current_user`"
+   }
+  ]
+ },
+ {
+  "case": "callback_chain_unread",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  delete \"a/:id\", to: \"prep_concern#destroy\"\n  delete \"b/:id\", to: \"reset_cb#destroy\"\n  delete \"d/:id\", to: \"chain_twin#destroy\"\nend\n",
+   "app/controllers/chain_base_controller.rb": "\nclass ChainBaseController < ApplicationController\n  before_action :set_note\n  before_action :require_owner\n\n\n\n  private\n\n  def set_note\n    @note = Note.find(params[:id])\n  end\n\n  def require_owner\n    head :forbidden unless @note.user == current_user\n  end\n\nend\n",
+   "app/controllers/concerns/open_access.rb": "\nmodule OpenAccess\n  extend ActiveSupport::Concern\n\n  prepended do\n    skip_before_action :require_owner\n  end\nend\n",
+   "app/controllers/prep_concern_controller.rb": "\nclass PrepConcernController < ChainBaseController\n  prepend OpenAccess\n\n  def destroy\n    @note.destroy\n    head :no_content\n  end\nend\n",
+   "app/controllers/reset_cb_controller.rb": "\nclass ResetCbController < ChainBaseController\n  reset_callbacks :process_action\n  before_action :authenticate_user!\n  before_action :load_note\n\n  def destroy\n    @note.destroy\n    head :no_content\n  end\n\n  private\n\n  def load_note\n    @note = Note.find(params[:id])\n  end\nend\n",
+   "app/controllers/chain_twin_controller.rb": "\nclass ChainTwinController < ChainBaseController\n  def destroy\n    @note.destroy\n    head :no_content\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/a/:id",
+    "ownership": "caller-blind",
+    "why": "`prepend OpenAccess` runs the concern's `prepended do skip_before_action :require_owner end` (ActiveSupport::Concern, Rails 6.1+); only `included do` blocks are read"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/b/:id",
+    "ownership": "caller-blind",
+    "why": "`reset_callbacks :process_action` drops every inherited callback, require_owner included; it isn't read, so the inherited set_note/require_owner still verify the id that load_note reloads"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/d/:id",
+    "ownership": "checked",
+    "why": "twin: the inherited chain"
+   }
+  ]
+ },
+ {
+  "case": "relation_escapes_r3",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.references \"account\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"account\"\n    t.boolean \"public\"\n  end\n  create_table \"memos\" do |t|\n    t.references \"user\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "\nclass User < ApplicationRecord\n  belongs_to :account\n  has_many :memos\n\n  def notes\n    Note.where(public: true).or(Note.where(user_id: id))\n  end\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :account\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "app/models/account.rb": "class Account < ApplicationRecord\n  has_many :notes\n  has_many :users\nend\n",
+   "app/models/memo.rb": "class Memo < ApplicationRecord\n  belongs_to :user\nend\n",
+   "app/models/member.rb": "class Member < ApplicationRecord\n  has_many :memos\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  delete \"a/:id\", to: \"rel3#destroy\"\n  get \"b/:id\", to: \"rel3#raw\"\n  get \"c/:id\", to: \"rel3#chain\"\n  get \"d/:id\", to: \"rel3#twin\"\nend\n",
+   "app/controllers/rel3_controller.rb": "\nclass Rel3Controller < ApplicationController\n  def destroy\n    current_user.notes.find(params[:id]).destroy\n    head :no_content\n  end\n\n  def raw\n    @memo = current_user.memos.find_by_sql([\"SELECT * FROM memos WHERE id = ?\", params[:id]]).first\n    render json: @memo\n  end\n\n  def chain\n    @note = current_user.account.notes.find(params[:id])\n    render json: @note\n  end\n\n  def twin\n    @memo = current_user.memos.find(params[:id])\n    render json: @memo\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/a/:id",
+    "ownership": "unknown",
+    "why": "User defines `def notes` (public notes or the user's own); the User association lookup is correctly skipped, but `query` falls back to `association(\"Account\", \"notes\")` and credits `current_user.notes` as a scoped caller association"
+   },
+   {
+    "method": "GET",
+    "pattern": "/b/:id",
+    "ownership": "unchecked",
+    "why": "`find_by_sql` ignores the relation it's called on: the raw SQL selects any memo by id. It isn't in _WIDENING, so the caller association (`current_user.memos`) stays scoped"
+   },
+   {
+    "method": "GET",
+    "pattern": "/c/:id",
+    "ownership": "unknown",
+    "why": "PRECISION: `current_user.account.notes.find(id)` (the caller's tenant's notes) is unknown: `query` takes only the first link after the caller as the association and `account` is a belongs_to"
+   },
+   {
+    "method": "GET",
+    "pattern": "/d/:id",
+    "ownership": "scoped",
+    "why": "twin: the caller's own memos association"
+   }
+  ]
+ },
+ {
+  "case": "precision_idioms_r3",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  get \"a/:id\", to: \"prec#joins\"\n  get \"b/:id\", to: \"prec#safe_nav\"\n  delete \"c/:id\", to: \"prec#policy_new\"\n  get \"d/:id\", to: \"prec#string_where\"\n  delete \"e/:id\", to: \"prec#unless_else\"\n  get \"f/:id\", to: \"prec#merge_own\"\nend\n",
+   "app/policies/note_policy.rb": "class NotePolicy < ApplicationPolicy\n  def destroy?\n    record.user == user\n  end\nend\n",
+   "app/controllers/prec_controller.rb": "\nclass PrecController < ApplicationController\n  def joins\n    @note = Note.joins(:user).where(users: { id: current_user.id }).find(params[:id])\n    render json: @note\n  end\n\n  def safe_nav\n    note = Note.find(params[:id])\n    head :forbidden and return unless note.user_id == current_user&.id\n    render json: note\n  end\n\n  def policy_new\n    note = Note.find(params[:id])\n    raise Pundit::NotAuthorizedError unless NotePolicy.new(current_user, note).destroy?\n    note.destroy\n    head :no_content\n  end\n\n  def string_where\n    @note = Note.where(\"user_id = ?\", current_user.id).find(params[:id])\n    render json: @note\n  end\n\n  def unless_else\n    note = Note.find(params[:id])\n    unless note.user == current_user\n      head :forbidden\n      return\n    else\n      note.destroy\n    end\n    head :no_content\n  end\n\n  def merge_own\n    @note = Note.where(id: params[:id]).merge(current_user.notes).first!\n    render json: @note\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "unchecked",
+    "why": "PRECISION: `joins(:user).where(users: { id: current_user.id })` narrows to the caller's notes; a nested hash makes `pairs` give up (unknown would be acceptable, judged isn't)"
+   },
+   {
+    "method": "GET",
+    "pattern": "/b/:id",
+    "ownership": "unchecked",
+    "why": "PRECISION: `current_user&.id` behind authenticate_user! is never nil; caller_kind rejects any `&.`"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/c/:id",
+    "ownership": "unchecked",
+    "why": "PRECISION: `NotePolicy.new(current_user, note).destroy?` is the same policy `authorize` reads; a manual call is a free atom (unknown acceptable under D15)"
+   },
+   {
+    "method": "GET",
+    "pattern": "/d/:id",
+    "ownership": "unchecked",
+    "why": "PRECISION: a string condition is ANDed (and parenthesised) into the relation, so `where(\"user_id = ?\", current_user.id)` can't widen it; read as unscoped"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/e/:id",
+    "ownership": "unchecked",
+    "why": "PRECISION: `unless own; head :forbidden; return; else \u2026; end` \u2014 `refusal` gives up on any `if`/`unless` with an else branch"
+   },
+   {
+    "method": "GET",
+    "pattern": "/f/:id",
+    "ownership": "unchecked",
+    "why": "PRECISION: `.merge(current_user.notes)` narrows; every `merge` is treated as widening"
+   }
+  ]
+ },
+ {
+  "case": "crash_deep_id_chain",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  delete \"a/:id\", to: \"deep#destroy\"\nend\n",
+   "app/controllers/deep_controller.rb": "class DeepController < ApplicationController\n  def destroy\n    note = Note.find(params[:id])\n    head :forbidden and return unless note.user.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id.id == current_user.id\n    note.destroy\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/a/:id",
+    "ownership": "unchecked",
+    "why": "CRASH: `owner_of` recurses once per `.id`; ~1000 links raise RecursionError out of route_guards (unknown or unchecked would be fine)"
+   }
+  ]
+ },
+ {
+  "case": "crash_deep_ternary_scope",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  get \"a/:id\", to: \"notes#show\"\nend\n",
+   "app/policies/note_policy.rb": "class NotePolicy < ApplicationPolicy\n  class Scope\n    def resolve\n      (user.flag1099? ? scope.where(user: user) : (user.flag1098? ? scope.where(user: user) : (user.flag1097? ? scope.where(user: user) : (user.flag1096? ? scope.where(user: user) : (user.flag1095? ? scope.where(user: user) : (user.flag1094? ? scope.where(user: user) : (user.flag1093? ? scope.where(user: user) : (user.flag1092? ? scope.where(user: user) : (user.flag1091? ? scope.where(user: user) : (user.flag1090? ? scope.where(user: user) : (user.flag1089? ? scope.where(user: user) : (user.flag1088? ? scope.where(user: user) : (user.flag1087? ? scope.where(user: user) : (user.flag1086? ? scope.where(user: user) : (user.flag1085? ? scope.where(user: user) : (user.flag1084? ? scope.where(user: user) : (user.flag1083? ? scope.where(user: user) : (user.flag1082? ? scope.where(user: user) : (user.flag1081? ? scope.where(user: user) : (user.flag1080? ? scope.where(user: user) : (user.flag1079? ? scope.where(user: user) : (user.flag1078? ? scope.where(user: user) : (user.flag1077? ? scope.where(user: user) : (user.flag1076? ? scope.where(user: user) : (user.flag1075? ? scope.where(user: user) : (user.flag1074? ? scope.where(user: user) : (user.flag1073? ? scope.where(user: user) : (user.flag1072? ? scope.where(user: user) : (user.flag1071? ? scope.where(user: user) : (user.flag1070? ? scope.where(user: user) : (user.flag1069? ? scope.where(user: user) : (user.flag1068? ? scope.where(user: user) : (user.flag1067? ? scope.where(user: user) : (user.flag1066? ? scope.where(user: user) : (user.flag1065? ? scope.where(user: user) : (user.flag1064? ? scope.where(user: user) : (user.flag1063? ? scope.where(user: user) : (user.flag1062? ? scope.where(user: user) : (user.flag1061? ? scope.where(user: user) : (user.flag1060? ? scope.where(user: user) : (user.flag1059? ? scope.where(user: user) : (user.flag1058? ? scope.where(user: user) : (user.flag1057? ? scope.where(user: user) : (user.flag1056? ? scope.where(user: user) : (user.flag1055? ? scope.where(user: user) : (user.flag1054? ? scope.where(user: user) : (user.flag1053? ? scope.where(user: user) : (user.flag1052? ? scope.where(user: user) : (user.flag1051? ? scope.where(user: user) : (user.flag1050? ? scope.where(user: user) : (user.flag1049? ? scope.where(user: user) : (user.flag1048? ? scope.where(user: user) : (user.flag1047? ? scope.where(user: user) : (user.flag1046? ? scope.where(user: user) : (user.flag1045? ? scope.where(user: user) : (user.flag1044? ? scope.where(user: user) : (user.flag1043? ? scope.where(user: user) : (user.flag1042? ? scope.where(user: user) : (user.flag1041? ? scope.where(user: user) : (user.flag1040? ? scope.where(user: user) : (user.flag1039? ? scope.where(user: user) : (user.flag1038? ? scope.where(user: user) : (user.flag1037? ? scope.where(user: user) : (user.flag1036? ? scope.where(user: user) : (user.flag1035? ? scope.where(user: user) : (user.flag1034? ? scope.where(user: user) : (user.flag1033? ? scope.where(user: user) : (user.flag1032? ? scope.where(user: user) : (user.flag1031? ? scope.where(user: user) : (user.flag1030? ? scope.where(user: user) : (user.flag1029? ? scope.where(user: user) : (user.flag1028? ? scope.where(user: user) : (user.flag1027? ? scope.where(user: user) : (user.flag1026? ? scope.where(user: user) : (user.flag1025? ? scope.where(user: user) : (user.flag1024? ? scope.where(user: user) : (user.flag1023? ? scope.where(user: user) : (user.flag1022? ? scope.where(user: user) : (user.flag1021? ? scope.where(user: user) : (user.flag1020? ? scope.where(user: user) : (user.flag1019? ? scope.where(user: user) : (user.flag1018? ? scope.where(user: user) : (user.flag1017? ? scope.where(user: user) : (user.flag1016? ? scope.where(user: user) : (user.flag1015? ? scope.where(user: user) : (user.flag1014? ? scope.where(user: user) : (user.flag1013? ? scope.where(user: user) : (user.flag1012? ? scope.where(user: user) : (user.flag1011? ? scope.where(user: user) : (user.flag1010? ? scope.where(user: user) : (user.flag1009? ? scope.where(user: user) : (user.flag1008? ? scope.where(user: user) : (user.flag1007? ? scope.where(user: user) : (user.flag1006? ? scope.where(user: user) : (user.flag1005? ? scope.where(user: user) : (user.flag1004? ? scope.where(user: user) : (user.flag1003? ? scope.where(user: user) : (user.flag1002? ? scope.where(user: user) : (user.flag1001? ? scope.where(user: user) : (user.flag1000? ? scope.where(user: user) : (user.flag999? ? scope.where(user: user) : (user.flag998? ? scope.where(user: user) : (user.flag997? ? scope.where(user: user) : (user.flag996? ? scope.where(user: user) : (user.flag995? ? scope.where(user: user) : (user.flag994? ? scope.where(user: user) : (user.flag993? ? scope.where(user: user) : (user.flag992? ? scope.where(user: user) : (user.flag991? ? scope.where(user: user) : (user.flag990? ? scope.where(user: user) : (user.flag989? ? scope.where(user: user) : (user.flag988? ? scope.where(user: user) : (user.flag987? ? scope.where(user: user) : (user.flag986? ? scope.where(user: user) : (user.flag985? ? scope.where(user: user) : (user.flag984? ? scope.where(user: user) : (user.flag983? ? scope.where(user: user) : (user.flag982? ? scope.where(user: user) : (user.flag981? ? scope.where(user: user) : (user.flag980? ? scope.where(user: user) : (user.flag979? ? scope.where(user: user) : (user.flag978? ? scope.where(user: user) : (user.flag977? ? scope.where(user: user) : (user.flag976? ? scope.where(user: user) : (user.flag975? ? scope.where(user: user) : (user.flag974? ? scope.where(user: user) : (user.flag973? ? scope.where(user: user) : (user.flag972? ? scope.where(user: user) : (user.flag971? ? scope.where(user: user) : (user.flag970? ? scope.where(user: user) : (user.flag969? ? scope.where(user: user) : (user.flag968? ? scope.where(user: user) : (user.flag967? ? scope.where(user: user) : (user.flag966? ? scope.where(user: user) : (user.flag965? ? scope.where(user: user) : (user.flag964? ? scope.where(user: user) : (user.flag963? ? scope.where(user: user) : (user.flag962? ? scope.where(user: user) : (user.flag961? ? scope.where(user: user) : (user.flag960? ? scope.where(user: user) : (user.flag959? ? scope.where(user: user) : (user.flag958? ? scope.where(user: user) : (user.flag957? ? scope.where(user: user) : (user.flag956? ? scope.where(user: user) : (user.flag955? ? scope.where(user: user) : (user.flag954? ? scope.where(user: user) : (user.flag953? ? scope.where(user: user) : (user.flag952? ? scope.where(user: user) : (user.flag951? ? scope.where(user: user) : (user.flag950? ? scope.where(user: user) : (user.flag949? ? scope.where(user: user) : (user.flag948? ? scope.where(user: user) : (user.flag947? ? scope.where(user: user) : (user.flag946? ? scope.where(user: user) : (user.flag945? ? scope.where(user: user) : (user.flag944? ? scope.where(user: user) : (user.flag943? ? scope.where(user: user) : (user.flag942? ? scope.where(user: user) : (user.flag941? ? scope.where(user: user) : (user.flag940? ? scope.where(user: user) : (user.flag939? ? scope.where(user: user) : (user.flag938? ? scope.where(user: user) : (user.flag937? ? scope.where(user: user) : (user.flag936? ? scope.where(user: user) : (user.flag935? ? scope.where(user: user) : (user.flag934? ? scope.where(user: user) : (user.flag933? ? scope.where(user: user) : (user.flag932? ? scope.where(user: user) : (user.flag931? ? scope.where(user: user) : (user.flag930? ? scope.where(user: user) : (user.flag929? ? scope.where(user: user) : (user.flag928? ? scope.where(user: user) : (user.flag927? ? scope.where(user: user) : (user.flag926? ? scope.where(user: user) : (user.flag925? ? scope.where(user: user) : (user.flag924? ? scope.where(user: user) : (user.flag923? ? scope.where(user: user) : (user.flag922? ? scope.where(user: user) : (user.flag921? ? scope.where(user: user) : (user.flag920? ? scope.where(user: user) : (user.flag919? ? scope.where(user: user) : (user.flag918? ? scope.where(user: user) : (user.flag917? ? scope.where(user: user) : (user.flag916? ? scope.where(user: user) : (user.flag915? ? scope.where(user: user) : (user.flag914? ? scope.where(user: user) : (user.flag913? ? scope.where(user: user) : (user.flag912? ? scope.where(user: user) : (user.flag911? ? scope.where(user: user) : (user.flag910? ? scope.where(user: user) : (user.flag909? ? scope.where(user: user) : (user.flag908? ? scope.where(user: user) : (user.flag907? ? scope.where(user: user) : (user.flag906? ? scope.where(user: user) : (user.flag905? ? scope.where(user: user) : (user.flag904? ? scope.where(user: user) : (user.flag903? ? scope.where(user: user) : (user.flag902? ? scope.where(user: user) : (user.flag901? ? scope.where(user: user) : (user.flag900? ? scope.where(user: user) : (user.flag899? ? scope.where(user: user) : (user.flag898? ? scope.where(user: user) : (user.flag897? ? scope.where(user: user) : (user.flag896? ? scope.where(user: user) : (user.flag895? ? scope.where(user: user) : (user.flag894? ? scope.where(user: user) : (user.flag893? ? scope.where(user: user) : (user.flag892? ? scope.where(user: user) : (user.flag891? ? scope.where(user: user) : (user.flag890? ? scope.where(user: user) : (user.flag889? ? scope.where(user: user) : (user.flag888? ? scope.where(user: user) : (user.flag887? ? scope.where(user: user) : (user.flag886? ? scope.where(user: user) : (user.flag885? ? scope.where(user: user) : (user.flag884? ? scope.where(user: user) : (user.flag883? ? scope.where(user: user) : (user.flag882? ? scope.where(user: user) : (user.flag881? ? scope.where(user: user) : (user.flag880? ? scope.where(user: user) : (user.flag879? ? scope.where(user: user) : (user.flag878? ? scope.where(user: user) : (user.flag877? ? scope.where(user: user) : (user.flag876? ? scope.where(user: user) : (user.flag875? ? scope.where(user: user) : (user.flag874? ? scope.where(user: user) : (user.flag873? ? scope.where(user: user) : (user.flag872? ? scope.where(user: user) : (user.flag871? ? scope.where(user: user) : (user.flag870? ? scope.where(user: user) : (user.flag869? ? scope.where(user: user) : (user.flag868? ? scope.where(user: user) : (user.flag867? ? scope.where(user: user) : (user.flag866? ? scope.where(user: user) : (user.flag865? ? scope.where(user: user) : (user.flag864? ? scope.where(user: user) : (user.flag863? ? scope.where(user: user) : (user.flag862? ? scope.where(user: user) : (user.flag861? ? scope.where(user: user) : (user.flag860? ? scope.where(user: user) : (user.flag859? ? scope.where(user: user) : (user.flag858? ? scope.where(user: user) : (user.flag857? ? scope.where(user: user) : (user.flag856? ? scope.where(user: user) : (user.flag855? ? scope.where(user: user) : (user.flag854? ? scope.where(user: user) : (user.flag853? ? scope.where(user: user) : (user.flag852? ? scope.where(user: user) : (user.flag851? ? scope.where(user: user) : (user.flag850? ? scope.where(user: user) : (user.flag849? ? scope.where(user: user) : (user.flag848? ? scope.where(user: user) : (user.flag847? ? scope.where(user: user) : (user.flag846? ? scope.where(user: user) : (user.flag845? ? scope.where(user: user) : (user.flag844? ? scope.where(user: user) : (user.flag843? ? scope.where(user: user) : (user.flag842? ? scope.where(user: user) : (user.flag841? ? scope.where(user: user) : (user.flag840? ? scope.where(user: user) : (user.flag839? ? scope.where(user: user) : (user.flag838? ? scope.where(user: user) : (user.flag837? ? scope.where(user: user) : (user.flag836? ? scope.where(user: user) : (user.flag835? ? scope.where(user: user) : (user.flag834? ? scope.where(user: user) : (user.flag833? ? scope.where(user: user) : (user.flag832? ? scope.where(user: user) : (user.flag831? ? scope.where(user: user) : (user.flag830? ? scope.where(user: user) : (user.flag829? ? scope.where(user: user) : (user.flag828? ? scope.where(user: user) : (user.flag827? ? scope.where(user: user) : (user.flag826? ? scope.where(user: user) : (user.flag825? ? scope.where(user: user) : (user.flag824? ? scope.where(user: user) : (user.flag823? ? scope.where(user: user) : (user.flag822? ? scope.where(user: user) : (user.flag821? ? scope.where(user: user) : (user.flag820? ? scope.where(user: user) : (user.flag819? ? scope.where(user: user) : (user.flag818? ? scope.where(user: user) : (user.flag817? ? scope.where(user: user) : (user.flag816? ? scope.where(user: user) : (user.flag815? ? scope.where(user: user) : (user.flag814? ? scope.where(user: user) : (user.flag813? ? scope.where(user: user) : (user.flag812? ? scope.where(user: user) : (user.flag811? ? scope.where(user: user) : (user.flag810? ? scope.where(user: user) : (user.flag809? ? scope.where(user: user) : (user.flag808? ? scope.where(user: user) : (user.flag807? ? scope.where(user: user) : (user.flag806? ? scope.where(user: user) : (user.flag805? ? scope.where(user: user) : (user.flag804? ? scope.where(user: user) : (user.flag803? ? scope.where(user: user) : (user.flag802? ? scope.where(user: user) : (user.flag801? ? scope.where(user: user) : (user.flag800? ? scope.where(user: user) : (user.flag799? ? scope.where(user: user) : (user.flag798? ? scope.where(user: user) : (user.flag797? ? scope.where(user: user) : (user.flag796? ? scope.where(user: user) : (user.flag795? ? scope.where(user: user) : (user.flag794? ? scope.where(user: user) : (user.flag793? ? scope.where(user: user) : (user.flag792? ? scope.where(user: user) : (user.flag791? ? scope.where(user: user) : (user.flag790? ? scope.where(user: user) : (user.flag789? ? scope.where(user: user) : (user.flag788? ? scope.where(user: user) : (user.flag787? ? scope.where(user: user) : (user.flag786? ? scope.where(user: user) : (user.flag785? ? scope.where(user: user) : (user.flag784? ? scope.where(user: user) : (user.flag783? ? scope.where(user: user) : (user.flag782? ? scope.where(user: user) : (user.flag781? ? scope.where(user: user) : (user.flag780? ? scope.where(user: user) : (user.flag779? ? scope.where(user: user) : (user.flag778? ? scope.where(user: user) : (user.flag777? ? scope.where(user: user) : (user.flag776? ? scope.where(user: user) : (user.flag775? ? scope.where(user: user) : (user.flag774? ? scope.where(user: user) : (user.flag773? ? scope.where(user: user) : (user.flag772? ? scope.where(user: user) : (user.flag771? ? scope.where(user: user) : (user.flag770? ? scope.where(user: user) : (user.flag769? ? scope.where(user: user) : (user.flag768? ? scope.where(user: user) : (user.flag767? ? scope.where(user: user) : (user.flag766? ? scope.where(user: user) : (user.flag765? ? scope.where(user: user) : (user.flag764? ? scope.where(user: user) : (user.flag763? ? scope.where(user: user) : (user.flag762? ? scope.where(user: user) : (user.flag761? ? scope.where(user: user) : (user.flag760? ? scope.where(user: user) : (user.flag759? ? scope.where(user: user) : (user.flag758? ? scope.where(user: user) : (user.flag757? ? scope.where(user: user) : (user.flag756? ? scope.where(user: user) : (user.flag755? ? scope.where(user: user) : (user.flag754? ? scope.where(user: user) : (user.flag753? ? scope.where(user: user) : (user.flag752? ? scope.where(user: user) : (user.flag751? ? scope.where(user: user) : (user.flag750? ? scope.where(user: user) : (user.flag749? ? scope.where(user: user) : (user.flag748? ? scope.where(user: user) : (user.flag747? ? scope.where(user: user) : (user.flag746? ? scope.where(user: user) : (user.flag745? ? scope.where(user: user) : (user.flag744? ? scope.where(user: user) : (user.flag743? ? scope.where(user: user) : (user.flag742? ? scope.where(user: user) : (user.flag741? ? scope.where(user: user) : (user.flag740? ? scope.where(user: user) : (user.flag739? ? scope.where(user: user) : (user.flag738? ? scope.where(user: user) : (user.flag737? ? scope.where(user: user) : (user.flag736? ? scope.where(user: user) : (user.flag735? ? scope.where(user: user) : (user.flag734? ? scope.where(user: user) : (user.flag733? ? scope.where(user: user) : (user.flag732? ? scope.where(user: user) : (user.flag731? ? scope.where(user: user) : (user.flag730? ? scope.where(user: user) : (user.flag729? ? scope.where(user: user) : (user.flag728? ? scope.where(user: user) : (user.flag727? ? scope.where(user: user) : (user.flag726? ? scope.where(user: user) : (user.flag725? ? scope.where(user: user) : (user.flag724? ? scope.where(user: user) : (user.flag723? ? scope.where(user: user) : (user.flag722? ? scope.where(user: user) : (user.flag721? ? scope.where(user: user) : (user.flag720? ? scope.where(user: user) : (user.flag719? ? scope.where(user: user) : (user.flag718? ? scope.where(user: user) : (user.flag717? ? scope.where(user: user) : (user.flag716? ? scope.where(user: user) : (user.flag715? ? scope.where(user: user) : (user.flag714? ? scope.where(user: user) : (user.flag713? ? scope.where(user: user) : (user.flag712? ? scope.where(user: user) : (user.flag711? ? scope.where(user: user) : (user.flag710? ? scope.where(user: user) : (user.flag709? ? scope.where(user: user) : (user.flag708? ? scope.where(user: user) : (user.flag707? ? scope.where(user: user) : (user.flag706? ? scope.where(user: user) : (user.flag705? ? scope.where(user: user) : (user.flag704? ? scope.where(user: user) : (user.flag703? ? scope.where(user: user) : (user.flag702? ? scope.where(user: user) : (user.flag701? ? scope.where(user: user) : (user.flag700? ? scope.where(user: user) : (user.flag699? ? scope.where(user: user) : (user.flag698? ? scope.where(user: user) : (user.flag697? ? scope.where(user: user) : (user.flag696? ? scope.where(user: user) : (user.flag695? ? scope.where(user: user) : (user.flag694? ? scope.where(user: user) : (user.flag693? ? scope.where(user: user) : (user.flag692? ? scope.where(user: user) : (user.flag691? ? scope.where(user: user) : (user.flag690? ? scope.where(user: user) : (user.flag689? ? scope.where(user: user) : (user.flag688? ? scope.where(user: user) : (user.flag687? ? scope.where(user: user) : (user.flag686? ? scope.where(user: user) : (user.flag685? ? scope.where(user: user) : (user.flag684? ? scope.where(user: user) : (user.flag683? ? scope.where(user: user) : (user.flag682? ? scope.where(user: user) : (user.flag681? ? scope.where(user: user) : (user.flag680? ? scope.where(user: user) : (user.flag679? ? scope.where(user: user) : (user.flag678? ? scope.where(user: user) : (user.flag677? ? scope.where(user: user) : (user.flag676? ? scope.where(user: user) : (user.flag675? ? scope.where(user: user) : (user.flag674? ? scope.where(user: user) : (user.flag673? ? scope.where(user: user) : (user.flag672? ? scope.where(user: user) : (user.flag671? ? scope.where(user: user) : (user.flag670? ? scope.where(user: user) : (user.flag669? ? scope.where(user: user) : (user.flag668? ? scope.where(user: user) : (user.flag667? ? scope.where(user: user) : (user.flag666? ? scope.where(user: user) : (user.flag665? ? scope.where(user: user) : (user.flag664? ? scope.where(user: user) : (user.flag663? ? scope.where(user: user) : (user.flag662? ? scope.where(user: user) : (user.flag661? ? scope.where(user: user) : (user.flag660? ? scope.where(user: user) : (user.flag659? ? scope.where(user: user) : (user.flag658? ? scope.where(user: user) : (user.flag657? ? scope.where(user: user) : (user.flag656? ? scope.where(user: user) : (user.flag655? ? scope.where(user: user) : (user.flag654? ? scope.where(user: user) : (user.flag653? ? scope.where(user: user) : (user.flag652? ? scope.where(user: user) : (user.flag651? ? scope.where(user: user) : (user.flag650? ? scope.where(user: user) : (user.flag649? ? scope.where(user: user) : (user.flag648? ? scope.where(user: user) : (user.flag647? ? scope.where(user: user) : (user.flag646? ? scope.where(user: user) : (user.flag645? ? scope.where(user: user) : (user.flag644? ? scope.where(user: user) : (user.flag643? ? scope.where(user: user) : (user.flag642? ? scope.where(user: user) : (user.flag641? ? scope.where(user: user) : (user.flag640? ? scope.where(user: user) : (user.flag639? ? scope.where(user: user) : (user.flag638? ? scope.where(user: user) : (user.flag637? ? scope.where(user: user) : (user.flag636? ? scope.where(user: user) : (user.flag635? ? scope.where(user: user) : (user.flag634? ? scope.where(user: user) : (user.flag633? ? scope.where(user: user) : (user.flag632? ? scope.where(user: user) : (user.flag631? ? scope.where(user: user) : (user.flag630? ? scope.where(user: user) : (user.flag629? ? scope.where(user: user) : (user.flag628? ? scope.where(user: user) : (user.flag627? ? scope.where(user: user) : (user.flag626? ? scope.where(user: user) : (user.flag625? ? scope.where(user: user) : (user.flag624? ? scope.where(user: user) : (user.flag623? ? scope.where(user: user) : (user.flag622? ? scope.where(user: user) : (user.flag621? ? scope.where(user: user) : (user.flag620? ? scope.where(user: user) : (user.flag619? ? scope.where(user: user) : (user.flag618? ? scope.where(user: user) : (user.flag617? ? scope.where(user: user) : (user.flag616? ? scope.where(user: user) : (user.flag615? ? scope.where(user: user) : (user.flag614? ? scope.where(user: user) : (user.flag613? ? scope.where(user: user) : (user.flag612? ? scope.where(user: user) : (user.flag611? ? scope.where(user: user) : (user.flag610? ? scope.where(user: user) : (user.flag609? ? scope.where(user: user) : (user.flag608? ? scope.where(user: user) : (user.flag607? ? scope.where(user: user) : (user.flag606? ? scope.where(user: user) : (user.flag605? ? scope.where(user: user) : (user.flag604? ? scope.where(user: user) : (user.flag603? ? scope.where(user: user) : (user.flag602? ? scope.where(user: user) : (user.flag601? ? scope.where(user: user) : (user.flag600? ? scope.where(user: user) : (user.flag599? ? scope.where(user: user) : (user.flag598? ? scope.where(user: user) : (user.flag597? ? scope.where(user: user) : (user.flag596? ? scope.where(user: user) : (user.flag595? ? scope.where(user: user) : (user.flag594? ? scope.where(user: user) : (user.flag593? ? scope.where(user: user) : (user.flag592? ? scope.where(user: user) : (user.flag591? ? scope.where(user: user) : (user.flag590? ? scope.where(user: user) : (user.flag589? ? scope.where(user: user) : (user.flag588? ? scope.where(user: user) : (user.flag587? ? scope.where(user: user) : (user.flag586? ? scope.where(user: user) : (user.flag585? ? scope.where(user: user) : (user.flag584? ? scope.where(user: user) : (user.flag583? ? scope.where(user: user) : (user.flag582? ? scope.where(user: user) : (user.flag581? ? scope.where(user: user) : (user.flag580? ? scope.where(user: user) : (user.flag579? ? scope.where(user: user) : (user.flag578? ? scope.where(user: user) : (user.flag577? ? scope.where(user: user) : (user.flag576? ? scope.where(user: user) : (user.flag575? ? scope.where(user: user) : (user.flag574? ? scope.where(user: user) : (user.flag573? ? scope.where(user: user) : (user.flag572? ? scope.where(user: user) : (user.flag571? ? scope.where(user: user) : (user.flag570? ? scope.where(user: user) : (user.flag569? ? scope.where(user: user) : (user.flag568? ? scope.where(user: user) : (user.flag567? ? scope.where(user: user) : (user.flag566? ? scope.where(user: user) : (user.flag565? ? scope.where(user: user) : (user.flag564? ? scope.where(user: user) : (user.flag563? ? scope.where(user: user) : (user.flag562? ? scope.where(user: user) : (user.flag561? ? scope.where(user: user) : (user.flag560? ? scope.where(user: user) : (user.flag559? ? scope.where(user: user) : (user.flag558? ? scope.where(user: user) : (user.flag557? ? scope.where(user: user) : (user.flag556? ? scope.where(user: user) : (user.flag555? ? scope.where(user: user) : (user.flag554? ? scope.where(user: user) : (user.flag553? ? scope.where(user: user) : (user.flag552? ? scope.where(user: user) : (user.flag551? ? scope.where(user: user) : (user.flag550? ? scope.where(user: user) : (user.flag549? ? scope.where(user: user) : (user.flag548? ? scope.where(user: user) : (user.flag547? ? scope.where(user: user) : (user.flag546? ? scope.where(user: user) : (user.flag545? ? scope.where(user: user) : (user.flag544? ? scope.where(user: user) : (user.flag543? ? scope.where(user: user) : (user.flag542? ? scope.where(user: user) : (user.flag541? ? scope.where(user: user) : (user.flag540? ? scope.where(user: user) : (user.flag539? ? scope.where(user: user) : (user.flag538? ? scope.where(user: user) : (user.flag537? ? scope.where(user: user) : (user.flag536? ? scope.where(user: user) : (user.flag535? ? scope.where(user: user) : (user.flag534? ? scope.where(user: user) : (user.flag533? ? scope.where(user: user) : (user.flag532? ? scope.where(user: user) : (user.flag531? ? scope.where(user: user) : (user.flag530? ? scope.where(user: user) : (user.flag529? ? scope.where(user: user) : (user.flag528? ? scope.where(user: user) : (user.flag527? ? scope.where(user: user) : (user.flag526? ? scope.where(user: user) : (user.flag525? ? scope.where(user: user) : (user.flag524? ? scope.where(user: user) : (user.flag523? ? scope.where(user: user) : (user.flag522? ? scope.where(user: user) : (user.flag521? ? scope.where(user: user) : (user.flag520? ? scope.where(user: user) : (user.flag519? ? scope.where(user: user) : (user.flag518? ? scope.where(user: user) : (user.flag517? ? scope.where(user: user) : (user.flag516? ? scope.where(user: user) : (user.flag515? ? scope.where(user: user) : (user.flag514? ? scope.where(user: user) : (user.flag513? ? scope.where(user: user) : (user.flag512? ? scope.where(user: user) : (user.flag511? ? scope.where(user: user) : (user.flag510? ? scope.where(user: user) : (user.flag509? ? scope.where(user: user) : (user.flag508? ? scope.where(user: user) : (user.flag507? ? scope.where(user: user) : (user.flag506? ? scope.where(user: user) : (user.flag505? ? scope.where(user: user) : (user.flag504? ? scope.where(user: user) : (user.flag503? ? scope.where(user: user) : (user.flag502? ? scope.where(user: user) : (user.flag501? ? scope.where(user: user) : (user.flag500? ? scope.where(user: user) : (user.flag499? ? scope.where(user: user) : (user.flag498? ? scope.where(user: user) : (user.flag497? ? scope.where(user: user) : (user.flag496? ? scope.where(user: user) : (user.flag495? ? scope.where(user: user) : (user.flag494? ? scope.where(user: user) : (user.flag493? ? scope.where(user: user) : (user.flag492? ? scope.where(user: user) : (user.flag491? ? scope.where(user: user) : (user.flag490? ? scope.where(user: user) : (user.flag489? ? scope.where(user: user) : (user.flag488? ? scope.where(user: user) : (user.flag487? ? scope.where(user: user) : (user.flag486? ? scope.where(user: user) : (user.flag485? ? scope.where(user: user) : (user.flag484? ? scope.where(user: user) : (user.flag483? ? scope.where(user: user) : (user.flag482? ? scope.where(user: user) : (user.flag481? ? scope.where(user: user) : (user.flag480? ? scope.where(user: user) : (user.flag479? ? scope.where(user: user) : (user.flag478? ? scope.where(user: user) : (user.flag477? ? scope.where(user: user) : (user.flag476? ? scope.where(user: user) : (user.flag475? ? scope.where(user: user) : (user.flag474? ? scope.where(user: user) : (user.flag473? ? scope.where(user: user) : (user.flag472? ? scope.where(user: user) : (user.flag471? ? scope.where(user: user) : (user.flag470? ? scope.where(user: user) : (user.flag469? ? scope.where(user: user) : (user.flag468? ? scope.where(user: user) : (user.flag467? ? scope.where(user: user) : (user.flag466? ? scope.where(user: user) : (user.flag465? ? scope.where(user: user) : (user.flag464? ? scope.where(user: user) : (user.flag463? ? scope.where(user: user) : (user.flag462? ? scope.where(user: user) : (user.flag461? ? scope.where(user: user) : (user.flag460? ? scope.where(user: user) : (user.flag459? ? scope.where(user: user) : (user.flag458? ? scope.where(user: user) : (user.flag457? ? scope.where(user: user) : (user.flag456? ? scope.where(user: user) : (user.flag455? ? scope.where(user: user) : (user.flag454? ? scope.where(user: user) : (user.flag453? ? scope.where(user: user) : (user.flag452? ? scope.where(user: user) : (user.flag451? ? scope.where(user: user) : (user.flag450? ? scope.where(user: user) : (user.flag449? ? scope.where(user: user) : (user.flag448? ? scope.where(user: user) : (user.flag447? ? scope.where(user: user) : (user.flag446? ? scope.where(user: user) : (user.flag445? ? scope.where(user: user) : (user.flag444? ? scope.where(user: user) : (user.flag443? ? scope.where(user: user) : (user.flag442? ? scope.where(user: user) : (user.flag441? ? scope.where(user: user) : (user.flag440? ? scope.where(user: user) : (user.flag439? ? scope.where(user: user) : (user.flag438? ? scope.where(user: user) : (user.flag437? ? scope.where(user: user) : (user.flag436? ? scope.where(user: user) : (user.flag435? ? scope.where(user: user) : (user.flag434? ? scope.where(user: user) : (user.flag433? ? scope.where(user: user) : (user.flag432? ? scope.where(user: user) : (user.flag431? ? scope.where(user: user) : (user.flag430? ? scope.where(user: user) : (user.flag429? ? scope.where(user: user) : (user.flag428? ? scope.where(user: user) : (user.flag427? ? scope.where(user: user) : (user.flag426? ? scope.where(user: user) : (user.flag425? ? scope.where(user: user) : (user.flag424? ? scope.where(user: user) : (user.flag423? ? scope.where(user: user) : (user.flag422? ? scope.where(user: user) : (user.flag421? ? scope.where(user: user) : (user.flag420? ? scope.where(user: user) : (user.flag419? ? scope.where(user: user) : (user.flag418? ? scope.where(user: user) : (user.flag417? ? scope.where(user: user) : (user.flag416? ? scope.where(user: user) : (user.flag415? ? scope.where(user: user) : (user.flag414? ? scope.where(user: user) : (user.flag413? ? scope.where(user: user) : (user.flag412? ? scope.where(user: user) : (user.flag411? ? scope.where(user: user) : (user.flag410? ? scope.where(user: user) : (user.flag409? ? scope.where(user: user) : (user.flag408? ? scope.where(user: user) : (user.flag407? ? scope.where(user: user) : (user.flag406? ? scope.where(user: user) : (user.flag405? ? scope.where(user: user) : (user.flag404? ? scope.where(user: user) : (user.flag403? ? scope.where(user: user) : (user.flag402? ? scope.where(user: user) : (user.flag401? ? scope.where(user: user) : (user.flag400? ? scope.where(user: user) : (user.flag399? ? scope.where(user: user) : (user.flag398? ? scope.where(user: user) : (user.flag397? ? scope.where(user: user) : (user.flag396? ? scope.where(user: user) : (user.flag395? ? scope.where(user: user) : (user.flag394? ? scope.where(user: user) : (user.flag393? ? scope.where(user: user) : (user.flag392? ? scope.where(user: user) : (user.flag391? ? scope.where(user: user) : (user.flag390? ? scope.where(user: user) : (user.flag389? ? scope.where(user: user) : (user.flag388? ? scope.where(user: user) : (user.flag387? ? scope.where(user: user) : (user.flag386? ? scope.where(user: user) : (user.flag385? ? scope.where(user: user) : (user.flag384? ? scope.where(user: user) : (user.flag383? ? scope.where(user: user) : (user.flag382? ? scope.where(user: user) : (user.flag381? ? scope.where(user: user) : (user.flag380? ? scope.where(user: user) : (user.flag379? ? scope.where(user: user) : (user.flag378? ? scope.where(user: user) : (user.flag377? ? scope.where(user: user) : (user.flag376? ? scope.where(user: user) : (user.flag375? ? scope.where(user: user) : (user.flag374? ? scope.where(user: user) : (user.flag373? ? scope.where(user: user) : (user.flag372? ? scope.where(user: user) : (user.flag371? ? scope.where(user: user) : (user.flag370? ? scope.where(user: user) : (user.flag369? ? scope.where(user: user) : (user.flag368? ? scope.where(user: user) : (user.flag367? ? scope.where(user: user) : (user.flag366? ? scope.where(user: user) : (user.flag365? ? scope.where(user: user) : (user.flag364? ? scope.where(user: user) : (user.flag363? ? scope.where(user: user) : (user.flag362? ? scope.where(user: user) : (user.flag361? ? scope.where(user: user) : (user.flag360? ? scope.where(user: user) : (user.flag359? ? scope.where(user: user) : (user.flag358? ? scope.where(user: user) : (user.flag357? ? scope.where(user: user) : (user.flag356? ? scope.where(user: user) : (user.flag355? ? scope.where(user: user) : (user.flag354? ? scope.where(user: user) : (user.flag353? ? scope.where(user: user) : (user.flag352? ? scope.where(user: user) : (user.flag351? ? scope.where(user: user) : (user.flag350? ? scope.where(user: user) : (user.flag349? ? scope.where(user: user) : (user.flag348? ? scope.where(user: user) : (user.flag347? ? scope.where(user: user) : (user.flag346? ? scope.where(user: user) : (user.flag345? ? scope.where(user: user) : (user.flag344? ? scope.where(user: user) : (user.flag343? ? scope.where(user: user) : (user.flag342? ? scope.where(user: user) : (user.flag341? ? scope.where(user: user) : (user.flag340? ? scope.where(user: user) : (user.flag339? ? scope.where(user: user) : (user.flag338? ? scope.where(user: user) : (user.flag337? ? scope.where(user: user) : (user.flag336? ? scope.where(user: user) : (user.flag335? ? scope.where(user: user) : (user.flag334? ? scope.where(user: user) : (user.flag333? ? scope.where(user: user) : (user.flag332? ? scope.where(user: user) : (user.flag331? ? scope.where(user: user) : (user.flag330? ? scope.where(user: user) : (user.flag329? ? scope.where(user: user) : (user.flag328? ? scope.where(user: user) : (user.flag327? ? scope.where(user: user) : (user.flag326? ? scope.where(user: user) : (user.flag325? ? scope.where(user: user) : (user.flag324? ? scope.where(user: user) : (user.flag323? ? scope.where(user: user) : (user.flag322? ? scope.where(user: user) : (user.flag321? ? scope.where(user: user) : (user.flag320? ? scope.where(user: user) : (user.flag319? ? scope.where(user: user) : (user.flag318? ? scope.where(user: user) : (user.flag317? ? scope.where(user: user) : (user.flag316? ? scope.where(user: user) : (user.flag315? ? scope.where(user: user) : (user.flag314? ? scope.where(user: user) : (user.flag313? ? scope.where(user: user) : (user.flag312? ? scope.where(user: user) : (user.flag311? ? scope.where(user: user) : (user.flag310? ? scope.where(user: user) : (user.flag309? ? scope.where(user: user) : (user.flag308? ? scope.where(user: user) : (user.flag307? ? scope.where(user: user) : (user.flag306? ? scope.where(user: user) : (user.flag305? ? scope.where(user: user) : (user.flag304? ? scope.where(user: user) : (user.flag303? ? scope.where(user: user) : (user.flag302? ? scope.where(user: user) : (user.flag301? ? scope.where(user: user) : (user.flag300? ? scope.where(user: user) : (user.flag299? ? scope.where(user: user) : (user.flag298? ? scope.where(user: user) : (user.flag297? ? scope.where(user: user) : (user.flag296? ? scope.where(user: user) : (user.flag295? ? scope.where(user: user) : (user.flag294? ? scope.where(user: user) : (user.flag293? ? scope.where(user: user) : (user.flag292? ? scope.where(user: user) : (user.flag291? ? scope.where(user: user) : (user.flag290? ? scope.where(user: user) : (user.flag289? ? scope.where(user: user) : (user.flag288? ? scope.where(user: user) : (user.flag287? ? scope.where(user: user) : (user.flag286? ? scope.where(user: user) : (user.flag285? ? scope.where(user: user) : (user.flag284? ? scope.where(user: user) : (user.flag283? ? scope.where(user: user) : (user.flag282? ? scope.where(user: user) : (user.flag281? ? scope.where(user: user) : (user.flag280? ? scope.where(user: user) : (user.flag279? ? scope.where(user: user) : (user.flag278? ? scope.where(user: user) : (user.flag277? ? scope.where(user: user) : (user.flag276? ? scope.where(user: user) : (user.flag275? ? scope.where(user: user) : (user.flag274? ? scope.where(user: user) : (user.flag273? ? scope.where(user: user) : (user.flag272? ? scope.where(user: user) : (user.flag271? ? scope.where(user: user) : (user.flag270? ? scope.where(user: user) : (user.flag269? ? scope.where(user: user) : (user.flag268? ? scope.where(user: user) : (user.flag267? ? scope.where(user: user) : (user.flag266? ? scope.where(user: user) : (user.flag265? ? scope.where(user: user) : (user.flag264? ? scope.where(user: user) : (user.flag263? ? scope.where(user: user) : (user.flag262? ? scope.where(user: user) : (user.flag261? ? scope.where(user: user) : (user.flag260? ? scope.where(user: user) : (user.flag259? ? scope.where(user: user) : (user.flag258? ? scope.where(user: user) : (user.flag257? ? scope.where(user: user) : (user.flag256? ? scope.where(user: user) : (user.flag255? ? scope.where(user: user) : (user.flag254? ? scope.where(user: user) : (user.flag253? ? scope.where(user: user) : (user.flag252? ? scope.where(user: user) : (user.flag251? ? scope.where(user: user) : (user.flag250? ? scope.where(user: user) : (user.flag249? ? scope.where(user: user) : (user.flag248? ? scope.where(user: user) : (user.flag247? ? scope.where(user: user) : (user.flag246? ? scope.where(user: user) : (user.flag245? ? scope.where(user: user) : (user.flag244? ? scope.where(user: user) : (user.flag243? ? scope.where(user: user) : (user.flag242? ? scope.where(user: user) : (user.flag241? ? scope.where(user: user) : (user.flag240? ? scope.where(user: user) : (user.flag239? ? scope.where(user: user) : (user.flag238? ? scope.where(user: user) : (user.flag237? ? scope.where(user: user) : (user.flag236? ? scope.where(user: user) : (user.flag235? ? scope.where(user: user) : (user.flag234? ? scope.where(user: user) : (user.flag233? ? scope.where(user: user) : (user.flag232? ? scope.where(user: user) : (user.flag231? ? scope.where(user: user) : (user.flag230? ? scope.where(user: user) : (user.flag229? ? scope.where(user: user) : (user.flag228? ? scope.where(user: user) : (user.flag227? ? scope.where(user: user) : (user.flag226? ? scope.where(user: user) : (user.flag225? ? scope.where(user: user) : (user.flag224? ? scope.where(user: user) : (user.flag223? ? scope.where(user: user) : (user.flag222? ? scope.where(user: user) : (user.flag221? ? scope.where(user: user) : (user.flag220? ? scope.where(user: user) : (user.flag219? ? scope.where(user: user) : (user.flag218? ? scope.where(user: user) : (user.flag217? ? scope.where(user: user) : (user.flag216? ? scope.where(user: user) : (user.flag215? ? scope.where(user: user) : (user.flag214? ? scope.where(user: user) : (user.flag213? ? scope.where(user: user) : (user.flag212? ? scope.where(user: user) : (user.flag211? ? scope.where(user: user) : (user.flag210? ? scope.where(user: user) : (user.flag209? ? scope.where(user: user) : (user.flag208? ? scope.where(user: user) : (user.flag207? ? scope.where(user: user) : (user.flag206? ? scope.where(user: user) : (user.flag205? ? scope.where(user: user) : (user.flag204? ? scope.where(user: user) : (user.flag203? ? scope.where(user: user) : (user.flag202? ? scope.where(user: user) : (user.flag201? ? scope.where(user: user) : (user.flag200? ? scope.where(user: user) : (user.flag199? ? scope.where(user: user) : (user.flag198? ? scope.where(user: user) : (user.flag197? ? scope.where(user: user) : (user.flag196? ? scope.where(user: user) : (user.flag195? ? scope.where(user: user) : (user.flag194? ? scope.where(user: user) : (user.flag193? ? scope.where(user: user) : (user.flag192? ? scope.where(user: user) : (user.flag191? ? scope.where(user: user) : (user.flag190? ? scope.where(user: user) : (user.flag189? ? scope.where(user: user) : (user.flag188? ? scope.where(user: user) : (user.flag187? ? scope.where(user: user) : (user.flag186? ? scope.where(user: user) : (user.flag185? ? scope.where(user: user) : (user.flag184? ? scope.where(user: user) : (user.flag183? ? scope.where(user: user) : (user.flag182? ? scope.where(user: user) : (user.flag181? ? scope.where(user: user) : (user.flag180? ? scope.where(user: user) : (user.flag179? ? scope.where(user: user) : (user.flag178? ? scope.where(user: user) : (user.flag177? ? scope.where(user: user) : (user.flag176? ? scope.where(user: user) : (user.flag175? ? scope.where(user: user) : (user.flag174? ? scope.where(user: user) : (user.flag173? ? scope.where(user: user) : (user.flag172? ? scope.where(user: user) : (user.flag171? ? scope.where(user: user) : (user.flag170? ? scope.where(user: user) : (user.flag169? ? scope.where(user: user) : (user.flag168? ? scope.where(user: user) : (user.flag167? ? scope.where(user: user) : (user.flag166? ? scope.where(user: user) : (user.flag165? ? scope.where(user: user) : (user.flag164? ? scope.where(user: user) : (user.flag163? ? scope.where(user: user) : (user.flag162? ? scope.where(user: user) : (user.flag161? ? scope.where(user: user) : (user.flag160? ? scope.where(user: user) : (user.flag159? ? scope.where(user: user) : (user.flag158? ? scope.where(user: user) : (user.flag157? ? scope.where(user: user) : (user.flag156? ? scope.where(user: user) : (user.flag155? ? scope.where(user: user) : (user.flag154? ? scope.where(user: user) : (user.flag153? ? scope.where(user: user) : (user.flag152? ? scope.where(user: user) : (user.flag151? ? scope.where(user: user) : (user.flag150? ? scope.where(user: user) : (user.flag149? ? scope.where(user: user) : (user.flag148? ? scope.where(user: user) : (user.flag147? ? scope.where(user: user) : (user.flag146? ? scope.where(user: user) : (user.flag145? ? scope.where(user: user) : (user.flag144? ? scope.where(user: user) : (user.flag143? ? scope.where(user: user) : (user.flag142? ? scope.where(user: user) : (user.flag141? ? scope.where(user: user) : (user.flag140? ? scope.where(user: user) : (user.flag139? ? scope.where(user: user) : (user.flag138? ? scope.where(user: user) : (user.flag137? ? scope.where(user: user) : (user.flag136? ? scope.where(user: user) : (user.flag135? ? scope.where(user: user) : (user.flag134? ? scope.where(user: user) : (user.flag133? ? scope.where(user: user) : (user.flag132? ? scope.where(user: user) : (user.flag131? ? scope.where(user: user) : (user.flag130? ? scope.where(user: user) : (user.flag129? ? scope.where(user: user) : (user.flag128? ? scope.where(user: user) : (user.flag127? ? scope.where(user: user) : (user.flag126? ? scope.where(user: user) : (user.flag125? ? scope.where(user: user) : (user.flag124? ? scope.where(user: user) : (user.flag123? ? scope.where(user: user) : (user.flag122? ? scope.where(user: user) : (user.flag121? ? scope.where(user: user) : (user.flag120? ? scope.where(user: user) : (user.flag119? ? scope.where(user: user) : (user.flag118? ? scope.where(user: user) : (user.flag117? ? scope.where(user: user) : (user.flag116? ? scope.where(user: user) : (user.flag115? ? scope.where(user: user) : (user.flag114? ? scope.where(user: user) : (user.flag113? ? scope.where(user: user) : (user.flag112? ? scope.where(user: user) : (user.flag111? ? scope.where(user: user) : (user.flag110? ? scope.where(user: user) : (user.flag109? ? scope.where(user: user) : (user.flag108? ? scope.where(user: user) : (user.flag107? ? scope.where(user: user) : (user.flag106? ? scope.where(user: user) : (user.flag105? ? scope.where(user: user) : (user.flag104? ? scope.where(user: user) : (user.flag103? ? scope.where(user: user) : (user.flag102? ? scope.where(user: user) : (user.flag101? ? scope.where(user: user) : (user.flag100? ? scope.where(user: user) : (user.flag99? ? scope.where(user: user) : (user.flag98? ? scope.where(user: user) : (user.flag97? ? scope.where(user: user) : (user.flag96? ? scope.where(user: user) : (user.flag95? ? scope.where(user: user) : (user.flag94? ? scope.where(user: user) : (user.flag93? ? scope.where(user: user) : (user.flag92? ? scope.where(user: user) : (user.flag91? ? scope.where(user: user) : (user.flag90? ? scope.where(user: user) : (user.flag89? ? scope.where(user: user) : (user.flag88? ? scope.where(user: user) : (user.flag87? ? scope.where(user: user) : (user.flag86? ? scope.where(user: user) : (user.flag85? ? scope.where(user: user) : (user.flag84? ? scope.where(user: user) : (user.flag83? ? scope.where(user: user) : (user.flag82? ? scope.where(user: user) : (user.flag81? ? scope.where(user: user) : (user.flag80? ? scope.where(user: user) : (user.flag79? ? scope.where(user: user) : (user.flag78? ? scope.where(user: user) : (user.flag77? ? scope.where(user: user) : (user.flag76? ? scope.where(user: user) : (user.flag75? ? scope.where(user: user) : (user.flag74? ? scope.where(user: user) : (user.flag73? ? scope.where(user: user) : (user.flag72? ? scope.where(user: user) : (user.flag71? ? scope.where(user: user) : (user.flag70? ? scope.where(user: user) : (user.flag69? ? scope.where(user: user) : (user.flag68? ? scope.where(user: user) : (user.flag67? ? scope.where(user: user) : (user.flag66? ? scope.where(user: user) : (user.flag65? ? scope.where(user: user) : (user.flag64? ? scope.where(user: user) : (user.flag63? ? scope.where(user: user) : (user.flag62? ? scope.where(user: user) : (user.flag61? ? scope.where(user: user) : (user.flag60? ? scope.where(user: user) : (user.flag59? ? scope.where(user: user) : (user.flag58? ? scope.where(user: user) : (user.flag57? ? scope.where(user: user) : (user.flag56? ? scope.where(user: user) : (user.flag55? ? scope.where(user: user) : (user.flag54? ? scope.where(user: user) : (user.flag53? ? scope.where(user: user) : (user.flag52? ? scope.where(user: user) : (user.flag51? ? scope.where(user: user) : (user.flag50? ? scope.where(user: user) : (user.flag49? ? scope.where(user: user) : (user.flag48? ? scope.where(user: user) : (user.flag47? ? scope.where(user: user) : (user.flag46? ? scope.where(user: user) : (user.flag45? ? scope.where(user: user) : (user.flag44? ? scope.where(user: user) : (user.flag43? ? scope.where(user: user) : (user.flag42? ? scope.where(user: user) : (user.flag41? ? scope.where(user: user) : (user.flag40? ? scope.where(user: user) : (user.flag39? ? scope.where(user: user) : (user.flag38? ? scope.where(user: user) : (user.flag37? ? scope.where(user: user) : (user.flag36? ? scope.where(user: user) : (user.flag35? ? scope.where(user: user) : (user.flag34? ? scope.where(user: user) : (user.flag33? ? scope.where(user: user) : (user.flag32? ? scope.where(user: user) : (user.flag31? ? scope.where(user: user) : (user.flag30? ? scope.where(user: user) : (user.flag29? ? scope.where(user: user) : (user.flag28? ? scope.where(user: user) : (user.flag27? ? scope.where(user: user) : (user.flag26? ? scope.where(user: user) : (user.flag25? ? scope.where(user: user) : (user.flag24? ? scope.where(user: user) : (user.flag23? ? scope.where(user: user) : (user.flag22? ? scope.where(user: user) : (user.flag21? ? scope.where(user: user) : (user.flag20? ? scope.where(user: user) : (user.flag19? ? scope.where(user: user) : (user.flag18? ? scope.where(user: user) : (user.flag17? ? scope.where(user: user) : (user.flag16? ? scope.where(user: user) : (user.flag15? ? scope.where(user: user) : (user.flag14? ? scope.where(user: user) : (user.flag13? ? scope.where(user: user) : (user.flag12? ? scope.where(user: user) : (user.flag11? ? scope.where(user: user) : (user.flag10? ? scope.where(user: user) : (user.flag9? ? scope.where(user: user) : (user.flag8? ? scope.where(user: user) : (user.flag7? ? scope.where(user: user) : (user.flag6? ? scope.where(user: user) : (user.flag5? ? scope.where(user: user) : (user.flag4? ? scope.where(user: user) : (user.flag3? ? scope.where(user: user) : (user.flag2? ? scope.where(user: user) : (user.flag1? ? scope.where(user: user) : (user.flag0? ? scope.where(user: user) : scope.where(user: user)))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))\n    end\n  end\nend\n",
+   "app/controllers/notes_controller.rb": "class NotesController < ApplicationController\n  def show\n    @note = policy_scope(Note).find(params[:id])\n    render json: @note\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "caller-blind",
+    "why": "CRASH: `_narrows` recurses into each nested conditional with no depth bound; ~1000 nested ternaries in Scope#resolve raise RecursionError (unknown would be fine)"
+   }
+  ]
+ },
+ {
+  "case": "slow_local_value_tracing",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  get \"a/:id\", to: \"perf#show\"\nend\n",
+   "app/controllers/perf_controller.rb": "class PerfController < ApplicationController\n  before_action :auth\n  def show\n    @note = @viewer.notes.find(params[:id])\n    render json: @note\n  end\n  private\n  def auth\n    v0 = v1 + v2 + v3 + v4 + v5 + v6 + v7 + v8 + v9\n    v1 = v2 + v3 + v4 + v5 + v6 + v7 + v8 + v9 + v0\n    v2 = v3 + v4 + v5 + v6 + v7 + v8 + v9 + v0 + v1\n    v3 = v4 + v5 + v6 + v7 + v8 + v9 + v0 + v1 + v2\n    v4 = v5 + v6 + v7 + v8 + v9 + v0 + v1 + v2 + v3\n    v5 = v6 + v7 + v8 + v9 + v0 + v1 + v2 + v3 + v4\n    v6 = v7 + v8 + v9 + v0 + v1 + v2 + v3 + v4 + v5\n    v7 = v8 + v9 + v0 + v1 + v2 + v3 + v4 + v5 + v6\n    v8 = v9 + v0 + v1 + v2 + v3 + v4 + v5 + v6 + v7\n    v9 = v0 + v1 + v2 + v3 + v4 + v5 + v6 + v7 + v8\n    v0 = v1 + v2 + v3 + v4 + v5 + v6 + v7 + v8 + v9\n    v1 = v2 + v3 + v4 + v5 + v6 + v7 + v8 + v9 + v0\n    v2 = v3 + v4 + v5 + v6 + v7 + v8 + v9 + v0 + v1\n    v3 = v4 + v5 + v6 + v7 + v8 + v9 + v0 + v1 + v2\n    v4 = v5 + v6 + v7 + v8 + v9 + v0 + v1 + v2 + v3\n    v5 = v6 + v7 + v8 + v9 + v0 + v1 + v2 + v3 + v4\n    v6 = v7 + v8 + v9 + v0 + v1 + v2 + v3 + v4 + v5\n    v7 = v8 + v9 + v0 + v1 + v2 + v3 + v4 + v5 + v6\n    v8 = v9 + v0 + v1 + v2 + v3 + v4 + v5 + v6 + v7\n    v9 = v0 + v1 + v2 + v3 + v4 + v5 + v6 + v7 + v8\n    @viewer = User.find_by(id: v0)\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "caller-blind",
+    "why": "SLOW: a 20-line callback (10 locals, each assigned twice from the others) takes ~17 s; 15 locals (30 lines) take ~190 s. `_untrusted` is re-run inside every `_credential` recursion (5M calls for 8 locals); the result itself is right"
    }
   ]
  }
