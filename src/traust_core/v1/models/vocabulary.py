@@ -58,6 +58,7 @@ if TYPE_CHECKING:
     InterfaceComplexity = StrEnum
     IsolationDimension = StrEnum
     IsolationPosture = StrEnum
+    ManifestCoverageReason = StrEnum
     MitigationEffort = StrEnum
     OwaspImpactBasis = StrEnum
     OwaspLlmCategory = StrEnum
@@ -148,6 +149,7 @@ else:
     InterfaceComplexity = contracts.enum("interface-complexity")
     IsolationDimension = contracts.enum("isolation-dimension")
     IsolationPosture = contracts.enum("isolation-posture")
+    ManifestCoverageReason = contracts.enum("manifest-coverage-reason")
     MitigationEffort = contracts.enum("mitigation-effort")
     OwaspImpactBasis = contracts.enum("owasp-impact-basis")
     OwaspLlmCategory = contracts.enum("owasp-llm-category")

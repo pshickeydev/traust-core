@@ -15,6 +15,7 @@ from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.process import ProcessResult, ProcessRunner
 from traust_core.v1.providers.syft import SyftSbom, unresolved_manifests
 from traust_core.v1.providers.tools import NoDatabase, ToolProvider, ToolRequest
+from traust_core.v1.providers.tree import MAX_FILE_BYTES
 
 AT = datetime(2026, 10, 26, tzinfo=UTC)
 CDX = json.dumps({"metadata": {"tools": {"components": [{"name": "syft", "version": "1.51.1"}]}}})
@@ -90,32 +91,68 @@ PACKAGE = json.dumps({"dependencies": {"lodash": "^4"}})
 CSPROJ = '<Project><ItemGroup><PackageReference Include="X" Version="1" /></ItemGroup></Project>'
 
 
+CARGO = '[dependencies]\nserde = "1"\n'
+
+
 @pytest.mark.parametrize(
     ("files", "expected"),
     [
         ({}, []),
         ({"pyproject.toml": PEP621}, [("pypi", "pyproject.toml")]),
-        ({"pyproject.toml": PEP621, "uv.lock": ""}, []),
-        ({"pyproject.toml": PEP621, "requirements.txt": "requests==2.32.0\n"}, []),
+        ({"pyproject.toml": PEP621, "uv.lock": "version = 1\n"}, []),
+        ({"pyproject.toml": PEP621, "uv.lock": ""}, [("pypi", "pyproject.toml")]),  # empty lock
+        # a requirements file pins only itself, never the pyproject beside it
+        (
+            {"pyproject.toml": PEP621, "requirements.txt": "flask==3.0.0\n"},
+            [("pypi", "pyproject.toml")],
+        ),
         ({"pyproject.toml": '[project]\nname = "app"\n'}, []),  # declares nothing
         ({"pyproject.toml": "not = = toml"}, [("pypi", "pyproject.toml")]),  # unreadable
-        ({"ui/package.json": PACKAGE}, [("npm", "ui/package.json")]),
-        ({"ui/package.json": PACKAGE, "yarn.lock": ""}, []),  # a workspace lock above
-        ({"ui/package.json": json.dumps({"name": "tool"})}, []),
-        ({"vendor/x/package.json": PACKAGE, "node_modules/y/package.json": PACKAGE}, []),
+        ({"pyproject.toml": "project = []\n"}, []),  # valid TOML, wrong shape
         (
-            {"crates/a/Cargo.toml": '[dependencies]\nserde = "1"\n'},
-            [("cargo", "crates/a/Cargo.toml")],
+            {"pyproject.toml": '[project.optional-dependencies]\ndev = ["pytest"]\n'},
+            [("pypi", "pyproject.toml")],
         ),
-        ({"crates/a/Cargo.toml": '[dependencies]\nserde = "1"\n', "Cargo.lock": ""}, []),
+        (
+            {"pyproject.toml": '[tool.poetry.group.dev.dependencies]\nruff = "*"\n'},
+            [("pypi", "pyproject.toml")],
+        ),
+        (
+            {"pyproject.toml": '[dependency-groups]\ntest = ["pytest"]\n'},
+            [("pypi", "pyproject.toml")],
+        ),
+        ({"requirements.txt": "requests==2.32.0\nflask==3.0.0 --hash=sha256:ab\n"}, []),
+        ({"requirements.txt": "requests==2.32.0\npyjwt\n"}, [("pypi", "requirements.txt")]),
+        (
+            {"dev-requirements.txt": "ruff>=0.5\n-r requirements.txt\n"},
+            [("pypi", "dev-requirements.txt")],
+        ),
+        ({"Pipfile": "[packages]\nrequests = '*'\n"}, [("pypi", "Pipfile")]),
+        ({"Pipfile": "[requires]\npython_version = '3.11'\n"}, []),
+        ({"Pipfile": "[packages]\nrequests = '*'\n", "Pipfile.lock": '{"default": {}}'}, []),
+        ({"ui/package.json": PACKAGE}, [("npm", "ui/package.json")]),
+        ({"ui/package.json": PACKAGE, "yarn.lock": "lodash@^4:\n"}, []),  # a workspace lock above
+        ({"ui/package.json": PACKAGE, "ui/package-lock.json": "{}"}, [("npm", "ui/package.json")]),
+        ({"ui/package.json": json.dumps({"name": "tool"})}, []),
+        ({"ui/package.json": "[]"}, []),
+        ({"vendor/x/package.json": PACKAGE, "node_modules/y/package.json": PACKAGE}, []),
+        ({"crates/a/Cargo.toml": CARGO}, [("cargo", "crates/a/Cargo.toml")]),
+        ({"crates/a/Cargo.toml": CARGO, "Cargo.lock": "version = 3\n"}, []),
+        (
+            {"Cargo.toml": "[target.'cfg(windows)'.dependencies]\nwinapi = '0.3'\n"},
+            [("cargo", "Cargo.toml")],
+        ),
+        ({"Cargo.toml": "workspace = []\n"}, []),
         ({"Gemfile": "gem 'rails'\n"}, [("ruby", "Gemfile")]),
-        ({"Pipfile": "[packages]\n", "Pipfile.lock": "{}"}, []),
+        ({"Gemfile": "source 'https://rubygems.org'\n"}, []),
         ({"src/App/App.csproj": CSPROJ}, [("nuget", "src/App/App.csproj")]),
+        ({"src/App/App.fsproj": CSPROJ}, [("nuget", "src/App/App.fsproj")]),
         # a project file's lock sits beside it, never above
         (
-            {"src/App/App.csproj": CSPROJ, "packages.lock.json": "{}"},
+            {"src/App/App.csproj": CSPROJ, "packages.lock.json": '{"version": 1}'},
             [("nuget", "src/App/App.csproj")],
         ),
+        ({"src/App/App.csproj": CSPROJ, "src/App/packages.lock.json": '{"version": 1}'}, []),
         ({"src/App/App.csproj": "<Project />"}, []),
     ],
 )
@@ -124,7 +161,14 @@ def test_manifests_with_nothing_to_pin_them_are_unresolved(
 ) -> None:
     found = unresolved_manifests(_tree(tmp_path, files))
     assert [(m.ecosystem, m.path) for m in found] == expected
-    assert all(m.reason == "no-lockfile" for m in found)
+    assert all(
+        m.reason == ("unpinned" if "requirements" in m.path else "no-lockfile") for m in found
+    )
+
+
+def test_an_oversized_manifest_is_unresolved_without_reading_it(tmp_path: Path) -> None:
+    (tmp_path / "package.json").write_text(" " * (MAX_FILE_BYTES + 1))
+    assert [m.path for m in unresolved_manifests(tmp_path)] == ["package.json"]
 
 
 def test_a_missing_workspace_is_refused(tmp_path: Path) -> None:

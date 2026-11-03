@@ -5,20 +5,22 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tomllib
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from typing import Any
 
 from traust_core.v1.errors import ServiceError, ValidationError
 from traust_core.v1.models.common import RepoPath
 from traust_core.v1.models.dependencies import UnresolvedManifest
-from traust_core.v1.models.vocabulary import Ecosystem
+from traust_core.v1.models.vocabulary import Ecosystem, ManifestCoverageReason
 from traust_core.v1.providers.base import Acquisition, Readiness, Result, argv_digest
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.process import ProcessRunner
 from traust_core.v1.providers.tools import DatabaseStatus, NoDatabase, ToolRequest
-from traust_core.v1.providers.tree import SKIP_DIRS
+from traust_core.v1.providers.tree import MAX_FILE_BYTES, SKIP_DIRS
 
 # npm devDependencies count, as the retired portfolio graph counted them: without this syft
 # drops them from package-lock (not from yarn.lock), measured 2026-10-28 (dependencies log).
@@ -81,6 +83,8 @@ MANIFESTS: tuple[str, ...] = (
     "packages.lock.json",
     "*.deps.json",
     "*.csproj",
+    "*.fsproj",  # read by no cataloger: kept so coverage can name it unresolved
+    "*.vbproj",
     "packages.config",
     "composer.lock",
     "installed.json",
@@ -159,22 +163,62 @@ def _tool_version(raw: bytes) -> str | None:
     return next((str(t["version"]) for t in listed if t.get("name") == "syft"), None)
 
 
+def _table(value: object) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _any_group(groups: object) -> bool:
+    return any(bool(g) for g in _table(groups).values())
+
+
 def _json_deps(text: str) -> bool:
-    doc = json.loads(text)
+    doc = _table(json.loads(text))
     keys = ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies")
-    return isinstance(doc, dict) and any(doc.get(k) for k in keys)
+    return any(doc.get(k) for k in keys)
 
 
 def _pyproject_deps(text: str) -> bool:
     doc = tomllib.loads(text)
-    poetry = doc.get("tool", {}).get("poetry", {}).get("dependencies", {})
-    return bool(doc.get("project", {}).get("dependencies")) or bool(set(poetry) - {"python"})
+    project = _table(doc.get("project"))
+    poetry = _table(_table(doc.get("tool")).get("poetry"))
+    return (
+        bool(project.get("dependencies"))
+        or _any_group(project.get("optional-dependencies"))
+        or _any_group(doc.get("dependency-groups"))
+        or bool(set(_table(poetry.get("dependencies"))) - {"python"})
+        or bool(poetry.get("dev-dependencies"))
+        or any(_table(g).get("dependencies") for g in _table(poetry.get("group")).values())
+    )
+
+
+_CARGO_TABLES = ("dependencies", "dev-dependencies", "build-dependencies")
 
 
 def _cargo_deps(text: str) -> bool:
     doc = tomllib.loads(text)
-    tables = ("dependencies", "dev-dependencies", "build-dependencies")
-    return any(doc.get(t) for t in tables) or bool(doc.get("workspace", {}).get("dependencies"))
+    targets = [_table(t) for t in _table(doc.get("target")).values()]
+    return any(t.get(k) for t in (doc, *targets) for k in _CARGO_TABLES) or bool(
+        _table(doc.get("workspace")).get("dependencies")
+    )
+
+
+def _pipfile_deps(text: str) -> bool:
+    doc = tomllib.loads(text)
+    return bool(doc.get("packages")) or bool(doc.get("dev-packages"))
+
+
+_GEM = re.compile(r"^\s*(?:gem|gemspec)\b", re.MULTILINE)
+_EXACT = re.compile(r"===?")
+_RANGE = re.compile(r"[<>!~]|,")
+
+
+def _unpinned_requirements(text: str) -> bool:
+    """A requirement without one exact version (a range, or a bare name): syft drops it."""
+    for line in text.replace("\\\n", " ").splitlines():
+        spec = line.split("#", 1)[0].split(" --", 1)[0].split(";", 1)[0].strip()
+        if spec and not spec.startswith("-") and (_RANGE.search(spec) or not _EXACT.search(spec)):
+            return True
+    return False
 
 
 def _requirements(name: str) -> bool:
@@ -182,49 +226,64 @@ def _requirements(name: str) -> bool:
 
 
 @dataclass(frozen=True)
-class _Locked:
-    """A manifest whose versions syft reads only from a lockfile (syft 1.51), the files that pin
-    it, and whether one above it counts (workspaces lock at their root; a project file's
-    packages.lock.json sits beside it). Measured gaps: dependencies log 2026-10-28."""
+class _Rule:
+    """A manifest syft can't fully resolve (syft 1.51) unless `locks` pin it, beside it or, with
+    `above`, higher in the tree (workspaces lock at their root; a project file's
+    packages.lock.json sits beside it). No locks: syft reads it directly and drops what
+    `declares` finds. Measured gaps: dependencies log 2026-10-28."""
 
     ecosystem: Ecosystem
     manifest: Callable[[str], bool]
     declares: Callable[[str], bool]
-    locks: frozenset[str]
+    locks: frozenset[str] = frozenset()
     above: bool = True
-    beside: Callable[[str], bool] = lambda _: False
+    reason: ManifestCoverageReason = ManifestCoverageReason.NO_LOCKFILE
 
 
-_LOCKED = (
-    _Locked(Ecosystem.NPM, lambda n: n == "package.json", _json_deps,
-            frozenset({"package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml",
-                       "bun.lock"})),
-    _Locked(Ecosystem.PYPI, lambda n: n == "pyproject.toml", _pyproject_deps,
-            frozenset({"poetry.lock", "uv.lock", "pdm.lock", "Pipfile.lock"}),
-            beside=_requirements),
-    _Locked(Ecosystem.PYPI, lambda n: n == "Pipfile", lambda _: True, frozenset({"Pipfile.lock"}),
-            above=False),
-    _Locked(Ecosystem.CARGO, lambda n: n == "Cargo.toml", _cargo_deps, frozenset({"Cargo.lock"})),
-    _Locked(Ecosystem.RUBY, lambda n: n == "Gemfile", lambda _: True, frozenset({"Gemfile.lock"})),
-    _Locked(Ecosystem.NUGET, lambda n: n.endswith((".csproj", ".fsproj", ".vbproj")),
-            lambda text: "<PackageReference" in text, frozenset({"packages.lock.json"}),
-            above=False),
+_RULES = (
+    _Rule(Ecosystem.NPM, lambda n: n == "package.json", _json_deps,
+          frozenset({"package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml",
+                     "bun.lock"})),
+    _Rule(Ecosystem.PYPI, lambda n: n == "pyproject.toml", _pyproject_deps,
+          frozenset({"poetry.lock", "uv.lock", "pdm.lock", "Pipfile.lock"})),
+    _Rule(Ecosystem.PYPI, lambda n: n == "Pipfile", _pipfile_deps, frozenset({"Pipfile.lock"}),
+          above=False),
+    _Rule(Ecosystem.PYPI, _requirements, _unpinned_requirements,
+          reason=ManifestCoverageReason.UNPINNED),
+    _Rule(Ecosystem.CARGO, lambda n: n == "Cargo.toml", _cargo_deps, frozenset({"Cargo.lock"})),
+    _Rule(Ecosystem.RUBY, lambda n: n == "Gemfile", lambda text: bool(_GEM.search(text)),
+          frozenset({"Gemfile.lock"})),
+    _Rule(Ecosystem.NUGET, lambda n: n.endswith((".csproj", ".fsproj", ".vbproj")),
+          lambda text: "<PackageReference" in text, frozenset({"packages.lock.json"}),
+          above=False),
 )  # fmt: skip
 
 
-def _declares(rule: _Locked, path: Path) -> bool:
+def _declares(rule: _Rule, path: Path) -> bool:
     try:
+        if path.stat().st_size > MAX_FILE_BYTES:
+            return True  # too large to read here; whatever it declares is unknown
         return rule.declares(path.read_text(encoding="utf-8", errors="replace"))
-    except (ValueError, tomllib.TOMLDecodeError):
+    except ValueError:
         return True  # syft can't read it either: whatever it declares is unknown
     except OSError as e:
         raise ServiceError(f"cannot read manifest {path.name}: {e}") from e
 
 
+def _filled(path: Path) -> bool:
+    """A lockfile with something in it: an empty one pins nothing."""
+    try:
+        with path.open("rb") as f:
+            head = f.read(64)
+    except OSError:
+        return False
+    return "".join(head.decode("utf-8", errors="replace").split()) not in {"", "{}", "[]"}
+
+
 def unresolved_manifests(workspace: Path) -> tuple[UnresolvedManifest, ...]:
-    """The checkout's dependency manifests that declare dependencies with nothing to pin them:
-    syft resolves them only through a lockfile, so their packages are missing from the SBOM.
-    Vendored and generated trees are skipped, as the profilers skip them."""
+    """The checkout's dependency manifests whose declarations syft can't all pin: a manifest
+    with no lockfile, or a requirements file with ranges. Their packages may be missing from
+    the SBOM. Vendored and generated trees are skipped, as the profilers skip them."""
     if not workspace.is_dir():
         raise ValidationError(f"workspace is not a directory: {workspace}")
     held: dict[PurePosixPath, set[str]] = {}
@@ -232,10 +291,11 @@ def unresolved_manifests(workspace: Path) -> tuple[UnresolvedManifest, ...]:
         dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS)
         held[PurePosixPath(Path(top).relative_to(workspace).as_posix())] = set(names)
 
-    def locked(rule: _Locked, directory: PurePosixPath) -> bool:
-        if any(n in rule.locks or rule.beside(n) for n in held[directory]):
-            return True
-        return rule.above and any(rule.locks & held.get(d, set()) for d in directory.parents)
+    def locked(rule: _Rule, directory: PurePosixPath) -> bool:
+        scope = [directory, *directory.parents] if rule.above else [directory]
+        return any(
+            _filled(workspace / d / n) for d in scope for n in rule.locks & held.get(d, set())
+        )
 
     found = []
     for directory, names in sorted(held.items()):
@@ -243,8 +303,13 @@ def unresolved_manifests(workspace: Path) -> tuple[UnresolvedManifest, ...]:
             path = workspace / directory / name
             if path.is_symlink() or not path.is_file():
                 continue
-            for rule in _LOCKED:
+            for rule in _RULES:
                 if rule.manifest(name) and not locked(rule, directory) and _declares(rule, path):
-                    rel = RepoPath((directory / name).as_posix())
-                    found.append(UnresolvedManifest(ecosystem=rule.ecosystem, path=rel))
+                    found.append(
+                        UnresolvedManifest(
+                            ecosystem=rule.ecosystem,
+                            path=RepoPath((directory / name).as_posix()),
+                            reason=rule.reason,
+                        )
+                    )
     return tuple(found)

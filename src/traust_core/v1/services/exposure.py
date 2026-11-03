@@ -405,15 +405,15 @@ class ExposureService:
 
     def ingest_dependencies(self, repository_ref_id: UUID, checkout: Path) -> DependencyIngest:
         """The commit's manifest SBOM, read from its checkout by the SBOM tool (syft) and
-        ingested, beside a `manifest-coverage` record of the manifests it could not resolve;
-        the same package list again is the same SBOM."""
+        ingested, with a `manifest-coverage` record of what it could not resolve written first,
+        so a failure before the SBOM lands is retried whole; the same package list again is the
+        same SBOM."""
         sbom_tool = self._require_sbom_tool()
         unresolved = unresolved_manifests(checkout)
         scanned = sbom_tool.acquire(ToolRequest(workspace=checkout))
         tool, version = scanned.acquisition.provider, scanned.acquisition.version
         if version is None:
             raise ServiceError(f"{tool} reported no version; its coverage can't be attributed")
-        sbom = self.ingest_sbom(scanned.data, repository_ref_id)
         coverage = ManifestCoverageArtifact.from_document(
             {
                 "artifact": "manifest-coverage",
@@ -421,12 +421,22 @@ class ExposureService:
                 "unresolved": [m.model_dump(mode="json") for m in unresolved],
             }
         )
-        with self._uow as uow:
-            ref = self._inventory.get_ref(repository_ref_id)
-            self._record_document(
-                uow, ref, coverage, AssessmentKind.TOOL_SCAN, tool, version, self._clock.now()
-            )
-            uow.commit()
+        latest = self._latest_coverage(repository_ref_id)
+        if latest is None or latest.digest != sha256_hex(coverage.payload):
+            with self._uow as uow:
+                ref = self._inventory.get_ref(repository_ref_id)
+                self._record_document(
+                    uow,
+                    ref,
+                    coverage,
+                    AssessmentKind.MANIFEST_SBOM,
+                    tool,
+                    version,
+                    self._clock.now(),
+                    reuse=False,
+                )
+                uow.commit()
+        sbom = self.ingest_sbom(scanned.data, repository_ref_id)
         return DependencyIngest(
             repository_ref_id=repository_ref_id,
             sbom=sbom,
@@ -438,16 +448,20 @@ class ExposureService:
     def unresolved_manifests(self, repository_ref_id: UUID) -> tuple[UnresolvedManifest, ...]:
         """The manifests the SBOM tool could not resolve on the commit, from its latest
         `manifest-coverage` record; none recorded (an SBOM ingested as a document) is none known."""
-        held = self._log.documents(
-            self._log.list_of(AssessmentKind.TOOL_SCAN, [repository_ref_id]),
-            [ManifestCoverageArtifact.schema],
-        )
-        if not held:
+        latest = self._latest_coverage(repository_ref_id)
+        if latest is None:
             return ()
-        doc = ManifestCoverageArtifact.parse(stored_bytes(self._objects, held[0][1]))
+        doc = ManifestCoverageArtifact.parse(stored_bytes(self._objects, latest))
         return tuple(
             UnresolvedManifest.model_validate(m, from_attributes=True) for m in doc.unresolved
         )
+
+    def _latest_coverage(self, repository_ref_id: UUID) -> Artifact | None:
+        held = self._log.documents(
+            self._log.list_of(AssessmentKind.MANIFEST_SBOM, [repository_ref_id]),
+            [ManifestCoverageArtifact.schema],
+        )
+        return held[0][1] if held else None
 
     def resolve_symbols(self, advisory_id: UUID) -> SymbolResolution:
         """The functions the advisory's fix touched: what its source publishes (Go's OSV
@@ -546,7 +560,7 @@ class ExposureService:
             else [
                 m.path
                 for m in self.unresolved_manifests(repository_ref_id)
-                if m.ecosystem == package.ecosystem
+                if m.ecosystem in {a.ecosystem for a in record.affected}
             ]
         )
         listed = any(r.image_id is None for r in rows)
@@ -721,13 +735,15 @@ class ExposureService:
         assessor: str,
         assessor_version: str,
         occurred_at: datetime,
+        *,
+        reuse: bool = True,
     ) -> tuple[Assessment, Artifact, bool]:
-        """`doc` as the artifact of a `kind` assessment on the commit; the same bytes again are
-        the assessment already recorded."""
+        """`doc` as the artifact of a `kind` assessment on the commit; with `reuse`, the same
+        bytes again are the assessment already recorded."""
         assert ref.id is not None
         digest = sha256_hex(doc.payload)
         schema = doc.schema
-        if recorded := self._log.find_recorded([ref.id], kind, schema, digest):
+        if reuse and (recorded := self._log.find_recorded([ref.id], kind, schema, digest)):
             assessment, artifact = recorded[0]
             return assessment, artifact, False
         assessment = self._log.open(

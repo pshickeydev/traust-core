@@ -12,7 +12,7 @@ from collections import Counter
 from collections.abc import Mapping, Sequence
 from datetime import date, datetime
 from enum import StrEnum
-from typing import Any, Literal, NamedTuple, NewType, Self
+from typing import Any, NamedTuple, NewType, Self
 from uuid import UUID
 
 from pydantic import Field, computed_field
@@ -36,6 +36,7 @@ from traust_core.v1.models.vocabulary import (
     ImpactSourceImportScan,
     ImpactSymbolUsageScan,
     ImpactTier,
+    ManifestCoverageReason,
     ScannerSeverity,
 )
 
@@ -549,7 +550,7 @@ class UnresolvedManifest(Model):
 
     ecosystem: Ecosystem
     path: RepoPath
-    reason: Literal["no-lockfile"] = "no-lockfile"
+    reason: ManifestCoverageReason
 
 
 class DependencyIngest(Model):
