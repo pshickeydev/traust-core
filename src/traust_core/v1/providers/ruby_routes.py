@@ -6,6 +6,7 @@ are `before` filters, `use Rack::Auth::*` and guard calls in the route body."""
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 
 from traust_core.v1.models.code_facts import RouteAsymmetry, RouteFamily
@@ -19,6 +20,7 @@ from traust_core.v1.providers.route_guards import (
     _row,
     _unique,
 )
+from traust_core.v1.providers.route_ownership import path_params
 from traust_core.v1.providers.syntax import Node, Parsed, walk
 from traust_core.v1.providers.syntax import ruby_parser as parser
 from traust_core.v1.providers.tree import TreeFile
@@ -298,6 +300,9 @@ class _Controller:
     callbacks: list[_Callback]
     actions: dict[str, Node]
     src: _Source
+    # the qualified names the superclass may be, innermost namespace first
+    # (`BaseController` inside `module Admin`: `Admin::BaseController`, then `BaseController`)
+    parents: tuple[str, ...] = ()
 
 
 def _controllers(sources: dict[str, _Source]) -> dict[str, _Controller]:
@@ -313,6 +318,14 @@ def _controllers(sources: dict[str, _Source]) -> dict[str, _Controller]:
             sup = n.child_by_field_name("superclass")
             base = sup.named_children[0] if sup is not None and sup.named_children else None
             parent = src.text(base).rsplit("::", 1)[-1] if base is not None else None
+            namespace = _namespace(src, n)
+            qualified = "::".join([*namespace, name])
+            written = src.text(base).removeprefix("::") if base is not None else ""
+            parents = (
+                tuple("::".join([*namespace[:k], written]) for k in range(len(namespace), -1, -1))
+                if base is not None and not src.text(base).startswith("::")
+                else (written,)
+            )
             callbacks: list[_Callback] = []
             actions: dict[str, Node] = {}
             body = n.child_by_field_name("body")
@@ -322,8 +335,9 @@ def _controllers(sources: dict[str, _Source]) -> dict[str, _Controller]:
                 elif stmt.type in ("call", "identifier"):
                     method = _method(src, stmt) if stmt.type == "call" else src.text(stmt)
                     callbacks += _callbacks(src, stmt, method)
-            controller = _Controller(name, parent, callbacks, actions, src)
-            found[name.rsplit("::", 1)[-1]] = controller
+            controller = _Controller(name, parent, callbacks, actions, src, parents)
+            found.setdefault(name.rsplit("::", 1)[-1], controller)
+            found[qualified] = controller
             if m := re.search(r"app/controllers/(.+)_controller\.rb$", rel):
                 found[m.group(1)] = controller
     return found
@@ -343,14 +357,29 @@ def _callbacks(src: _Source, stmt: Node, method: str) -> list[_Callback]:
 
 
 def _chain(controllers: dict[str, _Controller], c: _Controller) -> list[_Controller]:
-    chain, seen = [c], {c.name}
-    while chain[-1].parent and chain[-1].parent in controllers:
-        parent = controllers[chain[-1].parent]
-        if parent.name in seen:
+    chain, seen = [c], {id(c)}
+    while True:
+        last = chain[-1]
+        found = next((controllers[q] for q in last.parents if q in controllers), None)
+        if found is None and last.parent in controllers:
+            found = controllers[last.parent]  # type: ignore[index]
+        if found is None or id(found) in seen:
             break
-        chain.append(parent)
-        seen.add(parent.name)
+        chain.append(found)
+        seen.add(id(found))
     return chain[::-1]
+
+
+def _namespace(src: _Source, node: Node) -> list[str]:
+    """The modules and classes a class is written inside (`module Admin; class X`)."""
+    out = []
+    parent = node.parent
+    while parent is not None:
+        if parent.type in ("module", "class"):
+            out.append(src.text(parent.child_by_field_name("name")))
+        parent = parent.parent
+    written = src.text(node.child_by_field_name("name"))
+    return [*reversed(out), *written.split("::")[:-1]]
 
 
 def _rails_guards(
@@ -384,6 +413,7 @@ def _body_guard_calls(src: _Source, stmts: list[Node]) -> list[str]:
 
 def _rails_rows(sources: dict[str, _Source]) -> list[_Row]:
     controllers = _controllers(sources)
+    ownership: _Ownership | None = None
     rows = []
     for r in _RailsRoutes(sources).routes:
         c = controllers.get(r.controller)
@@ -408,10 +438,98 @@ def _rails_rows(sources: dict[str, _Source]) -> list[_Row]:
             unguards,
         )
         row.handler_path, row.handler_line = handler_path, handler_line
+        if path_params(row.pattern):
+            ownership = ownership or _Ownership(sources, controllers)
+            ownership.own(row, c, r)
         _mark(row, None, False, r.src.file.rel)
         row.view_class = c.name if c is not None else r.controller
         rows.append(row)
     return rows
+
+
+class _Ownership:
+    """Reads each Rails id route's action for ownership (`providers.ruby_ownership`)."""
+
+    def __init__(self, sources: dict[str, _Source], controllers: dict[str, _Controller]) -> None:
+        from traust_core.v1.providers.ruby_ownership import RubyCode
+
+        self.controllers = controllers
+        self.code = RubyCode(dict(sources))
+        self.concern_methods: dict[str, list[tuple[Parsed, Node]]] = {}
+        for src, module in self.code.modules.values():
+            for m in walk(module):
+                if m.type == "method":
+                    name = src.text(m.child_by_field_name("name"))
+                    self.concern_methods.setdefault(name, []).append((src, m))
+
+    def methods(self, c: _Controller) -> Callable[[str], tuple[Parsed, Node] | None]:
+        chain = _chain(self.controllers, c)
+
+        def find(name: str) -> tuple[Parsed, Node] | None:
+            for ctrl in reversed(chain):
+                if name in ctrl.actions:
+                    return ctrl.src, ctrl.actions[name]
+            found = self.concern_methods.get(name, [])
+            return found[0] if len(found) == 1 else None
+
+        return find
+
+    def own(self, row: _Row, c: _Controller | None, r: _Route) -> None:
+        from traust_core.v1.models.common import CodeSpan
+        from traust_core.v1.providers.route_ownership import HandlerFacts, privileged_only
+        from traust_core.v1.providers.ruby_ownership import action_facts, admin_gate
+
+        ids = set(path_params(row.pattern))
+        span = CodeSpan(path=RepoPath(r.src.file.rel), line=r.src.line(r.node))
+        if c is None or not r.action:
+            row.own(HandlerFacts(handoff=span, takes_id=True), self.code.fields)
+            return
+        find = self.methods(c)
+        guards = [] if row.unguards else [*row.guards, *row.scope_guards]
+        # an admin-named callback that, read, refuses no unprivileged caller is no admin gate
+        for g in list(guards):
+            if privileged_only(g) and (found := find(g)) is not None and not admin_gate(*found):
+                guards.remove(g)
+        action = find(r.action)
+        if action is None:
+            row.own(HandlerFacts(handoff=span, takes_id=True), self.code.fields, guards=guards)
+            return
+        steps: list[tuple[Parsed, Node, bool]] = []
+        cancan = False
+        for ctrl in _chain(self.controllers, c):
+            for cb in ctrl.callbacks:
+                if cb.skip or not cb.applies(r.action):
+                    continue
+                if cb.name in ("load_and_authorize_resource", "load_resource"):
+                    cancan = True
+                elif (found := find(cb.name)) is not None:
+                    if admin_gate(*found) and not any(privileged_only(g) for g in guards):
+                        guards.append(f"admin_gate:{cb.name}")  # refuses every non-admin caller
+                    cb_body = found[1].child_by_field_name("body")
+                    steps += [
+                        (found[0], s, True)
+                        for s in (cb_body.named_children if cb_body is not None else [])
+                        if s.type != "comment"
+                    ]
+        body = action[1].child_by_field_name("body")
+        steps += [
+            (action[0], s, False)
+            for s in (body.named_children if body is not None else [])
+            if s.type != "comment"
+        ]
+        snake = re.sub(r"(?<!^)(?=[A-Z])", "_", c.name.removesuffix("Controller").split("::")[-1])
+        model = "".join(p.capitalize() for p in _singular(snake.lower()).split("_"))
+        facts = action_facts(
+            self.code,
+            steps,
+            ids,
+            guarded=bool(guards),
+            methods=find,
+            action=r.action,
+            model=model,
+            load_and_authorize=cancan,
+        )
+        row.own(facts, self.code.fields, guards=guards)
 
 
 def callback_asymmetries(rows: list[_Row]) -> list[RouteAsymmetry]:
