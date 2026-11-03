@@ -2834,5 +2834,908 @@
     "why": "SLOW: a 20-line callback (10 locals, each assigned twice from the others) takes ~17 s; 15 locals (30 lines) take ~190 s. `_untrusted` is re-run inside every `_credential` recursion (5M calls for 8 locals); the result itself is right"
    }
   ]
+ },
+ {
+  "case": "dummy_app_shadows_controller",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  resources :notes, only: :destroy\n  resources :memos, only: :destroy\nend\n",
+   "app/controllers/notes_controller.rb": "\nclass NotesController < ApplicationController\n\n\n\n  def destroy\n    Note.find(params[:id]).destroy\n    head :no_content\n  end\n\n\n  private\n\n  def set_note\n    @note = Note.find(params[:id])\n  end\n\n  def require_owner\n    head :forbidden unless @note.user == current_user\n  end\n\nend\n",
+   "app/controllers/memos_controller.rb": "\nclass MemosController < ApplicationController\n\n  before_action :set_note\n  before_action :require_owner\n\n\n  def destroy\n    @note.destroy\n    head :no_content\n  end\n\n\n  private\n\n  def set_note\n    @note = Note.find(params[:id])\n  end\n\n  def require_owner\n    head :forbidden unless @note.user == current_user\n  end\n\nend\n",
+   "spec/dummy/config/routes.rb": "\nRails.application.routes.draw do\n  resources :notes, only: :destroy, path: \"dummy_notes\"\nend\n",
+   "spec/dummy/app/controllers/notes_controller.rb": "\nclass NotesController < ApplicationController\n\n  before_action :set_note\n  before_action :require_owner\n\n\n  def destroy\n    @note.destroy\n    head :no_content\n  end\n\n\n  private\n\n  def set_note\n    @note = Note.find(params[:id])\n  end\n\n  def require_owner\n    head :forbidden unless @note.user == current_user\n  end\n\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/notes/:id",
+    "ownership": "caller-blind",
+    "why": "the app's NotesController destroys any note; spec/dummy/app/controllers/notes_controller.rb (a test app, later in path order) overwrites the 'notes' route-name key in _controllers, so the app's route is read against the dummy's owner-checked controller"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/dummy_notes/:id",
+    "ownership": "checked",
+    "why": "the dummy's own route, reading its own controller"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/memos/:id",
+    "ownership": "checked",
+    "why": "twin: a route name only one controller file has"
+   }
+  ]
+ },
+ {
+  "case": "two_controllers_one_file",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  resources :notes, only: :destroy\n  resources :memos, only: :destroy\nend\n",
+   "app/controllers/notes_controller.rb": "\nclass NotesController < ApplicationController\n\n\n\n  def destroy\n    Note.find(params[:id]).destroy\n    head :no_content\n  end\n\n\n  private\n\n  def set_note\n    @note = Note.find(params[:id])\n  end\n\n  def require_owner\n    head :forbidden unless @note.user == current_user\n  end\n\nend\n\nclass StrictNotesController < NotesController\n\n  before_action :set_note\n  before_action :require_owner\n\n\n  def destroy\n    @note.destroy\n    head :no_content\n  end\n\n\n  private\n\n  def set_note\n    @note = Note.find(params[:id])\n  end\n\n  def require_owner\n    head :forbidden unless @note.user == current_user\n  end\n\nend\n",
+   "app/controllers/memos_controller.rb": "\nclass MemosController < ApplicationController\n\n\n\n  def destroy\n    Note.find(params[:id]).destroy\n    head :no_content\n  end\n\n\n  private\n\n  def set_note\n    @note = Note.find(params[:id])\n  end\n\n  def require_owner\n    head :forbidden unless @note.user == current_user\n  end\n\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/notes/:id",
+    "ownership": "caller-blind",
+    "why": "notes#destroy is NotesController#destroy (unscoped); the file also defines StrictNotesController, and _controllers maps the file's route name to the last class in it, so the route reads StrictNotesController's owner check"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/memos/:id",
+    "ownership": "caller-blind",
+    "why": "twin: one class per file, judged"
+   }
+  ]
+ },
+ {
+  "case": "action_ensure_after_refusal",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  resources :notes, only: [:destroy, :update]\nend\n",
+   "app/controllers/notes_controller.rb": "\nclass NotesController < ApplicationController\n\n\n\n  def destroy\n    note = Note.find(params[:id])\n    raise ActiveRecord::RecordNotFound unless note.user == current_user\n    note.destroy\n    head :no_content\n  ensure\n    note&.update_column(:body, params[:audit]) if params[:audit]\n  end\n\n  def update\n    note = Note.find(params[:id])\n    raise ActiveRecord::RecordNotFound unless note.user == current_user\n    note.update(body: params[:body])\n    head :no_content\n  ensure\n    Rails.logger.info(\"update #{params[:id]}\")\n  end\n\n\n  private\n\n  def set_note\n    @note = Note.find(params[:id])\n  end\n\n  def require_owner\n    head :forbidden unless @note.user == current_user\n  end\n\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/notes/:id",
+    "ownership": "unchecked",
+    "why": "the method-level `ensure` runs after the raise that refuses another user's note and writes it (update_column); statements() drops `ensure` and rescues() reads only `rescue`, so the write is never seen"
+   },
+   {
+    "method": "PATCH",
+    "pattern": "/notes/:id",
+    "ownership": "checked",
+    "why": "twin: the ensure only logs"
+   }
+  ]
+ },
+ {
+  "case": "concerning_block",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  resources :notes, only: :destroy\n  resources :memos, only: :destroy\n  resources :pads, only: :destroy\nend\n",
+   "app/controllers/owned_controller.rb": "\nclass OwnedController < ApplicationController\n\n  before_action :set_note\n  before_action :require_owner\n\n\n\n  private\n\n  def set_note\n    @note = Note.find(params[:id])\n  end\n\n  def require_owner\n    head :forbidden unless @note.user == current_user\n  end\n\nend\n",
+   "app/controllers/notes_controller.rb": "\nclass NotesController < OwnedController\n  concerning :Sharing do\n    included do\n      skip_before_action :require_owner, only: :destroy\n    end\n  end\n\n  def destroy\n    @note.destroy\n    head :no_content\n  end\nend\n",
+   "app/controllers/memos_controller.rb": "\nclass MemosController < OwnedController\n  concerning :Lenient do\n    def require_owner\n      true\n    end\n  end\n\n  def destroy\n    @note.destroy\n    head :no_content\n  end\nend\n",
+   "app/controllers/pads_controller.rb": "\nclass PadsController < OwnedController\n  def destroy\n    @note.destroy\n    head :no_content\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/notes/:id",
+    "ownership": "caller-blind",
+    "why": "`concerning :Sharing do included do skip_before_action :require_owner end end` defines and includes a module that skips the owner check; the class-body `concerning` call isn't read"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/memos/:id",
+    "ownership": "caller-blind",
+    "why": "`concerning :Lenient do def require_owner; true; end end` includes a module whose require_owner overrides OwnedController's (the module sits between the class and its parent); the def inside the block isn't indexed"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/pads/:id",
+    "ownership": "checked",
+    "why": "twin: inherits the check"
+   }
+  ]
+ },
+ {
+  "case": "class_macro_skips_check",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  resources :notes, only: :destroy\n  resources :memos, only: :destroy\nend\n",
+   "app/controllers/owned_controller.rb": "\nclass OwnedController < ApplicationController\n\n  before_action :set_note\n  before_action :require_owner\n\n\n  def self.shared_actions(*names)\n    skip_before_action :require_owner, only: names\n  end\n\n\n  private\n\n  def set_note\n    @note = Note.find(params[:id])\n  end\n\n  def require_owner\n    head :forbidden unless @note.user == current_user\n  end\n\nend\n",
+   "app/controllers/notes_controller.rb": "\nclass NotesController < OwnedController\n  shared_actions :destroy\n\n  def destroy\n    @note.destroy\n    head :no_content\n  end\nend\n",
+   "app/controllers/memos_controller.rb": "\nclass MemosController < OwnedController\n  shared_actions :show\n\n  def destroy\n    @note.destroy\n    head :no_content\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/notes/:id",
+    "ownership": "unchecked",
+    "why": "`shared_actions :destroy` is the parent's class macro around `skip_before_action :require_owner, only: names`; the call isn't followed, so the skipped check is credited"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/memos/:id",
+    "ownership": "unchecked",
+    "why": "twin: the macro names another action (reading it would still need the argument)"
+   }
+  ]
+ },
+ {
+  "case": "controller_reopened_elsewhere",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  resources :notes, only: :destroy\n  resources :memos, only: :destroy\n  resources :pads, only: :destroy\nend\n",
+   "app/controllers/notes_controller.rb": "\nclass NotesController < ApplicationController\n\n  before_action :set_note\n  before_action :require_owner\n\n\n  def destroy\n    @note.destroy\n    head :no_content\n  end\n\n\n  private\n\n  def set_note\n    @note = Note.find(params[:id])\n  end\n\n  def require_owner\n    head :forbidden unless @note.user == current_user\n  end\n\nend\n",
+   "app/controllers/memos_controller.rb": "\nclass MemosController < ApplicationController\n\n  before_action :set_note\n  before_action :require_owner\n\n\n  def destroy\n    @note.destroy\n    head :no_content\n  end\n\n\n  private\n\n  def set_note\n    @note = Note.find(params[:id])\n  end\n\n  def require_owner\n    head :forbidden unless @note.user == current_user\n  end\n\nend\n",
+   "app/controllers/pads_controller.rb": "\nclass PadsController < ApplicationController\n\n  before_action :set_note\n  before_action :require_owner\n\n\n  def destroy\n    @note.destroy\n    head :no_content\n  end\n\n\n  private\n\n  def set_note\n    @note = Note.find(params[:id])\n  end\n\n  def require_owner\n    head :forbidden unless @note.user == current_user\n  end\n\nend\n",
+   "config/initializers/notes_sharing.rb": "\nRails.application.config.to_prepare do\n  NotesController.class_eval do\n    skip_before_action :require_owner, only: :destroy\n  end\nend\n",
+   "config/initializers/patches.rb": "Rails.application.config.to_prepare do\n  load Rails.root.join(\"lib/patches/memos_controller.rb\")\nend\n",
+   "lib/patches/memos_controller.rb": "\nclass MemosController\n  skip_before_action :require_owner, only: :destroy\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/notes/:id",
+    "ownership": "caller-blind",
+    "why": "an initializer's `NotesController.class_eval do skip_before_action :require_owner \u2026 end` removes the check; class_eval on a controller isn't read"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/memos/:id",
+    "ownership": "caller-blind",
+    "why": "lib/patches/memos_controller.rb (loaded from a to_prepare block) reopens MemosController and skips the check; only the app/controllers file is keyed by route name, so the reopened body is never read"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/pads/:id",
+    "ownership": "checked",
+    "why": "twin: not reopened"
+   }
+  ]
+ },
+ {
+  "case": "with_options_callbacks",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  resources :notes, only: :destroy\n  resources :memos, only: :destroy\nend\n",
+   "app/controllers/owned_controller.rb": "\nclass OwnedController < ApplicationController\n\n  before_action :set_note\n  before_action :require_owner\n\n\n\n  private\n\n  def set_note\n    @note = Note.find(params[:id])\n  end\n\n  def require_owner\n    head :forbidden unless @note.user == current_user\n  end\n\nend\n",
+   "app/controllers/notes_controller.rb": "\nclass NotesController < OwnedController\n  with_options only: :destroy do\n    skip_before_action :require_owner\n  end\n\n  def destroy\n    @note.destroy\n    head :no_content\n  end\nend\n",
+   "app/controllers/memos_controller.rb": "\nclass MemosController < ApplicationController\n  with_options only: [:update, :destroy] do\n    before_action :set_note\n    before_action :require_owner\n  end\n\n  def destroy\n    @note.destroy\n    head :no_content\n  end\n\n  private\n\n  def set_note\n    @note = Note.find(params[:id])\n  end\n\n  def require_owner\n    head :forbidden unless @note.user == current_user\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/notes/:id",
+    "ownership": "caller-blind",
+    "why": "`with_options only: :destroy do skip_before_action :require_owner end` skips the check; callbacks inside with_options aren't read"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/memos/:id",
+    "ownership": "checked",
+    "why": "PRECISION: the same with_options block holding set_note + require_owner; the callbacks aren't read"
+   }
+  ]
+ },
+ {
+  "case": "ownerless_but_owned",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"wallet\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.text \"body\"\n  end\n  create_table \"wallets\" do |t|\n    t.decimal \"balance\"\n    t.string \"iban\"\n  end\n  create_table \"submissions\" do |t|\n    t.bigint \"submitted_by\"\n    t.text \"answer\"\n  end\n  create_table \"documents\" do |t|\n    t.string \"title\"\n    t.text \"body\"\n  end\n  create_table \"permissions\" do |t|\n    t.references \"user\"\n    t.references \"document\"\n  end\n  create_table \"tags\" do |t|\n    t.string \"name\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :wallet\n  has_many :permissions\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "app/models/wallet.rb": "class Wallet < ApplicationRecord\nend\n",
+   "app/models/submission.rb": "class Submission < ApplicationRecord\n  def submitter\n    User.find(submitted_by)\n  end\nend\n",
+   "app/models/document.rb": "class Document < ApplicationRecord\n  has_many :permissions\nend\n",
+   "app/models/permission.rb": "class Permission < ApplicationRecord\n  belongs_to :user\n  belongs_to :document\nend\n",
+   "app/models/tag.rb": "class Tag < ApplicationRecord\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  resources :wallets, only: :show\n  resources :submissions, only: :show\n  resources :documents, only: :show\n  resources :tags, only: :show\nend\n",
+   "app/controllers/wallets_controller.rb": "\nclass WalletsController < ApplicationController\n  def show\n    render json: Wallet.find(params[:id])\n  end\nend\n",
+   "app/controllers/submissions_controller.rb": "\nclass SubmissionsController < ApplicationController\n  def show\n    render json: Submission.find(params[:id])\n  end\nend\n",
+   "app/controllers/documents_controller.rb": "\nclass DocumentsController < ApplicationController\n  def show\n    render json: Document.find(params[:id])\n  end\nend\n",
+   "app/controllers/tags_controller.rb": "\nclass TagsController < ApplicationController\n  def show\n    render json: Tag.find(params[:id])\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/wallets/:id",
+    "ownership": "caller-blind",
+    "why": "users.wallet_id ties each wallet to its user (User belongs_to :wallet); the wallets table has no owner column, so the classifier reads Wallet as ownerless (none) and any user reads another's balance/IBAN; the owner link from the other side isn't looked at"
+   },
+   {
+    "method": "GET",
+    "pattern": "/submissions/:id",
+    "ownership": "caller-blind",
+    "why": "`submitted_by` holds the submitting user's id (no `_id` suffix, no association); neither OWNER_FIELD_RX nor _LINK_RX matches it, so Submission reads as ownerless"
+   },
+   {
+    "method": "GET",
+    "pattern": "/documents/:id",
+    "ownership": "caller-blind",
+    "why": "documents are reachable through per-user permissions rows (Document has_many :permissions, Permission belongs_to :user); without a `through: :users` the join isn't seen and Document reads ownerless"
+   },
+   {
+    "method": "GET",
+    "pattern": "/tags/:id",
+    "ownership": "none",
+    "why": "twin: a truly ownerless record"
+   }
+  ]
+ },
+ {
+  "case": "rescue_from_renders_record",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  resources :notes, only: :show\n  resources :memos, only: :show\nend\n",
+   "app/controllers/notes_controller.rb": "\nclass NotesController < ApplicationController\n  class NotOwner < StandardError; end\n  rescue_from NotOwner, with: :read_only\n  before_action :set_note\n  before_action :require_owner\n\n  def show\n    render json: @note\n  end\n\n  private\n\n  def set_note\n    @note = Note.find(params[:id])\n  end\n\n  def require_owner\n    raise NotOwner unless @note.user == current_user\n  end\n\n  def read_only\n    render json: @note, status: :forbidden\n  end\nend\n",
+   "app/controllers/memos_controller.rb": "\nclass MemosController < ApplicationController\n  class NotOwner < StandardError; end\n  rescue_from NotOwner, with: :denied\n  before_action :set_note\n  before_action :require_owner\n\n  def show\n    render json: @note\n  end\n\n  private\n\n  def set_note\n    @note = Note.find(params[:id])\n  end\n\n  def require_owner\n    raise NotOwner unless @note.user == current_user\n  end\n\n  def denied\n    head :forbidden\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/notes/:id",
+    "ownership": "unchecked",
+    "why": "the refusal raises NotOwner, and `rescue_from NotOwner, with: :read_only` answers it with `render json: @note` (status 403): another user's note is sent with the refusal; rescue_from handlers aren't read"
+   },
+   {
+    "method": "GET",
+    "pattern": "/memos/:id",
+    "ownership": "checked",
+    "why": "twin: the handler answers head :forbidden"
+   }
+  ]
+ },
+ {
+  "case": "ability_rules_from_helper_object",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  resources :notes, only: :destroy\nend\n",
+   "app/models/ability.rb": "\nclass Ability\n  include CanCan::Ability\n\n  def initialize(user)\n    can :destroy, Note, user_id: user.id\n    NoteSharing.grant(self, user)\n  end\nend\n",
+   "app/models/note_sharing.rb": "\nmodule NoteSharing\n  def self.grant(ability, user)\n    ability.can :destroy, Note\n  end\nend\n",
+   "app/controllers/notes_controller.rb": "\nclass NotesController < ApplicationController\n  load_and_authorize_resource\n\n  def destroy\n    @note.destroy\n    head :no_content\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/notes/:id",
+    "ownership": "unknown",
+    "why": "NoteSharing.grant(self, user) runs `ability.can :destroy, Note` for every user; _ability reads only receiver-less `can` calls inside Ability (it gives up on include/merge, not on a rule builder handed `self`), so the owner-restricted rule is credited"
+   }
+  ]
+ },
+ {
+  "case": "ability_rules_from_helper_object_twin",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  resources :notes, only: :destroy\nend\n",
+   "app/models/ability.rb": "\nclass Ability\n  include CanCan::Ability\n\n  def initialize(user)\n    can :destroy, Note, user_id: user.id\n  end\nend\n",
+   "app/controllers/notes_controller.rb": "\nclass NotesController < ApplicationController\n  load_and_authorize_resource\n\n  def destroy\n    @note.destroy\n    head :no_content\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/notes/:id",
+    "ownership": "checked",
+    "why": "twin: the owner-restricted rule alone"
+   }
+  ]
+ },
+ {
+  "case": "cancan_load_options",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.text \"body\"\n  end\n  create_table \"memos\" do |t|\n    t.references \"user\"\n    t.text \"body\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "app/models/memo.rb": "class Memo < ApplicationRecord\n  belongs_to :user\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  resources :notes, only: :destroy\n  resources :pads, only: :destroy\nend\n",
+   "app/models/ability.rb": "\nclass Ability\n  include CanCan::Ability\n\n  def initialize(user)\n    can [:destroy, :update], Note, user_id: user.id\n    can :destroy, Memo\n  end\nend\n",
+   "app/controllers/notes_controller.rb": "\nclass NotesController < ApplicationController\n  load_and_authorize_resource class: \"Memo\"\n\n  def destroy\n    @note.destroy\n    head :no_content\n  end\nend\n",
+   "app/controllers/pads_controller.rb": "\nclass PadsController < ApplicationController\n  load_and_authorize_resource :note, parent: false\n\n  def destroy\n    @note.destroy\n    head :no_content\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/notes/:id",
+    "ownership": "caller-blind",
+    "why": "`load_and_authorize_resource class: 'Memo'` loads @note = Memo.find(params[:id]) and authorizes it against `can :destroy, Memo` (everyone); cancan_load ignores the options and asks the Ability about Note (owner-restricted), the model guessed from the controller name"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/pads/:id",
+    "ownership": "checked",
+    "why": "PRECISION: `load_and_authorize_resource :note, parent: false` in PadsController loads a Note (owner-restricted); the guessed model Pad isn't a model, so it reads unknown"
+   }
+  ]
+ },
+ {
+  "case": "cancan_load_options_twin",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.text \"body\"\n  end\n  create_table \"memos\" do |t|\n    t.references \"user\"\n    t.text \"body\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "app/models/memo.rb": "class Memo < ApplicationRecord\n  belongs_to :user\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  resources :notes, only: :destroy\nend\n",
+   "app/models/ability.rb": "\nclass Ability\n  include CanCan::Ability\n\n  def initialize(user)\n    can [:destroy, :update], Note, user_id: user.id\n    can :destroy, Memo\n  end\nend\n",
+   "app/controllers/notes_controller.rb": "\nclass NotesController < ApplicationController\n  load_and_authorize_resource\n\n  def destroy\n    @note.destroy\n    head :no_content\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/notes/:id",
+    "ownership": "checked",
+    "why": "twin: no class option, Note's owner rule"
+   }
+  ]
+ },
+ {
+  "case": "cancan_load_twice",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  resources :notes, only: [:destroy, :update]\nend\n",
+   "app/models/ability.rb": "\nclass Ability\n  include CanCan::Ability\n\n  def initialize(user)\n    can [:destroy, :update], Note, user_id: user.id\n  end\nend\n",
+   "app/controllers/notes_controller.rb": "\nclass NotesController < ApplicationController\n  load_and_authorize_resource only: :destroy\n  load_and_authorize_resource only: :update\n\n  def destroy\n    @note.destroy\n    head :no_content\n  end\n\n  def update\n    @note.update(body: params[:body])\n    head :no_content\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/notes/:id",
+    "ownership": "checked",
+    "why": "PRECISION: two load_and_authorize_resource calls are two separate before_actions in CanCanCan; callbacks() treats the second as a re-declaration of the first (same name) and drops destroy's"
+   },
+   {
+    "method": "PATCH",
+    "pattern": "/notes/:id",
+    "ownership": "checked",
+    "why": "the surviving declaration"
+   }
+  ]
+ },
+ {
+  "case": "define_method_override",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  resources :notes, only: :destroy\n  resources :memos, only: :destroy\nend\n",
+   "app/controllers/owned_controller.rb": "\nclass OwnedController < ApplicationController\n\n  before_action :set_note\n  before_action :require_owner\n\n\n\n  private\n\n  def set_note\n    @note = Note.find(params[:id])\n  end\n\n  def require_owner\n    head :forbidden unless @note.user == current_user\n  end\n\nend\n",
+   "app/controllers/notes_controller.rb": "\nclass NotesController < OwnedController\n  %i[require_owner].each do |name|\n    define_method(name) { true }\n  end\n\n  def destroy\n    @note.destroy\n    head :no_content\n  end\nend\n",
+   "app/controllers/memos_controller.rb": "\nclass MemosController < OwnedController\n  def destroy\n    @note.destroy\n    head :no_content\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/notes/:id",
+    "ownership": "unknown",
+    "why": "`define_method(:require_owner) { true }` in the child replaces the inherited check with a no-op; define_method isn't read, so OwnedController#require_owner is credited"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/memos/:id",
+    "ownership": "checked",
+    "why": "twin: inherited check"
+   }
+  ]
+ },
+ {
+  "case": "pundit_policy_override",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  resources :notes, only: :destroy\n  resources :memos, only: :destroy\nend\n",
+   "app/policies/note_policy.rb": "\nclass NotePolicy < ApplicationPolicy\n  def destroy?\n    record.user == user\n  end\nend\n",
+   "app/policies/open_policy.rb": "\nclass OpenPolicy < ApplicationPolicy\n  def destroy?\n    true\n  end\nend\n",
+   "app/controllers/notes_controller.rb": "\nclass NotesController < ApplicationController\n  def destroy\n    note = Note.find(params[:id])\n    authorize note\n    note.destroy\n    head :no_content\n  end\n\n  private\n\n  def policy(record)\n    OpenPolicy.new(current_user, record)\n  end\nend\n",
+   "app/controllers/memos_controller.rb": "\nclass MemosController < ApplicationController\n  def destroy\n    note = Note.find(params[:id])\n    authorize note\n    note.destroy\n    head :no_content\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/notes/:id",
+    "ownership": "unknown",
+    "why": "Pundit's `authorize` calls the controller's `policy(record)`, which this controller overrides to OpenPolicy (destroy? true); the engine reads NotePolicy by name. (current_ability and pundit_user overrides are checked; `policy` isn't)"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/memos/:id",
+    "ownership": "checked",
+    "why": "twin: Pundit's own policy lookup"
+   }
+  ]
+ },
+ {
+  "case": "app_defined_authorize",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "\nclass ApplicationController < ActionController::Base\n  before_action :authenticate_user!\n\n  private\n\n  def authorize(record, query = nil)\n    head :forbidden unless current_user.persisted?\n  end\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  resources :notes, only: :destroy\nend\n",
+   "app/policies/note_policy.rb": "\nclass NotePolicy < ApplicationPolicy\n  def destroy?\n    record.user == user\n  end\nend\n",
+   "app/controllers/notes_controller.rb": "\nclass NotesController < ApplicationController\n  def destroy\n    note = Note.find(params[:id])\n    authorize note\n    note.destroy\n    head :no_content\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/notes/:id",
+    "ownership": "caller-blind",
+    "why": "ApplicationController defines its own `authorize` (no Pundit included) that only checks the caller is signed in; a NotePolicy file exists, and every `authorize x` is read as Pundit's and resolved to NotePolicy#destroy?"
+   }
+  ]
+ },
+ {
+  "case": "precision_r4",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.string \"slug\"\n    t.text \"body\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  scope \"(:locale)\" do\n    resources :notes, only: :destroy\n  end\n  resources :memos, only: :destroy, param: :slug\n  resources :pads, only: :destroy\nend\n",
+   "app/controllers/notes_controller.rb": "\nclass NotesController < ApplicationController\n\n  before_action :set_note\n  before_action :require_owner\n\n\n  def destroy\n    @note.destroy\n    head :no_content\n  end\n\n\n  private\n\n  def set_note\n    @note = Note.find(params[:id])\n  end\n\n  def require_owner\n    head :forbidden unless @note.user == current_user\n  end\n\nend\n",
+   "app/controllers/memos_controller.rb": "\nclass MemosController < ApplicationController\n  def destroy\n    current_user.notes.find_by!(slug: params[:slug]).destroy\n    head :no_content\n  end\nend\n",
+   "app/controllers/owned_controller.rb": "\nclass OwnedController < ApplicationController\n\n  before_action :set_note\n  before_action :require_owner\n\n\n\n  private\n\n  def set_note\n    @note = Note.find(params[:id])\n  end\n\n  def require_owner\n    head :forbidden unless @note.user == current_user\n  end\n\nend\n",
+   "app/controllers/pads_controller.rb": "\nclass PadsController < OwnedController\n  def destroy\n    @note.destroy\n    head :no_content\n  end\n\n  private\n\n  def require_owner\n    super\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/(:locale)/notes/:id",
+    "ownership": "unknown",
+    "why": "PRECISION: `scope \"(:locale)\"` adds an optional :locale segment; the action never reads it, and run() hands off any path id it never sees, so every localized route is unknown"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/memos/:id",
+    "ownership": "unknown",
+    "why": "PRECISION/COVERAGE: `param: :slug` makes the route /memos/:slug; the engine emits /memos/:id, so the scoped find_by!(slug: params[:slug]) never mentions a path id"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/pads/:id",
+    "ownership": "caller-blind",
+    "why": "PRECISION: the child's `def require_owner; super; end` isn't followed to the parent's check; with the check unread and the load unscoped the row is judged caller-blind"
+   }
+  ]
+ },
+ {
+  "case": "routes_concern_coverage",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  concern :commentable do\n    resources :notes, only: :destroy\n  end\n  resources :projects, only: [], concerns: :commentable\nend\n",
+   "app/controllers/notes_controller.rb": "\nclass NotesController < ApplicationController\n\n\n\n  def destroy\n    Note.find(params[:id]).destroy\n    head :no_content\n  end\n\n\n  private\n\n  def set_note\n    @note = Note.find(params[:id])\n  end\n\n  def require_owner\n    head :forbidden unless @note.user == current_user\n  end\n\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/projects/:project_id/notes/:id",
+    "ownership": "unknown",
+    "why": "COVERAGE: `concern :commentable` bodies are skipped and `concerns:` never expands them; the unscoped destroy route isn't emitted at all"
+   }
+  ]
+ },
+ {
+  "case": "precision_r4_idioms",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  resources :notes, only: :destroy\n  resources :memos, only: :destroy\nend\n",
+   "app/controllers/notes_controller.rb": "\nclass NotesController < ApplicationController\n  load_and_authorize_resource\n\n  def destroy\n    @note.destroy\n    head :no_content\n  end\nend\n",
+   "app/models/ability.rb": "\nclass Ability\n  include CanCan::Ability\n\n  def initialize(user)\n    return admin_rules if user.admin?\n    can :destroy, Note, user_id: user.id\n  end\n\n  def admin_rules\n    can :manage, :all\n  end\nend\n",
+   "app/controllers/memos_controller.rb": "\nclass MemosController < ApplicationController\n\n  before_action :set_note\n  before_action :require_owner\n\n\n  def destroy\n    @note.destroy\n    head :no_content\n  end\n\n\n  private\n\n  def set_note\n    @note = Note.find(params[:id])\n  end\n\n  def require_owner\n    return if @note.user == current_user\n    head :forbidden\n  end\n\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/notes/:id",
+    "ownership": "caller-blind",
+    "why": "PRECISION: Ability's `can :manage, :all` lives in admin_rules, reached only through `return admin_rules if user.admin?`; _ability takes every `can` in the class as applying to every user"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/memos/:id",
+    "ownership": "unchecked",
+    "why": "PRECISION: the guard-clause form `return if @note.user == current_user` then `head :forbidden` refuses every foreign note; early_return marks the rest of the callback conditional"
+   }
+  ]
+ },
+ {
+  "case": "admin_guard_in_ambiguous_module",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  namespace :api do\n    resources :notes, only: :destroy\n  end\n  namespace :web do\n    resources :notes, only: :destroy\n  end\nend\n",
+   "app/lib/api/guard.rb": "\nmodule Api\n  module Guard\n    def require_admin\n      head :forbidden unless current_user.admin? || current_user.api_client?\n    end\n  end\nend\n",
+   "app/lib/web/guard.rb": "\nmodule Web\n  module Guard\n    def require_admin\n      head :forbidden unless current_user.admin?\n    end\n  end\nend\n",
+   "app/controllers/api/notes_controller.rb": "\nmodule Api\n  class NotesController < ApplicationController\n    include Guard\n    before_action :require_admin\n\n    def destroy\n      Note.find(params[:id]).destroy\n      head :no_content\n    end\n  end\nend\n",
+   "app/controllers/web/notes_controller.rb": "\nmodule Web\n  class NotesController < ApplicationController\n    include Web::Guard\n    before_action :require_admin\n\n    def destroy\n      Note.find(params[:id]).destroy\n      head :no_content\n    end\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/api/notes/:id",
+    "ownership": "caller-blind",
+    "why": "`include Guard` inside `module Api` is Api::Guard, whose require_admin also admits any api client; two modules are named Guard, so module() is UNREAD, find() returns None, and _Ownership.own keeps the admin-named guard as privileged_only (n/a). Fail-closed for methods becomes trusted-by-name for admin gates"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/web/notes/:id",
+    "ownership": "n/a",
+    "why": "twin: `include Web::Guard` resolves, and its require_admin refuses every non-admin"
+   }
+  ]
+ },
+ {
+  "case": "keyword_alias_overrides_check",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  resources :notes, only: :destroy\n  resources :memos, only: :destroy\nend\n",
+   "app/controllers/owned_controller.rb": "\nclass OwnedController < ApplicationController\n\n  before_action :set_note\n  before_action :require_owner\n\n\n\n  private\n\n  def set_note\n    @note = Note.find(params[:id])\n  end\n\n  def require_owner\n    head :forbidden unless @note.user == current_user\n  end\n\n  def log_access\n    Rails.logger.info(\"access\")\n  end\n\nend\n",
+   "app/controllers/notes_controller.rb": "\nclass NotesController < OwnedController\n  alias require_owner log_access\n\n  def destroy\n    @note.destroy\n    head :no_content\n  end\nend\n",
+   "app/controllers/memos_controller.rb": "\nclass MemosController < OwnedController\n  alias_method :require_owner, :log_access\n\n  def destroy\n    @note.destroy\n    head :no_content\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/notes/:id",
+    "ownership": "caller-blind",
+    "why": "`alias require_owner log_access` (the keyword form) makes the child's require_owner the logger; _controllers reads only `alias_method` calls, so the inherited check is credited"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/memos/:id",
+    "ownership": "caller-blind",
+    "why": "twin: the alias_method form is seen"
+   }
+  ]
+ },
+ {
+  "case": "namespace_module_option",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  namespace :admin, module: \"backoffice\" do\n    resources :notes, only: :destroy\n  end\nend\n",
+   "app/controllers/admin/notes_controller.rb": "\nmodule Admin\n  class NotesController < ApplicationController\n    before_action :set_note\n    before_action :require_owner\n  \n  \n    def destroy\n      @note.destroy\n      head :no_content\n    end\n  \n  \n    private\n  \n    def set_note\n      @note = Note.find(params[:id])\n    end\n  \n    def require_owner\n      head :forbidden unless @note.user == current_user\n    end\n  \n  end\nend\n",
+   "app/controllers/backoffice/notes_controller.rb": "\nmodule Backoffice\n  class NotesController < ApplicationController\n    def destroy\n      Note.find(params[:id]).destroy\n      head :no_content\n    end\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/admin/notes/:id",
+    "ownership": "caller-blind",
+    "why": "`namespace :admin, module: \"backoffice\"` routes to Backoffice::NotesController (unscoped); _call's namespace branch ignores module: and reads admin/notes, an owner-checked controller (cf. r3 resources_module_option, the resources form)"
+   }
+  ]
+ },
+ {
+  "case": "namespaced_model_same_short_name",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.text \"body\"\n  end\n  create_table \"archive_notes\" do |t|\n    t.references \"user\"\n    t.text \"body\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "app/models/archive/note.rb": "module Archive\n  class Note < ApplicationRecord\n    self.table_name = \"archive_notes\"\n    belongs_to :user\n  end\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  resources :notes, only: [:destroy, :update]\nend\n",
+   "app/controllers/notes_controller.rb": "\nclass NotesController < ApplicationController\n  def destroy\n    note = Note.find(params[:id])\n    raise ActiveRecord::RecordNotFound unless note.user == current_user\n    Archive::Note.find(params[:id]).destroy\n    head :no_content\n  end\n\n  def update\n    note = Note.find(params[:id])\n    raise ActiveRecord::RecordNotFound unless note.user == current_user\n    Note.find(params[:id]).update(body: params[:body])\n    head :no_content\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/notes/:id",
+    "ownership": "unknown",
+    "why": "the check is on notes row :id; Archive::Note.find(params[:id]) reads archive_notes row :id, another user's. query() keys a constant by its short name (`Note`), so the verified key (id, Note, pk) covers the archive lookup"
+   },
+   {
+    "method": "PATCH",
+    "pattern": "/notes/:id",
+    "ownership": "unknown",
+    "why": "twin: the same model"
+   }
+  ]
+ },
+ {
+  "case": "crash_ambiguous_include",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  namespace :api do\n    namespace :v1 do\n      resources :notes, only: :destroy\n    end\n  end\nend\n",
+   "app/controllers/concerns/api/v1/pagination.rb": "module Api\n  module V1\n    module Pagination\n      def page_size\n        25\n      end\n    end\n  end\nend\n",
+   "app/controllers/concerns/api/v2/pagination.rb": "module Api\n  module V2\n    module Pagination\n      def page_size\n        50\n      end\n    end\n  end\nend\n",
+   "app/controllers/api/v1/notes_controller.rb": "\nmodule Api\n  module V1\n    class NotesController < ApplicationController\n      include Pagination\n\n      def destroy\n        current_user.notes.find(params[:id]).destroy\n        head :no_content\n      end\n    end\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/api/v1/notes/:id",
+    "ownership": "scoped",
+    "why": "CRASH: `include Pagination` (lexically Api::V1::Pagination) with Api::V2::Pagination also defined: RubyCode.module returns the module-level UNREAD sentinel, but _Ownership.methods compares against its own local `unread = object()`, so it unpacks UNREAD and raises TypeError out of route_guards for the whole checkout"
+   }
+  ]
+ },
+ {
+  "case": "admin_guard_included_on_load",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  namespace :admin do\n    resources :notes, only: :destroy\n    resources :memos, only: :destroy\n  end\nend\n",
+   "config/initializers/admin_guard.rb": "ActiveSupport.on_load(:action_controller_base) { include AdminGuard }\n",
+   "lib/admin_guard.rb": "\nmodule AdminGuard\n  def require_admin\n    return if current_user.admin?\n    flash[:alert] = \"This area is for admins\"\n  end\nend\n",
+   "app/controllers/admin/notes_controller.rb": "\nmodule Admin\n  class NotesController < ApplicationController\n    before_action :require_admin\n\n    def destroy\n      Note.find(params[:id]).destroy\n      head :no_content\n    end\n  end\nend\n",
+   "app/controllers/admin/memos_controller.rb": "\nmodule Admin\n  class MemosController < ApplicationController\n    include AdminGuard\n    before_action :require_admin\n\n    def destroy\n      Note.find(params[:id]).destroy\n      head :no_content\n    end\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/admin/notes/:id",
+    "ownership": "caller-blind",
+    "why": "AdminGuard (lib/, included into every controller by an initializer's on_load) defines require_admin, which only sets a flash and halts nobody; find() can't place the method (not included in the class body, not under concerns/), and _Ownership.own keeps an unfound admin-named guard as privileged_only, so the route reads n/a"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/admin/memos/:id",
+    "ownership": "unchecked",
+    "why": "twin: included in the class body, the same require_admin is read and rejected"
+   }
+  ]
+ },
+ {
+  "case": "policy_with_forged_current_user",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "\nclass ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\n\n  private\n\n  def current_user\n    @current_user ||= User.find_by(id: params[:as_user_id]) || super\n  end\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  resources :notes, only: :destroy\n  resources :memos, only: :destroy\n  resources :pads, only: :destroy\nend\n",
+   "app/policies/note_policy.rb": "\nclass NotePolicy < ApplicationPolicy\n  def destroy?\n    record.user == user\n  end\nend\n",
+   "app/models/ability.rb": "\nclass Ability\n  include CanCan::Ability\n\n  def initialize(user)\n    can :destroy, Note, user_id: user.id\n  end\nend\n",
+   "app/controllers/notes_controller.rb": "\nclass NotesController < ApplicationController\n  def destroy\n    note = Note.find(params[:id])\n    authorize note\n    note.destroy\n    head :no_content\n  end\nend\n",
+   "app/controllers/memos_controller.rb": "\nclass MemosController < ApplicationController\n  def destroy\n    note = Note.find(params[:id])\n    authorize! :destroy, note\n    note.destroy\n    head :no_content\n  end\nend\n",
+   "app/controllers/pads_controller.rb": "\nclass PadsController < ApplicationController\n  def destroy\n    note = Note.find(params[:id])\n    head :forbidden and return unless note.user == current_user\n    note.destroy\n    head :no_content\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/notes/:id",
+    "ownership": "caller-blind",
+    "why": "the app's current_user takes ?as_user_id (D17: forged); Pundit's default pundit_user is current_user, so `authorize note` asks NotePolicy about the attacker's pick. _Action.authorize checks only a `pundit_user` override (pundit_user_forged), not a forged current_user"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/memos/:id",
+    "ownership": "caller-blind",
+    "why": "same for CanCanCan: Ability.new(current_user) gets the forged user; the cancan verdict never consults the forged set"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/pads/:id",
+    "ownership": "caller-blind",
+    "why": "twin: the hand-written check on the same forged current_user is rejected"
+   }
+  ]
+ },
+ {
+  "case": "association_through_other_users",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n  end\n  create_table \"friendships\" do |t|\n    t.references \"user\"\n    t.references \"friend\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.text \"body\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "\nclass User < ApplicationRecord\n  has_many :notes\n  has_many :friendships\n  has_many :friends, through: :friendships\n  has_many :friend_notes, through: :friends, source: :notes\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "app/models/friendship.rb": "class Friendship < ApplicationRecord\n  belongs_to :user\n  belongs_to :friend, class_name: \"User\"\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  resources :notes, only: [:destroy, :update]\nend\n",
+   "app/controllers/notes_controller.rb": "\nclass NotesController < ApplicationController\n  def destroy\n    current_user.friend_notes.find(params[:id]).destroy\n    head :no_content\n  end\n\n  def update\n    current_user.notes.find(params[:id]).update(body: params[:body])\n    head :no_content\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/notes/:id",
+    "ownership": "unknown",
+    "why": "`friend_notes` is `has_many through: :friends, source: :notes`: every row is a friend's note, another user's record the caller can destroy. Any caller association counts as D18 scoping, even one that runs through other users (cf. caller_derived_other_user, `where(user: current_user.manager)`). The guessed class FriendNote isn't a model either, so the classifier has no fields to judge"
+   },
+   {
+    "method": "PATCH",
+    "pattern": "/notes/:id",
+    "ownership": "scoped",
+    "why": "twin: the caller's own notes"
+   }
+  ]
+ },
+ {
+  "case": "precision_raising_helper_refusal",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "\nclass ApplicationController < ActionController::Base\n  before_action :authenticate_user!\n\n  private\n\n  def not_found!\n    raise ActionController::RoutingError, \"Not Found\"\n  end\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  resources :notes, only: :destroy\n  resources :memos, only: :destroy\nend\n",
+   "app/controllers/notes_controller.rb": "\nclass NotesController < ApplicationController\n  def destroy\n    note = Note.find(params[:id])\n    not_found! unless note.user == current_user\n    note.destroy\n    head :no_content\n  end\nend\n",
+   "app/controllers/memos_controller.rb": "\nclass MemosController < ApplicationController\n\n  before_action :set_note\n  before_action :require_owner\n\n\n  def destroy\n    @note.destroy\n    head :no_content\n  end\n\n\n  private\n\n  def set_note\n    @note = Note.find(params[:id])\n  end\n\n  def require_owner\n    not_found! unless @note.user == current_user\n  end\n\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/notes/:id",
+    "ownership": "unchecked",
+    "why": "PRECISION: `not_found! unless note.user == current_user`, where not_found! only raises, is the common Rails 404 idiom; refuses_request reads only a literal `raise`, never a helper that raises"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/memos/:id",
+    "ownership": "unchecked",
+    "why": "PRECISION: same in a before_action"
+   }
+  ]
+ },
+ {
+  "case": "slow_many_ivar_assignments",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  before_action :authenticate_user!\n  before_action :load_context\n  private\n  def load_context\n    @v0 = session[:v0] || cookies[:v0]\n    @v1 = session[:v1] || cookies[:v1]\n    @v2 = session[:v2] || cookies[:v2]\n    @v3 = session[:v3] || cookies[:v3]\n    @v4 = session[:v4] || cookies[:v4]\n    @v5 = session[:v5] || cookies[:v5]\n    @v6 = session[:v6] || cookies[:v6]\n    @v7 = session[:v7] || cookies[:v7]\n    @v8 = session[:v8] || cookies[:v8]\n    @v9 = session[:v9] || cookies[:v9]\n    @v10 = session[:v10] || cookies[:v10]\n    @v11 = session[:v11] || cookies[:v11]\n    @v12 = session[:v12] || cookies[:v12]\n    @v13 = session[:v13] || cookies[:v13]\n    @v14 = session[:v14] || cookies[:v14]\n    @v15 = session[:v15] || cookies[:v15]\n    @v16 = session[:v16] || cookies[:v16]\n    @v17 = session[:v17] || cookies[:v17]\n    @v18 = session[:v18] || cookies[:v18]\n    @v19 = session[:v19] || cookies[:v19]\n    @v20 = session[:v20] || cookies[:v20]\n    @v21 = session[:v21] || cookies[:v21]\n    @v22 = session[:v22] || cookies[:v22]\n    @v23 = session[:v23] || cookies[:v23]\n    @v24 = session[:v24] || cookies[:v24]\n    @v25 = session[:v25] || cookies[:v25]\n    @v26 = session[:v26] || cookies[:v26]\n    @v27 = session[:v27] || cookies[:v27]\n    @v28 = session[:v28] || cookies[:v28]\n    @v29 = session[:v29] || cookies[:v29]\n    @v30 = session[:v30] || cookies[:v30]\n    @v31 = session[:v31] || cookies[:v31]\n    @v32 = session[:v32] || cookies[:v32]\n    @v33 = session[:v33] || cookies[:v33]\n    @v34 = session[:v34] || cookies[:v34]\n    @v35 = session[:v35] || cookies[:v35]\n    @v36 = session[:v36] || cookies[:v36]\n    @v37 = session[:v37] || cookies[:v37]\n    @v38 = session[:v38] || cookies[:v38]\n    @v39 = session[:v39] || cookies[:v39]\n    @v40 = session[:v40] || cookies[:v40]\n    @v41 = session[:v41] || cookies[:v41]\n    @v42 = session[:v42] || cookies[:v42]\n    @v43 = session[:v43] || cookies[:v43]\n    @v44 = session[:v44] || cookies[:v44]\n    @v45 = session[:v45] || cookies[:v45]\n    @v46 = session[:v46] || cookies[:v46]\n    @v47 = session[:v47] || cookies[:v47]\n    @v48 = session[:v48] || cookies[:v48]\n    @v49 = session[:v49] || cookies[:v49]\n    @v50 = session[:v50] || cookies[:v50]\n    @v51 = session[:v51] || cookies[:v51]\n    @v52 = session[:v52] || cookies[:v52]\n    @v53 = session[:v53] || cookies[:v53]\n    @v54 = session[:v54] || cookies[:v54]\n    @v55 = session[:v55] || cookies[:v55]\n    @v56 = session[:v56] || cookies[:v56]\n    @v57 = session[:v57] || cookies[:v57]\n    @v58 = session[:v58] || cookies[:v58]\n    @v59 = session[:v59] || cookies[:v59]\n    @v60 = session[:v60] || cookies[:v60]\n    @v61 = session[:v61] || cookies[:v61]\n    @v62 = session[:v62] || cookies[:v62]\n    @v63 = session[:v63] || cookies[:v63]\n    @v64 = session[:v64] || cookies[:v64]\n    @v65 = session[:v65] || cookies[:v65]\n    @v66 = session[:v66] || cookies[:v66]\n    @v67 = session[:v67] || cookies[:v67]\n    @v68 = session[:v68] || cookies[:v68]\n    @v69 = session[:v69] || cookies[:v69]\n    @v70 = session[:v70] || cookies[:v70]\n    @v71 = session[:v71] || cookies[:v71]\n    @v72 = session[:v72] || cookies[:v72]\n    @v73 = session[:v73] || cookies[:v73]\n    @v74 = session[:v74] || cookies[:v74]\n    @v75 = session[:v75] || cookies[:v75]\n    @v76 = session[:v76] || cookies[:v76]\n    @v77 = session[:v77] || cookies[:v77]\n    @v78 = session[:v78] || cookies[:v78]\n    @v79 = session[:v79] || cookies[:v79]\n    @v80 = session[:v80] || cookies[:v80]\n    @v81 = session[:v81] || cookies[:v81]\n    @v82 = session[:v82] || cookies[:v82]\n    @v83 = session[:v83] || cookies[:v83]\n    @v84 = session[:v84] || cookies[:v84]\n    @v85 = session[:v85] || cookies[:v85]\n    @v86 = session[:v86] || cookies[:v86]\n    @v87 = session[:v87] || cookies[:v87]\n    @v88 = session[:v88] || cookies[:v88]\n    @v89 = session[:v89] || cookies[:v89]\n    @v90 = session[:v90] || cookies[:v90]\n    @v91 = session[:v91] || cookies[:v91]\n    @v92 = session[:v92] || cookies[:v92]\n    @v93 = session[:v93] || cookies[:v93]\n    @v94 = session[:v94] || cookies[:v94]\n    @v95 = session[:v95] || cookies[:v95]\n    @v96 = session[:v96] || cookies[:v96]\n    @v97 = session[:v97] || cookies[:v97]\n    @v98 = session[:v98] || cookies[:v98]\n    @v99 = session[:v99] || cookies[:v99]\n    @v100 = session[:v100] || cookies[:v100]\n    @v101 = session[:v101] || cookies[:v101]\n    @v102 = session[:v102] || cookies[:v102]\n    @v103 = session[:v103] || cookies[:v103]\n    @v104 = session[:v104] || cookies[:v104]\n    @v105 = session[:v105] || cookies[:v105]\n    @v106 = session[:v106] || cookies[:v106]\n    @v107 = session[:v107] || cookies[:v107]\n    @v108 = session[:v108] || cookies[:v108]\n    @v109 = session[:v109] || cookies[:v109]\n    @v110 = session[:v110] || cookies[:v110]\n    @v111 = session[:v111] || cookies[:v111]\n    @v112 = session[:v112] || cookies[:v112]\n    @v113 = session[:v113] || cookies[:v113]\n    @v114 = session[:v114] || cookies[:v114]\n    @v115 = session[:v115] || cookies[:v115]\n    @v116 = session[:v116] || cookies[:v116]\n    @v117 = session[:v117] || cookies[:v117]\n    @v118 = session[:v118] || cookies[:v118]\n    @v119 = session[:v119] || cookies[:v119]\n    @v120 = session[:v120] || cookies[:v120]\n    @v121 = session[:v121] || cookies[:v121]\n    @v122 = session[:v122] || cookies[:v122]\n    @v123 = session[:v123] || cookies[:v123]\n    @v124 = session[:v124] || cookies[:v124]\n    @v125 = session[:v125] || cookies[:v125]\n    @v126 = session[:v126] || cookies[:v126]\n    @v127 = session[:v127] || cookies[:v127]\n    @v128 = session[:v128] || cookies[:v128]\n    @v129 = session[:v129] || cookies[:v129]\n    @v130 = session[:v130] || cookies[:v130]\n    @v131 = session[:v131] || cookies[:v131]\n    @v132 = session[:v132] || cookies[:v132]\n    @v133 = session[:v133] || cookies[:v133]\n    @v134 = session[:v134] || cookies[:v134]\n    @v135 = session[:v135] || cookies[:v135]\n    @v136 = session[:v136] || cookies[:v136]\n    @v137 = session[:v137] || cookies[:v137]\n    @v138 = session[:v138] || cookies[:v138]\n    @v139 = session[:v139] || cookies[:v139]\n    @v140 = session[:v140] || cookies[:v140]\n    @v141 = session[:v141] || cookies[:v141]\n    @v142 = session[:v142] || cookies[:v142]\n    @v143 = session[:v143] || cookies[:v143]\n    @v144 = session[:v144] || cookies[:v144]\n    @v145 = session[:v145] || cookies[:v145]\n    @v146 = session[:v146] || cookies[:v146]\n    @v147 = session[:v147] || cookies[:v147]\n    @v148 = session[:v148] || cookies[:v148]\n    @v149 = session[:v149] || cookies[:v149]\n    @v150 = session[:v150] || cookies[:v150]\n    @v151 = session[:v151] || cookies[:v151]\n    @v152 = session[:v152] || cookies[:v152]\n    @v153 = session[:v153] || cookies[:v153]\n    @v154 = session[:v154] || cookies[:v154]\n    @v155 = session[:v155] || cookies[:v155]\n    @v156 = session[:v156] || cookies[:v156]\n    @v157 = session[:v157] || cookies[:v157]\n    @v158 = session[:v158] || cookies[:v158]\n    @v159 = session[:v159] || cookies[:v159]\n    @v160 = session[:v160] || cookies[:v160]\n    @v161 = session[:v161] || cookies[:v161]\n    @v162 = session[:v162] || cookies[:v162]\n    @v163 = session[:v163] || cookies[:v163]\n    @v164 = session[:v164] || cookies[:v164]\n    @v165 = session[:v165] || cookies[:v165]\n    @v166 = session[:v166] || cookies[:v166]\n    @v167 = session[:v167] || cookies[:v167]\n    @v168 = session[:v168] || cookies[:v168]\n    @v169 = session[:v169] || cookies[:v169]\n    @v170 = session[:v170] || cookies[:v170]\n    @v171 = session[:v171] || cookies[:v171]\n    @v172 = session[:v172] || cookies[:v172]\n    @v173 = session[:v173] || cookies[:v173]\n    @v174 = session[:v174] || cookies[:v174]\n    @v175 = session[:v175] || cookies[:v175]\n    @v176 = session[:v176] || cookies[:v176]\n    @v177 = session[:v177] || cookies[:v177]\n    @v178 = session[:v178] || cookies[:v178]\n    @v179 = session[:v179] || cookies[:v179]\n    @v180 = session[:v180] || cookies[:v180]\n    @v181 = session[:v181] || cookies[:v181]\n    @v182 = session[:v182] || cookies[:v182]\n    @v183 = session[:v183] || cookies[:v183]\n    @v184 = session[:v184] || cookies[:v184]\n    @v185 = session[:v185] || cookies[:v185]\n    @v186 = session[:v186] || cookies[:v186]\n    @v187 = session[:v187] || cookies[:v187]\n    @v188 = session[:v188] || cookies[:v188]\n    @v189 = session[:v189] || cookies[:v189]\n    @v190 = session[:v190] || cookies[:v190]\n    @v191 = session[:v191] || cookies[:v191]\n    @v192 = session[:v192] || cookies[:v192]\n    @v193 = session[:v193] || cookies[:v193]\n    @v194 = session[:v194] || cookies[:v194]\n    @v195 = session[:v195] || cookies[:v195]\n    @v196 = session[:v196] || cookies[:v196]\n    @v197 = session[:v197] || cookies[:v197]\n    @v198 = session[:v198] || cookies[:v198]\n    @v199 = session[:v199] || cookies[:v199]\n    @v200 = session[:v200] || cookies[:v200]\n    @v201 = session[:v201] || cookies[:v201]\n    @v202 = session[:v202] || cookies[:v202]\n    @v203 = session[:v203] || cookies[:v203]\n    @v204 = session[:v204] || cookies[:v204]\n    @v205 = session[:v205] || cookies[:v205]\n    @v206 = session[:v206] || cookies[:v206]\n    @v207 = session[:v207] || cookies[:v207]\n    @v208 = session[:v208] || cookies[:v208]\n    @v209 = session[:v209] || cookies[:v209]\n    @v210 = session[:v210] || cookies[:v210]\n    @v211 = session[:v211] || cookies[:v211]\n    @v212 = session[:v212] || cookies[:v212]\n    @v213 = session[:v213] || cookies[:v213]\n    @v214 = session[:v214] || cookies[:v214]\n    @v215 = session[:v215] || cookies[:v215]\n    @v216 = session[:v216] || cookies[:v216]\n    @v217 = session[:v217] || cookies[:v217]\n    @v218 = session[:v218] || cookies[:v218]\n    @v219 = session[:v219] || cookies[:v219]\n    @v220 = session[:v220] || cookies[:v220]\n    @v221 = session[:v221] || cookies[:v221]\n    @v222 = session[:v222] || cookies[:v222]\n    @v223 = session[:v223] || cookies[:v223]\n    @v224 = session[:v224] || cookies[:v224]\n    @v225 = session[:v225] || cookies[:v225]\n    @v226 = session[:v226] || cookies[:v226]\n    @v227 = session[:v227] || cookies[:v227]\n    @v228 = session[:v228] || cookies[:v228]\n    @v229 = session[:v229] || cookies[:v229]\n    @v230 = session[:v230] || cookies[:v230]\n    @v231 = session[:v231] || cookies[:v231]\n    @v232 = session[:v232] || cookies[:v232]\n    @v233 = session[:v233] || cookies[:v233]\n    @v234 = session[:v234] || cookies[:v234]\n    @v235 = session[:v235] || cookies[:v235]\n    @v236 = session[:v236] || cookies[:v236]\n    @v237 = session[:v237] || cookies[:v237]\n    @v238 = session[:v238] || cookies[:v238]\n    @v239 = session[:v239] || cookies[:v239]\n    @v240 = session[:v240] || cookies[:v240]\n    @v241 = session[:v241] || cookies[:v241]\n    @v242 = session[:v242] || cookies[:v242]\n    @v243 = session[:v243] || cookies[:v243]\n    @v244 = session[:v244] || cookies[:v244]\n    @v245 = session[:v245] || cookies[:v245]\n    @v246 = session[:v246] || cookies[:v246]\n    @v247 = session[:v247] || cookies[:v247]\n    @v248 = session[:v248] || cookies[:v248]\n    @v249 = session[:v249] || cookies[:v249]\n    @v250 = session[:v250] || cookies[:v250]\n    @v251 = session[:v251] || cookies[:v251]\n    @v252 = session[:v252] || cookies[:v252]\n    @v253 = session[:v253] || cookies[:v253]\n    @v254 = session[:v254] || cookies[:v254]\n    @v255 = session[:v255] || cookies[:v255]\n    @v256 = session[:v256] || cookies[:v256]\n    @v257 = session[:v257] || cookies[:v257]\n    @v258 = session[:v258] || cookies[:v258]\n    @v259 = session[:v259] || cookies[:v259]\n    @v260 = session[:v260] || cookies[:v260]\n    @v261 = session[:v261] || cookies[:v261]\n    @v262 = session[:v262] || cookies[:v262]\n    @v263 = session[:v263] || cookies[:v263]\n    @v264 = session[:v264] || cookies[:v264]\n    @v265 = session[:v265] || cookies[:v265]\n    @v266 = session[:v266] || cookies[:v266]\n    @v267 = session[:v267] || cookies[:v267]\n    @v268 = session[:v268] || cookies[:v268]\n    @v269 = session[:v269] || cookies[:v269]\n    @v270 = session[:v270] || cookies[:v270]\n    @v271 = session[:v271] || cookies[:v271]\n    @v272 = session[:v272] || cookies[:v272]\n    @v273 = session[:v273] || cookies[:v273]\n    @v274 = session[:v274] || cookies[:v274]\n    @v275 = session[:v275] || cookies[:v275]\n    @v276 = session[:v276] || cookies[:v276]\n    @v277 = session[:v277] || cookies[:v277]\n    @v278 = session[:v278] || cookies[:v278]\n    @v279 = session[:v279] || cookies[:v279]\n    @v280 = session[:v280] || cookies[:v280]\n    @v281 = session[:v281] || cookies[:v281]\n    @v282 = session[:v282] || cookies[:v282]\n    @v283 = session[:v283] || cookies[:v283]\n    @v284 = session[:v284] || cookies[:v284]\n    @v285 = session[:v285] || cookies[:v285]\n    @v286 = session[:v286] || cookies[:v286]\n    @v287 = session[:v287] || cookies[:v287]\n    @v288 = session[:v288] || cookies[:v288]\n    @v289 = session[:v289] || cookies[:v289]\n    @v290 = session[:v290] || cookies[:v290]\n    @v291 = session[:v291] || cookies[:v291]\n    @v292 = session[:v292] || cookies[:v292]\n    @v293 = session[:v293] || cookies[:v293]\n    @v294 = session[:v294] || cookies[:v294]\n    @v295 = session[:v295] || cookies[:v295]\n    @v296 = session[:v296] || cookies[:v296]\n    @v297 = session[:v297] || cookies[:v297]\n    @v298 = session[:v298] || cookies[:v298]\n    @v299 = session[:v299] || cookies[:v299]\n    @v300 = session[:v300] || cookies[:v300]\n    @v301 = session[:v301] || cookies[:v301]\n    @v302 = session[:v302] || cookies[:v302]\n    @v303 = session[:v303] || cookies[:v303]\n    @v304 = session[:v304] || cookies[:v304]\n    @v305 = session[:v305] || cookies[:v305]\n    @v306 = session[:v306] || cookies[:v306]\n    @v307 = session[:v307] || cookies[:v307]\n    @v308 = session[:v308] || cookies[:v308]\n    @v309 = session[:v309] || cookies[:v309]\n    @v310 = session[:v310] || cookies[:v310]\n    @v311 = session[:v311] || cookies[:v311]\n    @v312 = session[:v312] || cookies[:v312]\n    @v313 = session[:v313] || cookies[:v313]\n    @v314 = session[:v314] || cookies[:v314]\n    @v315 = session[:v315] || cookies[:v315]\n    @v316 = session[:v316] || cookies[:v316]\n    @v317 = session[:v317] || cookies[:v317]\n    @v318 = session[:v318] || cookies[:v318]\n    @v319 = session[:v319] || cookies[:v319]\n    @v320 = session[:v320] || cookies[:v320]\n    @v321 = session[:v321] || cookies[:v321]\n    @v322 = session[:v322] || cookies[:v322]\n    @v323 = session[:v323] || cookies[:v323]\n    @v324 = session[:v324] || cookies[:v324]\n    @v325 = session[:v325] || cookies[:v325]\n    @v326 = session[:v326] || cookies[:v326]\n    @v327 = session[:v327] || cookies[:v327]\n    @v328 = session[:v328] || cookies[:v328]\n    @v329 = session[:v329] || cookies[:v329]\n    @v330 = session[:v330] || cookies[:v330]\n    @v331 = session[:v331] || cookies[:v331]\n    @v332 = session[:v332] || cookies[:v332]\n    @v333 = session[:v333] || cookies[:v333]\n    @v334 = session[:v334] || cookies[:v334]\n    @v335 = session[:v335] || cookies[:v335]\n    @v336 = session[:v336] || cookies[:v336]\n    @v337 = session[:v337] || cookies[:v337]\n    @v338 = session[:v338] || cookies[:v338]\n    @v339 = session[:v339] || cookies[:v339]\n    @v340 = session[:v340] || cookies[:v340]\n    @v341 = session[:v341] || cookies[:v341]\n    @v342 = session[:v342] || cookies[:v342]\n    @v343 = session[:v343] || cookies[:v343]\n    @v344 = session[:v344] || cookies[:v344]\n    @v345 = session[:v345] || cookies[:v345]\n    @v346 = session[:v346] || cookies[:v346]\n    @v347 = session[:v347] || cookies[:v347]\n    @v348 = session[:v348] || cookies[:v348]\n    @v349 = session[:v349] || cookies[:v349]\n    @v350 = session[:v350] || cookies[:v350]\n    @v351 = session[:v351] || cookies[:v351]\n    @v352 = session[:v352] || cookies[:v352]\n    @v353 = session[:v353] || cookies[:v353]\n    @v354 = session[:v354] || cookies[:v354]\n    @v355 = session[:v355] || cookies[:v355]\n    @v356 = session[:v356] || cookies[:v356]\n    @v357 = session[:v357] || cookies[:v357]\n    @v358 = session[:v358] || cookies[:v358]\n    @v359 = session[:v359] || cookies[:v359]\n    @v360 = session[:v360] || cookies[:v360]\n    @v361 = session[:v361] || cookies[:v361]\n    @v362 = session[:v362] || cookies[:v362]\n    @v363 = session[:v363] || cookies[:v363]\n    @v364 = session[:v364] || cookies[:v364]\n    @v365 = session[:v365] || cookies[:v365]\n    @v366 = session[:v366] || cookies[:v366]\n    @v367 = session[:v367] || cookies[:v367]\n    @v368 = session[:v368] || cookies[:v368]\n    @v369 = session[:v369] || cookies[:v369]\n    @v370 = session[:v370] || cookies[:v370]\n    @v371 = session[:v371] || cookies[:v371]\n    @v372 = session[:v372] || cookies[:v372]\n    @v373 = session[:v373] || cookies[:v373]\n    @v374 = session[:v374] || cookies[:v374]\n    @v375 = session[:v375] || cookies[:v375]\n    @v376 = session[:v376] || cookies[:v376]\n    @v377 = session[:v377] || cookies[:v377]\n    @v378 = session[:v378] || cookies[:v378]\n    @v379 = session[:v379] || cookies[:v379]\n    @v380 = session[:v380] || cookies[:v380]\n    @v381 = session[:v381] || cookies[:v381]\n    @v382 = session[:v382] || cookies[:v382]\n    @v383 = session[:v383] || cookies[:v383]\n    @v384 = session[:v384] || cookies[:v384]\n    @v385 = session[:v385] || cookies[:v385]\n    @v386 = session[:v386] || cookies[:v386]\n    @v387 = session[:v387] || cookies[:v387]\n    @v388 = session[:v388] || cookies[:v388]\n    @v389 = session[:v389] || cookies[:v389]\n    @v390 = session[:v390] || cookies[:v390]\n    @v391 = session[:v391] || cookies[:v391]\n    @v392 = session[:v392] || cookies[:v392]\n    @v393 = session[:v393] || cookies[:v393]\n    @v394 = session[:v394] || cookies[:v394]\n    @v395 = session[:v395] || cookies[:v395]\n    @v396 = session[:v396] || cookies[:v396]\n    @v397 = session[:v397] || cookies[:v397]\n    @v398 = session[:v398] || cookies[:v398]\n    @v399 = session[:v399] || cookies[:v399]\n    @v400 = session[:v400] || cookies[:v400]\n    @v401 = session[:v401] || cookies[:v401]\n    @v402 = session[:v402] || cookies[:v402]\n    @v403 = session[:v403] || cookies[:v403]\n    @v404 = session[:v404] || cookies[:v404]\n    @v405 = session[:v405] || cookies[:v405]\n    @v406 = session[:v406] || cookies[:v406]\n    @v407 = session[:v407] || cookies[:v407]\n    @v408 = session[:v408] || cookies[:v408]\n    @v409 = session[:v409] || cookies[:v409]\n    @v410 = session[:v410] || cookies[:v410]\n    @v411 = session[:v411] || cookies[:v411]\n    @v412 = session[:v412] || cookies[:v412]\n    @v413 = session[:v413] || cookies[:v413]\n    @v414 = session[:v414] || cookies[:v414]\n    @v415 = session[:v415] || cookies[:v415]\n    @v416 = session[:v416] || cookies[:v416]\n    @v417 = session[:v417] || cookies[:v417]\n    @v418 = session[:v418] || cookies[:v418]\n    @v419 = session[:v419] || cookies[:v419]\n    @v420 = session[:v420] || cookies[:v420]\n    @v421 = session[:v421] || cookies[:v421]\n    @v422 = session[:v422] || cookies[:v422]\n    @v423 = session[:v423] || cookies[:v423]\n    @v424 = session[:v424] || cookies[:v424]\n    @v425 = session[:v425] || cookies[:v425]\n    @v426 = session[:v426] || cookies[:v426]\n    @v427 = session[:v427] || cookies[:v427]\n    @v428 = session[:v428] || cookies[:v428]\n    @v429 = session[:v429] || cookies[:v429]\n    @v430 = session[:v430] || cookies[:v430]\n    @v431 = session[:v431] || cookies[:v431]\n    @v432 = session[:v432] || cookies[:v432]\n    @v433 = session[:v433] || cookies[:v433]\n    @v434 = session[:v434] || cookies[:v434]\n    @v435 = session[:v435] || cookies[:v435]\n    @v436 = session[:v436] || cookies[:v436]\n    @v437 = session[:v437] || cookies[:v437]\n    @v438 = session[:v438] || cookies[:v438]\n    @v439 = session[:v439] || cookies[:v439]\n    @v440 = session[:v440] || cookies[:v440]\n    @v441 = session[:v441] || cookies[:v441]\n    @v442 = session[:v442] || cookies[:v442]\n    @v443 = session[:v443] || cookies[:v443]\n    @v444 = session[:v444] || cookies[:v444]\n    @v445 = session[:v445] || cookies[:v445]\n    @v446 = session[:v446] || cookies[:v446]\n    @v447 = session[:v447] || cookies[:v447]\n    @v448 = session[:v448] || cookies[:v448]\n    @v449 = session[:v449] || cookies[:v449]\n    @v450 = session[:v450] || cookies[:v450]\n    @v451 = session[:v451] || cookies[:v451]\n    @v452 = session[:v452] || cookies[:v452]\n    @v453 = session[:v453] || cookies[:v453]\n    @v454 = session[:v454] || cookies[:v454]\n    @v455 = session[:v455] || cookies[:v455]\n    @v456 = session[:v456] || cookies[:v456]\n    @v457 = session[:v457] || cookies[:v457]\n    @v458 = session[:v458] || cookies[:v458]\n    @v459 = session[:v459] || cookies[:v459]\n    @v460 = session[:v460] || cookies[:v460]\n    @v461 = session[:v461] || cookies[:v461]\n    @v462 = session[:v462] || cookies[:v462]\n    @v463 = session[:v463] || cookies[:v463]\n    @v464 = session[:v464] || cookies[:v464]\n    @v465 = session[:v465] || cookies[:v465]\n    @v466 = session[:v466] || cookies[:v466]\n    @v467 = session[:v467] || cookies[:v467]\n    @v468 = session[:v468] || cookies[:v468]\n    @v469 = session[:v469] || cookies[:v469]\n    @v470 = session[:v470] || cookies[:v470]\n    @v471 = session[:v471] || cookies[:v471]\n    @v472 = session[:v472] || cookies[:v472]\n    @v473 = session[:v473] || cookies[:v473]\n    @v474 = session[:v474] || cookies[:v474]\n    @v475 = session[:v475] || cookies[:v475]\n    @v476 = session[:v476] || cookies[:v476]\n    @v477 = session[:v477] || cookies[:v477]\n    @v478 = session[:v478] || cookies[:v478]\n    @v479 = session[:v479] || cookies[:v479]\n    @v480 = session[:v480] || cookies[:v480]\n    @v481 = session[:v481] || cookies[:v481]\n    @v482 = session[:v482] || cookies[:v482]\n    @v483 = session[:v483] || cookies[:v483]\n    @v484 = session[:v484] || cookies[:v484]\n    @v485 = session[:v485] || cookies[:v485]\n    @v486 = session[:v486] || cookies[:v486]\n    @v487 = session[:v487] || cookies[:v487]\n    @v488 = session[:v488] || cookies[:v488]\n    @v489 = session[:v489] || cookies[:v489]\n    @v490 = session[:v490] || cookies[:v490]\n    @v491 = session[:v491] || cookies[:v491]\n    @v492 = session[:v492] || cookies[:v492]\n    @v493 = session[:v493] || cookies[:v493]\n    @v494 = session[:v494] || cookies[:v494]\n    @v495 = session[:v495] || cookies[:v495]\n    @v496 = session[:v496] || cookies[:v496]\n    @v497 = session[:v497] || cookies[:v497]\n    @v498 = session[:v498] || cookies[:v498]\n    @v499 = session[:v499] || cookies[:v499]\n  end\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  resources :things0, only: :destroy\n  resources :things1, only: :destroy\n  resources :things2, only: :destroy\nend\n",
+   "app/controllers/things0_controller.rb": "class Things0Controller < ApplicationController\n  def destroy\n    current_user.notes.find(params[:id]).destroy\n  end\nend\n",
+   "app/controllers/things1_controller.rb": "class Things1Controller < ApplicationController\n  def destroy\n    current_user.notes.find(params[:id]).destroy\n  end\nend\n",
+   "app/controllers/things2_controller.rb": "class Things2Controller < ApplicationController\n  def destroy\n    current_user.notes.find(params[:id]).destroy\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/things0/:id",
+    "ownership": "scoped",
+    "why": "SLOW: one before_action with 500 `@vN = session[...]` lines costs ~1.4 s per id route (quadratic: _ivar_kinds walks every reached step once per caller ivar, and _Action is built twice per route, caller_forged and action_facts, with nothing cached across routes); 400 lines: ~0.9 s/route, 800: ~3.4 s/route"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/things1/:id",
+    "ownership": "scoped",
+    "why": "SLOW: one before_action with 500 `@vN = session[...]` lines costs ~1.4 s per id route (quadratic: _ivar_kinds walks every reached step once per caller ivar, and _Action is built twice per route, caller_forged and action_facts, with nothing cached across routes); 400 lines: ~0.9 s/route, 800: ~3.4 s/route"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/things2/:id",
+    "ownership": "scoped",
+    "why": "SLOW: one before_action with 500 `@vN = session[...]` lines costs ~1.4 s per id route (quadratic: _ivar_kinds walks every reached step once per caller ivar, and _Action is built twice per route, caller_forged and action_facts, with nothing cached across routes); 400 lines: ~0.9 s/route, 800: ~3.4 s/route"
+   }
+  ]
+ },
+ {
+  "case": "slow_deep_module_nesting",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  resources :notes, only: :destroy\nend\n",
+   "app/models/deep.rb": "module M0\nmodule M1\nmodule M2\nmodule M3\nmodule M4\nmodule M5\nmodule M6\nmodule M7\nmodule M8\nmodule M9\nmodule M10\nmodule M11\nmodule M12\nmodule M13\nmodule M14\nmodule M15\nmodule M16\nmodule M17\nmodule M18\nmodule M19\nmodule M20\nmodule M21\nmodule M22\nmodule M23\nmodule M24\nmodule M25\nmodule M26\nmodule M27\nmodule M28\nmodule M29\nmodule M30\nmodule M31\nmodule M32\nmodule M33\nmodule M34\nmodule M35\nmodule M36\nmodule M37\nmodule M38\nmodule M39\nmodule M40\nmodule M41\nmodule M42\nmodule M43\nmodule M44\nmodule M45\nmodule M46\nmodule M47\nmodule M48\nmodule M49\nmodule M50\nmodule M51\nmodule M52\nmodule M53\nmodule M54\nmodule M55\nmodule M56\nmodule M57\nmodule M58\nmodule M59\nmodule M60\nmodule M61\nmodule M62\nmodule M63\nmodule M64\nmodule M65\nmodule M66\nmodule M67\nmodule M68\nmodule M69\nmodule M70\nmodule M71\nmodule M72\nmodule M73\nmodule M74\nmodule M75\nmodule M76\nmodule M77\nmodule M78\nmodule M79\nmodule M80\nmodule M81\nmodule M82\nmodule M83\nmodule M84\nmodule M85\nmodule M86\nmodule M87\nmodule M88\nmodule M89\nmodule M90\nmodule M91\nmodule M92\nmodule M93\nmodule M94\nmodule M95\nmodule M96\nmodule M97\nmodule M98\nmodule M99\nmodule M100\nmodule M101\nmodule M102\nmodule M103\nmodule M104\nmodule M105\nmodule M106\nmodule M107\nmodule M108\nmodule M109\nmodule M110\nmodule M111\nmodule M112\nmodule M113\nmodule M114\nmodule M115\nmodule M116\nmodule M117\nmodule M118\nmodule M119\nmodule M120\nmodule M121\nmodule M122\nmodule M123\nmodule M124\nmodule M125\nmodule M126\nmodule M127\nmodule M128\nmodule M129\nmodule M130\nmodule M131\nmodule M132\nmodule M133\nmodule M134\nmodule M135\nmodule M136\nmodule M137\nmodule M138\nmodule M139\nmodule M140\nmodule M141\nmodule M142\nmodule M143\nmodule M144\nmodule M145\nmodule M146\nmodule M147\nmodule M148\nmodule M149\nmodule M150\nmodule M151\nmodule M152\nmodule M153\nmodule M154\nmodule M155\nmodule M156\nmodule M157\nmodule M158\nmodule M159\nmodule M160\nmodule M161\nmodule M162\nmodule M163\nmodule M164\nmodule M165\nmodule M166\nmodule M167\nmodule M168\nmodule M169\nmodule M170\nmodule M171\nmodule M172\nmodule M173\nmodule M174\nmodule M175\nmodule M176\nmodule M177\nmodule M178\nmodule M179\nmodule M180\nmodule M181\nmodule M182\nmodule M183\nmodule M184\nmodule M185\nmodule M186\nmodule M187\nmodule M188\nmodule M189\nmodule M190\nmodule M191\nmodule M192\nmodule M193\nmodule M194\nmodule M195\nmodule M196\nmodule M197\nmodule M198\nmodule M199\nmodule M200\nmodule M201\nmodule M202\nmodule M203\nmodule M204\nmodule M205\nmodule M206\nmodule M207\nmodule M208\nmodule M209\nmodule M210\nmodule M211\nmodule M212\nmodule M213\nmodule M214\nmodule M215\nmodule M216\nmodule M217\nmodule M218\nmodule M219\nmodule M220\nmodule M221\nmodule M222\nmodule M223\nmodule M224\nmodule M225\nmodule M226\nmodule M227\nmodule M228\nmodule M229\nmodule M230\nmodule M231\nmodule M232\nmodule M233\nmodule M234\nmodule M235\nmodule M236\nmodule M237\nmodule M238\nmodule M239\nmodule M240\nmodule M241\nmodule M242\nmodule M243\nmodule M244\nmodule M245\nmodule M246\nmodule M247\nmodule M248\nmodule M249\nmodule M250\nmodule M251\nmodule M252\nmodule M253\nmodule M254\nmodule M255\nmodule M256\nmodule M257\nmodule M258\nmodule M259\nmodule M260\nmodule M261\nmodule M262\nmodule M263\nmodule M264\nmodule M265\nmodule M266\nmodule M267\nmodule M268\nmodule M269\nmodule M270\nmodule M271\nmodule M272\nmodule M273\nmodule M274\nmodule M275\nmodule M276\nmodule M277\nmodule M278\nmodule M279\nmodule M280\nmodule M281\nmodule M282\nmodule M283\nmodule M284\nmodule M285\nmodule M286\nmodule M287\nmodule M288\nmodule M289\nmodule M290\nmodule M291\nmodule M292\nmodule M293\nmodule M294\nmodule M295\nmodule M296\nmodule M297\nmodule M298\nmodule M299\nmodule M300\nmodule M301\nmodule M302\nmodule M303\nmodule M304\nmodule M305\nmodule M306\nmodule M307\nmodule M308\nmodule M309\nmodule M310\nmodule M311\nmodule M312\nmodule M313\nmodule M314\nmodule M315\nmodule M316\nmodule M317\nmodule M318\nmodule M319\nmodule M320\nmodule M321\nmodule M322\nmodule M323\nmodule M324\nmodule M325\nmodule M326\nmodule M327\nmodule M328\nmodule M329\nmodule M330\nmodule M331\nmodule M332\nmodule M333\nmodule M334\nmodule M335\nmodule M336\nmodule M337\nmodule M338\nmodule M339\nmodule M340\nmodule M341\nmodule M342\nmodule M343\nmodule M344\nmodule M345\nmodule M346\nmodule M347\nmodule M348\nmodule M349\nmodule M350\nmodule M351\nmodule M352\nmodule M353\nmodule M354\nmodule M355\nmodule M356\nmodule M357\nmodule M358\nmodule M359\nmodule M360\nmodule M361\nmodule M362\nmodule M363\nmodule M364\nmodule M365\nmodule M366\nmodule M367\nmodule M368\nmodule M369\nmodule M370\nmodule M371\nmodule M372\nmodule M373\nmodule M374\nmodule M375\nmodule M376\nmodule M377\nmodule M378\nmodule M379\nmodule M380\nmodule M381\nmodule M382\nmodule M383\nmodule M384\nmodule M385\nmodule M386\nmodule M387\nmodule M388\nmodule M389\nmodule M390\nmodule M391\nmodule M392\nmodule M393\nmodule M394\nmodule M395\nmodule M396\nmodule M397\nmodule M398\nmodule M399\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\nend\n",
+   "app/controllers/notes_controller.rb": "class NotesController < ApplicationController\n  def destroy\n    current_user.notes.find(params[:id]).destroy\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/notes/:id",
+    "ownership": "scoped",
+    "why": "SLOW: ruby_ownership._lexical prepends (`out[:0] = \u2026`) once per enclosing module for every module node: cubic in nesting depth; 200 levels 0.6 s, 400 levels ~5 s, 1500 levels > 60 s (pathological input)"
+   }
+  ]
  }
 ]

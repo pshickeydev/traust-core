@@ -101,7 +101,9 @@ _CREDENTIAL = re.compile(
 )
 _UNTRUSTED = re.compile(
     r"\bparams\b|\brequest\.(params|parameters|query_parameters|request_parameters|"
-    r"path_parameters|GET|POST|query_string|raw_post|body)\b"
+    r"path_parameters|GET|POST|query_string|raw_post|body)\b|"
+    # D20 amended: a plain cookie is set by the client; `cookies.signed`/`.encrypted` aren't
+    r"\bcookies\s*(\[|\.fetch\b|\.dig\b|\.to_h\b)"
 )
 _STRING = re.compile(r"\"(?:[^\"\\]|\\.)*\"|'(?:[^'\\]|\\.)*'")
 # the caller's own tenant (`current_user.account_id`); never another user it names
@@ -109,6 +111,7 @@ _TENANT = re.compile(
     r"(?i)^(account|customer|org|organi[sz]ation|workspace|team|client|group|company|realm|"
     r"tenant|project)(_?id)?$"
 )
+_BY_USER = re.compile(r"(?i)_by(_id)?$|_user_id$")
 _TOKEN_KEY = re.compile(r"(?i)token|api_key|digest|secret|jti")
 _PARAMS = {"params", "request.path_parameters", "request.params", "request.parameters"}
 # views that show the record (`render :show, status: :forbidden`)
@@ -214,7 +217,7 @@ def method_body(method: Node) -> list[Node]:
     body = method.child_by_field_name("body")
     if body is None:
         return []
-    return statements(body) if body.type == "body_statement" else [body]
+    return statements(body) if body.type in ("body_statement", "block_body") else [body]
 
 
 def code_text(src: Parsed, node: Node | None) -> str:
@@ -236,6 +239,8 @@ class _Model:
     policy: str | None = None  # `def self.policy_class`
     base: str = ""  # the class it inherits from
     users: list[str] = field(default_factory=list)  # `belongs_to :uploader, class_name: "User"`
+    children: list[str] = field(default_factory=list)  # the classes its `has_many`s hold
+    qualified: set[str] = field(default_factory=set)  # `Note`, `Archive::Note`
 
 
 class RubyCode:
@@ -251,8 +256,14 @@ class RubyCode:
         self.modules: dict[str, list[tuple[Parsed, Node]]] = {}  # module name -> definitions
         self.ability: tuple[Parsed, Node] | None = None
         self.qualified: dict[str, tuple[Parsed, Node]] = {}  # `Api::Relaxed` -> module
+        self.defined: set[str] = set()  # every method name the checkout defines
         for rel, src in sources.items():
             self._index(rel, src)
+            self.defined |= {
+                src.text(m.child_by_field_name("name"))
+                for m in walk(src.root)
+                if m.type in ("method", "singleton_method")
+            }
         self.fields = self._fields()
 
     def _index(self, rel: str, src: Parsed) -> None:
@@ -278,7 +289,9 @@ class RubyCode:
                 and any(s.type == "call" and call_name(src, s) == "include" for s in body)
             ) or (name == "Ability" and "CanCan" in src.text(n)):
                 self.ability = (src, n)
-            elif base in ("ApplicationRecord", "ActiveRecord::Base") or "/app/models/" in f"/{rel}":
+            elif "/app/" in f"/{rel}" and (
+                base in ("ApplicationRecord", "ActiveRecord::Base") or "/app/models/" in f"/{rel}"
+            ):  # never a migration's or a task's stub (`db/migrate`: `class Account < …`)
                 if (
                     not base
                     or base.endswith(("Controller", "CurrentAttributes"))
@@ -286,6 +299,9 @@ class RubyCode:
                 ):
                     continue
                 model = self.models.setdefault(name, _Model(name))
+                model.qualified.add(
+                    "::".join([*_lexical(src, n), src.text(n.child_by_field_name("name"))])
+                )
                 model.base = base.rsplit("::", 1)[-1]
                 if base not in ("ApplicationRecord", "ActiveRecord::Base"):
                     model.linked = True  # inherited associations (STI)
@@ -316,8 +332,12 @@ class RubyCode:
                             for a in args(s)
                         ):
                             continue  # `-> { unscope(where: :user_id) }`: not the caller's own
-                        if first not in defined:  # `def notes; …; end` overrides it
+                        # `def notes` overrides it; `through:` reaches records through others
+                        # (a membership, D22, or other users), so it is never the caller's own
+                        if first not in defined and "through" not in opts:
                             model.associations[first] = target
+                        if "through" not in opts:
+                            model.children.append(target)
                     elif kind == "belongs_to":
                         model.belongs[first] = target
                         if target == "User":
@@ -345,6 +365,8 @@ class RubyCode:
     def _fields(self) -> dict[str, tuple[str, ...]]:
         """A model's fields (columns and associations), only for models we can fully read."""
         out = {}
+        user = self.models.get("User")
+        users_hold = set(user.belongs.values()) if user is not None else set()
         for name, model in self.models.items():
             table = _table_of(name)
             # owned through a join (`has_many :users, through: :memberships`), or by a user
@@ -352,8 +374,19 @@ class RubyCode:
             if model.linked or model.members or table not in self.columns:
                 continue
             fields = tuple(dict.fromkeys([*self.columns[table], *model.belongs]))
-            if model.users and not any(OWNER_FIELD_RX.match(f) for f in fields):
+            owned = any(OWNER_FIELD_RX.match(f) for f in fields)
+            # owned in ways no field of its own names: a user column we don't read as an owner
+            # (`submitted_by`), the user holding the link (`users.wallet_id`), or rows that
+            # hold users (`has_many :permissions` with `permissions.user_id`)
+            if not owned and (
+                model.users
+                or any(_BY_USER.search(f) for f in fields)
+                or name in users_hold
+                or any(self._owned(child) for child in model.children)
+            ):
                 continue
+            if len(model.qualified) > 1:
+                continue  # `Note` and `Archive::Note`: which one a name means isn't read
             out[name] = fields
         return out
 
@@ -377,6 +410,11 @@ class RubyCode:
         if not found:
             return None
         return found[0] if len(found) == 1 else UNREAD
+
+    def _owned(self, model: str) -> bool:
+        cols = self.columns.get(_table_of(model), [])
+        found = self.models.get(model)
+        return any(OWNER_CHECK_RX.match(c) for c in [*cols, *(found.belongs if found else ())])
 
     def module_methods(self, src: Parsed, module: Node) -> dict[str, Node]:
         return {
@@ -468,13 +506,13 @@ UNREAD = object()  # a module several definitions share a name with
 
 def _lexical(src: Parsed, node: Node) -> list[str]:
     """The modules and classes a node is written inside."""
-    out: list[str] = []
+    parts: list[list[str]] = []
     parent = node.parent
     while parent is not None:
         if parent.type in ("module", "class"):
-            out[:0] = src.text(parent.child_by_field_name("name")).split("::")
+            parts.append(src.text(parent.child_by_field_name("name")).split("::"))
         parent = parent.parent
-    return out
+    return [p for names in reversed(parts) for p in names]
 
 
 def _class_of(association: str) -> str:
@@ -634,6 +672,7 @@ class Kind(Enum):
     CALLBACK = "callback"  # a `before_action`: a response there halts the chain
     CONDITIONAL = "conditional"  # a callback that may not run (`if:`, after an early `return`)
     AFTER = "after"  # an `after_action`: runs even when the action refused
+    ENSURE = "ensure"  # an `ensure` clause: runs even after the raise that refused
 
 
 @dataclass
@@ -662,7 +701,9 @@ class _Action:
         action: str,
         model: str | None,
         cancan: tuple[bool, bool],
+        raises: bool = True,
     ) -> None:
+        self.raise_refuses = raises
         self.code, self.steps, self.path_ids = code, steps, path_ids
         self.methods, self.action, self.model = methods, action, model
         self.lookups: list[Lookup] = []
@@ -698,10 +739,10 @@ class _Action:
         self.caller_ivars = self._caller_ivars()
         # what each caller ivar stands for: the user, or the caller's tenant (`@account =
         # current_user.account`)
+        kinds = self._ivar_kinds()
         self.ivar_kind = {
-            name: kinds.pop() if len(kinds) == 1 else "user"
+            name: next(iter(kinds[name])) if len(kinds.get(name, ())) == 1 else "user"
             for name in self.caller_ivars
-            if (kinds := self._ivar_kinds(name)) is not None
         }
         self.forged = self._forged()
         self.cancan = cancan
@@ -712,6 +753,7 @@ class _Action:
         self.verified_kind: dict[_Key, Kind] = {}
         self.checked_in: dict[int, Kind] = {}
         self.after: set[int] = set()  # lookups an `after_action` makes
+        self.ensured: set[int] = set()  # lookups an `ensure` clause makes
         self.raises = False  # whether the last refusal read raises
         # a name a method assigns is its local there, never a call (`note = Note.find(…)`)
         self.locals = {
@@ -799,22 +841,17 @@ class _Action:
                 out.append(name)
         return " ".join(out)
 
-    def _ivar_kinds(self, name: str) -> set[str]:
-        kinds = set()
+    def _ivar_kinds(self) -> dict[str, set[str]]:
+        kinds: dict[str, set[str]] = {}
         for step in self.reached:
             for n in walk(step.node):
-                left = (
-                    n.child_by_field_name("left")
-                    if n.type
-                    in (
-                        "assignment",
-                        "operator_assignment",
-                    )
-                    else None
-                )
-                if left is not None and step.src.text(left) == name:
+                if n.type not in ("assignment", "operator_assignment"):
+                    continue
+                left = n.child_by_field_name("left")
+                if left is not None and left.type == "instance_variable":
                     right = n.child_by_field_name("right")
-                    kinds.add(_own_chain(chain_text(step.src, right)) or "user")
+                    kind = _own_chain(chain_text(step.src, right)) or "user"
+                    kinds.setdefault(step.src.text(left), set()).add(kind)
         return kinds
 
     def _caller_ivars(self) -> set[str]:
@@ -986,6 +1023,8 @@ class _Action:
         self.position += 1
         if self.kind is Kind.AFTER:
             self.after.add(len(self.lookups))
+        if self.kind is Kind.ENSURE:
+            self.ensured.add(len(self.lookups))
         self.lookups.append(lookup)
         self.nodes.append(node)
         self.terminals.append(call_name(src, node))
@@ -1000,7 +1039,7 @@ class _Action:
 
     def verify(self, keys: set[_Key] | None) -> None:
         self.position += 1
-        if self.kind in (Kind.CONDITIONAL, Kind.AFTER):
+        if self.kind in (Kind.CONDITIONAL, Kind.AFTER, Kind.ENSURE):
             return  # a check that may not run, or runs after the response, protects nothing
         for k in keys or set():
             if k[0] not in self.unstable:
@@ -1037,8 +1076,14 @@ class _Action:
             scoped, start = True, start + 1
         elif root is not None and root.type in ("constant", "scope_resolution"):
             model = src.text(root).rsplit("::", 1)[-1]
-            if model not in self.code.models:
-                return None, False
+            found = self.code.models.get(model)
+            written = src.text(root).removeprefix("::")
+            if (
+                found is None
+                or len(found.qualified) > 1
+                or ("::" in written and written not in found.qualified)
+            ):
+                return None, False  # `Archive::Note` beside `Note`: not the model we read
         elif root is None and chain and call_name(src, chain[0]) == "policy_scope":
             a = args(chain[0])
             model = src.text(a[0]).rsplit("::", 1)[-1] if a else None
@@ -1188,10 +1233,18 @@ class _Action:
             self.statement(step)
         verified = {k: at for k, at in self.verified.items() if k[0] not in self.unstable}
 
-        def held(keys: set[_Key] | None, at: int, after: bool = False, one: bool = True) -> bool:
+        def held(
+            keys: set[_Key] | None,
+            at: int,
+            after: bool = False,
+            one: bool = True,
+            ensured: bool = False,
+        ) -> bool:
             # an `after_action` runs even when the action refused: only a callback's check holds;
             # a key other than the primary one pins only the record read by it
             if not one and any(f != "pk" for _, _, f in keys or ()):
+                return False
+            if ensured:
                 return False
             return bool(keys) and all(
                 any(
@@ -1227,6 +1280,7 @@ class _Action:
                             self.starts[k],
                             k in self.after,
                             self.terminals[k] in _ONE,
+                            k in self.ensured,
                         )
                     ),
                     x.record_type,
@@ -1254,7 +1308,9 @@ class _Action:
         if not self.cancan[1]:
             return  # loaded, never authorized (`skip_authorize_resource`)
         verdict = (
-            _ability(self.code, self.action, self.model)  # type: ignore[arg-type]
+            False  # `Ability.new(current_user)` with a user the request names
+            if "current_user" in self.forged
+            else _ability(self.code, self.action, self.model)  # type: ignore[arg-type]
             if self.model in self.code.models and self.methods("current_ability") is None
             else None  # a model we can't name, or an ability the controller picks
         )
@@ -1347,7 +1403,7 @@ class _Action:
         helper = depth > 0 and step.kind is Kind.ACTION
         refusal = (
             None
-            if conditional or step.kind is Kind.AFTER
+            if conditional or step.kind in (Kind.AFTER, Kind.ENSURE)
             else self.refusal(src, node, step.callback, helper)
         )
         if refusal is not None:
@@ -1367,11 +1423,9 @@ class _Action:
         if (
             not conditional
             and node.type == "call"
-            and call_name(src, node)
-            in (
-                "authorize",
-                "authorize!",
-            )
+            and call_name(src, node) in ("authorize", "authorize!")
+            and node.child_by_field_name("receiver") is None
+            and self.library(call_name(src, node))  # an app's own `authorize` is a helper
             and args(node)
         ):
             self.authorize(src, node)
@@ -1534,6 +1588,8 @@ class _Action:
         if not stmts:
             return False
         self.raises = len(stmts) == 1 and _raises(src, stmts[0])
+        if self.raises and not self.raise_refuses:
+            return False  # a `rescue_from` handler uses the record
         if helper:
             return self.raises
         if (
@@ -1550,7 +1606,7 @@ class _Action:
             return True
         last = stmts[-1]
         if len(stmts) == 1 and _raises(src, last):
-            return True
+            return self.raise_refuses
         if len(stmts) == 1 and last.type == "return":
             a = args(last)
             return len(a) == 1 and _responds(src, a[0], self.literals, self.action)
@@ -1588,7 +1644,10 @@ class _Action:
         for name, record in self.records.items():
             if name in names:
                 record.used = True
-                if self.kind is Kind.AFTER and self.checked_in.get(record.lookup) is Kind.ACTION:
+                after = (
+                    self.kind is Kind.AFTER and self.checked_in.get(record.lookup) is Kind.ACTION
+                )
+                if after or self.kind is Kind.ENSURE:
                     x = self.lookups[record.lookup]
                     self.lookups[record.lookup] = Lookup(x.span, x.scoped, False, x.record_type)
 
@@ -1682,6 +1741,12 @@ class _Action:
             node = receiver
         return None
 
+    def library(self, name: str) -> bool:
+        """Whether `authorize`/`authorize!` is the library's: the app doesn't define it, or
+        only wraps it (`def authorize(*) = super`)."""
+        found = self.methods(name)
+        return found is None or any(n.type in ("super", "zsuper") for n in walk(found[1]))
+
     def pundit_user_forged(self) -> bool:
         found = self.methods("pundit_user")
         return found is not None and any(
@@ -1710,7 +1775,13 @@ class _Action:
             return
         query = symbol(src, a[1]) if len(a) > 1 else f"{self.action}?"
         policy = src.text(options["policy_class"]) if "policy_class" in options else None
-        if cancan:
+        if "current_user" in self.forged and not (
+            not cancan and self.methods("pundit_user") is not None
+        ):
+            verdict: bool | None = False  # asked about a user the request names
+        elif not cancan and (self.methods("policy") or self.methods("policy_scope")):
+            verdict = None  # the controller picks the policy itself
+        elif cancan:
             action = symbol(src, a[0]) or ""
             verdict = (
                 _ability(self.code, action, record.model)
@@ -2175,6 +2246,11 @@ def _ability(code: RubyCode, action: str, model: str) -> bool | None:
         for s in statements(cls.child_by_field_name("body"))
     ):
         return None  # `merge(OtherAbility.new(user))`, `include Shared`: rules we don't read
+    if any(
+        n.type == "self" and n.parent is not None and n.parent.type == "argument_list"
+        for n in walk(cls)
+    ):
+        return None  # `NoteSharing.grant(self, user)`: rules added elsewhere
     rules = [n for n in walk(cls) if n.type == "call" and n.child_by_field_name("receiver") is None]
     aliases = {k: set(v) for k, v in _CANCAN_ALIASES.items()}
     for rule in rules:
@@ -2317,6 +2393,17 @@ def _user_flag(src: Parsed, node: Node | None) -> bool:
     )
 
 
+def ensures(method: Node) -> list[Node]:
+    """The statements of a method's `ensure` clause."""
+    body = method.child_by_field_name("body")
+    return [
+        s
+        for r in (body.named_children if body is not None and body.type == "body_statement" else [])
+        if r.type == "ensure"
+        for s in statements(r)
+    ]
+
+
 def rescues(method: Node) -> list[Node]:
     """The statements of a method's `rescue` clauses."""
     body = method.child_by_field_name("body")
@@ -2417,6 +2504,7 @@ def action_facts(
     action: str,
     model: str | None,
     cancan: tuple[bool, bool],
+    raises: bool = True,
 ) -> HandlerFacts:
     """An action's ownership facts from the statements it runs in order (its callbacks', then
     its own). `cancan`: whether `load_resource` and `authorize_resource` run for it."""
@@ -2429,5 +2517,6 @@ def action_facts(
         action,
         model,
         cancan,
+        raises,
     )
     return walk_.run()

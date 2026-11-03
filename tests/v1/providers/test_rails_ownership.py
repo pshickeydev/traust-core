@@ -740,3 +740,32 @@ def test_callbacks_that_set_the_caller_from_a_credential_keep_it(
     tmp_path: Path, method: str, pattern: str
 ) -> None:
     assert _row(_tree(tmp_path, AUTH), method, pattern)["ownership"] == "scoped"
+
+
+@pytest.mark.parametrize(
+    ("read", "ownership"),
+    [
+        # D20 amended: a plain cookie is the client's choice; signed and encrypted ones aren't
+        ("cookies[:user_id]", "caller-blind"),
+        ("cookies.signed[:user_id]", "scoped"),
+        ("cookies.encrypted[:user_id]", "scoped"),
+    ],
+)
+def test_only_a_tamper_proof_cookie_names_the_caller(
+    tmp_path: Path, read: str, ownership: str
+) -> None:
+    files = {
+        **MODELS,
+        "db/schema.rb": SCHEMA,
+        "config/routes.rb": (
+            "Rails.application.routes.draw do\n  resources :notes, only: [:show]\nend\n"
+        ),
+        "app/controllers/notes_controller.rb": (
+            "class NotesController < ActionController::Base\n"
+            "  before_action :authenticate\n\n"
+            "  def show\n    @user.notes.find(params[:id])\n  end\n\n  private\n\n"
+            f"  def authenticate\n    @user = User.find_by(id: {read})\n"
+            "    head :unauthorized unless @user\n  end\nend\n"
+        ),
+    }
+    assert _row(_tree(tmp_path, files), "GET", "/notes/:id")["ownership"] == ownership

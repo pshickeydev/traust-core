@@ -292,3 +292,17 @@ def test_a_superclass_resolves_where_ruby_looks_it_up(tmp_path):
     assert _route(result, "GET", "/pub/:slug")["guards"] == []
     assert _route(result, "GET", "/api/:id")["guards"] == []
     assert _route(result, "GET", "/shop/:id")["guards"] == []
+
+
+def test_routes_nested_past_any_real_file_neither_crash_nor_hang(tmp_path):
+    depth = 500
+    routes = (
+        "Rails.application.routes.draw do\n"
+        + "".join("  " * k + 'scope "/x" do\n' for k in range(depth))
+        + "  " * depth
+        + "resources :notes, only: [:destroy]\n"
+        + "".join("  " * k + "end\n" for k in reversed(range(depth)))
+        + "  resources :tags, only: [:show]\nend\n"
+    )
+    _write(tmp_path, "config/routes.rb", routes)
+    assert ("GET", "/tags/:id") in _patterns(_enum(tmp_path), "rails")
