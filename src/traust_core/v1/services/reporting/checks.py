@@ -64,7 +64,7 @@ CIS_CONTROL_TEXT_RE = re.compile(
 _REPO_SEGMENT_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 _REPO_HOST_RE = re.compile(r"^[a-z0-9-]+(\.[a-z0-9-]+)+$")
 _REPO_URL_RE = re.compile(r"^https://[a-z0-9.-]+/[^/]+/.+$", re.I)
-_LOCAL_FIXTURE_RE = re.compile(r"file:///[^;\s?#]*[^/;\s?#]")
+_LOCAL_FIXTURE_RE = re.compile(r"file:///[^;\s?#<>]*[^/;\s?#<>]")
 
 _BANDS = (("critical", 9.0), ("high", 7.0), ("medium", 4.0), ("low", 0.1))
 _BAND_ORDER = ["informational", "low", "medium", "high", "critical"]
