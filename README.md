@@ -276,10 +276,14 @@ skill-port slices.
 
 Java route ownership credits resolver receivers only when they resolve to declared
 injected fields with admitted injection initialization and no later field writes
-or setter mutation in the checkout hierarchy. Unproven fields and request-selected
-resolver values remain judged. Framework request getters are resolved by qualified
-type, explicit import and package: checkout class/record/enum lookalikes do not
-prove an authenticated caller, while genuine framework references remain eligible.
+or setter mutation in the checkout hierarchy, and only while the field's value stays
+unaliased: a local copy, a method reference, an argument hand-off or a returned field
+leaves it judged. Unproven fields and request-selected resolver values remain judged.
+Framework request getters are resolved by qualified type, explicit import (an imported
+outer class qualifies its nested types) and package: checkout class/record/enum
+lookalikes do not prove an authenticated caller, while genuine framework references
+remain eligible. A field's request-ness is judged by the file declaring the field,
+not the handler's imports.
 
 `AnalysisResultsRepository` is the legacy path-keyed reader; new publisher output
 is read by artifact ID. Companion documents are rendered from the validated

@@ -1794,3 +1794,189 @@ def test_request_getter_identity_excludes_checkout_lookalikes(
     else:
         assert row["ownership"] in {"caller-blind", "unchecked"}
         assert row["judgement_required"] is True
+
+
+@pytest.mark.parametrize(
+    ("mutation", "receiver"),
+    [
+        ("Owners alias = owners; alias.setTenant(tenant);", "this.owners"),
+        ("Owners alias = this.owners; alias.setTenant(tenant);", "owners"),
+        ("Owners alias = owners; alias = registry.forTenant(tenant);", "owners"),
+        ("Owners alias = owners; use(alias);", "owners"),
+        ("use(owners);", "owners"),
+        ("use(this.owners);", "owners"),
+        ("Owners alias = owners::resolve;", "owners"),
+        ("return owners;", "owners"),
+        ("return this.owners;", "owners"),
+    ],
+)
+def test_an_aliased_resolver_field_is_not_trusted(tmp_path, mutation: str, receiver: str) -> None:
+    """Once the field value escapes under another name, its provenance is unproven: a request
+    parameter may reach a setter through the alias, so `this.owners.resolve(...)` stays judged."""
+    source = (
+        "package provenance;\n"
+        "import org.springframework.web.bind.annotation.*;\n"
+        "import java.security.Principal;\n"
+        "class Card { Long id; String ownerEmail; }\n"
+        "class Owners { String tenant; String resolve(String caller) { return tenant; }"
+        " void setTenant(String tenant) { this.tenant = tenant; } }\n"
+        "class Registry { Owners forTenant(String tenant) { return null; } }\n"
+        "interface CardRepository extends JpaRepository<Card, Long> {\n"
+        " Optional<Card> findByIdAndOwnerEmail(Long id, String ownerEmail);\n}\n"
+        "@RestController class Api {\n"
+        " private CardRepository cards;\n"
+        " private Registry registry;\n"
+        " @Autowired private Owners owners;\n"
+        " void use(Object o) {}\n"
+        ' @PostMapping("/select") void select(@RequestParam String tenant) {\n'
+        f"  {mutation}\n"
+        " }\n"
+        ' @GetMapping("/cards/{id}") Card get(@PathVariable Long id, Principal me) {\n'
+        f"  return cards.findByIdAndOwnerEmail(id, {receiver}.resolve(me.getName()))"
+        ".orElseThrow();\n }\n}\n"
+    )
+    result = _tree(
+        tmp_path,
+        {
+            "pom.xml": POM,
+            "src/main/java/provenance/Api.java": source,
+            "src/main/java/provenance/Security.java": METHOD_SECURITY,
+        },
+    )
+    row = _row(result, "GET", "/cards/{id}")
+    assert row["ownership"] in {"caller-blind", "unchecked"}
+    assert row["judgement_required"] is True
+
+
+@pytest.mark.parametrize(
+    ("kind", "outer_import", "outer_rel", "outer_src"),
+    [
+        (
+            "Dto.HttpServletRequest",
+            "import other.Dto;\n",
+            "src/main/java/other/Dto.java",
+            "package other; public class Dto { public static class HttpServletRequest {"
+            " public String getRemoteUser() { return null; } } }\n",
+        ),
+        (
+            "Api.Principal",
+            "import other.Api;\n",
+            "src/main/java/other/Api.java",
+            "package other; public class Api { public static class Principal {"
+            " public String getRemoteUser() { return null; } } }\n",
+        ),
+        (
+            "other.Dto.HttpServletRequest",
+            "",
+            "src/main/java/other/Dto.java",
+            "package other; public class Dto { public static class HttpServletRequest {"
+            " public String getRemoteUser() { return null; } } }\n",
+        ),
+    ],
+)
+def test_imported_and_qualified_outer_lookalikes_are_checkout_types(
+    tmp_path, kind: str, outer_import: str, outer_rel: str, outer_src: str
+) -> None:
+    """A nested lookalike reached through an outer class from another package (`Dto.HttpServlet…`
+    with `import other.Dto`, or fully qualified) is a checkout type, not a framework request."""
+    source = (
+        "package provenance;\n"
+        "import org.springframework.web.bind.annotation.*;\n"
+        f"{outer_import}"
+        "class Card { Long id; String ownerEmail; }\n"
+        "interface CardRepository extends JpaRepository<Card, Long> {\n"
+        " Optional<Card> findByIdAndOwnerEmail(Long id, String ownerEmail);\n}\n"
+        "@RestController class Api {\n private CardRepository cards;\n"
+        ' @GetMapping("/requests/{id}") Card get(@PathVariable Long id,'
+        f" @RequestBody {kind} body) {{\n"
+        "  return cards.findByIdAndOwnerEmail(id, body.getRemoteUser()).orElseThrow();\n"
+        " }\n}\n"
+    )
+    result = _tree(
+        tmp_path,
+        {
+            "pom.xml": POM,
+            "src/main/java/provenance/Api.java": source,
+            outer_rel: outer_src,
+            "src/main/java/provenance/Security.java": METHOD_SECURITY,
+        },
+    )
+    row = _row(result, "GET", "/requests/{id}")
+    assert row["ownership"] in {"caller-blind", "unchecked"}
+    assert row["judgement_required"] is True
+
+
+def test_inherited_field_types_are_judged_by_their_declaring_file(tmp_path) -> None:
+    """A superclass field of a checkout lookalike type (`HttpServletRequest` in package a) is
+    request data even when the subclass imports the real framework type."""
+    base = "package a;\npublic class Base {\n  protected HttpServletRequest request;\n}\n"
+    lookalike = (
+        "package a;\n"
+        "public class HttpServletRequest { public String getRemoteUser() { return null; } }\n"
+    )
+    api = (
+        "package b;\n"
+        "import org.springframework.web.bind.annotation.*;\n"
+        "import jakarta.servlet.http.HttpServletRequest;\n"
+        "import a.Base;\n"
+        "class Card { Long id; String ownerEmail; }\n"
+        "interface CardRepository extends JpaRepository<Card, Long> {\n"
+        "  Optional<Card> findByIdAndOwnerEmail(Long id, String ownerEmail);\n}\n"
+        "@RestController class Api extends Base {\n"
+        "  private CardRepository cards;\n"
+        '  @GetMapping("/cards/{id}") Card get(@PathVariable Long id) {\n'
+        "    return cards.findByIdAndOwnerEmail(id, request.getRemoteUser()).orElseThrow();\n"
+        "  }\n"
+        "}\n"
+    )
+    result = _tree(
+        tmp_path,
+        {
+            "pom.xml": POM,
+            "src/main/java/a/Base.java": base,
+            "src/main/java/a/HttpServletRequest.java": lookalike,
+            "src/main/java/b/Api.java": api,
+            "src/main/java/b/Security.java": METHOD_SECURITY,
+        },
+    )
+    row = _row(result, "GET", "/cards/{id}")
+    assert row["ownership"] in {"caller-blind", "unchecked"}
+    assert row["judgement_required"] is True
+
+
+def test_an_inherited_real_request_field_stays_the_caller(tmp_path) -> None:
+    """The same shape with a genuine inherited servlet request field stays scoped: the declaring
+    file's own type, not an import in the subclass, decides."""
+    base = (
+        "package a;\n"
+        "import jakarta.servlet.http.HttpServletRequest;\n"
+        "public class Base {\n"
+        "  protected HttpServletRequest request;\n"
+        "}\n"
+    )
+    api = (
+        "package b;\n"
+        "import org.springframework.web.bind.annotation.*;\n"
+        "import a.Base;\n"
+        "class Card { Long id; String ownerEmail; }\n"
+        "interface CardRepository extends JpaRepository<Card, Long> {\n"
+        "  Optional<Card> findByIdAndOwnerEmail(Long id, String ownerEmail);\n}\n"
+        "@RestController class Api extends Base {\n"
+        "  private CardRepository cards;\n"
+        '  @GetMapping("/cards/{id}") Card get(@PathVariable Long id) {\n'
+        "    return cards.findByIdAndOwnerEmail(id, request.getRemoteUser()).orElseThrow();\n"
+        "  }\n"
+        "}\n"
+    )
+    result = _tree(
+        tmp_path,
+        {
+            "pom.xml": POM,
+            "src/main/java/a/Base.java": base,
+            "src/main/java/b/Api.java": api,
+            "src/main/java/b/Security.java": METHOD_SECURITY,
+        },
+    )
+    row = _row(result, "GET", "/cards/{id}")
+    assert row["ownership"] == "scoped"
+    assert row["judgement_required"] is False

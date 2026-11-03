@@ -618,14 +618,29 @@ class _Java:
         return self.hierarchies[key]
 
     def resolve(self, src: Parsed, kind: str) -> list[_Type]:
-        """Resolve checkout types by qualified name, explicit import, then package."""
+        """Resolve checkout types by qualified name, explicit import, then package. A qualified
+        name honors the imports of its outer segments too (`import other.Dto` makes
+        `Dto.HttpServletRequest` a checkout type when `other.Dto.HttpServletRequest` is one)."""
         key = (src.file.rel, kind)
         if key not in self.resolved:
             simple = kind.rsplit(".", 1)[-1]
             candidates = self.types.get(simple, [])
+            names = {kind, f"{_package(src)}.{kind}"}
             if "." in kind:
-                names = {kind, f"{_package(src)}.{kind}"}
-                found = [c for c in candidates if c.qualified in names]
+                head = kind.split(".", 1)[0]
+                # an imported outer (`import other.Dto`) qualifies its nested types
+                names |= {
+                    f"{prefix}.{kind}"
+                    for prefix in re.findall(
+                        rf"^\s*import\s+([\w.]+)\.{re.escape(head)}\s*;", src.file.text, re.M
+                    )
+                }
+                # `Outer.Inner` whose outer is another checkout type can only be that type's
+                # nested one; matching every such candidate keeps lookalikes checkout types
+                outer = self.types.get(head, []) and [
+                    c for c in candidates if c.qualified.endswith(f".{kind}")
+                ]
+                found = [c for c in candidates if c.qualified in names] or outer
             else:
                 imported = re.findall(
                     rf"^\s*import\s+([\w.]+\.{re.escape(kind)})\s*;", src.file.text, re.M
@@ -1129,11 +1144,17 @@ class _Ownership:
             for n in self._field_names(h, f)
         }
 
-    def _field_type(self, t: _Type, name: str) -> str | None:
+    def _field_site(self, t: _Type, name: str) -> tuple[Parsed, str] | None:
+        """A field's declared type and the file that declares it: request-ness is resolved by
+        that file's imports, not the handler's (a subclass may import the framework type)."""
         for h, f in self._fields(t):
             if name in self._field_names(h, f):
-                return _type_name(h.src, f)
+                return h.src, _type_name(h.src, f)
         return None
+
+    def _field_type(self, t: _Type, name: str) -> str | None:
+        site = self._field_site(t, name)
+        return site[1] if site else None
 
     def _resolver_fields(self, t: _Type) -> frozenset[str]:
         key = (t.src.file.rel, t.name)
@@ -1241,11 +1262,62 @@ class _Ownership:
                         )
                         injected |= constructor
                         stable &= constructor
-            if injected and stable:
+            if injected and stable and not self._aliasing(t, name):
                 trusted.add(name)
         result = frozenset(trusted)
         self.java.resolver_fields[key] = result
         return result
+
+    def _aliasing(self, t: _Type, name: str) -> bool:
+        """A local of `t`'s hierarchy reads field `name` into a name the request may reach: once
+        the field's value is aliased, its setter can be called from anywhere, so the field's own
+        writes no longer prove where it came from."""
+        for ancestor in self.java._hierarchy(t):
+            for member in ancestor.node.child_by_field_name("body").named_children:
+                if member.type == "field_declaration":
+                    continue
+                parameters = {n for n, _, _ in _params(ancestor.src, member)}
+                for node in walk(member):
+                    if node.type == "variable_declarator":
+                        value = node.child_by_field_name("value")
+                        if (
+                            ancestor.src.text(node.child_by_field_name("name")) != name
+                            and value is not None
+                            and ancestor.src.text(value).removeprefix("this.") == name
+                            and node.parent.type == "local_variable_declaration"
+                        ):
+                            return True
+                    if (
+                        node.type == "method_reference"
+                        and node.named_children
+                        and ancestor.src.text(node.named_children[0]).removeprefix("this.") == name
+                    ):
+                        return True
+                    if node.type == "assignment_expression":
+                        right = node.child_by_field_name("right")
+                        target = ancestor.src.text(node.child_by_field_name("left"))
+                        if (
+                            right is not None
+                            and right.type == "identifier"
+                            and ancestor.src.text(right) == name
+                            and target.removeprefix("this.") != name
+                            and target not in parameters
+                        ):
+                            return True
+                    # an argument or return that is the field itself hands it to unseen code
+                    if node.type in ("method_invocation", "return_statement"):
+                        args = (
+                            node.child_by_field_name("arguments").named_children
+                            if node.type == "method_invocation"
+                            and node.child_by_field_name("arguments") is not None
+                            else node.named_children
+                        )
+                        for arg in args:
+                            if (
+                                arg.type in ("identifier", "field_access")
+                                and ancestor.src.text(arg).removeprefix("this.") == name
+                            ):
+                                return True
 
     def _request(self, src: Parsed, kind: str) -> bool:
         return bool(_REQUEST_TYPES.fullmatch(kind)) and not self.java.resolve(src, kind)
@@ -1275,7 +1347,10 @@ class _Ownership:
                 fields,
                 found,
                 kinds=lambda n, h=h: self._field_type(h, n),
-                request=lambda kind, h=h: self._request(h.src, kind),
+                # a field's type is judged by the file declaring it, not this helper's
+                request=lambda kind, n=None, h=h: self._request(
+                    site[0] if (site := self._field_site(h, n)) else h.src, kind
+                ),
                 resolvers=self._resolver_fields(h),
             ).returns_caller(m.child_by_field_name("body"))
         }:
@@ -1445,11 +1520,13 @@ class _Values:
         params: frozenset[str] = frozenset(),
         kinds: Callable[[str], str | None] = lambda _: None,
         *,
-        request: Callable[[str], bool],
+        request: Callable[..., bool],
         resolvers: frozenset[str],
     ) -> None:
         self.src, self.callers, self.helpers, self.params = src, set(callers), helpers, params
         self.kinds = kinds  # the declared type of a parameter, local or field
+        # request(kind, name?): is `kind` a framework request type — for a field, judged by the
+        # file declaring it (its name is passed so the caller can find that file)
         self.request, self.resolvers = request, resolvers
         self.locals: set[str] = set()
 
@@ -1525,10 +1602,15 @@ class _Values:
             return True
         # `request.getUserPrincipal()`: only on the caller or a framework request or context
         text = self.src.text(receiver).removeprefix("this.")
+        # a bare receiver may be a field; a parameter or local of that name shadows it
+        field = receiver.type == "field_access" or text not in self.params | self.locals
         return (
             bool(_CALLER_CALLS.match(name))
             and not _arguments(n)
-            and (text in self.callers or self.request(self.kinds(text) or ""))
+            and (
+                text in self.callers
+                or self.request(self.kinds(text) or "", text if field else None)
+            )
         )
 
     def _resolver(self, node: Node) -> bool:
@@ -1619,7 +1701,10 @@ class _Walk:
             o._caller_helpers(t),
             frozenset(self.params),
             kinds=lambda n: kinds.get(n) or self.local_types.get(n) or o._field_type(t, n),
-            request=lambda kind: o._request(src, kind),
+            # a field's type is judged by the file declaring it, not the handler's
+            request=lambda kind, n=None: o._request(
+                site[0] if n is not None and (site := o._field_site(t, n)) else src, kind
+            ),
             resolvers=o._resolver_fields(t),
         )
         assigned = self.v.bind(body)
