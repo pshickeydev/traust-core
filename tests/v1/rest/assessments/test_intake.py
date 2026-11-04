@@ -71,13 +71,18 @@ def test_intake_read_uses_digest_verified_original_report_bytes(
     assert recording.rows(context) == before
 
 
-def test_identical_repository_fingerprint_from_another_assessment_is_not_source_intake(
+def test_both_assessments_of_one_document_bind_the_same_findings_without_duplication(
     context: Context, client: TestClient, ref: UUID
 ) -> None:
     services = context.services()
     provenance = Provenance(
         run_id=uuid4(), source=SourceType.VULN_SCAN_REPORT, occurred_at=recording.WHEN
     )
+    # A document-only record is no longer constructible through the record door
+    # (secure-code takes its findings in at record since 2026-11-03); this now
+    # asserts the flip's invariant instead: one document recorded as two kinds
+    # binds the same findings through each assessment's own intake, with no
+    # duplication — the fingerprint match never invents a second finding.
     source = services.assessment.record(
         recording.DOC,
         ref,
@@ -91,8 +96,14 @@ def test_identical_repository_fingerprint_from_another_assessment_is_not_source_
     )
     before = recording.rows(context)
     response = client.get(path(source.id), headers=bearer(context))
-    assert response.status_code == 409, response.text
-    assert "does not identify an admitted finding" in response.json()["detail"]
+    assert response.status_code == 200, response.text
+    bindings = response.json()["findings"]
+    assert set(bindings) == {"AUDIT-1", "AUDIT-2"}
+    with SqlTraustUnitOfWork(context.database) as uow:
+        repository_id = uow.repository_refs.get(ref).repository_id
+        findings = uow.findings.list_for_repository(repository_id)
+    assert {str(finding.id) for finding in findings} == set(bindings.values())
+    assert len(findings) == 2, "two assessments of one document, still two findings"
     assert recording.rows(context) == before
 
 

@@ -227,6 +227,35 @@ def test_one_report_recorded_as_two_kinds_is_two_assessments_over_one_published_
     assert len(uris) == 1
 
 
+def test_a_secure_code_report_records_its_findings_and_a_rerecord_adds_nothing(
+    context: Context, ref: UUID
+) -> None:
+    doc = authored_report()
+    body = json.loads(doc.payload)
+
+    saved = record(context, doc, ref, AssessmentKind.SECURE_CODE_CANONICAL)
+
+    with SqlTraustUnitOfWork(context.database) as uow:
+        repository_id = uow.repository_refs.get(ref).repository_id
+        findings = uow.findings.list_for_repository(repository_id)
+        occurrences = uow.occurrences.list_for_assessment(saved.id)
+    assert len(findings) == len(occurrences) == len(body["findings"])
+    titles = {f.title for f in findings}
+    assert titles == {finding["title"] for finding in body["findings"]}
+    assert {o.severity for o in occurrences} <= {
+        finding["severity"] for finding in body["findings"]
+    }
+    with SqlTraustUnitOfWork(context.database) as uow:
+        where = uow.locations.list_for_occurrences([o.id for o in occurrences])  # type: ignore[arg-type]
+    assert where, "a report finding keeps its locations"
+
+    again = record(context, doc, ref, AssessmentKind.SECURE_CODE_CANONICAL)
+    assert again.id == saved.id  # the same document is the same run
+    with SqlTraustUnitOfWork(context.database) as uow:
+        assert len(uow.findings.list_for_repository(repository_id)) == len(body["findings"])
+        assert len(uow.occurrences.list_for_assessment(saved.id)) == len(body["findings"])
+
+
 def test_a_document_published_earlier_is_recorded_by_its_reference(
     context: Context, ref: UUID
 ) -> None:
@@ -453,7 +482,11 @@ def test_report_validity_is_preserved_without_inferring_a_finding_decision(
         occurrences = uow.occurrences.list_for_assessment(saved.id)
         [held] = uow.artifacts.list_for_assessment(saved.id)
         assert all(not uow.decisions.list_for_finding(finding.id) for finding in findings)
-    takes_findings = kind in (AssessmentKind.CONTAINER, AssessmentKind.RPM)
+    takes_findings = kind in (
+        AssessmentKind.SECURE_CODE_CANONICAL,
+        AssessmentKind.CONTAINER,
+        AssessmentKind.RPM,
+    )
     assert len(findings) == len(occurrences) == (len(body["findings"]) if takes_findings else 0)
     views = context.services().findings.list_by_ids([finding.id for finding in findings])
     assert all(view.disposition is None or view.disposition.validity is None for view in views)

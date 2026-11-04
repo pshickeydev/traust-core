@@ -41,6 +41,9 @@ from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services.artifact_publishing import ArtifactPublisher, PublishSpec, PublishSpecs
 from traust_core.v1.services.assessment import AssessmentService
 from traust_core.v1.services.detection_quality import DetectionQualityService, _failed
+from traust_core.v1.services.findings.identity import IdentityPolicy
+from traust_core.v1.services.findings.intake import FindingIntake
+from traust_core.v1.services.findings.taxonomy import TaxonomyPolicy
 
 REPO = "https://github.com/org/x"
 FP = "f" * 64
@@ -119,7 +122,8 @@ def bench(engine: Engine) -> Bench:
         uow,
     )
     service = DetectionQualityService(uow, finding_service(engine), publisher)
-    return Bench(uow, publisher, AssessmentService(uow), service, ref)
+    assessments = AssessmentService(uow, FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy()))
+    return Bench(uow, publisher, assessments, service, ref)
 
 
 def provenance(artifact: ArtifactRef | None = None) -> Provenance:

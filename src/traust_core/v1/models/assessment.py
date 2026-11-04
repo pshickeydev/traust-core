@@ -70,8 +70,13 @@ RECORDED_SCHEMAS: dict[AssessmentKind, str] = {
 }
 # Kinds whose recorded document's findings (a fuzz report's crashers) are findings of the
 # assessment, and how the document states them. Benchmark runs are scored, never taken in;
-# secure-code reports are not taken in at record (not decided here).
+# secure-code reports are taken in at record like container and RPM ones (2026-11-03: the
+# rig's live run found the exclusion starved every findings consumer — triage, decisions,
+# the ledger — while the report shape and of_report matched exactly).
 REPORTED_FINDINGS: dict[AssessmentKind, Callable[[Any, UUID], list[FindingCandidate]]] = {
+    AssessmentKind.SECURE_CODE_CANONICAL: lambda doc, r: FindingCandidate.of_report(
+        doc.findings, r
+    ),
     AssessmentKind.CONTAINER: lambda doc, r: FindingCandidate.of_report(doc.findings, r),
     AssessmentKind.RPM: lambda doc, r: FindingCandidate.of_report(doc.findings, r),
     AssessmentKind.VULN_SCAN_CANONICAL: lambda doc, r: FindingCandidate.of_scan(doc.findings, r),
