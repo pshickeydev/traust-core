@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from statistics import median
-from typing import Any, Protocol, TypeVar
+from typing import Any, Final, Protocol, TypeVar
 from uuid import UUID
 
 from traust_core.v1.errors import (
@@ -32,6 +32,8 @@ from traust_core.v1.models.operations import (
     BudgetVerdict,
     ConfigDigest,
     DegradedKey,
+    DenyCode,
+    DenyIssue,
     FeedEvent,
     Freshness,
     JobResult,
@@ -45,6 +47,8 @@ from traust_core.v1.models.operations import (
     OrderReason,
     OrderRequest,
     OrderState,
+    PreflightRequest,
+    PreflightResult,
     RecordingStartScope,
     Refusal,
     RescanEventSource,
@@ -67,7 +71,12 @@ from traust_core.v1.models.operations import (
     WorkerId,
     WorkLane,
 )
-from traust_core.v1.models.vocabulary import ActorKind, AssessmentKind, SourceType
+from traust_core.v1.models.vocabulary import (
+    ActorKind,
+    AssessmentKind,
+    BudgetEnforcement,
+    SourceType,
+)
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.feeds import FeedStatus
 from traust_core.v1.providers.model_catalog import ModelCatalog, ModelSpec
@@ -89,6 +98,19 @@ _RECORDING_SOURCES = {
     # value; the remediation report records under its triage source until one lands.
     "remediation": SourceType.TRIAGE_REPORT,
 }
+
+# A stage may run only after its predecessor left a finished order for the subject; stages not
+# listed (fleet assets, scans) have no ordering precondition. Remediation's plan-level gate is a
+# disposition, which lives on the findings service behind OpsService (a wiring cycle), so the
+# finished triage order is its record until that door is reachable.
+PRIOR_ORDER_STAGE: Final[Mapping[AssetName, AssetName]] = {
+    AssetName("triage"): AssetName("assessment"),
+    AssetName("remediation"): AssetName("triage"),
+    AssetName("validation"): AssetName("triage"),
+    AssetName("verification"): AssetName("remediation"),
+}
+
+_WITHHOLDING = (BudgetEnforcement.ADVISORY, BudgetEnforcement.ENFORCED)
 
 S = TypeVar("S", contravariant=True)
 E = TypeVar("E", contravariant=True)
@@ -119,6 +141,18 @@ class Router(Protocol[S, E]):
     def route(
         self, state: S, events: Sequence[E], refusals: Sequence[Refusal]
     ) -> tuple[Route, ...]: ...
+
+
+class PolicyDenied(ForbiddenError):
+    """A policy gate refused the action; every issue carries a deny code the envelope shows."""
+
+    def __init__(self, issues: Sequence[DenyIssue]) -> None:
+        super().__init__("; ".join(f"{issue.code}: {issue.detail}" for issue in issues))
+        self.deny_issues = tuple(issues)
+
+    @property
+    def deny_code(self) -> DenyCode:
+        return self.deny_issues[0].code
 
 
 class OpsService:
@@ -152,6 +186,14 @@ class OpsService:
         self, request: OrderRequest, principal: Principal, config: Sequence[ConfigDigest] = ()
     ) -> RunOrder:
         """Queue an order directly, with the config it must run under in its run manifest."""
+        issues = self._policy_issues(
+            asset=request.asset,
+            repository_id=request.repository_id,
+            lane=request.lane,
+            principal=principal,
+        )
+        if issues:
+            raise PolicyDenied(issues)
         _classifiers(lane=request.lane, event_source=request.event_source)
         self._check_work_item(request)
         order = RunOrder(
@@ -195,6 +237,85 @@ class OpsService:
                 f"work item {request.work_item_id} is not a remediation work item of "
                 f"repository {request.repository_id}"
             )
+
+    def preflight(self, request: PreflightRequest, principal: Principal) -> PreflightResult:
+        """May this stage run on this subject now: fail-fast courtesy; submit re-verifies."""
+        issues = self._policy_issues(
+            asset=request.asset,
+            repository_id=request.repository_id,
+            lane=request.lane,
+            principal=principal,
+        )
+        if issues:
+            raise PolicyDenied(issues)
+        return PreflightResult(
+            allowed=True,
+            asset=request.asset,
+            repository_id=request.repository_id,
+            config_generation=request.config_generation,
+            lane=request.lane,
+        )
+
+    def _policy_issues(
+        self,
+        *,
+        asset: AssetName,
+        repository_id: UUID | None,
+        lane: LaneName | None,
+        principal: Principal,
+    ) -> tuple[DenyIssue, ...]:
+        """The gates preflight reports and submit enforces: one code path, called from both."""
+        issues: list[DenyIssue] = []
+        if not (
+            principal.is_verified_human()
+            or (
+                principal.kind == ActorKind.MACHINE
+                and principal.verified_by is not None
+                and repository_id is not None
+                and self._in_start_scope(principal, asset, repository_id)
+            )
+        ):
+            # Who may ask for a run: authorize_request's rule, as a typed issue.
+            issues.append(
+                DenyIssue(
+                    code=DenyCode.ROLE_DENIED,
+                    detail=f"asking for a run is a person's; {principal.ref} is not one, "
+                    "nor a machine granted it in recording.start",
+                )
+            )
+        if repository_id is not None:
+            if self._inventory is None:
+                raise ConfigError("subject checks need the inventory door")
+            try:
+                self._inventory.get_repository(repository_id)
+            except NotFoundError:
+                issues.append(
+                    DenyIssue(
+                        code=DenyCode.SUBJECT_UNKNOWN, detail=f"no repository {repository_id}"
+                    )
+                )
+            else:
+                prior = PRIOR_ORDER_STAGE.get(asset)
+                if prior is not None and repository_id not in self.subjects(
+                    prior, FINISHED_ORDER_STATES
+                ):
+                    issues.append(
+                        DenyIssue(
+                            code=DenyCode.ORDERING_VIOLATED,
+                            detail=f"{asset} needs a completed {prior} order for the subject first",
+                        )
+                    )
+        if lane is not None:
+            verdict = self._spend.check_budget(lane, None)
+            if verdict.status is BudgetStatus.OVER and verdict.enforcement in _WITHHOLDING:
+                # No estimate exists before the run, so the gate is measured spend alone.
+                issues.append(
+                    DenyIssue(
+                        code=DenyCode.BUDGET_EXHAUSTED,
+                        detail=f"lane {lane} spent ${verdict.spent_usd} of ${verdict.budget_usd}",
+                    )
+                )
+        return tuple(issues)
 
     def plan(
         self, request: OrderRequest, principal: Principal, config: Sequence[ConfigDigest] = ()

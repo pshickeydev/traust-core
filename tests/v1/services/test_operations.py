@@ -44,6 +44,7 @@ from traust_core.v1.models.operations import (
     OrderRequest,
     OrderState,
     Outcome,
+    PreflightRequest,
     RunOrder,
     SpendDimension,
     SpendEvent,
@@ -55,7 +56,8 @@ from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.repositories.objects.store import InMemoryObjectStore
 from traust_core.v1.services.artifact_publishing import ArtifactPublisher, PublishSpec, PublishSpecs
-from traust_core.v1.services.operations import OpsService, SpendService
+from traust_core.v1.services.operations import OpsService, PolicyDenied, SpendService
+from traust_core.v1.services.portfolio import Inventory
 
 LEASE = timedelta(minutes=5)
 W1, W2 = WorkerId("w1"), WorkerId("w2")
@@ -950,3 +952,105 @@ def test_check_budget_logs_an_overrun_as_a_warning(
 def test_two_budgets_for_one_lane_are_refused(engine: Engine) -> None:
     with pytest.raises(ConfigError):
         spend(engine, audit_budget("observe"), audit_budget("advisory", "20"))
+
+
+# preflight ----------------------------------------------------------------------------------------
+
+
+def gated(engine: Engine, *budgets: Budget) -> OpsService:
+    """An OpsService with the doors the policy checks need (inventory, spend with budgets)."""
+    return OpsService(
+        SqlTraustUnitOfWork(engine),
+        FixedClock(T0),
+        publisher(engine),
+        spend=spend(engine, *budgets),
+        inventory=Inventory(SqlTraustUnitOfWork(engine)),
+    )
+
+
+def subject(engine: Engine) -> UUID:
+    with SqlTraustUnitOfWork(engine) as uow:
+        repo = Seed(uow).repository()
+        uow.commit()
+    return repo.id
+
+
+MACHINE = Principal(
+    identity="runner-1",
+    kind=ActorKind("machine"),
+    display="runner",
+    verified_by=IdentitySource.DATABASE,
+)
+
+
+def test_preflight_allows_a_stage_whose_prior_record_exists(engine: Engine) -> None:
+    repo = subject(engine)
+    seeded(engine, asset="assessment", repository_id=repo, state="succeeded")
+    result = gated(engine).preflight(
+        PreflightRequest(asset="triage", repository_id=repo, config_generation="g7"), OPERATOR
+    )
+    assert result.allowed is True
+    assert (result.asset, result.repository_id, result.config_generation) == ("triage", repo, "g7")
+
+
+def test_preflight_denies_an_unknown_subject(engine: Engine) -> None:
+    with pytest.raises(PolicyDenied) as denied:
+        gated(engine).preflight(PreflightRequest(asset="triage", repository_id=uuid4()), OPERATOR)
+    assert denied.value.deny_code == "subject_unknown"
+
+
+def test_preflight_denies_a_caller_without_the_role(engine: Engine) -> None:
+    with pytest.raises(PolicyDenied) as denied:
+        gated(engine).preflight(
+            PreflightRequest(asset="triage", repository_id=subject(engine)), MACHINE
+        )
+    assert denied.value.deny_code == "role_denied"
+
+
+def test_preflight_denies_a_stage_whose_prior_record_is_missing(engine: Engine) -> None:
+    with pytest.raises(PolicyDenied) as denied:
+        gated(engine).preflight(
+            PreflightRequest(asset="triage", repository_id=subject(engine)), OPERATOR
+        )
+    assert [i.code for i in denied.value.deny_issues] == ["ordering_violated"]
+
+
+def test_preflight_collects_every_failing_gate(engine: Engine) -> None:
+    with pytest.raises(PolicyDenied) as denied:
+        gated(engine).preflight(PreflightRequest(asset="triage", repository_id=uuid4()), MACHINE)
+    assert [i.code for i in denied.value.deny_issues] == ["role_denied", "subject_unknown"]
+
+
+def test_preflight_denies_an_exhausted_lane_budget(engine: Engine) -> None:
+    repo = subject(engine)
+    seeded(engine, asset="assessment", repository_id=repo, state="succeeded")
+    spent(engine, "50.00")
+    with pytest.raises(PolicyDenied) as denied:
+        gated(engine, audit_budget("advisory")).preflight(
+            PreflightRequest(asset="triage", repository_id=repo, lane=AUDIT), OPERATOR
+        )
+    assert denied.value.deny_code == "budget_exhausted"
+
+
+def test_subject_checks_need_the_inventory_door(engine: Engine) -> None:
+    with pytest.raises(ConfigError):
+        ops(engine).preflight(PreflightRequest(asset="triage", repository_id=uuid4()), OPERATOR)
+
+
+def test_submit_rejects_what_preflight_would_deny_without_preflight_being_called(
+    engine: Engine,
+) -> None:
+    with pytest.raises(PolicyDenied) as denied:
+        gated(engine).submit(
+            OrderRequest(asset="triage", priority=1, repository_id=subject(engine)), OPERATOR
+        )
+    assert denied.value.deny_code == "ordering_violated"
+
+
+def test_submit_accepts_what_preflight_allowed(engine: Engine) -> None:
+    repo = subject(engine)
+    seeded(engine, asset="assessment", repository_id=repo, state="succeeded")
+    order = gated(engine).submit(
+        OrderRequest(asset="triage", priority=1, repository_id=repo), OPERATOR
+    )
+    assert order.state == OrderState.QUEUED

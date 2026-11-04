@@ -18,6 +18,7 @@ from traust_core.v1.errors import (
     ValidationError,
 )
 from traust_core.v1.models.base import Dto
+from traust_core.v1.models.operations import DenyCode, DenyIssue
 from traust_core.v1.providers.correlation import correlation_scope
 
 log = logging.getLogger(__name__)
@@ -107,6 +108,14 @@ def problem(request: Request, exc: Exception) -> JSONResponse:
         "instance": request.url.path,
         "request_id": request.state.request_id,
     }
+    deny_code = getattr(exc, "deny_code", None)
+    if deny_code is not None:
+        body["code"] = str(deny_code)
+    deny_issues = getattr(exc, "deny_issues", ())
+    if deny_issues:
+        body["issues"] = [
+            {"code": str(issue.code), "detail": issue.detail} for issue in deny_issues
+        ]
     headers = {"WWW-Authenticate": "Bearer"} if status == HTTPStatus.UNAUTHORIZED else None
     return JSONResponse(body, status_code=status, media_type=PROBLEM_JSON, headers=headers)
 
@@ -120,6 +129,8 @@ class Problem(Dto):
     detail: str
     instance: str
     request_id: str
+    code: DenyCode | None = None
+    issues: tuple[DenyIssue, ...] = ()
 
 
 def PROBLEMS(*statuses: int) -> dict[int | str, dict[str, object]]:

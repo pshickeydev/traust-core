@@ -67,14 +67,21 @@ def machine(context: Context, identity: str = "runner-7") -> Principal:
     return context.identity.authenticate(Credential(token=grant.token))
 
 
+def person(context: Context, identity: str = "asker@example.com") -> Principal:
+    assert context.identity is not None
+    grant = context.local_issuer.mint(identity)
+    return context.identity.authenticate(Credential(token=grant.token))
+
+
 def leased(context: Context, world: World, *, asset: str = "verify") -> RunOrder:
-    principal = machine(context)
     ops = context.services().ops
     assert world.repo.id is not None
     queued = ops.submit(
-        OrderRequest(asset=AssetName(asset), priority=1, repository_id=world.repo.id), principal
+        OrderRequest(asset=AssetName(asset), priority=1, repository_id=world.repo.id),
+        person(context),
     )
-    order = ops.claim(WorkerId(principal.ref), timedelta(hours=2), (AssetName(asset),))
+    runner = machine(context)
+    order = ops.claim(WorkerId(runner.ref), timedelta(hours=2), (AssetName(asset),))
     assert order is not None and order.id == queued.id
     return order
 
@@ -422,12 +429,12 @@ def test_order_authorization_refusals_leave_rows_and_objects_unchanged(
     if case == "wrong repository":
         order = leased(context, World(engine))
     elif case == "wrong asset":
-        order = leased(context, world, asset="triage")
+        order = leased(context, world, asset="audit")
     elif case in {"repositoryless order", "queued order"}:
         repository_id = None if case == "repositoryless order" else world.repo.id
         ops = context.services().ops
         order = ops.submit(
-            OrderRequest(asset="verify", priority=1, repository_id=repository_id), owner
+            OrderRequest(asset="verify", priority=1, repository_id=repository_id), person(context)
         )
         if case == "repositoryless order":
             claimed = ops.claim(WorkerId(owner.ref), timedelta(hours=2))

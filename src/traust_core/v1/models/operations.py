@@ -43,12 +43,14 @@ if TYPE_CHECKING:
     WorkLane = StrEnum
     RescanEventSource = StrEnum
     DegradedKey = StrEnum
+    DenyCode = StrEnum
 else:
     OrderState = contracts.enum("run-order-state")
     OrderReason = contracts.enum("run-order-reason")
     WorkLane = contracts.enum("work-lane")
     RescanEventSource = contracts.enum("rescan-event-source")
     DegradedKey = contracts.enum("degraded-key")
+    DenyCode = contracts.enum("deny-code")
 
 
 class JobResult(Model):
@@ -170,6 +172,30 @@ class OrderRequest(Model):
     rule: str | None = None
     event_source: str | None = None
     work_item_id: UUID | None = None  # the remediation work item the order runs, if any
+
+
+class DenyIssue(Model):
+    """One typed reason a policy gate refused an action (problem+json `issues[]`)."""
+
+    code: DenyCode
+    detail: str
+
+
+class PreflightRequest(Model):
+    """May this stage run on this subject now, under the config generation the caller holds."""
+
+    asset: AssetName
+    repository_id: UUID
+    config_generation: str | None = None
+    lane: LaneName | None = None
+
+
+class PreflightResult(Model):
+    allowed: bool
+    asset: AssetName
+    repository_id: UUID
+    config_generation: str | None = None
+    lane: LaneName | None = None
 
 
 class StartRecordingRequest(Model):

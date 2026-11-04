@@ -63,9 +63,16 @@ def machine(context: Context, identity: str = "runner-7") -> Principal:
     return context.identity.authenticate(Credential(token=grant.token))
 
 
+def human(context: Context, identity: str = "asker@example.com") -> Principal:
+    assert context.identity is not None
+    grant = context.local_issuer.mint(identity)
+    return context.identity.authenticate(Credential(token=grant.token))
+
+
 def leased(
     context: Context, world: World, *, asset: str = ASSET, work_item_id: UUID | None = None
 ) -> RunOrder:
+    # a person asks for the order (submit re-verifies who may ask); the runner claims it
     principal = machine(context)
     ops = context.services().ops
     assert world.repo.id is not None
@@ -76,7 +83,7 @@ def leased(
             repository_id=world.repo.id,
             work_item_id=work_item_id,
         ),
-        principal,
+        human(context),
     )
     order = ops.claim(WorkerId(principal.ref), timedelta(hours=2), (AssetName(asset),))
     assert order is not None and order.id == queued.id
@@ -405,12 +412,17 @@ def test_order_authorization_refusals_leave_rows_and_objects_unchanged(
                 "recording": context.config.recording.model_copy(update={"triage": (ASSET, asset)})
             }
         )
+        # submit's ordering gate needs the prior stage completed for the subject first
+        prior = "assessment" if asset == "triage" else "triage"
+        with SqlTraustUnitOfWork(context.database) as uow:
+            Seed(uow).run_order(asset=prior, repository_id=world.repo.id, state="succeeded")
+            uow.commit()
         order = leased(context, world, asset=asset)
     elif case in {"repositoryless order", "queued order"}:
         repository_id = None if case == "repositoryless order" else world.repo.id
         ops = context.services().ops
         order = ops.submit(
-            OrderRequest(asset=ASSET, priority=1, repository_id=repository_id), owner
+            OrderRequest(asset=ASSET, priority=1, repository_id=repository_id), human(context)
         )
         if case == "repositoryless order":
             claimed = ops.claim(WorkerId(owner.ref), timedelta(hours=2))
