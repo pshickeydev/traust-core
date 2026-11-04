@@ -47,7 +47,13 @@ def context(engine: Engine, tmp_path: Path) -> Context:
 
 
 def record_container(
-    context: Context, ref_id: UUID, image: str, day: int, indices: tuple[int, ...] = (0, 1)
+    context: Context,
+    ref_id: UUID,
+    image: str,
+    day: int,
+    indices: tuple[int, ...] = (0, 1),
+    *,
+    description: str | None = None,
 ) -> UUID:
     body = json.loads(authored_report().payload)
     body["title"] = f"Container assessment {day}: {image}"
@@ -63,6 +69,8 @@ def record_container(
         finding.pop("validation_status", None)
         finding.pop("disposition", None)
         finding.pop("effective_severity", None)
+        if description is not None:
+            finding["description"] = description
     saved = context.services().assessment.record(
         SecurityAuditArtifact.from_document(body),
         ref_id,
@@ -208,3 +216,33 @@ def test_container_single_item_view_is_excluded_from_dashboard_refresh(context: 
     )
     refreshed = InsightService([view], FixedClock(T0)).refresh(None, ViewFilter())
     assert refreshed.rendered == {} and refreshed.failed == {}
+
+
+def test_container_body_values_are_literal_after_storage_and_publication(
+    context: Context, engine: Engine
+) -> None:
+    with SqlTraustUnitOfWork(engine) as uow:
+        ref = Seed(uow).repository_ref()
+        uow.commit()
+    assert ref.id is not None
+    image_repository = "registry.example/apps/widget<img src=x onerror=alert(2)>"
+    description = "<iframe src=x></iframe> [open](javascript:alert(1))\n## Injected heading"
+    assessment_id = record_container(
+        context,
+        ref.id,
+        f"{image_repository}:latest",
+        1,
+        (0,),
+        description=description,
+    )
+    rendered = context.services().insight.publish(
+        ViewName.CONTAINER_FINDINGS,
+        ViewFilter(artifact_id=attached_report(context, assessment_id)),
+    )
+    assert rendered.model.image_repository == image_repository
+    assert rendered.model.findings[0].description == description
+    assert "<img" not in rendered.markdown
+    assert "<iframe" not in rendered.markdown
+    assert "&lt;img" in rendered.markdown and "&lt;iframe" in rendered.markdown
+    assert "[open](javascript:" not in rendered.markdown
+    assert "\n## Injected heading" not in rendered.markdown

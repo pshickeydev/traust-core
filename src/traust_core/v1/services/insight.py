@@ -184,6 +184,7 @@ from traust_core.v1.rendering import (
     Table,
     csv_table,
     inline,
+    markdown_text,
 )
 from traust_core.v1.services.findings.intake import CATEGORY
 from traust_core.v1.services.findings.rating import CvssFloor, RatingConfig, RatingPolicy, SlaConfig
@@ -433,7 +434,7 @@ class ContainerFindingsView:
             sections=(
                 Section(
                     heading="Population",
-                    body=f"Image repository: {inline(model.image_repository)}. "
+                    body=f"Image repository: {markdown_text(model.image_repository)}. "
                     f"{len(model.reports)} stored container reports; {len(model.findings)} "
                     "distinct canonical findings. Decisions supply current disposition; "
                     "absence from a later report does not establish resolution.",
@@ -467,7 +468,7 @@ class ContainerFindingsView:
                 *(
                     Section(
                         heading=f"Finding {row.view.finding.id}: {inline(row.view.finding.title)}",
-                        body=inline(row.description),
+                        body=markdown_text(row.description),
                         table=Table(
                             columns=("decision", "time", "validity", "resolution", "rationale"),
                             rows=tuple(
