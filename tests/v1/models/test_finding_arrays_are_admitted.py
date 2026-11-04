@@ -6,19 +6,52 @@ admitted or listed with the reason it isn't (connectivity audit 2026-11-03)."""
 from __future__ import annotations
 
 import importlib
+import json
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import pytest
 
 from traust_core.v1 import contracts
+from traust_core.v1.models.artifacts import CloudConfigAuditArtifact, VerificationArtifact
 from traust_core.v1.models.assessment import RECORDED_SCHEMAS, REPORTED_FINDINGS, AssessmentKind
+
+TESTS = Path(__file__).parents[2]
+FIXTURES = TESTS / "fixtures"
+
+
+@dataclass(frozen=True)
+class Door:
+    """Where another door admits an array: the converter it passes the document through, a
+    fixture that carries the array, and the service test that records it end to end."""
+
+    converter: str
+    document: Any
+    fixture: str
+    proven_by: str
+
 
 # Arrays a kind recorded through `AssessmentService.record` admits (REPORTED_FINDINGS).
 REPORTED = {("report", "findings"), ("vuln-findings", "findings"), ("fuzz-report", "crashers")}
 
-# Arrays another door admits, named so the test can check the door still exists.
+# Arrays another door admits.
 ADMITTED_ELSEWHERE = {
-    ("cloud-config-audit", "findings"): "traust_core.v1.models.cloud_config:audit_candidates",
+    ("cloud-config-audit", "findings"): Door(
+        "traust_core.v1.models.cloud_config:audit_candidates",
+        CloudConfigAuditArtifact,
+        "cloud_config/myrepo-cloud-config-audit.json",
+        "v1/services/test_cloud_config_audit.py::"
+        "test_every_stated_finding_is_a_row_and_two_checks_on_one_bucket_stay_two",
+    ),
+    ("verification", "regressions"): Door(
+        "traust_core.v1.models.remediation:regression_candidates",
+        VerificationArtifact,
+        "remediation/verification-report.json",
+        "v1/services/test_verification.py::"
+        "test_record_states_each_verdict_and_takes_the_regressions",
+    ),
 }
 
 # Arrays that are not new findings, and why.
@@ -46,17 +79,40 @@ UNREPORTED_KINDS = {
 }
 
 
+def _resolve(schema: dict[str, Any], node: Any, depth: int = 0) -> Any:
+    """`node` with local and cross-schema `$ref`s followed (enough to see an item's fields)."""
+    if not isinstance(node, dict) or depth > 8 or "$ref" not in node:
+        return node
+    name, _, fragment = node["$ref"].partition("#")
+    if name:
+        schema = contracts.schema(name.split(".")[0])
+    target: Any = schema
+    for part in filter(None, fragment.split("/")):
+        target = target.get(part, {})
+    return _resolve(schema, target, depth + 1)
+
+
+def _finding_shaped(schema: dict[str, Any], node: dict[str, Any]) -> bool:
+    """An array whose items are findings by their fields, whatever the array is called."""
+    items = _resolve(schema, node.get("items", {}))
+    fields = set(items.get("properties", {})) if isinstance(items, dict) else set()
+    return "title" in fields and bool(fields & {"severity", "cwe", "cwes", "locations"})
+
+
 def _arrays() -> set[tuple[str, str]]:
+    """Every array named for findings, or holding finding-shaped items."""
     found = set()
     for name in contracts.schema_names():
-        props: dict[str, Any] = contracts.schema(name).get("properties", {})
+        schema = contracts.schema(name)
         found |= {
             (name, key)
-            for key, node in props.items()
+            for key, node in schema.get("properties", {}).items()
             if isinstance(node, dict)
             and node.get("type") == "array"
-            and ("finding" in key or key in ("crashers", "results"))
             and key != "findings_summary"
+            and (
+                "finding" in key or key in ("crashers", "results") or _finding_shaped(schema, node)
+            )
         }
     return found
 
@@ -79,7 +135,20 @@ def test_a_recorded_kind_with_a_reported_array_admits_it() -> None:
     assert {RECORDED_SCHEMAS[k] for k in REPORTED_FINDINGS} == schemas
 
 
-@pytest.mark.parametrize("door", sorted(ADMITTED_ELSEWHERE.values()))
-def test_each_named_door_exists(door: str) -> None:
-    module, name = door.split(":")
-    assert callable(getattr(importlib.import_module(module), name))
+@pytest.mark.parametrize("array", sorted(ADMITTED_ELSEWHERE), ids="/".join)
+def test_each_named_door_takes_every_entry_of_its_array(array: tuple[str, str]) -> None:
+    door = ADMITTED_ELSEWHERE[array]
+    module, name = door.converter.split(":")
+    convert = getattr(importlib.import_module(module), name)
+    raw = json.loads((FIXTURES / door.fixture).read_text())
+    assert raw[array[1]], f"{door.fixture} carries no {array[1]}"
+    candidates = convert(door.document.parse(json.dumps(raw).encode()), uuid4())
+    assert len(candidates) == len(raw[array[1]])
+
+
+@pytest.mark.parametrize("array", sorted(ADMITTED_ELSEWHERE), ids="/".join)
+def test_each_named_door_has_a_service_test_that_records_it(array: tuple[str, str]) -> None:
+    """The converter alone isn't the connection: a service test records a document through the
+    door and asserts its findings are rows, and must keep existing."""
+    path, test = ADMITTED_ELSEWHERE[array].proven_by.split("::")
+    assert f"def {test}(" in (TESTS / path).read_text()
