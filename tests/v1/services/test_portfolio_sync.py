@@ -47,8 +47,10 @@ class Forge:
         visibility: str | None = "public",
         heads: dict[str, str] | None = None,
         error: SourceError | None = None,
+        described: RepoInfo | None = None,
     ) -> None:
         self.listing, self.visibility, self.heads, self.error = listing, visibility, heads, error
+        self.described = described
         self.calls: list[str] = []
 
     def _result(self, data):
@@ -62,7 +64,7 @@ class Forge:
 
     def info(self, repo: HttpsRepoUrl) -> Result[RepoInfo]:
         self.calls.append(f"info {repo}")
-        return self._result(RepoInfo(repo=repo, visibility=self.visibility))
+        return self._result(self.described or RepoInfo(repo=repo, visibility=self.visibility))
 
     def head(self, repo: HttpsRepoUrl, branch: str) -> Result[GitSha]:
         assert self.heads is not None
@@ -78,6 +80,10 @@ class Forge:
 
 def listed(*paths: str, visibility: str = "public") -> list[RepoInfo]:
     return [RepoInfo(repo=url(p), visibility=visibility) for p in paths]
+
+
+def describing(repo: str, parent: str | None, *, fork: bool = True) -> RepoInfo:
+    return RepoInfo(repo=url(repo), visibility="public", fork=fork, parent=parent)
 
 
 @pytest.fixture(params=SQL_BACKENDS)
@@ -147,15 +153,75 @@ def test_a_forge_failure_imports_nothing(portfolio: PortfolioService) -> None:
 
 
 @pytest.mark.parametrize(("visibility", "public"), [("public", True), (None, False)])
-def test_import_repository_asks_the_forge_only_for_a_new_repository(
+def test_import_repository_asks_the_forge_for_a_new_repository_and_an_unlinked_one(
     portfolio: PortfolioService, visibility: str | None, public: bool
 ) -> None:
     forge = Forge(visibility=visibility)
     repo = url("example-group/sub/api", "gitlab.com")
     added = sync(portfolio, forge).import_repository(repo)
     assert portfolio.get_repository(added.added[0]).public is public
+    # a known repository without an upstream is asked once more: the forge may name its parent
     assert sync(portfolio, forge).import_repository(repo) == SyncReport(unchanged=added.added)
-    assert forge.calls == [f"info {repo}"]
+    assert forge.calls == [f"info {repo}", f"info {repo}"]
+
+
+def test_import_repository_registers_a_fork_with_its_upstream(
+    portfolio: PortfolioService,
+) -> None:
+    forge = Forge(described=describing("example-org/fork", "example-org/api"))
+    report = sync(portfolio, forge).import_repository(url("example-org/fork"))
+    fork = portfolio.get_repository(report.added[0])
+    parent = portfolio.find_repository(url("example-org/api"))
+    assert parent is not None and parent.id is not None
+    assert fork.upstream_id == parent.id
+    # the parent is brought in private, until its own import says otherwise
+    assert parent.public is False
+
+
+@pytest.mark.parametrize("fork", [False, None])
+def test_import_repository_leaves_a_non_fork_without_an_upstream(
+    portfolio: PortfolioService, fork: bool | None
+) -> None:
+    # fork=None is the forge not saying: no lineage is recorded either way
+    forge = Forge(described=describing("example-org/plain", None, fork=fork))
+    report = sync(portfolio, forge).import_repository(url("example-org/plain"))
+    assert portfolio.get_repository(report.added[0]).upstream_id is None
+
+
+def test_import_repository_backfills_a_known_forks_missing_upstream(
+    portfolio: PortfolioService,
+) -> None:
+    registered = portfolio.register_repository(url("example-org/fork"), public=True)
+    assert registered.id is not None
+    forge = Forge(described=describing("example-org/fork", "example-org/api"))
+    report = sync(portfolio, forge).import_repository(url("example-org/fork"))
+    assert report == SyncReport(unchanged=(registered.id,))
+    parent = portfolio.find_repository(url("example-org/api"))
+    assert parent is not None and parent.id is not None
+    assert portfolio.get_repository(registered.id).upstream_id == parent.id
+
+
+def test_import_repository_leaves_a_linked_fork_unchanged(portfolio: PortfolioService) -> None:
+    forge = Forge(described=describing("example-org/fork", "example-org/api"))
+    first = sync(portfolio, forge).import_repository(url("example-org/fork"))
+    linked = portfolio.get_repository(first.added[0])
+    assert linked.id is not None and linked.upstream_id is not None
+    again = sync(portfolio, forge).import_repository(url("example-org/fork"))
+    assert again == SyncReport(unchanged=(linked.id,))
+    assert portfolio.get_repository(linked.id).upstream_id == linked.upstream_id
+    # the link settles the question: the forge is not asked again
+    assert forge.calls == [f"info {url('example-org/fork')}"]
+
+
+def test_import_repository_matches_the_forks_parent_by_normalized_url(
+    portfolio: PortfolioService,
+) -> None:
+    parent = portfolio.register_repository(url("example-org/api"), public=True)
+    assert parent.id is not None
+    forge = Forge(described=describing("example-org/fork", "Example-Org/API"))
+    report = sync(portfolio, forge).import_repository(url("example-org/fork"))
+    assert portfolio.get_repository(report.added[0]).upstream_id == parent.id
+    assert portfolio.find_repository(url("Example-Org/API")) is None
 
 
 def test_import_branch_registers_the_commit_the_branch_points_at(

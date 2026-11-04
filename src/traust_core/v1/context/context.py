@@ -868,7 +868,7 @@ class Context:
             findings=findings,
             checkout=self.checkouts,
         )
-        sync = PortfolioSync(portfolio, sources, clock=self.clock)
+        sync = PortfolioSync(portfolio, sources, clock=self.clock, hosts=hosts)
         catalog = ProviderCatalog(
             self.tools,
             self.feeds,

@@ -324,11 +324,7 @@ class PortfolioService:
 
     def _keep(self, target: ObservationTarget, facts: ForgeFacts, started: float) -> None:
         assert facts.repo is not None and facts.head is not None and self._assessment is not None
-        fork_of = (
-            observation_url(f"https://{facts.repo.host}/{facts.parent}", self._hosts)
-            if facts.fork and facts.parent
-            else None
-        )
+        fork_of = _fork_parent_url(facts.repo.host, facts.fork, facts.parent, self._hosts)
         observed = facts.status in (*OBSERVED, ComparisonStatus.NO_PINNED_SHA)
         with self._uow as uow:
             repository = uow.repositories.get(facts.repository_id)
@@ -602,6 +598,22 @@ class PortfolioService:
                     *committed,
                 )
             )
+        return repository
+
+    def link_upstream(self, repository_id: UUID, parent_url: HttpsRepoUrl) -> Repository:
+        """Point a repository at its fork's parent: the parent is brought into the inventory
+        (private, until its own import says otherwise) when absent, found by URL when known."""
+        require_uuid(repository_id, "repository.id")
+        if not isinstance(parent_url, HttpsRepoUrl):
+            raise ValidationError("repository.parent_url must be an HttpsRepoUrl")
+        with self._uow as uow:
+            repository = uow.repositories.get(repository_id)
+            upstream = uow.repositories.get_or_add(Repository(url=str(parent_url), public=False))
+            if repository.upstream_id != upstream.id:
+                repository = uow.repositories.update(
+                    repository.model_copy(update={"upstream_id": upstream.id})
+                )
+                uow.commit()
         return repository
 
     def register_ref(
@@ -1122,6 +1134,13 @@ def _release_version(label: str) -> tuple[int, int, int] | None:
     return None if found is None else (int(found[1]), int(found[2]), int(found[3] or 0))
 
 
+def _fork_parent_url(
+    host: str, fork: bool | None, parent: str | None, hosts: Mapping[str, str]
+) -> HttpsRepoUrl | None:
+    """A reported fork's parent as an observation URL; None when unreported or unusable."""
+    return observation_url(f"https://{host}/{parent}", hosts) if fork and parent else None
+
+
 def _require_ownership(ownership: object, business_unit: str) -> None:
     if not isinstance(ownership, OwnershipClass):
         raise ValidationError(f"corpus ownership must be one of {list(OwnershipClass)}")
@@ -1148,11 +1167,17 @@ class PortfolioSync:
     """Brings forge listings and the declared ownership source into the portfolio."""
 
     def __init__(
-        self, portfolio: PortfolioService, sources: SourceProvider, *, clock: Clock | None = None
+        self,
+        portfolio: PortfolioService,
+        sources: SourceProvider,
+        *,
+        clock: Clock | None = None,
+        hosts: Mapping[str, str] | None = None,
     ) -> None:
         self._portfolio = portfolio
         self._sources = sources
         self._clock = clock or SystemClock()
+        self._hosts = dict(hosts or DEFAULT_FORGE_HOSTS)
 
     def list_org(self, org: OrgName, host: str) -> list[RepoInfo]:
         return self._sources.list_org(org, host).data
@@ -1165,11 +1190,23 @@ class PortfolioSync:
         )
 
     def import_repository(self, url: HttpsRepoUrl) -> SyncReport:
-        """Register one repository with the visibility its forge reports."""
+        """Register one repository with the visibility its forge reports and its fork's
+        upstream linked; a known repository's missing upstream is back-filled."""
         known = self._portfolio.find_repository(url)
         if known is not None and known.id is not None:
+            if known.upstream_id is None:
+                self._link_upstream(known.id, self._sources.info(url).data)
             return SyncReport(unchanged=(known.id,))
-        return self._register(url, self._sources.info(url).data.visibility)
+        info = self._sources.info(url).data
+        report = self._register(url, info.visibility)
+        self._link_upstream((*report.added, *report.unchanged)[0], info)
+        return report
+
+    def _link_upstream(self, repository_id: UUID, info: RepoInfo) -> None:
+        """The fork's parent, normalized as an observation URL, as the repository's upstream."""
+        parent = _fork_parent_url(info.repo.host, info.fork, info.parent, self._hosts)
+        if parent is not None:
+            self._portfolio.link_upstream(repository_id, parent)
 
     def import_branch(
         self, repository_id: UUID, url: HttpsRepoUrl, branch: RefName
