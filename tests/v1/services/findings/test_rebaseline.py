@@ -132,6 +132,16 @@ def test_a_candidate_is_claimed_once() -> None:
     assert [m.finding_id for m in moves] == [twins[0].finding.id]
 
 
+def test_an_exposure_finding_never_moves() -> None:
+    """Its identity is (advisory, package); another package is another exposure."""
+    old = view(SQLI, ("a/db.go",), ("CWE-89",), "fp-exposure")
+    exposure = old.model_copy(
+        update={"finding": old.finding.model_copy(update={"fingerprint_algo": "exposure-v1"})}
+    )
+    new = [cand("N1", SQLI, ("a/db.go",), ("CWE-89",))]
+    assert IdentityPolicy().moves([exposure], new, [Fingerprint("v3", hx("new"))]) == []
+
+
 # the service
 
 

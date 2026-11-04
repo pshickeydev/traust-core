@@ -8,12 +8,20 @@ from datetime import UTC, date, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
-from traust_core.v1.errors import NotFoundError, ValidationError
+from traust_core.v1.errors import ConflictError, NotFoundError, ValidationError
 from traust_core.v1.models.artifacts import (
     ANALYSIS_ARTIFACTS,
     CodeFactsArtifact,
     ImpactAnalysisArtifact,
     IsolationReviewArtifact,
+    ReportArtifact,
+    VulnFindingsArtifact,
+)
+from traust_core.v1.models.assessment import (
+    REBASELINED_KINDS,
+    RECORDED_SCHEMAS,
+    REPORTED_FINDINGS,
+    AssessmentKind,
 )
 from traust_core.v1.models.common import (
     Page,
@@ -34,8 +42,11 @@ from traust_core.v1.models.findings import (
     FindingState,
     FindingView,
     IdentityMove,
+    IntakeResult,
+    Label,
     Location,
     Occurrence,
+    ReviewItem,
     SurfaceCoverage,
     normalize_decision,
 )
@@ -44,6 +55,7 @@ from traust_core.v1.models.inventory import default_line
 from traust_core.v1.models.vocabulary import (
     DecisionReason,
     DispositionResolution,
+    ReviewItemStatus,
     ScannerSeverity,
     Severity,
     Validity,
@@ -70,9 +82,15 @@ from traust_core.v1.services.findings.intake import (
 from traust_core.v1.services.findings.precedents import FindingPrecedents
 from traust_core.v1.services.findings.rating import RatingPolicy
 from traust_core.v1.services.findings.records import FindingRecords
-from traust_core.v1.services.findings.review import FindingReview
+from traust_core.v1.services.findings.review import FindingReview, request
 from traust_core.v1.services.findings.views import FindingViewQuery
 from traust_core.v1.services.portfolio import Inventory
+
+_HELD_TIERS = frozenset({"path_cwe", "path_set"})
+_HELD_DOCUMENTS = {
+    ReportArtifact.schema: ReportArtifact,
+    VulnFindingsArtifact.schema: VulnFindingsArtifact,
+}
 
 
 class FindingService:
@@ -133,6 +151,89 @@ class FindingService:
                 return []
             ids = [fc.finding_id for fc in uow.finding_cwes.list_for_cwe(tagged.id)]  # type: ignore[arg-type]
             return self._views.views(uow, uow.findings.list_by_ids(ids), as_of=None) if ids else []
+
+    def hold_moves(
+        self, repository_id: UUID, candidates: Sequence[FindingCandidate]
+    ) -> list[IdentityMove]:
+        """A re-audit's candidates that report a recorded finding under another identity by
+        location (a title alone is too loose to hold one back), each with a pending
+        `rebaseline_mapping` review on that finding; the recorder admits only the others, so
+        a re-audit never opens a duplicate. Inside the caller's transaction."""
+        held = [
+            m
+            for m in self.intake.moves(
+                self.all(FindingFilter(repository_id=repository_id)), candidates
+            )
+            if m.matched_by in _HELD_TIERS
+        ]
+        with self._uow as uow:
+            for move in held:
+                request(uow, move.finding_id, REBASELINE_MAPPING)
+        return held
+
+    def settle_move(self, review_item_id: UUID) -> IntakeResult:
+        """After a person answers a held move's `rebaseline_mapping` review, in one transaction
+        (the caller's, when it answered the review in it): accepted, the recorded finding takes
+        the newest re-audit's identity and every held occurrence (same id, so its decisions
+        follow); rejected, each held candidate is admitted as the finding it is. Settling again
+        admits nothing more."""
+        with self._uow.write() as uow:
+            item = uow.review_items.get(review_item_id)
+            if item.reason != REBASELINE_MAPPING:
+                raise ValidationError(f"review item {review_item_id} is not a rebaseline review")
+            if item.status == ReviewItemStatus.PENDING:
+                raise ConflictError(f"review item {review_item_id} is still pending")
+            held = self._held(item)
+            accepted = item.status == ReviewItemStatus.ACCEPTED
+            if held and accepted:
+                self.intake.rebaseline([held[-1][2]], review_item_id)
+            findings: dict[Label, UUID] = {}
+            created: list[UUID] = []
+            for assessment_id, candidate, _ in held:
+                if accepted:
+                    candidate = candidate.model_copy(update={"finding_id": item.finding_id})
+                taken = self.intake.accept(assessment_id, [candidate])
+                findings |= taken.findings
+                created += taken.created
+            uow.commit()
+        return IntakeResult(findings=findings, created=tuple(dict.fromkeys(created)))
+
+    def _held(self, item: ReviewItem) -> list[tuple[UUID, FindingCandidate, IdentityMove]]:
+        """Every candidate still held under this review, oldest audit first. Holding opens the
+        review before it records its audit, so only audits recorded since the review opened
+        can hold under it; an audit that already reports the finding holds nothing."""
+        repository_id = self.intake.get(item.finding_id).repository_id
+        assert item.created_at is not None
+        with self._uow as uow:
+            reported = {o.assessment_id for o in uow.occurrences.list_for_finding(item.finding_id)}
+        refs = [r.id for r in self._inventory.list_refs(repository_id) if r.id]
+        audits = [
+            a
+            for a in self._log.list_of(None, refs)
+            if a.kind in REBASELINED_KINDS
+            and a.created_at is not None
+            and a.created_at >= item.created_at
+            and a.id not in reported
+        ]
+        if not audits:
+            return []
+        schemas = {RECORDED_SCHEMAS[AssessmentKind(a.kind)] for a in audits}
+        previous = self.all(FindingFilter(repository_id=repository_id))
+        held = []
+        for assessment, artifact in sorted(
+            self._log.documents(audits, schemas),
+            key=lambda pair: (pair[0].created_at, pair[0].occurred_at),
+        ):
+            doc = _HELD_DOCUMENTS[artifact.kind].parse(stored_bytes(self._objects, artifact))
+            candidates = REPORTED_FINDINGS[AssessmentKind(assessment.kind)](doc, repository_id)
+            by_label = {c.label: c for c in candidates}
+            assert assessment.id is not None
+            held += [
+                (assessment.id, by_label[m.label], m)
+                for m in self.intake.moves(previous, candidates)
+                if m.finding_id == item.finding_id and m.matched_by in _HELD_TIERS
+            ]
+        return held
 
     def moves(
         self, repository_id: UUID, candidates: Sequence[FindingCandidate]

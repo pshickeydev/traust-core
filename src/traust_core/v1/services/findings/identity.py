@@ -173,6 +173,7 @@ class IdentityPolicy:
             v
             for v in previous
             if (v.finding.fingerprint_algo, v.finding.fingerprint) not in reported
+            and v.finding.fingerprint_algo != EXPOSURE_ALGO  # (advisory, package) never moves
         ]
         moves: list[IdentityMove] = []
 

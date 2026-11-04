@@ -82,6 +82,17 @@ REPORTED_FINDINGS: dict[AssessmentKind, Callable[[Any, UUID], list[FindingCandid
     AssessmentKind.VULN_SCAN_CANONICAL: lambda doc, r: FindingCandidate.of_scan(doc.findings, r),
     AssessmentKind.FUZZ: lambda doc, r: FindingCandidate.of_fuzz(doc.crashers, r),
 }
+# Audit kinds whose findings a re-audit may name differently (an LLM's locations drift): a
+# candidate that reports a recorded finding under another identity waits for a person's
+# rebaseline review instead of opening a duplicate.
+REBASELINED_KINDS = frozenset(
+    {
+        AssessmentKind.SECURE_CODE_CANONICAL,
+        AssessmentKind.CONTAINER,
+        AssessmentKind.RPM,
+        AssessmentKind.VULN_SCAN_CANONICAL,
+    }
+)
 
 
 class GapSignal(StrEnum):
