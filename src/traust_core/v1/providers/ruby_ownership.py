@@ -103,7 +103,8 @@ _UNTRUSTED = re.compile(
     r"\bparams\b|\brequest\.(params|parameters|query_parameters|request_parameters|"
     r"path_parameters|GET|POST|query_string|raw_post|body)\b|"
     # D20 amended: a plain cookie is set by the client; `cookies.signed`/`.encrypted` aren't
-    r"\bcookies\s*(\[|\.fetch\b|\.dig\b|\.to_h\b)"
+    r"\bcookies(\.permanent)?\s*(\[|\.fetch\b|\.dig\b|\.to_h(ash)?\b|\.each\b)|"
+    r"\brequest\.(cookie_jar|cookies)\b"
 )
 _STRING = re.compile(r"\"(?:[^\"\\]|\\.)*\"|'(?:[^'\\]|\\.)*'")
 # the caller's own tenant (`current_user.account_id`); never another user it names
@@ -114,13 +115,10 @@ _TENANT = re.compile(
 _BY_USER = re.compile(r"(?i)_by(_id)?$|_user_id$")
 _TOKEN_KEY = re.compile(r"(?i)token|api_key|digest|secret|jti")
 _PARAMS = {"params", "request.path_parameters", "request.params", "request.parameters"}
-# views that show the record (`render :show, status: :forbidden`)
-_RECORD_VIEWS = {"show", "edit", "index", "new"}
+# a `render` naming a view (`render :show`, `template:`) may print the record
 _VIEW_KEYS = {"action", "template"}
-_ERROR_VIEW = re.compile(
-    r"(?i)^(forbidden|unauthori[sz]ed|not_found|denied|access_denied|error|errors|40[1-4]|"
-    r"blank|empty|nothing)$"
-)
+# what a `render` sends instead of a view
+_BODY_KEYS = {"json", "plain", "html", "body", "xml", "js", "text", "nothing", "inline", "partial"}
 # `JWT.decode(token, nil, false)`: a token read without its signature
 _UNVERIFIED = re.compile(r"\bdecode\s*\([^)]*,\s*(false|nil)\s*(,|\))|verify(_signature)?:\s*false")
 _SIGN_IN = {"sign_in", "bypass_sign_in", "login", "log_in", "auto_login", "set_user"}
@@ -128,6 +126,7 @@ _CONVERSIONS = {"to_i", "to_s", "to_param", "presence"}
 _INERT = {"logger", "Rails", "puts", "p", "pp", "flash", "notice", "alert", "t", "I18n"}
 _MAX_DEPTH = 64
 _MAX_NESTING = 64  # alternating `&&`/`||` levels a condition may nest
+_MAX_HELPERS = 6  # argument-free helpers followed inside one another
 _Key = tuple[str, str, str]  # (the id, the model, the field); "*" for unknown
 
 
@@ -240,6 +239,8 @@ class _Model:
     base: str = ""  # the class it inherits from
     users: list[str] = field(default_factory=list)  # `belongs_to :uploader, class_name: "User"`
     children: list[str] = field(default_factory=list)  # the classes its `has_many`s hold
+    scopes: dict[str, Node] = field(default_factory=dict)  # `scope :x, -> { … }`, `def self.x`
+    polymorphic: set[str] = field(default_factory=set)  # `belongs_to :owner, polymorphic: true`
     qualified: set[str] = field(default_factory=set)  # `Note`, `Archive::Note`
 
 
@@ -256,6 +257,7 @@ class RubyCode:
         self.modules: dict[str, list[tuple[Parsed, Node]]] = {}  # module name -> definitions
         self.ability: tuple[Parsed, Node] | None = None
         self.qualified: dict[str, tuple[Parsed, Node]] = {}  # `Api::Relaxed` -> module
+        self.method_cache: dict[tuple[str, int, int], dict[str, Node]] = {}
         self.defined: set[str] = set()  # every method name the checkout defines
         for rel, src in sources.items():
             self._index(rel, src)
@@ -270,11 +272,11 @@ class RubyCode:
         if rel.endswith("db/schema.rb"):
             self._schema(src)
         for n in walk(src.root):
-            if n.type == "module":
+            if n.type == "module" and n.is_named:
                 written = src.text(n.child_by_field_name("name"))
                 self.modules.setdefault(written.rsplit("::", 1)[-1], []).append((src, n))
                 self.qualified["::".join([*_lexical(src, n), written])] = (src, n)
-            if n.type != "class":
+            if n.type != "class" or not n.is_named:
                 continue
             name = src.text(n.child_by_field_name("name")).rsplit("::", 1)[-1]
             sup = n.child_by_field_name("superclass")
@@ -315,9 +317,14 @@ class RubyCode:
                     ):
                         found = method_body(s)
                         model.policy = src.text(found[-1]) if found else None
+                    if s.type == "singleton_method":
+                        model.scopes[src.text(s.child_by_field_name("name"))] = s
                     if s.type != "call" or not args(s):
                         continue
                     kind, first = call_name(src, s), symbol(src, args(s)[0])
+                    if kind == "scope" and first is not None:
+                        model.scopes[first] = s
+                        continue
                     opts = dict(pairs(src, [a for a in args(s)[1:] if a.type != "lambda"]) or [])
                     if first is None:
                         continue
@@ -333,13 +340,20 @@ class RubyCode:
                         ):
                             continue  # `-> { unscope(where: :user_id) }`: not the caller's own
                         # `def notes` overrides it; `through:` reaches records through others
-                        # (a membership, D22, or other users), so it is never the caller's own
-                        if first not in defined and "through" not in opts:
+                        # (a membership, D22, or other users), so it is never the caller's own;
+                        # an extension block may widen it
+                        block = s.child_by_field_name("block")
+                        widened = block is not None and any(
+                            call_name(src, c) in _WIDENING for c in walk(block)
+                        )
+                        if first not in defined and "through" not in opts and not widened:
                             model.associations[first] = target
                         if "through" not in opts:
                             model.children.append(target)
                     elif kind == "belongs_to":
                         model.belongs[first] = target
+                        if src.text(opts.get("polymorphic")) == "true":
+                            model.polymorphic.add(first)
                         if target == "User":
                             model.users.append(first)
                     elif kind in ("include", "acts_as_tenant", "delegated_type", "store"):
@@ -367,6 +381,22 @@ class RubyCode:
         out = {}
         user = self.models.get("User")
         users_hold = set(user.belongs.values()) if user is not None else set()
+        if user is not None:
+            users_hold |= set(user.associations.values()) | set(user.children)
+        for other in self.models.values():
+            owner_cols = [
+                c for c in self.columns.get(_table_of(other.name), []) if OWNER_FIELD_RX.match(c)
+            ]
+            if owner_cols or any(OWNER_FIELD_RX.match(b) for b in other.belongs):
+                users_hold |= set(other.belongs.values())
+        # what a held record holds is held too (`User` → `Account` → `BillingProfile`)
+        queue = list(users_hold)
+        while queue:
+            held = self.models.get(queue.pop())
+            for target in held.belongs.values() if held is not None else ():
+                if target not in users_hold:
+                    users_hold.add(target)
+                    queue.append(target)
         for name, model in self.models.items():
             table = _table_of(name)
             # owned through a join (`has_many :users, through: :memberships`), or by a user
@@ -406,6 +436,8 @@ class RubyCode:
         doesn't define it, or UNREAD when several share the name."""
         if name in self.qualified:
             return self.qualified[name]
+        if "::" in name and not any(q.endswith(f"::{name}") for q in self.qualified):
+            return None  # `Pundit::Authorization`: a gem's, not the app's `Authorization`
         found = self.modules.get(name.rsplit("::", 1)[-1], [])
         if not found:
             return None
@@ -416,7 +448,50 @@ class RubyCode:
         found = self.models.get(model)
         return any(OWNER_CHECK_RX.match(c) for c in [*cols, *(found.belongs if found else ())])
 
+    def narrows(self, model: str | None, name: str) -> bool:
+        """Whether a model's own scope only narrows (`scope :recent, -> { order(…) }`); an
+        unread one, or one that drops conditions, may reach past the caller's records."""
+        found = self.models.get(model or "")
+        scope = found.scopes.get(name) if found is not None else None
+        return scope is not None and not any(
+            n.type == "call"
+            and n.child_by_field_name("method") is not None
+            and n.child_by_field_name("method").text.decode() in _WIDENING  # type: ignore[union-attr]
+            for n in walk(scope)
+        )
+
+    def module_includes(self, src: Parsed, module: Node) -> list[str]:
+        return [
+            src.text(a).removeprefix("::")
+            for m in statements(module.child_by_field_name("body"))
+            if m.type == "call" and call_name(src, m) == "include"
+            for a in args(m)
+        ]
+
+    def class_macro(
+        self, src: Parsed, module: Node, name: str, extended: bool
+    ) -> tuple[Parsed, Node] | None:
+        """A class macro a module adds: its methods when extended, its `class_methods do`
+        methods when included."""
+        if extended:
+            found = self.module_methods(src, module).get(name)
+            return (src, found) if found is not None else None
+        for n in walk(module):
+            if n.type == "call" and call_name(src, n) == "class_methods":
+                for m in walk(n):
+                    if m.type == "method" and src.text(m.child_by_field_name("name")) == name:
+                        return src, m
+        return None
+
     def module_methods(self, src: Parsed, module: Node) -> dict[str, Node]:
+        key = (src.file.rel, module.start_byte, module.end_byte)
+        if key in self.method_cache:
+            return self.method_cache[key]
+        found = self._module_methods(src, module)
+        self.method_cache[key] = found
+        return found
+
+    def _module_methods(self, src: Parsed, module: Node) -> dict[str, Node]:
         return {
             src.text(m.child_by_field_name("name")): m
             for m in statements(module.child_by_field_name("body"))
@@ -808,7 +883,7 @@ class _Action:
         found = (
             bool(_CREDENTIAL.search(self._words(src, node)))
             or _own_chain(chain_text(src, node)) is not None
-            or any(n.type == "instance_variable" and src.text(n) in ivars for n in walk(node))
+            or _own_chain(chain_text(src, node), ivars) is not None
             or (
                 depth < 3
                 and any(
@@ -973,7 +1048,10 @@ class _Action:
         if node.type == "element_reference":
             obj = node.child_by_field_name("object")
             keys = [c for c in node.named_children if c != obj]
-            if obj is not None and src.text(obj) in _PARAMS and len(keys) == 1:
+            permitted = obj is not None and re.fullmatch(
+                r"params(\.(require|permit|expect)\([^()]*\))+", src.text(obj)
+            )
+            if obj is not None and (src.text(obj) in _PARAMS or permitted) and len(keys) == 1:
                 key = symbol(src, keys[0])
                 return key if key in self.path_ids else None
         if node.type == "call" and call_name(src, node) in ("fetch", "require", "expect", "dig"):
@@ -1120,6 +1198,14 @@ class _Action:
         else:
             return None, False
         if not chain[start:] or not any(self.mentions(src, c) for c in chain[start:]):
+            if any(
+                _finder(call_name(src, c)) and any(self._untrusted(src, a) for a in args(c))
+                for c in chain[start:]
+            ):
+                # a record the request names some other way (`Note.find(note_params[:id])`):
+                # handed on, so nothing else in the action vouches for it
+                self.handoff(src, call)
+                return None, True
             return None, False
         cover: set[_Key] = set()
         plain = True
@@ -1163,16 +1249,24 @@ class _Action:
                         OWNER_CHECK_RX.match(k)
                         and self.caller_kind(src, v) == _owner_kind(k)
                         and plain
+                        and not self.polymorphic_id(model, k)
                     ):
                         scoped = True  # shape 1: `where(user: current_user)`
             elif name in _READS or name in _WRITES or name in ("first", "last", "take"):
                 continue
             else:
                 plain = False  # `or`, `not`, `merge`, `unscope`, a scope we can't read
+                if not self.code.narrows(model, name):
+                    scoped = False  # `current_user.notes.including_archived`: may widen
         if any(call_name(src, c) in _WIDENING for c in chain):
             # widened past the caller's records, and past the ids it was read by
             return self.record_lookup(src, call, model, False, None, terminal), True
         return self.record_lookup(src, call, model, scoped, cover or None, terminal), True
+
+    def polymorphic_id(self, model: str | None, field_: str) -> bool:
+        """`owner_id` of a polymorphic `owner`: an id alone matches another type's row too."""
+        found = self.code.models.get(model or "")
+        return found is not None and field_.endswith("_id") and field_[:-3] in found.polymorphic
 
     def record_lookup(
         self,
@@ -1242,8 +1336,8 @@ class _Action:
         ) -> bool:
             # an `after_action` runs even when the action refused: only a callback's check holds;
             # a key other than the primary one pins only the record read by it
-            if not one and any(f != "pk" for _, _, f in keys or ()):
-                return False
+            if any(f != "pk" for _, _, f in keys or ()):
+                return False  # `slug` is unique per user at most: it pins no one record
             if ensured:
                 return False
             return bool(keys) and all(
@@ -1314,6 +1408,8 @@ class _Action:
             if self.model in self.code.models and self.methods("current_ability") is None
             else None  # a model we can't name, or an ability the controller picks
         )
+        if verdict and not self.raise_refuses:
+            verdict = False  # `rescue_from CanCan::AccessDenied` answers with the record
         if verdict is None:
             self.deferred.add(k)
             self.handoff(step.src, step.node)
@@ -1335,7 +1431,7 @@ class _Action:
             if not name or name in self.inlined or name in self.locals or name in self.records:
                 continue
             found = self.methods(name)
-            if found is None or depth > 1:
+            if found is None or depth > _MAX_HELPERS:
                 continue
             if name.endswith("?") and not self.mentions(*found):
                 continue  # a predicate (`owner?`): read where it's tested
@@ -1598,9 +1694,12 @@ class _Action:
             and all(_halts(src, s) or _raises(src, s) or _inert(src, s) for s in stmts)
             and not any(
                 _render_leaks(src, n, self.literals, self.action)
+                if call_name(src, n) == "render"
+                else _redirect_leaks(src, n, self.literals)
                 for s in stmts
                 for n in walk(s)
-                if n.type == "call" and call_name(src, n) == "render"
+                if n.type == "call"
+                and call_name(src, n) in ("render", "redirect_to", "redirect_back")
             )
         ):
             return True
@@ -1705,6 +1804,8 @@ class _Action:
             sides = [unwrap(node.child_by_field_name(x)) for x in ("left", "right")]
             for a, b in (sides, sides[::-1]):
                 owner = self.owner_of(src, a, record, model)
+                if owner is not None and self.polymorphic_id(model, owner):
+                    owner = None  # `note.owner_id == current_user.id` on a polymorphic owner
                 if (
                     owner is not None
                     and self.caller_kind(src, b) == _owner_kind(owner)
@@ -1745,7 +1846,10 @@ class _Action:
         """Whether `authorize`/`authorize!` is the library's: the app doesn't define it, or
         only wraps it (`def authorize(*) = super`)."""
         found = self.methods(name)
-        return found is None or any(n.type in ("super", "zsuper") for n in walk(found[1]))
+        if found is None:
+            return True
+        body = method_body(found[1])
+        return len(body) == 1 and body[0].type in ("super", "zsuper") and not args(body[0])
 
     def pundit_user_forged(self) -> bool:
         found = self.methods("pundit_user")
@@ -1805,6 +1909,8 @@ class _Action:
             verdict = (
                 None if None in verdicts else all(verdicts)  # type: ignore[arg-type]
             )
+        if verdict and not self.raise_refuses:
+            verdict = False  # `rescue_from Pundit::NotAuthorizedError` answers with the record
         if verdict is None:
             self.deferred.add(record.lookup)
             self.handoff(src, call)
@@ -1899,7 +2005,7 @@ def _owner_kind(field_: str) -> str:
     return base.lower() if _TENANT.match(base) or base.lower() == "member" else "user"
 
 
-def _own_chain(text: str) -> str | None:
+def _own_chain(text: str, ivars: set[str] | None = None) -> str | None:
     """What `current_user`, `current_user.id` or `current_user&.account` stands for: the user
     or its own tenant ("account"); None for anything else, such as another user it names."""
     head, _, rest = text.removeprefix("self.").partition(".")
@@ -1907,6 +2013,8 @@ def _own_chain(text: str) -> str | None:
         head, _, rest = f"Current.{rest}".partition(".")
         head, rest = f"{head}.{rest.split('.', 1)[0]}", rest.partition(".")[2]
     group = _caller_group(head)
+    if group is None and head in (ivars or ()):
+        group = "current_user"  # an ivar the authenticating callback set
     if group is None:
         return None
     kind = "user" if group in ("current_user", "current_admin") else group[8:]
@@ -1990,6 +2098,13 @@ def _writes(src: Parsed, node: Node | None) -> bool:
     )
 
 
+def _finder(name: str) -> bool:
+    """An ActiveRecord read of a record by a value (`find`, `find_by_slug!`, `where`)."""
+    return name in ("find", "find!", "where", "find_sole_by", "exists?") or name.startswith(
+        ("find_by", "destroy_by", "delete_by")
+    )
+
+
 def _is_receiver(node: Node) -> bool:
     parent = node.parent
     return (
@@ -2044,45 +2159,87 @@ def _responds(
 def _render_leaks(src: Parsed, node: Node, safe: set[str], action: str = "") -> bool:
     """A `render` whose body names a value, which may be the record (`render json: note`), or
     that renders a view showing it (`render :show`)."""
+    items = [p for x in args(node) for p in (x.named_children if x.type == "hash" else [x])]
+    keys = {symbol(src, p.child_by_field_name("key")) for p in items if p.type == "pair"}
+    if not keys & _BODY_KEYS and not any(p.type != "pair" for p in items):
+        return True  # `render status: :forbidden`: the action's own view, which may show it
+    for p in items:
+        key = symbol(src, p.child_by_field_name("key")) if p.type == "pair" else None
+        if key in (*_VIEW_KEYS, "partial", "inline", "layout") or (
+            p.type != "pair" and (symbol(src, p) is not None)
+        ):
+            return True  # a view, a partial or a template may print the record
+        if p.type != "pair":
+            if p.type not in _LITERAL and not (p.type == "identifier" and src.text(p) in safe):
+                return True
+            continue
+        key = symbol(src, p.child_by_field_name("key"))
+        value = p.child_by_field_name("value")
+        if key == "status":
+            continue
+        if value is None:  # `render json:`, the local or method of that name
+            if key not in safe:
+                return True
+            continue
+        for n in walk(value):
+            method = (
+                n.parent is not None
+                and n.parent.type == "call"
+                and (n.parent.child_by_field_name("method") == n)
+            )
+            if n.type == "instance_variable" or (
+                n.type == "identifier" and not method and src.text(n) not in safe
+            ):
+                return True
+            if n.type == "call" and not (
+                call_name(src, n) in ("t", "translate")
+                and chain_text(src, n.child_by_field_name("receiver")) in ("", "I18n")
+                and all(_is_literal(a) for a in args(n))
+            ):
+                return True
+    return False
+
+
+def _redirect_leaks(src: Parsed, node: Node, safe: set[str]) -> bool:
+    """A redirect carrying a value in its flash (`alert: "#{@note.body}"`, `flash: {…}`)."""
     for x in args(node):
         for p in x.named_children if x.type == "hash" else [x]:
-            view = (
-                symbol(src, p.child_by_field_name("value")) if p.type == "pair" else symbol(src, p)
-            )
             key = symbol(src, p.child_by_field_name("key")) if p.type == "pair" else None
-            if key in ("partial", "inline", "layout") and not (key == "layout" and view is None):
-                return True  # a partial or an ERB template may print the record
-            named = p.type != "pair" or key in _VIEW_KEYS
-            if named and view is not None and not _ERROR_VIEW.search(view.rsplit("/", 1)[-1]):
-                return True  # `render :show`, `render "notes/locked"`: a view that may show it
-            if p.type != "pair":
-                if p.type not in _LITERAL and not (p.type == "identifier" and src.text(p) in safe):
-                    return True
+            if p.type != "pair" or key in ("status", "fallback_location"):
                 continue
-            key = symbol(src, p.child_by_field_name("key"))
             value = p.child_by_field_name("value")
-            if key == "status":
-                continue
-            if value is None:  # `render json:`, the local or method of that name
-                if key not in safe:
-                    return True
-                continue
-            for n in walk(value):
-                method = (
-                    n.parent is not None
-                    and n.parent.type == "call"
-                    and (n.parent.child_by_field_name("method") == n)
+            if value is None or not (
+                _is_literal(value)
+                or (value.type == "identifier" and src.text(value) in safe)
+                or (
+                    value.type == "call"
+                    and call_name(src, value) in ("t", "translate")
+                    and all(_is_literal(a) for a in args(value))
                 )
-                if n.type == "instance_variable" or (
-                    n.type == "identifier" and not method and src.text(n) not in safe
-                ):
-                    return True
-                if n.type == "call" and not (
-                    call_name(src, n) in ("t", "translate")
-                    and chain_text(src, n.child_by_field_name("receiver")) in ("", "I18n")
-                    and all(_is_literal(a) for a in args(n))
-                ):
-                    return True
+            ):
+                return True
+    return False
+
+
+def uses_record(
+    src: Parsed, node: Node, methods: Callable[[str], tuple[Parsed, Node] | None], depth: int = 0
+) -> bool:
+    """Whether code may send or act on a record: an instance variable, an exception's record
+    (`e.record`, `exception.subject`), or a helper doing so."""
+    for n in walk(node):
+        if n.type == "instance_variable":
+            return True
+        if n.type == "call" and call_name(src, n) in ("record", "subject", "resource", "object"):
+            return True
+        name = _helper_name(src, n)
+        if (
+            name
+            and depth < 3
+            and (found := methods(name)) is not None
+            and found[1] != node
+            and uses_record(found[0], found[1], methods, depth + 1)
+        ):
+            return True
     return False
 
 
@@ -2167,8 +2324,9 @@ def _narrows(code: RubyCode, src: Parsed, expr: Node | None, model: str, depth: 
 
 
 def _privileged_test(src: Parsed, node: Node | None, user: str) -> bool:
-    text = chain_text(src, node)
-    return text.startswith(f"{user}.") and bool(_PRIVILEGE.match(text.rsplit(".", 1)[-1]))
+    """`user.admin?`: the user's own flag, never `user.membership.admin?` (D21)."""
+    head, _, flag = chain_text(src, node).partition(".")
+    return head == user and "." not in flag and bool(_PRIVILEGE.match(flag))
 
 
 def _owner_atom(src: Parsed, node: Node | None, records: tuple[str, ...]) -> _Atom | None:

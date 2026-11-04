@@ -1548,7 +1548,7 @@
    {
     "method": "GET",
     "pattern": "/c/:id",
-    "ownership": "checked",
+    "ownership": "unchecked",
     "why": "twin: the 403 renders a template that shows no record"
    }
   ]
@@ -3364,12 +3364,6 @@
    },
    {
     "method": "DELETE",
-    "pattern": "/memos/:id",
-    "ownership": "unknown",
-    "why": "PRECISION/COVERAGE: `param: :slug` makes the route /memos/:slug; the engine emits /memos/:id, so the scoped find_by!(slug: params[:slug]) never mentions a path id"
-   },
-   {
-    "method": "DELETE",
     "pattern": "/pads/:id",
     "ownership": "caller-blind",
     "why": "PRECISION: the child's `def require_owner; super; end` isn't followed to the parent's check; with the check unread and the load unscoped the row is judged caller-blind"
@@ -3735,6 +3729,936 @@
     "pattern": "/notes/:id",
     "ownership": "scoped",
     "why": "SLOW: ruby_ownership._lexical prepends (`out[:0] = \u2026`) once per enclosing module for every module node: cubic in nesting depth; 200 levels 0.6 s, 400 levels ~5 s, 1500 levels > 60 s (pathological input)"
+   }
+  ]
+ },
+ {
+  "case": "class_body_if_block",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  resources :notes, only: :destroy\n  resources :memos, only: :destroy\n  resources :pads, only: :destroy\nend\n",
+   "app/controllers/owned_controller.rb": "\nclass OwnedController < ApplicationController\n  before_action :set_note, :require_owner\n\n  private\n\n  def set_note\n    @note = Note.find(params[:id])\n  end\n\n  def require_owner\n    head :forbidden unless @note.user == current_user\n  end\nend\n",
+   "app/controllers/notes_controller.rb": "class NotesController < OwnedController\n  if ENV[\"PUBLIC_NOTES\"]\n    skip_before_action :require_owner, only: :destroy\n  end\n\n  def destroy\n    @note.destroy\n    head :no_content\n  end\nend\n",
+   "app/controllers/memos_controller.rb": "class MemosController < OwnedController\n  if ENV[\"PUBLIC_NOTES\"]\n    def require_owner\n      true\n    end\n  end\n\n  def destroy\n    @note.destroy\n    head :no_content\n  end\nend\n",
+   "app/controllers/pads_controller.rb": "class PadsController < OwnedController\n\n  def destroy\n    @note.destroy\n    head :no_content\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/notes/:id",
+    "ownership": "unchecked",
+    "why": "`if ENV[...] ... end` (block form) around `skip_before_action :require_owner` removes the check on boots with the flag; _read_class drops every `if`/`unless` statement node (only the modifier forms are unwrapped), so the skip is never seen and the inherited check is credited"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/memos/:id",
+    "ownership": "caller-blind",
+    "why": "a `def require_owner; true; end` no-op override inside an `if` block is never indexed either; the parent's check is credited"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/pads/:id",
+    "ownership": "checked",
+    "why": "twin: the inherited check, nothing skipped"
+   }
+  ]
+ },
+ {
+  "case": "class_macro_definition_shapes",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  resources :notes, only: :destroy\n  resources :memos, only: :destroy\n  resources :tabs, only: :destroy\n  resources :pads, only: :destroy\nend\n",
+   "app/controllers/owned_controller.rb": "\nclass OwnedController < ApplicationController\n  before_action :set_note, :require_owner\n\n  class << self\n    def public_actions(*names)\n      skip_before_action :require_owner, only: names\n    end\n  end\n\n  private\n\n  def set_note\n    @note = Note.find(params[:id])\n  end\n\n  def require_owner\n    head :forbidden unless @note.user == current_user\n  end\nend\n",
+   "app/controllers/concerns/sharing.rb": "module Sharing\n  extend ActiveSupport::Concern\n  class_methods do\n    def shared(*names)\n      skip_before_action :require_owner, only: names\n    end\n  end\nend\n",
+   "app/controllers/concerns/sharing_macros.rb": "module SharingMacros\n  def open_actions(*names)\n    skip_before_action :require_owner, only: names\n  end\nend\n",
+   "app/controllers/notes_controller.rb": "class NotesController < OwnedController\n  public_actions :destroy\n\n  def destroy\n    @note.destroy\n    head :no_content\n  end\nend\n",
+   "app/controllers/memos_controller.rb": "class MemosController < OwnedController\n  include Sharing\n  shared :destroy\n\n  def destroy\n    @note.destroy\n    head :no_content\n  end\nend\n",
+   "app/controllers/tabs_controller.rb": "class TabsController < OwnedController\n  extend SharingMacros\n  open_actions :destroy\n\n  def destroy\n    @note.destroy\n    head :no_content\n  end\nend\n",
+   "app/controllers/pads_controller.rb": "class PadsController < OwnedController\n\n  def destroy\n    @note.destroy\n    head :no_content\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/notes/:id",
+    "ownership": "unchecked",
+    "why": "the parent defines the macro in `class << self` (not `def self.x`); `macro()` looks only in `singletons`, so `public_actions :destroy` (a skip of require_owner) reads as no callbacks and the check is credited"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/memos/:id",
+    "ownership": "unchecked",
+    "why": "the macro comes from a concern's `class_methods do ... end` (ActiveSupport::Concern's idiom for class macros); never read, the skip is missed"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/tabs/:id",
+    "ownership": "unchecked",
+    "why": "the macro comes from `extend SharingMacros`; extended modules aren't searched for macros"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/pads/:id",
+    "ownership": "checked",
+    "why": "twin: no macro call"
+   }
+  ]
+ },
+ {
+  "case": "concern_composition",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  resources :notes, only: :destroy\n  resources :memos, only: :destroy\n  resources :tabs, only: :destroy\n  resources :pads, only: :destroy\nend\n",
+   "app/controllers/owned_controller.rb": "\nclass OwnedController < ApplicationController\n  before_action :set_note, :require_owner\n\n  private\n\n  def set_note\n    @note = Note.find(params[:id])\n  end\n\n  def require_owner\n    head :forbidden unless @note.user == current_user\n  end\nend\n",
+   "app/controllers/concerns/lenient.rb": "module Lenient\n  def require_owner\n    true\n  end\nend\n",
+   "app/controllers/concerns/sharing.rb": "module Sharing\n  extend ActiveSupport::Concern\n  include Lenient\nend\n",
+   "app/controllers/concerns/publicish.rb": "module Publicish\n  extend ActiveSupport::Concern\n  included do\n    with_options only: :destroy do\n      skip_before_action :require_owner\n    end\n  end\nend\n",
+   "app/controllers/concerns/flag_public.rb": "module FlagPublic\n  extend ActiveSupport::Concern\n  included do\n    skip_before_action :require_owner, only: :destroy if ENV['PUBLIC_NOTES']\n  end\nend\n",
+   "app/controllers/notes_controller.rb": "class NotesController < OwnedController\n  include Sharing\n\n  def destroy\n    @note.destroy\n    head :no_content\n  end\nend\n",
+   "app/controllers/memos_controller.rb": "class MemosController < OwnedController\n  include Publicish\n\n  def destroy\n    @note.destroy\n    head :no_content\n  end\nend\n",
+   "app/controllers/tabs_controller.rb": "class TabsController < OwnedController\n  include FlagPublic\n\n  def destroy\n    @note.destroy\n    head :no_content\n  end\nend\n",
+   "app/controllers/pads_controller.rb": "class PadsController < OwnedController\n\n  def destroy\n    @note.destroy\n    head :no_content\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/notes/:id",
+    "ownership": "caller-blind",
+    "why": "Sharing includes Lenient, so NotesController's ancestors are [NotesController, Sharing, Lenient, OwnedController]: Lenient#require_owner (a no-op) wins. find() asks only Sharing's own methods, never the modules Sharing includes, and falls through to OwnedController's real check"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/memos/:id",
+    "ownership": "caller-blind",
+    "why": "the concern's `included do with_options only: :destroy do skip_before_action :require_owner end end`: included() passes each statement to _callbacks, which returns [] for `with_options`, so the skip is lost"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/tabs/:id",
+    "ownership": "unchecked",
+    "why": "the concern's `included do skip_before_action ... if ENV[...] end`: included() skips any statement that isn't a call or identifier, so the modifier-wrapped skip is lost (the class-body form is read)"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/pads/:id",
+    "ownership": "checked",
+    "why": "twin: the inherited check"
+   }
+  ]
+ },
+ {
+  "case": "rescue_from_handler_shapes",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  resources :notes, only: :show\n  resources :memos, only: :show\n  resources :pads, only: :show\n  resources :docs, only: :show\n  resources :tabs, only: :show\nend\n",
+   "app/errors/not_owner.rb": "class NotOwner < StandardError\n  attr_reader :record\n  def initialize(record = nil)\n    @record = record\n    super('not owner')\n  end\nend\n",
+   "app/controllers/concerns/friendly_errors.rb": "module FriendlyErrors\n  extend ActiveSupport::Concern\n  included do\n    rescue_from NotOwner, with: :read_only\n  end\n  def read_only\n    render json: @note\n  end\nend\n",
+   "app/controllers/notes_controller.rb": "class NotesController < ApplicationController\n  rescue_from NotOwner, with: ->(e) { render json: @note }\n  before_action :set_note, :require_owner\n  def show\n    render json: @note\n  end\n  private\n\n  def set_note\n    @note = Note.find(params[:id])\n  end\n\n  def require_owner\n    raise NotOwner unless @note.user == current_user\n  end\nend\n",
+   "app/controllers/memos_controller.rb": "class MemosController < ApplicationController\n  include FriendlyErrors\n  before_action :set_note, :require_owner\n  def show\n    render json: @note\n  end\n  private\n\n  def set_note\n    @note = Note.find(params[:id])\n  end\n\n  def require_owner\n    raise NotOwner unless @note.user == current_user\n  end\nend\n",
+   "app/controllers/pads_controller.rb": "class PadsController < ApplicationController\n  rescue_from NotOwner, with: :read_only\n  before_action :set_note, :require_owner\n  def show\n    render json: @note\n  end\n  private\n  def read_only\n    render_preview\n  end\n  def render_preview\n    render json: @note.slice(:body)\n  end\n\n  def set_note\n    @note = Note.find(params[:id])\n  end\n\n  def require_owner\n    raise NotOwner unless @note.user == current_user\n  end\nend\n",
+   "app/controllers/docs_controller.rb": "class DocsController < ApplicationController\n  rescue_from NotOwner do |e|\n    render json: { error: 'not yours', body: e.record.body }, status: :forbidden\n  end\n  before_action :set_note\n  def show\n    raise NotOwner.new(@note) unless @note.user == current_user\n    render json: @note\n  end\n  private\n\n  def set_note\n    @note = Note.find(params[:id])\n  end\nend\n",
+   "app/controllers/tabs_controller.rb": "class TabsController < ApplicationController\n  rescue_from NotOwner, with: :deny\n  before_action :set_note, :require_owner\n  def show\n    render json: @note\n  end\n  private\n  def deny\n    head :forbidden\n  end\n\n  def set_note\n    @note = Note.find(params[:id])\n  end\n\n  def require_owner\n    raise NotOwner unless @note.user == current_user\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/notes/:id",
+    "ownership": "unchecked",
+    "why": "`rescue_from NotOwner, with: ->(e) { render json: @note }`: a Proc handler (instance_exec'd by Rails) answers the refusal with the record. _read_class keeps a handler only when `with:` is a symbol/string or a block is given, so the lambda is dropped, handled() is false and the raise counts as a refusal"
+   },
+   {
+    "method": "GET",
+    "pattern": "/memos/:id",
+    "ownership": "unchecked",
+    "why": "the record-rendering rescue_from is declared in a concern's `included do` block; included() returns only callbacks, so the controller has no rescues and the raise refuses"
+   },
+   {
+    "method": "GET",
+    "pattern": "/pads/:id",
+    "ownership": "unchecked",
+    "why": "the handler renders the record through a helper it calls; handled() only looks for an instance variable in the handler's own body"
+   },
+   {
+    "method": "GET",
+    "pattern": "/docs/:id",
+    "ownership": "unchecked",
+    "why": "the exception carries the record (`raise NotOwner.new(@note)`) and the block handler renders `e.record.body`; no instance variable appears in the handler, so it's taken as record-free"
+   },
+   {
+    "method": "GET",
+    "pattern": "/tabs/:id",
+    "ownership": "checked",
+    "why": "twin: the handler answers head :forbidden"
+   }
+  ]
+ },
+ {
+  "case": "library_denial_rescued_with_record",
+  "files": {
+   "db/schema.rb": "ActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.text \"body\"\n  end\n  create_table \"pads\" do |t|\n    t.references \"user\"\n    t.text \"body\"\n  end\n  create_table \"tabs\" do |t|\n    t.references \"user\"\n    t.text \"body\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  resources :notes, only: :show\n  resources :memos, only: :show\n  resources :pads, only: :show\n  resources :tabs, only: :show\nend\n",
+   "app/models/pad.rb": "class Pad < ApplicationRecord\n  belongs_to :user\nend\n",
+   "app/models/tab.rb": "class Tab < ApplicationRecord\n  belongs_to :user\nend\n",
+   "app/policies/note_policy.rb": "class NotePolicy < ApplicationPolicy\n  def show?\n    record.user == user\n  end\nend\n",
+   "app/models/ability.rb": "class Ability\n  include CanCan::Ability\n  def initialize(user)\n    can :read, Pad, user_id: user.id\n    can :read, Tab, user_id: user.id\n  end\nend\n",
+   "app/controllers/notes_controller.rb": "class NotesController < ApplicationController\n  rescue_from Pundit::NotAuthorizedError, with: :denied\n  def show\n    @note = Note.find(params[:id])\n    authorize @note\n    render json: @note\n  end\n  private\n  def denied\n    render json: @note.slice(:id, :body), status: :forbidden\n  end\nend\n",
+   "app/controllers/memos_controller.rb": "class MemosController < ApplicationController\n  rescue_from Pundit::NotAuthorizedError do |e|\n    render json: { error: 'not allowed', record: e.record }, status: :forbidden\n  end\n  def show\n    note = Note.find(params[:id])\n    authorize note\n    render json: note\n  end\nend\n",
+   "app/controllers/pads_controller.rb": "class PadsController < ApplicationController\n  load_and_authorize_resource\n  rescue_from CanCan::AccessDenied do |exception|\n    render json: { error: exception.message, pad: exception.subject }, status: :forbidden\n  end\n  def show\n    render json: @pad\n  end\nend\n",
+   "app/controllers/tabs_controller.rb": "class TabsController < ApplicationController\n  load_and_authorize_resource\n  rescue_from CanCan::AccessDenied do |exception|\n    render json: { error: exception.message }, status: :forbidden\n  end\n  def show\n    render json: @tab\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/notes/:id",
+    "ownership": "caller-blind",
+    "why": "Pundit's `authorize` refuses by raising NotAuthorizedError, and this controller's rescue_from answers it with the foreign note's body. authorize() credits the policy's owner compare without consulting handled() (the D16 rescue rule is applied only to the app's own `raise`)"
+   },
+   {
+    "method": "GET",
+    "pattern": "/memos/:id",
+    "ownership": "caller-blind",
+    "why": "same with the standard block handler rendering `e.record` (Pundit::NotAuthorizedError#record is the denied note)"
+   },
+   {
+    "method": "GET",
+    "pattern": "/pads/:id",
+    "ownership": "caller-blind",
+    "why": "CanCanCan's load_and_authorize_resource raises AccessDenied; the handler renders `exception.subject`, the denied pad. cancan_load credits the Ability without consulting rescue_from"
+   },
+   {
+    "method": "GET",
+    "pattern": "/tabs/:id",
+    "ownership": "checked",
+    "why": "twin: the AccessDenied handler sends only the message"
+   }
+  ]
+ },
+ {
+  "case": "refusal_renders_action_template",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  resources :notes, only: :show\n  resources :memos, only: :show\n  resources :pads, only: :show\n  resources :docs, only: :show\nend\n",
+   "app/views/notes/show.json.jbuilder": "json.extract! @note, :id, :body\n",
+   "app/views/memos/show.json.jbuilder": "json.extract! @note, :id, :body\n",
+   "app/views/pads/forbidden.json.jbuilder": "json.error 'forbidden'\njson.note @note, :id, :body\n",
+   "app/controllers/notes_controller.rb": "class NotesController < ApplicationController\n  before_action :set_note\n  def show\n    render status: :forbidden and return unless @note.user == current_user\n  end\n  private\n\n  def set_note\n    @note = Note.find(params[:id])\n  end\nend\n",
+   "app/controllers/memos_controller.rb": "class MemosController < ApplicationController\n  before_action :set_note, :require_owner\n  def show\n  end\n  private\n\n  def set_note\n    @note = Note.find(params[:id])\n  end\n  def require_owner\n    render status: :forbidden unless @note.user == current_user\n  end\nend\n",
+   "app/controllers/pads_controller.rb": "class PadsController < ApplicationController\n  before_action :set_note\n  def show\n    render :forbidden, status: :forbidden and return unless @note.user == current_user\n  end\n  private\n\n  def set_note\n    @note = Note.find(params[:id])\n  end\nend\n",
+   "app/controllers/docs_controller.rb": "class DocsController < ApplicationController\n  before_action :set_note\n  def show\n    head :forbidden and return unless @note.user == current_user\n  end\n  private\n\n  def set_note\n    @note = Note.find(params[:id])\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/notes/:id",
+    "ownership": "unchecked",
+    "why": "`render status: :forbidden` names no template, so Rails renders the action's own (notes/show.json.jbuilder, which prints @note) with a 403: the foreign note is sent. _render_leaks skips the status pair and sees nothing else, so _responds accepts it as a D16 refusal"
+   },
+   {
+    "method": "GET",
+    "pattern": "/memos/:id",
+    "ownership": "unchecked",
+    "why": "the same status-only render in a before_action renders memos/show with the loaded foreign @note; read as a clean D19 halt"
+   },
+   {
+    "method": "GET",
+    "pattern": "/pads/:id",
+    "ownership": "unchecked",
+    "why": "`render :forbidden` is trusted by its error-like name, but pads/forbidden.json.jbuilder prints the note (unknown also acceptable, since views aren't read)"
+   },
+   {
+    "method": "GET",
+    "pattern": "/docs/:id",
+    "ownership": "checked",
+    "why": "twin: head :forbidden sends no body"
+   }
+  ]
+ },
+ {
+  "case": "redirect_flash_option_leak",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  get 'a/:id', to: 'rf#show'\n  get 'b/:id', to: 'rf2#show'\n  get 'c/:id', to: 'rf3#show'\nend\n",
+   "app/controllers/rf_controller.rb": "class RfController < ApplicationController\n  before_action :set_note, :require_owner\n  def show\n    render json: @note\n  end\n  private\n\n  def set_note\n    @note = Note.find(params[:id])\n  end\n  def require_owner\n    redirect_to root_path, alert: \"#{@note.body} (owner #{@note.user.email})\" unless @note.user == current_user\n  end\nend\n",
+   "app/controllers/rf2_controller.rb": "class Rf2Controller < ApplicationController\n  before_action :set_note, :require_owner\n  def show\n    render json: @note\n  end\n  private\n\n  def set_note\n    @note = Note.find(params[:id])\n  end\n  def require_owner\n    redirect_to root_path, flash: { preview: @note.body } unless @note.user == current_user\n  end\nend\n",
+   "app/controllers/rf3_controller.rb": "class Rf3Controller < ApplicationController\n  before_action :set_note, :require_owner\n  def show\n    render json: @note\n  end\n  private\n\n  def set_note\n    @note = Note.find(params[:id])\n  end\n  def require_owner\n    redirect_to root_path, alert: 'Not yours' unless @note.user == current_user\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "unchecked",
+    "why": "the callback's refusal redirects with `alert:` interpolating the foreign note's body and owner email, shown on the next page; only `render` is checked for leaks (the earlier fix covers `flash[...] =` assignments, not redirect_to's alert:/notice:/flash: options)"
+   },
+   {
+    "method": "GET",
+    "pattern": "/b/:id",
+    "ownership": "unchecked",
+    "why": "same with `flash: { preview: @note.body }`"
+   },
+   {
+    "method": "GET",
+    "pattern": "/c/:id",
+    "ownership": "checked",
+    "why": "twin: a literal alert"
+   }
+  ]
+ },
+ {
+  "case": "plain_cookie_read_through_jar_api",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  get 'a/:id', to: 'perm#show'\n  get 'b/:id', to: 'hash#show'\n  get 'c/:id', to: 'jar#show'\n  get 'd/:id', to: 'signed#show'\nend\n",
+   "app/controllers/perm_controller.rb": "class PermController < ActionController::Base\n  before_action :authenticate\n  def show\n    render json: @viewer.notes.find(params[:id])\n  end\n  private\n  def authenticate\n    @viewer = User.find_by(id: cookies.permanent[:uid])\n    head :unauthorized unless @viewer\n  end\nend\n",
+   "app/controllers/hash_controller.rb": "class HashController < ActionController::Base\n  before_action :authenticate\n  def show\n    render json: @viewer.notes.find(params[:id])\n  end\n  private\n  def authenticate\n    @viewer = User.find_by(id: cookies.to_hash['uid'])\n    head :unauthorized unless @viewer\n  end\nend\n",
+   "app/controllers/jar_controller.rb": "class JarController < ActionController::Base\n  before_action :authenticate\n  def show\n    render json: @viewer.notes.find(params[:id])\n  end\n  private\n  def authenticate\n    @viewer = User.find_by(id: request.cookie_jar[:uid] || session[:uid])\n    head :unauthorized unless @viewer\n  end\nend\n",
+   "app/controllers/signed_controller.rb": "class SignedController < ActionController::Base\n  before_action :authenticate\n  def show\n    render json: @viewer.notes.find(params[:id])\n  end\n  private\n  def authenticate\n    @viewer = User.find_by(id: cookies.permanent.signed[:uid])\n    head :unauthorized unless @viewer\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "caller-blind",
+    "why": "`cookies.permanent[:uid]` reads the plain, client-set cookie (PermanentCookieJar#[] returns the parent jar's raw value; only `.signed`/`.encrypted` verify). D20: never a caller. _UNTRUSTED matches only `cookies[`, `.fetch`, `.dig`, `.to_h`, while _CREDENTIAL accepts the word `cookies`"
+   },
+   {
+    "method": "GET",
+    "pattern": "/b/:id",
+    "ownership": "caller-blind",
+    "why": "`cookies.to_hash['uid']`: the raw cookie hash; `\\.to_h\\b` doesn't match `to_hash`"
+   },
+   {
+    "method": "GET",
+    "pattern": "/c/:id",
+    "ownership": "caller-blind",
+    "why": "`request.cookie_jar[:uid] || session[:uid]`: the plain jar under its request name lets the client pick the user; the `|| session` alternative makes it a credential"
+   },
+   {
+    "method": "GET",
+    "pattern": "/d/:id",
+    "ownership": "scoped",
+    "why": "twin: `cookies.permanent.signed[:uid]` is verified"
+   }
+  ]
+ },
+ {
+  "case": "body_param_selects_record",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  patch 'a/:id', to: 'sp#update'\n  patch 'b/:id', to: 'sp#merge'\n  delete 'c/:id', to: 'sp#permit_id'\n  patch 'd/:id', to: 'sp#twin'\nend\n",
+   "app/controllers/sp_controller.rb": "\nclass SpController < ApplicationController\n  def update\n    @note = current_user.notes.find(params[:id])\n    Note.find(note_params[:id]).update!(body: note_params[:body])\n    head :no_content\n  end\n\n  def merge\n    @note = current_user.notes.find(params[:id])\n    other = Note.find(params.require(:note).permit(:source_id)[:source_id])\n    @note.update!(body: other.body)\n    render json: @note\n  end\n\n  def permit_id\n    @note = current_user.notes.find_by(id: params[:id])\n    Note.find(params.permit(:id)[:id]).destroy\n    head :no_content\n  end\n\n  def twin\n    @note = current_user.notes.find(params[:id])\n    @note.update!(body: note_params[:body])\n    head :no_content\n  end\n\n  private\n\n  def note_params\n    params.require(:note).permit(:id, :body)\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "PATCH",
+    "pattern": "/a/:id",
+    "ownership": "unknown",
+    "why": "the path id is scoped, but the write goes to `Note.find(note_params[:id])`, a note the request body names (strong params `params.require(:note).permit(:id, ...)`). A lookup that mentions no path id is not a lookup at all, so only the scoped one is reported"
+   },
+   {
+    "method": "PATCH",
+    "pattern": "/b/:id",
+    "ownership": "unknown",
+    "why": "`Note.find(params.require(:note).permit(:source_id)[:source_id])` reads any note and copies its body into the caller's; invisible for the same reason"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/c/:id",
+    "ownership": "unchecked",
+    "why": "`params.permit(:id)[:id]` is the path id under a strong-parameter accessor path_id() doesn't read; the unscoped find_by (nil not refused) makes the id 'seen', so the unscoped destroy is invisible (cf. the dig/path_parameters case of round 3)"
+   },
+   {
+    "method": "PATCH",
+    "pattern": "/d/:id",
+    "ownership": "scoped",
+    "why": "twin: writes the scoped record"
+   }
+  ]
+ },
+ {
+  "case": "isolated_engine_route_reads_host_controller",
+  "files": {
+   "db/schema.rb": "ActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n  end\n  create_table \"invoices\" do |t|\n    t.references \"user\"\n    t.integer \"amount\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :invoices\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  resources :invoices, only: :destroy\n  mount Billing::Engine, at: '/billing'\nend\n",
+   "app/models/invoice.rb": "class Invoice < ApplicationRecord\n  belongs_to :user\nend\n",
+   "app/controllers/invoices_controller.rb": "class InvoicesController < ApplicationController\n  def destroy\n    current_user.invoices.find(params[:id]).destroy\n    head :no_content\n  end\nend\n",
+   "engines/billing/lib/billing/engine.rb": "module Billing\n  class Engine < ::Rails::Engine\n    isolate_namespace Billing\n  end\nend\n",
+   "engines/billing/config/routes.rb": "Billing::Engine.routes.draw do\n  resources :invoices, only: :destroy, path: \"bills\"\nend\n",
+   "engines/billing/app/controllers/billing/application_controller.rb": "module Billing\n  class ApplicationController < ::ApplicationController\n  end\nend\n",
+   "engines/billing/app/controllers/billing/invoices_controller.rb": "module Billing\n  class InvoicesController < ApplicationController\n    def destroy\n      Invoice.find(params[:id]).destroy\n      head :no_content\n    end\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/bills/:id",
+    "ownership": "caller-blind",
+    "why": "`isolate_namespace Billing` makes the engine's `resources :invoices` route to Billing::InvoicesController (unscoped destroy). The engine's routes are read without the namespace, so `route:invoices` misses in the engine root and _lookup falls back to the one other app defining it: the host's scoped InvoicesController. (Also: the row lacks the `/billing` mount prefix)"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/invoices/:id",
+    "ownership": "caller-blind",
+    "why": "twin: the host's own route"
+   }
+  ]
+ },
+ {
+  "case": "relation_widened_by_model_scope",
+  "files": {
+   "db/schema.rb": "ActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.boolean \"archived\"\n  end\n  create_table \"memos\" do |t|\n    t.references \"user\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  has_many :memos do\n    def everyone\n      unscope(where: :user_id)\n    end\n  end\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  default_scope { where(archived: false) }\n  scope :including_archived, -> { unscope(:where) }\n  scope :recent, -> { order(created_at: :desc) }\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  delete 'a/:id', to: 'ms#destroy'\n  delete 'b/:id', to: 'ms#ext'\n  delete 'c/:id', to: 'ms#twin'\nend\n",
+   "app/models/memo.rb": "class Memo < ApplicationRecord\n  belongs_to :user\nend\n",
+   "app/controllers/ms_controller.rb": "class MsController < ApplicationController\n  def destroy\n    current_user.notes.including_archived.find(params[:id]).destroy\n    head :no_content\n  end\n\n  def ext\n    current_user.memos.everyone.find(params[:id]).destroy\n    head :no_content\n  end\n\n  def twin\n    current_user.notes.recent.find(params[:id]).destroy\n    head :no_content\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/a/:id",
+    "ownership": "unchecked",
+    "why": "the model scope `including_archived` is `unscope(:where)`, meant to lift the default scope, but on `current_user.notes` it also drops `user_id = ?`: any note is destroyed. query() keeps `scoped` from the caller association whatever unread scope follows (an unknown chain link only clears `plain`, which governs where-keys)"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/b/:id",
+    "ownership": "unknown",
+    "why": "an association extension (`has_many :memos do def everyone; unscope(where: :user_id); end end`) widens the same way; only lambda arguments of has_many are searched for widening calls"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/c/:id",
+    "ownership": "scoped",
+    "why": "twin: a scope that only orders"
+   }
+  ]
+ },
+ {
+  "case": "polymorphic_owner_by_id_only",
+  "files": {
+   "db/schema.rb": "ActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n  end\n  create_table \"orgs\" do |t|\n    t.string \"name\"\n  end\n  create_table \"repos\" do |t|\n    t.references \"owner\", polymorphic: true\n    t.string \"name\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :repos, as: :owner\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  delete 'a/:id', to: 'repos#destroy'\n  delete 'b/:id', to: 'repos#check'\n  delete 'c/:id', to: 'repos#twin'\nend\n",
+   "app/models/repo.rb": "class Repo < ApplicationRecord\n  belongs_to :owner, polymorphic: true\nend\n",
+   "app/models/org.rb": "class Org < ApplicationRecord\n  has_many :repos, as: :owner\nend\n",
+   "app/controllers/repos_controller.rb": "class ReposController < ApplicationController\n  def destroy\n    Repo.find_by!(id: params[:id], owner_id: current_user.id).destroy\n    head :no_content\n  end\n\n  def check\n    repo = Repo.find(params[:id])\n    head :forbidden and return unless repo.owner_id == current_user.id\n    repo.destroy\n    head :no_content\n  end\n\n  def twin\n    Repo.find_by!(id: params[:id], owner: current_user).destroy\n    head :no_content\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/a/:id",
+    "ownership": "unchecked",
+    "why": "`owner` is polymorphic (User or Org): `owner_id: current_user.id` without `owner_type` also matches the repos of the Org whose id equals the caller's user id. _owner_kind reads every `owner_id` as a user column (D18's column-kind rule)"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/b/:id",
+    "ownership": "unchecked",
+    "why": "the same id-only compare in a refusal (`repo.owner_id == current_user.id`)"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/c/:id",
+    "ownership": "scoped",
+    "why": "twin: `owner: current_user` makes Rails add owner_type = 'User'"
+   }
+  ]
+ },
+ {
+  "case": "authorize_wrapper_changes_query",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  delete 'a/:id', to: 'wrap#destroy'\n  delete 'b/:id', to: 'wrap2#destroy'\n  delete 'c/:id', to: 'wrap3#destroy'\nend\n",
+   "app/policies/note_policy.rb": "class NotePolicy < ApplicationPolicy\n  def show?\n    true\n  end\n  def destroy?\n    record.user == user\n  end\nend\n",
+   "app/controllers/wrap_controller.rb": "class WrapController < ApplicationController\n  def destroy\n    @note = Note.find(params[:id])\n    authorize @note\n    @note.destroy\n    head :no_content\n  end\n  private\n  def authorize(record, query = nil, **opts)\n    super(record, :show?, **opts)\n  end\nend\n",
+   "app/controllers/wrap2_controller.rb": "class Wrap2Controller < ApplicationController\n  def destroy\n    @note = Note.find(params[:id])\n    authorize @note\n    @note.destroy\n    head :no_content\n  end\n  private\n  def authorize(record, query = nil)\n    super if Rails.env.production?\n  end\nend\n",
+   "app/controllers/wrap3_controller.rb": "class Wrap3Controller < ApplicationController\n  def destroy\n    @note = Note.find(params[:id])\n    authorize @note\n    @note.destroy\n    head :no_content\n  end\n  private\n  def authorize(record, query = nil)\n    logger.info('authorize')\n    super\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/a/:id",
+    "ownership": "caller-blind",
+    "why": "the app's `authorize` wrapper calls `super(record, :show?)`: Pundit asks show? (true for everyone), not destroy?. library() accepts any wrapper containing a `super`, and authorize() then reads destroy? from the call site's arguments"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/b/:id",
+    "ownership": "caller-blind",
+    "why": "`super if Rails.env.production?`: outside production the wrapper authorizes nothing; a conditional super still counts as the library's"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/c/:id",
+    "ownership": "caller-blind",
+    "why": "twin: a bare `super` that forwards the arguments"
+   }
+  ]
+ },
+ {
+  "case": "ensure_and_pre_check_writes_in_deep_helpers",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  get 'a/:id', to: 'deep_ens#show'\n  get 'b/:id', to: 'deep_pre#show'\n  get 'c/:id', to: 'deep_after#show'\n  get 'd/:id', to: 'deep_after#twin'\nend\n",
+   "app/controllers/deep_ens_controller.rb": "class DeepEnsController < ApplicationController\n  def show\n    @note = Note.find(params[:id])\n    raise ActiveRecord::RecordNotFound unless @note.user == current_user\n    render json: @note\n  ensure\n    audit\n  end\n\n  private\n\n  def audit\n    record_metrics\n  end\n\n  def record_metrics\n    bump_views\n  end\n\n  def bump_views\n    @note.touch(:viewed_at) if @note\n  end\nend\n",
+   "app/controllers/deep_pre_controller.rb": "class DeepPreController < ApplicationController\n  def show\n    @note = Note.find(params[:id])\n    prepare\n    head :forbidden and return unless @note.user == current_user\n    render json: @note\n  end\n\n  private\n\n  def prepare\n    load_stats\n  end\n\n  def load_stats\n    mark_seen\n  end\n\n  def mark_seen\n    @note.update!(seen: true)\n  end\nend\n",
+   "app/controllers/deep_after_controller.rb": "class DeepAfterController < ApplicationController\n  after_action :track, only: :show\n\n  def show\n    @note = Note.find(params[:id])\n    head :forbidden and return unless @note.user == current_user\n    render json: @note\n  end\n\n  def twin\n    @note = Note.find(params[:id])\n    head :forbidden and return unless @note.user == current_user\n    render json: @note\n  end\n\n  private\n\n  def track\n    record_metrics\n  end\n\n  def record_metrics\n    bump_views\n  end\n\n  def bump_views\n    @note.increment!(:views)\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "unchecked",
+    "why": "the method-level `ensure` runs after the refusing raise and writes the foreign note three helpers down (audit -> record_metrics -> bump_views); inline() follows only two levels (`depth > 1`), so the Kind.ENSURE use of @note is never seen and the check is credited"
+   },
+   {
+    "method": "GET",
+    "pattern": "/b/:id",
+    "ownership": "unchecked",
+    "why": "the action writes the note before its owner check, three helpers down; the write is unseen, record.used stays false and the later refusal credits the record"
+   },
+   {
+    "method": "GET",
+    "pattern": "/c/:id",
+    "ownership": "unchecked",
+    "why": "reference (already correct): the same three-deep write in an after_action is judged"
+   },
+   {
+    "method": "GET",
+    "pattern": "/d/:id",
+    "ownership": "checked",
+    "why": "twin: no after_action for this action"
+   }
+  ]
+ },
+ {
+  "case": "ownerless_owned_from_elsewhere",
+  "files": {
+   "db/schema.rb": "ActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.references \"account\"\n  end\n  create_table \"accounts\" do |t|\n    t.string \"name\"\n    t.references \"billing_profile\"\n  end\n  create_table \"billing_profiles\" do |t|\n    t.string \"iban\"\n    t.string \"legal_name\"\n  end\n  create_table \"documents\" do |t|\n    t.string \"title\"\n    t.text \"body\"\n  end\n  create_table \"documents_users\" do |t|\n    t.references \"document\"\n    t.references \"user\"\n  end\n  create_table \"holidays\" do |t|\n    t.string \"name\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  belongs_to :account\n  has_and_belongs_to_many :documents\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  resources :billing_profiles, only: :show\n  resources :documents, only: :show\n  resources :holidays, only: :show\nend\n",
+   "app/models/account.rb": "class Account < ApplicationRecord\n  has_many :users\n  belongs_to :billing_profile\nend\n",
+   "app/models/billing_profile.rb": "class BillingProfile < ApplicationRecord\nend\n",
+   "app/models/document.rb": "class Document < ApplicationRecord\nend\n",
+   "app/models/holiday.rb": "class Holiday < ApplicationRecord\nend\n",
+   "app/controllers/billing_profiles_controller.rb": "class BillingProfilesController < ApplicationController\n  def show\n    render json: BillingProfile.find(params[:id])\n  end\nend\n",
+   "app/controllers/documents_controller.rb": "class DocumentsController < ApplicationController\n  def show\n    render json: Document.find(params[:id])\n  end\nend\n",
+   "app/controllers/holidays_controller.rb": "class HolidaysController < ApplicationController\n  def show\n    render json: Holiday.find(params[:id])\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/billing_profiles/:id",
+    "ownership": "caller-blind",
+    "why": "each account holds its billing profile (accounts.billing_profile_id, `Account belongs_to :billing_profile`); any caller reads another tenant's IBAN. _fields' users_hold looks only at the User model's belongs_to, so the profile reads as ownerless `none`"
+   },
+   {
+    "method": "GET",
+    "pattern": "/documents/:id",
+    "ownership": "caller-blind",
+    "why": "documents are owned per user through documents_users, declared only on the User side (`has_and_belongs_to_many :documents`); Document declares nothing, so neither members nor children mark it, and it reads as ownerless"
+   },
+   {
+    "method": "GET",
+    "pattern": "/holidays/:id",
+    "ownership": "none",
+    "why": "twin: a truly ownerless record"
+   }
+  ]
+ },
+ {
+  "case": "non_unique_key_single_read",
+  "files": {
+   "db/schema.rb": "ActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.string \"slug\"\n    t.text \"body\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  validates :slug, uniqueness: { scope: :user_id }\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  get 'a/:id', to: 'slug#show'\n  get 'b/:id', to: 'slug#twin'\nend\n",
+   "app/controllers/slug_controller.rb": "class SlugController < ApplicationController\n  def show\n    current_user.notes.find_by!(slug: params[:id])\n    render json: Note.find_by!(slug: params[:id])\n  end\n\n  def twin\n    current_user.notes.find(params[:id])\n    render json: Note.find(params[:id])\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "unchecked",
+    "why": "slugs are unique per user only; the scoped find_by! proves the caller has *a* note with this slug, then `Note.find_by!(slug:)` returns whichever note has it first, often another user's. held() still accepts a one-record read by a non-primary key (`one=True`); round 4 closed only the bulk case"
+   },
+   {
+    "method": "GET",
+    "pattern": "/b/:id",
+    "ownership": "checked",
+    "why": "twin: the same by primary key"
+   }
+  ]
+ },
+ {
+  "case": "caller_ivar_rebound_to_other_user",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  get 'a/:id', to: 'deleg#show'\n  get 'b/:id', to: 'deleg_twin#show'\nend\n",
+   "app/controllers/deleg_controller.rb": "class DelegController < ActionController::Base\n  before_action :authenticate\n  def show\n    render json: @viewer.notes.find(params[:id])\n  end\n  private\n  def authenticate\n    @viewer = User.find_by(id: session[:uid])\n    head :unauthorized and return unless @viewer\n    @viewer = @viewer.manager if @viewer.assistant?\n  end\nend\n",
+   "app/controllers/deleg_twin_controller.rb": "class DelegTwinController < ActionController::Base\n  before_action :authenticate\n  def show\n    render json: @viewer.notes.find(params[:id])\n  end\n  private\n  def authenticate\n    @viewer = User.find_by(id: session[:uid])\n    head :unauthorized and return unless @viewer\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "caller-blind",
+    "why": "`@viewer = @viewer.manager` rebinds the caller ivar to another user (D20: the caller's own fields, never another user it names; cf. round 2's `current_user.manager`). _credential accepts any expression mentioning a caller ivar, and _caller_ivars seeds the ivar's own name, so the manager counts as the caller"
+   },
+   {
+    "method": "GET",
+    "pattern": "/b/:id",
+    "ownership": "scoped",
+    "why": "twin: no rebinding"
+   }
+  ]
+ },
+ {
+  "case": "tenant_flag_as_admin_in_policies",
+  "files": {
+   "db/schema.rb": "ActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n  end\n  create_table \"memberships\" do |t|\n    t.references \"user\"\n    t.references \"account\"\n    t.boolean \"admin\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.text \"body\"\n  end\n  create_table \"memos\" do |t|\n    t.references \"user\"\n  end\n  create_table \"pads\" do |t|\n    t.references \"user\"\n  end\n  create_table \"tabs\" do |t|\n    t.references \"user\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  has_one :membership\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  resources :notes, only: :destroy\n  resources :memos, only: :destroy\n  resources :pads, only: :destroy\n  resources :tabs, only: :destroy\nend\n",
+   "app/models/memo.rb": "class Memo < ApplicationRecord\n  belongs_to :user\nend\n",
+   "app/models/pad.rb": "class Pad < ApplicationRecord\n  belongs_to :user\nend\n",
+   "app/models/tab.rb": "class Tab < ApplicationRecord\n  belongs_to :user\nend\n",
+   "app/policies/note_policy.rb": "class NotePolicy < ApplicationPolicy\n  def destroy?\n    user.membership.admin? || record.user == user\n  end\nend\n",
+   "app/policies/tab_policy.rb": "class TabPolicy < ApplicationPolicy\n  def destroy?\n    user.admin? || record.user == user\n  end\nend\n",
+   "app/policies/pad_policy.rb": "class PadPolicy < ApplicationPolicy\n  class Scope\n    attr_reader :user, :scope\n    def initialize(user, scope)\n      @user, @scope = user, scope\n    end\n    def resolve\n      user.membership.admin? ? scope.all : scope.where(user: user)\n    end\n  end\nend\n",
+   "app/models/ability.rb": "class Ability\n  include CanCan::Ability\n  def initialize(user)\n    if user.membership.admin?\n      can :manage, :all\n    end\n    can :destroy, Memo, user_id: user.id\n  end\nend\n",
+   "app/controllers/notes_controller.rb": "class NotesController < ApplicationController\n  def destroy\n    note = Note.find(params[:id])\n    authorize note\n    note.destroy\n    head :no_content\n  end\nend\n",
+   "app/controllers/tabs_controller.rb": "class TabsController < ApplicationController\n  def destroy\n    tab = Tab.find(params[:id])\n    authorize tab\n    tab.destroy\n    head :no_content\n  end\nend\n",
+   "app/controllers/memos_controller.rb": "class MemosController < ApplicationController\n  load_and_authorize_resource\n  def destroy\n    @memo.destroy\n    head :no_content\n  end\nend\n",
+   "app/controllers/pads_controller.rb": "class PadsController < ApplicationController\n  def destroy\n    policy_scope(Pad).find(params[:id]).destroy\n    head :no_content\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/notes/:id",
+    "ownership": "caller-blind",
+    "why": "`user.membership.admin?` is the admin flag of the caller's membership in one account (D21: a tenant admin isn't an admin), yet it lets them destroy any note in any account. _privileged_test accepts any `user.<...>.admin?` chain, unlike the controller-side _user_flag"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/memos/:id",
+    "ownership": "caller-blind",
+    "why": "the same tenant flag guarding `can :manage, :all` in Ability: _under_admin treats it as the D10 admin branch"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/pads/:id",
+    "ownership": "caller-blind",
+    "why": "the same flag choosing `scope.all` in Scope#resolve: _narrows reads only the other branch"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/tabs/:id",
+    "ownership": "checked",
+    "why": "twin: the user's own admin flag"
+   }
+  ]
+ },
+ {
+  "case": "crash_shorthand_callback_option",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  resources :notes, only: :destroy\n  resources :memos, only: :destroy\nend\n",
+   "app/controllers/notes_controller.rb": "class NotesController < ApplicationController\n  only = %i[destroy]\n  before_action(:touch_it, only:)\n\n  def destroy\n    current_user.notes.find(params[:id]).destroy\n    head :no_content\n  end\n\n  private\n\n  def touch_it; end\nend\n",
+   "app/controllers/memos_controller.rb": "class MemosController < ApplicationController\n  def destroy\n    current_user.notes.find(params[:id]).destroy\n    head :no_content\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/notes/:id",
+    "ownership": "scoped",
+    "why": "CRASH: Ruby 3.1 value omission `before_action(:touch_it, only:)` leaves the pair's value None; _callbacks' `unread` test reads `opts[k].type` and raises AttributeError out of route_guards, so the whole checkout yields no routes (same for `with_options only: do`, `skip_before_action(:x, except:)`)"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/memos/:id",
+    "ownership": "scoped",
+    "why": "an unrelated controller's route is lost too"
+   }
+  ]
+ },
+ {
+  "case": "slow_many_concerns_with_callbacks",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  before_action :authenticate_user!\n  include Mod0\n  include Mod1\n  include Mod2\n  include Mod3\n  include Mod4\n  include Mod5\n  include Mod6\n  include Mod7\n  include Mod8\n  include Mod9\n  include Mod10\n  include Mod11\n  include Mod12\n  include Mod13\n  include Mod14\n  include Mod15\n  include Mod16\n  include Mod17\n  include Mod18\n  include Mod19\n  include Mod20\n  include Mod21\n  include Mod22\n  include Mod23\n  include Mod24\n  include Mod25\n  include Mod26\n  include Mod27\n  include Mod28\n  include Mod29\n  include Mod30\n  include Mod31\n  include Mod32\n  include Mod33\n  include Mod34\n  include Mod35\n  include Mod36\n  include Mod37\n  include Mod38\n  include Mod39\n  include Mod40\n  include Mod41\n  include Mod42\n  include Mod43\n  include Mod44\n  include Mod45\n  include Mod46\n  include Mod47\n  include Mod48\n  include Mod49\n  include Mod50\n  include Mod51\n  include Mod52\n  include Mod53\n  include Mod54\n  include Mod55\n  include Mod56\n  include Mod57\n  include Mod58\n  include Mod59\n  include Mod60\n  include Mod61\n  include Mod62\n  include Mod63\n  include Mod64\n  include Mod65\n  include Mod66\n  include Mod67\n  include Mod68\n  include Mod69\n  include Mod70\n  include Mod71\n  include Mod72\n  include Mod73\n  include Mod74\n  include Mod75\n  include Mod76\n  include Mod77\n  include Mod78\n  include Mod79\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "app/controllers/concerns/mod0.rb": "module Mod0\n  extend ActiveSupport::Concern\n  included do\n    before_action :m0_0\n  end\n  def m0_0\n    @x0 = session[:k0]\n  end\n  def m0_1\n    @x1 = session[:k1]\n  end\n  def m0_2\n    @x2 = session[:k2]\n  end\n  def m0_3\n    @x3 = session[:k3]\n  end\n  def m0_4\n    @x4 = session[:k4]\n  end\n  def m0_5\n    @x5 = session[:k5]\n  end\n  def m0_6\n    @x6 = session[:k6]\n  end\n  def m0_7\n    @x7 = session[:k7]\n  end\n  def m0_8\n    @x8 = session[:k8]\n  end\n  def m0_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod1.rb": "module Mod1\n  extend ActiveSupport::Concern\n  included do\n    before_action :m1_0\n  end\n  def m1_0\n    @x0 = session[:k0]\n  end\n  def m1_1\n    @x1 = session[:k1]\n  end\n  def m1_2\n    @x2 = session[:k2]\n  end\n  def m1_3\n    @x3 = session[:k3]\n  end\n  def m1_4\n    @x4 = session[:k4]\n  end\n  def m1_5\n    @x5 = session[:k5]\n  end\n  def m1_6\n    @x6 = session[:k6]\n  end\n  def m1_7\n    @x7 = session[:k7]\n  end\n  def m1_8\n    @x8 = session[:k8]\n  end\n  def m1_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod2.rb": "module Mod2\n  extend ActiveSupport::Concern\n  included do\n    before_action :m2_0\n  end\n  def m2_0\n    @x0 = session[:k0]\n  end\n  def m2_1\n    @x1 = session[:k1]\n  end\n  def m2_2\n    @x2 = session[:k2]\n  end\n  def m2_3\n    @x3 = session[:k3]\n  end\n  def m2_4\n    @x4 = session[:k4]\n  end\n  def m2_5\n    @x5 = session[:k5]\n  end\n  def m2_6\n    @x6 = session[:k6]\n  end\n  def m2_7\n    @x7 = session[:k7]\n  end\n  def m2_8\n    @x8 = session[:k8]\n  end\n  def m2_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod3.rb": "module Mod3\n  extend ActiveSupport::Concern\n  included do\n    before_action :m3_0\n  end\n  def m3_0\n    @x0 = session[:k0]\n  end\n  def m3_1\n    @x1 = session[:k1]\n  end\n  def m3_2\n    @x2 = session[:k2]\n  end\n  def m3_3\n    @x3 = session[:k3]\n  end\n  def m3_4\n    @x4 = session[:k4]\n  end\n  def m3_5\n    @x5 = session[:k5]\n  end\n  def m3_6\n    @x6 = session[:k6]\n  end\n  def m3_7\n    @x7 = session[:k7]\n  end\n  def m3_8\n    @x8 = session[:k8]\n  end\n  def m3_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod4.rb": "module Mod4\n  extend ActiveSupport::Concern\n  included do\n    before_action :m4_0\n  end\n  def m4_0\n    @x0 = session[:k0]\n  end\n  def m4_1\n    @x1 = session[:k1]\n  end\n  def m4_2\n    @x2 = session[:k2]\n  end\n  def m4_3\n    @x3 = session[:k3]\n  end\n  def m4_4\n    @x4 = session[:k4]\n  end\n  def m4_5\n    @x5 = session[:k5]\n  end\n  def m4_6\n    @x6 = session[:k6]\n  end\n  def m4_7\n    @x7 = session[:k7]\n  end\n  def m4_8\n    @x8 = session[:k8]\n  end\n  def m4_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod5.rb": "module Mod5\n  extend ActiveSupport::Concern\n  included do\n    before_action :m5_0\n  end\n  def m5_0\n    @x0 = session[:k0]\n  end\n  def m5_1\n    @x1 = session[:k1]\n  end\n  def m5_2\n    @x2 = session[:k2]\n  end\n  def m5_3\n    @x3 = session[:k3]\n  end\n  def m5_4\n    @x4 = session[:k4]\n  end\n  def m5_5\n    @x5 = session[:k5]\n  end\n  def m5_6\n    @x6 = session[:k6]\n  end\n  def m5_7\n    @x7 = session[:k7]\n  end\n  def m5_8\n    @x8 = session[:k8]\n  end\n  def m5_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod6.rb": "module Mod6\n  extend ActiveSupport::Concern\n  included do\n    before_action :m6_0\n  end\n  def m6_0\n    @x0 = session[:k0]\n  end\n  def m6_1\n    @x1 = session[:k1]\n  end\n  def m6_2\n    @x2 = session[:k2]\n  end\n  def m6_3\n    @x3 = session[:k3]\n  end\n  def m6_4\n    @x4 = session[:k4]\n  end\n  def m6_5\n    @x5 = session[:k5]\n  end\n  def m6_6\n    @x6 = session[:k6]\n  end\n  def m6_7\n    @x7 = session[:k7]\n  end\n  def m6_8\n    @x8 = session[:k8]\n  end\n  def m6_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod7.rb": "module Mod7\n  extend ActiveSupport::Concern\n  included do\n    before_action :m7_0\n  end\n  def m7_0\n    @x0 = session[:k0]\n  end\n  def m7_1\n    @x1 = session[:k1]\n  end\n  def m7_2\n    @x2 = session[:k2]\n  end\n  def m7_3\n    @x3 = session[:k3]\n  end\n  def m7_4\n    @x4 = session[:k4]\n  end\n  def m7_5\n    @x5 = session[:k5]\n  end\n  def m7_6\n    @x6 = session[:k6]\n  end\n  def m7_7\n    @x7 = session[:k7]\n  end\n  def m7_8\n    @x8 = session[:k8]\n  end\n  def m7_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod8.rb": "module Mod8\n  extend ActiveSupport::Concern\n  included do\n    before_action :m8_0\n  end\n  def m8_0\n    @x0 = session[:k0]\n  end\n  def m8_1\n    @x1 = session[:k1]\n  end\n  def m8_2\n    @x2 = session[:k2]\n  end\n  def m8_3\n    @x3 = session[:k3]\n  end\n  def m8_4\n    @x4 = session[:k4]\n  end\n  def m8_5\n    @x5 = session[:k5]\n  end\n  def m8_6\n    @x6 = session[:k6]\n  end\n  def m8_7\n    @x7 = session[:k7]\n  end\n  def m8_8\n    @x8 = session[:k8]\n  end\n  def m8_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod9.rb": "module Mod9\n  extend ActiveSupport::Concern\n  included do\n    before_action :m9_0\n  end\n  def m9_0\n    @x0 = session[:k0]\n  end\n  def m9_1\n    @x1 = session[:k1]\n  end\n  def m9_2\n    @x2 = session[:k2]\n  end\n  def m9_3\n    @x3 = session[:k3]\n  end\n  def m9_4\n    @x4 = session[:k4]\n  end\n  def m9_5\n    @x5 = session[:k5]\n  end\n  def m9_6\n    @x6 = session[:k6]\n  end\n  def m9_7\n    @x7 = session[:k7]\n  end\n  def m9_8\n    @x8 = session[:k8]\n  end\n  def m9_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod10.rb": "module Mod10\n  extend ActiveSupport::Concern\n  included do\n    before_action :m10_0\n  end\n  def m10_0\n    @x0 = session[:k0]\n  end\n  def m10_1\n    @x1 = session[:k1]\n  end\n  def m10_2\n    @x2 = session[:k2]\n  end\n  def m10_3\n    @x3 = session[:k3]\n  end\n  def m10_4\n    @x4 = session[:k4]\n  end\n  def m10_5\n    @x5 = session[:k5]\n  end\n  def m10_6\n    @x6 = session[:k6]\n  end\n  def m10_7\n    @x7 = session[:k7]\n  end\n  def m10_8\n    @x8 = session[:k8]\n  end\n  def m10_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod11.rb": "module Mod11\n  extend ActiveSupport::Concern\n  included do\n    before_action :m11_0\n  end\n  def m11_0\n    @x0 = session[:k0]\n  end\n  def m11_1\n    @x1 = session[:k1]\n  end\n  def m11_2\n    @x2 = session[:k2]\n  end\n  def m11_3\n    @x3 = session[:k3]\n  end\n  def m11_4\n    @x4 = session[:k4]\n  end\n  def m11_5\n    @x5 = session[:k5]\n  end\n  def m11_6\n    @x6 = session[:k6]\n  end\n  def m11_7\n    @x7 = session[:k7]\n  end\n  def m11_8\n    @x8 = session[:k8]\n  end\n  def m11_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod12.rb": "module Mod12\n  extend ActiveSupport::Concern\n  included do\n    before_action :m12_0\n  end\n  def m12_0\n    @x0 = session[:k0]\n  end\n  def m12_1\n    @x1 = session[:k1]\n  end\n  def m12_2\n    @x2 = session[:k2]\n  end\n  def m12_3\n    @x3 = session[:k3]\n  end\n  def m12_4\n    @x4 = session[:k4]\n  end\n  def m12_5\n    @x5 = session[:k5]\n  end\n  def m12_6\n    @x6 = session[:k6]\n  end\n  def m12_7\n    @x7 = session[:k7]\n  end\n  def m12_8\n    @x8 = session[:k8]\n  end\n  def m12_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod13.rb": "module Mod13\n  extend ActiveSupport::Concern\n  included do\n    before_action :m13_0\n  end\n  def m13_0\n    @x0 = session[:k0]\n  end\n  def m13_1\n    @x1 = session[:k1]\n  end\n  def m13_2\n    @x2 = session[:k2]\n  end\n  def m13_3\n    @x3 = session[:k3]\n  end\n  def m13_4\n    @x4 = session[:k4]\n  end\n  def m13_5\n    @x5 = session[:k5]\n  end\n  def m13_6\n    @x6 = session[:k6]\n  end\n  def m13_7\n    @x7 = session[:k7]\n  end\n  def m13_8\n    @x8 = session[:k8]\n  end\n  def m13_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod14.rb": "module Mod14\n  extend ActiveSupport::Concern\n  included do\n    before_action :m14_0\n  end\n  def m14_0\n    @x0 = session[:k0]\n  end\n  def m14_1\n    @x1 = session[:k1]\n  end\n  def m14_2\n    @x2 = session[:k2]\n  end\n  def m14_3\n    @x3 = session[:k3]\n  end\n  def m14_4\n    @x4 = session[:k4]\n  end\n  def m14_5\n    @x5 = session[:k5]\n  end\n  def m14_6\n    @x6 = session[:k6]\n  end\n  def m14_7\n    @x7 = session[:k7]\n  end\n  def m14_8\n    @x8 = session[:k8]\n  end\n  def m14_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod15.rb": "module Mod15\n  extend ActiveSupport::Concern\n  included do\n    before_action :m15_0\n  end\n  def m15_0\n    @x0 = session[:k0]\n  end\n  def m15_1\n    @x1 = session[:k1]\n  end\n  def m15_2\n    @x2 = session[:k2]\n  end\n  def m15_3\n    @x3 = session[:k3]\n  end\n  def m15_4\n    @x4 = session[:k4]\n  end\n  def m15_5\n    @x5 = session[:k5]\n  end\n  def m15_6\n    @x6 = session[:k6]\n  end\n  def m15_7\n    @x7 = session[:k7]\n  end\n  def m15_8\n    @x8 = session[:k8]\n  end\n  def m15_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod16.rb": "module Mod16\n  extend ActiveSupport::Concern\n  included do\n    before_action :m16_0\n  end\n  def m16_0\n    @x0 = session[:k0]\n  end\n  def m16_1\n    @x1 = session[:k1]\n  end\n  def m16_2\n    @x2 = session[:k2]\n  end\n  def m16_3\n    @x3 = session[:k3]\n  end\n  def m16_4\n    @x4 = session[:k4]\n  end\n  def m16_5\n    @x5 = session[:k5]\n  end\n  def m16_6\n    @x6 = session[:k6]\n  end\n  def m16_7\n    @x7 = session[:k7]\n  end\n  def m16_8\n    @x8 = session[:k8]\n  end\n  def m16_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod17.rb": "module Mod17\n  extend ActiveSupport::Concern\n  included do\n    before_action :m17_0\n  end\n  def m17_0\n    @x0 = session[:k0]\n  end\n  def m17_1\n    @x1 = session[:k1]\n  end\n  def m17_2\n    @x2 = session[:k2]\n  end\n  def m17_3\n    @x3 = session[:k3]\n  end\n  def m17_4\n    @x4 = session[:k4]\n  end\n  def m17_5\n    @x5 = session[:k5]\n  end\n  def m17_6\n    @x6 = session[:k6]\n  end\n  def m17_7\n    @x7 = session[:k7]\n  end\n  def m17_8\n    @x8 = session[:k8]\n  end\n  def m17_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod18.rb": "module Mod18\n  extend ActiveSupport::Concern\n  included do\n    before_action :m18_0\n  end\n  def m18_0\n    @x0 = session[:k0]\n  end\n  def m18_1\n    @x1 = session[:k1]\n  end\n  def m18_2\n    @x2 = session[:k2]\n  end\n  def m18_3\n    @x3 = session[:k3]\n  end\n  def m18_4\n    @x4 = session[:k4]\n  end\n  def m18_5\n    @x5 = session[:k5]\n  end\n  def m18_6\n    @x6 = session[:k6]\n  end\n  def m18_7\n    @x7 = session[:k7]\n  end\n  def m18_8\n    @x8 = session[:k8]\n  end\n  def m18_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod19.rb": "module Mod19\n  extend ActiveSupport::Concern\n  included do\n    before_action :m19_0\n  end\n  def m19_0\n    @x0 = session[:k0]\n  end\n  def m19_1\n    @x1 = session[:k1]\n  end\n  def m19_2\n    @x2 = session[:k2]\n  end\n  def m19_3\n    @x3 = session[:k3]\n  end\n  def m19_4\n    @x4 = session[:k4]\n  end\n  def m19_5\n    @x5 = session[:k5]\n  end\n  def m19_6\n    @x6 = session[:k6]\n  end\n  def m19_7\n    @x7 = session[:k7]\n  end\n  def m19_8\n    @x8 = session[:k8]\n  end\n  def m19_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod20.rb": "module Mod20\n  extend ActiveSupport::Concern\n  included do\n    before_action :m20_0\n  end\n  def m20_0\n    @x0 = session[:k0]\n  end\n  def m20_1\n    @x1 = session[:k1]\n  end\n  def m20_2\n    @x2 = session[:k2]\n  end\n  def m20_3\n    @x3 = session[:k3]\n  end\n  def m20_4\n    @x4 = session[:k4]\n  end\n  def m20_5\n    @x5 = session[:k5]\n  end\n  def m20_6\n    @x6 = session[:k6]\n  end\n  def m20_7\n    @x7 = session[:k7]\n  end\n  def m20_8\n    @x8 = session[:k8]\n  end\n  def m20_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod21.rb": "module Mod21\n  extend ActiveSupport::Concern\n  included do\n    before_action :m21_0\n  end\n  def m21_0\n    @x0 = session[:k0]\n  end\n  def m21_1\n    @x1 = session[:k1]\n  end\n  def m21_2\n    @x2 = session[:k2]\n  end\n  def m21_3\n    @x3 = session[:k3]\n  end\n  def m21_4\n    @x4 = session[:k4]\n  end\n  def m21_5\n    @x5 = session[:k5]\n  end\n  def m21_6\n    @x6 = session[:k6]\n  end\n  def m21_7\n    @x7 = session[:k7]\n  end\n  def m21_8\n    @x8 = session[:k8]\n  end\n  def m21_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod22.rb": "module Mod22\n  extend ActiveSupport::Concern\n  included do\n    before_action :m22_0\n  end\n  def m22_0\n    @x0 = session[:k0]\n  end\n  def m22_1\n    @x1 = session[:k1]\n  end\n  def m22_2\n    @x2 = session[:k2]\n  end\n  def m22_3\n    @x3 = session[:k3]\n  end\n  def m22_4\n    @x4 = session[:k4]\n  end\n  def m22_5\n    @x5 = session[:k5]\n  end\n  def m22_6\n    @x6 = session[:k6]\n  end\n  def m22_7\n    @x7 = session[:k7]\n  end\n  def m22_8\n    @x8 = session[:k8]\n  end\n  def m22_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod23.rb": "module Mod23\n  extend ActiveSupport::Concern\n  included do\n    before_action :m23_0\n  end\n  def m23_0\n    @x0 = session[:k0]\n  end\n  def m23_1\n    @x1 = session[:k1]\n  end\n  def m23_2\n    @x2 = session[:k2]\n  end\n  def m23_3\n    @x3 = session[:k3]\n  end\n  def m23_4\n    @x4 = session[:k4]\n  end\n  def m23_5\n    @x5 = session[:k5]\n  end\n  def m23_6\n    @x6 = session[:k6]\n  end\n  def m23_7\n    @x7 = session[:k7]\n  end\n  def m23_8\n    @x8 = session[:k8]\n  end\n  def m23_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod24.rb": "module Mod24\n  extend ActiveSupport::Concern\n  included do\n    before_action :m24_0\n  end\n  def m24_0\n    @x0 = session[:k0]\n  end\n  def m24_1\n    @x1 = session[:k1]\n  end\n  def m24_2\n    @x2 = session[:k2]\n  end\n  def m24_3\n    @x3 = session[:k3]\n  end\n  def m24_4\n    @x4 = session[:k4]\n  end\n  def m24_5\n    @x5 = session[:k5]\n  end\n  def m24_6\n    @x6 = session[:k6]\n  end\n  def m24_7\n    @x7 = session[:k7]\n  end\n  def m24_8\n    @x8 = session[:k8]\n  end\n  def m24_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod25.rb": "module Mod25\n  extend ActiveSupport::Concern\n  included do\n    before_action :m25_0\n  end\n  def m25_0\n    @x0 = session[:k0]\n  end\n  def m25_1\n    @x1 = session[:k1]\n  end\n  def m25_2\n    @x2 = session[:k2]\n  end\n  def m25_3\n    @x3 = session[:k3]\n  end\n  def m25_4\n    @x4 = session[:k4]\n  end\n  def m25_5\n    @x5 = session[:k5]\n  end\n  def m25_6\n    @x6 = session[:k6]\n  end\n  def m25_7\n    @x7 = session[:k7]\n  end\n  def m25_8\n    @x8 = session[:k8]\n  end\n  def m25_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod26.rb": "module Mod26\n  extend ActiveSupport::Concern\n  included do\n    before_action :m26_0\n  end\n  def m26_0\n    @x0 = session[:k0]\n  end\n  def m26_1\n    @x1 = session[:k1]\n  end\n  def m26_2\n    @x2 = session[:k2]\n  end\n  def m26_3\n    @x3 = session[:k3]\n  end\n  def m26_4\n    @x4 = session[:k4]\n  end\n  def m26_5\n    @x5 = session[:k5]\n  end\n  def m26_6\n    @x6 = session[:k6]\n  end\n  def m26_7\n    @x7 = session[:k7]\n  end\n  def m26_8\n    @x8 = session[:k8]\n  end\n  def m26_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod27.rb": "module Mod27\n  extend ActiveSupport::Concern\n  included do\n    before_action :m27_0\n  end\n  def m27_0\n    @x0 = session[:k0]\n  end\n  def m27_1\n    @x1 = session[:k1]\n  end\n  def m27_2\n    @x2 = session[:k2]\n  end\n  def m27_3\n    @x3 = session[:k3]\n  end\n  def m27_4\n    @x4 = session[:k4]\n  end\n  def m27_5\n    @x5 = session[:k5]\n  end\n  def m27_6\n    @x6 = session[:k6]\n  end\n  def m27_7\n    @x7 = session[:k7]\n  end\n  def m27_8\n    @x8 = session[:k8]\n  end\n  def m27_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod28.rb": "module Mod28\n  extend ActiveSupport::Concern\n  included do\n    before_action :m28_0\n  end\n  def m28_0\n    @x0 = session[:k0]\n  end\n  def m28_1\n    @x1 = session[:k1]\n  end\n  def m28_2\n    @x2 = session[:k2]\n  end\n  def m28_3\n    @x3 = session[:k3]\n  end\n  def m28_4\n    @x4 = session[:k4]\n  end\n  def m28_5\n    @x5 = session[:k5]\n  end\n  def m28_6\n    @x6 = session[:k6]\n  end\n  def m28_7\n    @x7 = session[:k7]\n  end\n  def m28_8\n    @x8 = session[:k8]\n  end\n  def m28_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod29.rb": "module Mod29\n  extend ActiveSupport::Concern\n  included do\n    before_action :m29_0\n  end\n  def m29_0\n    @x0 = session[:k0]\n  end\n  def m29_1\n    @x1 = session[:k1]\n  end\n  def m29_2\n    @x2 = session[:k2]\n  end\n  def m29_3\n    @x3 = session[:k3]\n  end\n  def m29_4\n    @x4 = session[:k4]\n  end\n  def m29_5\n    @x5 = session[:k5]\n  end\n  def m29_6\n    @x6 = session[:k6]\n  end\n  def m29_7\n    @x7 = session[:k7]\n  end\n  def m29_8\n    @x8 = session[:k8]\n  end\n  def m29_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod30.rb": "module Mod30\n  extend ActiveSupport::Concern\n  included do\n    before_action :m30_0\n  end\n  def m30_0\n    @x0 = session[:k0]\n  end\n  def m30_1\n    @x1 = session[:k1]\n  end\n  def m30_2\n    @x2 = session[:k2]\n  end\n  def m30_3\n    @x3 = session[:k3]\n  end\n  def m30_4\n    @x4 = session[:k4]\n  end\n  def m30_5\n    @x5 = session[:k5]\n  end\n  def m30_6\n    @x6 = session[:k6]\n  end\n  def m30_7\n    @x7 = session[:k7]\n  end\n  def m30_8\n    @x8 = session[:k8]\n  end\n  def m30_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod31.rb": "module Mod31\n  extend ActiveSupport::Concern\n  included do\n    before_action :m31_0\n  end\n  def m31_0\n    @x0 = session[:k0]\n  end\n  def m31_1\n    @x1 = session[:k1]\n  end\n  def m31_2\n    @x2 = session[:k2]\n  end\n  def m31_3\n    @x3 = session[:k3]\n  end\n  def m31_4\n    @x4 = session[:k4]\n  end\n  def m31_5\n    @x5 = session[:k5]\n  end\n  def m31_6\n    @x6 = session[:k6]\n  end\n  def m31_7\n    @x7 = session[:k7]\n  end\n  def m31_8\n    @x8 = session[:k8]\n  end\n  def m31_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod32.rb": "module Mod32\n  extend ActiveSupport::Concern\n  included do\n    before_action :m32_0\n  end\n  def m32_0\n    @x0 = session[:k0]\n  end\n  def m32_1\n    @x1 = session[:k1]\n  end\n  def m32_2\n    @x2 = session[:k2]\n  end\n  def m32_3\n    @x3 = session[:k3]\n  end\n  def m32_4\n    @x4 = session[:k4]\n  end\n  def m32_5\n    @x5 = session[:k5]\n  end\n  def m32_6\n    @x6 = session[:k6]\n  end\n  def m32_7\n    @x7 = session[:k7]\n  end\n  def m32_8\n    @x8 = session[:k8]\n  end\n  def m32_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod33.rb": "module Mod33\n  extend ActiveSupport::Concern\n  included do\n    before_action :m33_0\n  end\n  def m33_0\n    @x0 = session[:k0]\n  end\n  def m33_1\n    @x1 = session[:k1]\n  end\n  def m33_2\n    @x2 = session[:k2]\n  end\n  def m33_3\n    @x3 = session[:k3]\n  end\n  def m33_4\n    @x4 = session[:k4]\n  end\n  def m33_5\n    @x5 = session[:k5]\n  end\n  def m33_6\n    @x6 = session[:k6]\n  end\n  def m33_7\n    @x7 = session[:k7]\n  end\n  def m33_8\n    @x8 = session[:k8]\n  end\n  def m33_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod34.rb": "module Mod34\n  extend ActiveSupport::Concern\n  included do\n    before_action :m34_0\n  end\n  def m34_0\n    @x0 = session[:k0]\n  end\n  def m34_1\n    @x1 = session[:k1]\n  end\n  def m34_2\n    @x2 = session[:k2]\n  end\n  def m34_3\n    @x3 = session[:k3]\n  end\n  def m34_4\n    @x4 = session[:k4]\n  end\n  def m34_5\n    @x5 = session[:k5]\n  end\n  def m34_6\n    @x6 = session[:k6]\n  end\n  def m34_7\n    @x7 = session[:k7]\n  end\n  def m34_8\n    @x8 = session[:k8]\n  end\n  def m34_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod35.rb": "module Mod35\n  extend ActiveSupport::Concern\n  included do\n    before_action :m35_0\n  end\n  def m35_0\n    @x0 = session[:k0]\n  end\n  def m35_1\n    @x1 = session[:k1]\n  end\n  def m35_2\n    @x2 = session[:k2]\n  end\n  def m35_3\n    @x3 = session[:k3]\n  end\n  def m35_4\n    @x4 = session[:k4]\n  end\n  def m35_5\n    @x5 = session[:k5]\n  end\n  def m35_6\n    @x6 = session[:k6]\n  end\n  def m35_7\n    @x7 = session[:k7]\n  end\n  def m35_8\n    @x8 = session[:k8]\n  end\n  def m35_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod36.rb": "module Mod36\n  extend ActiveSupport::Concern\n  included do\n    before_action :m36_0\n  end\n  def m36_0\n    @x0 = session[:k0]\n  end\n  def m36_1\n    @x1 = session[:k1]\n  end\n  def m36_2\n    @x2 = session[:k2]\n  end\n  def m36_3\n    @x3 = session[:k3]\n  end\n  def m36_4\n    @x4 = session[:k4]\n  end\n  def m36_5\n    @x5 = session[:k5]\n  end\n  def m36_6\n    @x6 = session[:k6]\n  end\n  def m36_7\n    @x7 = session[:k7]\n  end\n  def m36_8\n    @x8 = session[:k8]\n  end\n  def m36_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod37.rb": "module Mod37\n  extend ActiveSupport::Concern\n  included do\n    before_action :m37_0\n  end\n  def m37_0\n    @x0 = session[:k0]\n  end\n  def m37_1\n    @x1 = session[:k1]\n  end\n  def m37_2\n    @x2 = session[:k2]\n  end\n  def m37_3\n    @x3 = session[:k3]\n  end\n  def m37_4\n    @x4 = session[:k4]\n  end\n  def m37_5\n    @x5 = session[:k5]\n  end\n  def m37_6\n    @x6 = session[:k6]\n  end\n  def m37_7\n    @x7 = session[:k7]\n  end\n  def m37_8\n    @x8 = session[:k8]\n  end\n  def m37_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod38.rb": "module Mod38\n  extend ActiveSupport::Concern\n  included do\n    before_action :m38_0\n  end\n  def m38_0\n    @x0 = session[:k0]\n  end\n  def m38_1\n    @x1 = session[:k1]\n  end\n  def m38_2\n    @x2 = session[:k2]\n  end\n  def m38_3\n    @x3 = session[:k3]\n  end\n  def m38_4\n    @x4 = session[:k4]\n  end\n  def m38_5\n    @x5 = session[:k5]\n  end\n  def m38_6\n    @x6 = session[:k6]\n  end\n  def m38_7\n    @x7 = session[:k7]\n  end\n  def m38_8\n    @x8 = session[:k8]\n  end\n  def m38_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod39.rb": "module Mod39\n  extend ActiveSupport::Concern\n  included do\n    before_action :m39_0\n  end\n  def m39_0\n    @x0 = session[:k0]\n  end\n  def m39_1\n    @x1 = session[:k1]\n  end\n  def m39_2\n    @x2 = session[:k2]\n  end\n  def m39_3\n    @x3 = session[:k3]\n  end\n  def m39_4\n    @x4 = session[:k4]\n  end\n  def m39_5\n    @x5 = session[:k5]\n  end\n  def m39_6\n    @x6 = session[:k6]\n  end\n  def m39_7\n    @x7 = session[:k7]\n  end\n  def m39_8\n    @x8 = session[:k8]\n  end\n  def m39_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod40.rb": "module Mod40\n  extend ActiveSupport::Concern\n  included do\n    before_action :m40_0\n  end\n  def m40_0\n    @x0 = session[:k0]\n  end\n  def m40_1\n    @x1 = session[:k1]\n  end\n  def m40_2\n    @x2 = session[:k2]\n  end\n  def m40_3\n    @x3 = session[:k3]\n  end\n  def m40_4\n    @x4 = session[:k4]\n  end\n  def m40_5\n    @x5 = session[:k5]\n  end\n  def m40_6\n    @x6 = session[:k6]\n  end\n  def m40_7\n    @x7 = session[:k7]\n  end\n  def m40_8\n    @x8 = session[:k8]\n  end\n  def m40_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod41.rb": "module Mod41\n  extend ActiveSupport::Concern\n  included do\n    before_action :m41_0\n  end\n  def m41_0\n    @x0 = session[:k0]\n  end\n  def m41_1\n    @x1 = session[:k1]\n  end\n  def m41_2\n    @x2 = session[:k2]\n  end\n  def m41_3\n    @x3 = session[:k3]\n  end\n  def m41_4\n    @x4 = session[:k4]\n  end\n  def m41_5\n    @x5 = session[:k5]\n  end\n  def m41_6\n    @x6 = session[:k6]\n  end\n  def m41_7\n    @x7 = session[:k7]\n  end\n  def m41_8\n    @x8 = session[:k8]\n  end\n  def m41_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod42.rb": "module Mod42\n  extend ActiveSupport::Concern\n  included do\n    before_action :m42_0\n  end\n  def m42_0\n    @x0 = session[:k0]\n  end\n  def m42_1\n    @x1 = session[:k1]\n  end\n  def m42_2\n    @x2 = session[:k2]\n  end\n  def m42_3\n    @x3 = session[:k3]\n  end\n  def m42_4\n    @x4 = session[:k4]\n  end\n  def m42_5\n    @x5 = session[:k5]\n  end\n  def m42_6\n    @x6 = session[:k6]\n  end\n  def m42_7\n    @x7 = session[:k7]\n  end\n  def m42_8\n    @x8 = session[:k8]\n  end\n  def m42_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod43.rb": "module Mod43\n  extend ActiveSupport::Concern\n  included do\n    before_action :m43_0\n  end\n  def m43_0\n    @x0 = session[:k0]\n  end\n  def m43_1\n    @x1 = session[:k1]\n  end\n  def m43_2\n    @x2 = session[:k2]\n  end\n  def m43_3\n    @x3 = session[:k3]\n  end\n  def m43_4\n    @x4 = session[:k4]\n  end\n  def m43_5\n    @x5 = session[:k5]\n  end\n  def m43_6\n    @x6 = session[:k6]\n  end\n  def m43_7\n    @x7 = session[:k7]\n  end\n  def m43_8\n    @x8 = session[:k8]\n  end\n  def m43_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod44.rb": "module Mod44\n  extend ActiveSupport::Concern\n  included do\n    before_action :m44_0\n  end\n  def m44_0\n    @x0 = session[:k0]\n  end\n  def m44_1\n    @x1 = session[:k1]\n  end\n  def m44_2\n    @x2 = session[:k2]\n  end\n  def m44_3\n    @x3 = session[:k3]\n  end\n  def m44_4\n    @x4 = session[:k4]\n  end\n  def m44_5\n    @x5 = session[:k5]\n  end\n  def m44_6\n    @x6 = session[:k6]\n  end\n  def m44_7\n    @x7 = session[:k7]\n  end\n  def m44_8\n    @x8 = session[:k8]\n  end\n  def m44_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod45.rb": "module Mod45\n  extend ActiveSupport::Concern\n  included do\n    before_action :m45_0\n  end\n  def m45_0\n    @x0 = session[:k0]\n  end\n  def m45_1\n    @x1 = session[:k1]\n  end\n  def m45_2\n    @x2 = session[:k2]\n  end\n  def m45_3\n    @x3 = session[:k3]\n  end\n  def m45_4\n    @x4 = session[:k4]\n  end\n  def m45_5\n    @x5 = session[:k5]\n  end\n  def m45_6\n    @x6 = session[:k6]\n  end\n  def m45_7\n    @x7 = session[:k7]\n  end\n  def m45_8\n    @x8 = session[:k8]\n  end\n  def m45_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod46.rb": "module Mod46\n  extend ActiveSupport::Concern\n  included do\n    before_action :m46_0\n  end\n  def m46_0\n    @x0 = session[:k0]\n  end\n  def m46_1\n    @x1 = session[:k1]\n  end\n  def m46_2\n    @x2 = session[:k2]\n  end\n  def m46_3\n    @x3 = session[:k3]\n  end\n  def m46_4\n    @x4 = session[:k4]\n  end\n  def m46_5\n    @x5 = session[:k5]\n  end\n  def m46_6\n    @x6 = session[:k6]\n  end\n  def m46_7\n    @x7 = session[:k7]\n  end\n  def m46_8\n    @x8 = session[:k8]\n  end\n  def m46_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod47.rb": "module Mod47\n  extend ActiveSupport::Concern\n  included do\n    before_action :m47_0\n  end\n  def m47_0\n    @x0 = session[:k0]\n  end\n  def m47_1\n    @x1 = session[:k1]\n  end\n  def m47_2\n    @x2 = session[:k2]\n  end\n  def m47_3\n    @x3 = session[:k3]\n  end\n  def m47_4\n    @x4 = session[:k4]\n  end\n  def m47_5\n    @x5 = session[:k5]\n  end\n  def m47_6\n    @x6 = session[:k6]\n  end\n  def m47_7\n    @x7 = session[:k7]\n  end\n  def m47_8\n    @x8 = session[:k8]\n  end\n  def m47_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod48.rb": "module Mod48\n  extend ActiveSupport::Concern\n  included do\n    before_action :m48_0\n  end\n  def m48_0\n    @x0 = session[:k0]\n  end\n  def m48_1\n    @x1 = session[:k1]\n  end\n  def m48_2\n    @x2 = session[:k2]\n  end\n  def m48_3\n    @x3 = session[:k3]\n  end\n  def m48_4\n    @x4 = session[:k4]\n  end\n  def m48_5\n    @x5 = session[:k5]\n  end\n  def m48_6\n    @x6 = session[:k6]\n  end\n  def m48_7\n    @x7 = session[:k7]\n  end\n  def m48_8\n    @x8 = session[:k8]\n  end\n  def m48_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod49.rb": "module Mod49\n  extend ActiveSupport::Concern\n  included do\n    before_action :m49_0\n  end\n  def m49_0\n    @x0 = session[:k0]\n  end\n  def m49_1\n    @x1 = session[:k1]\n  end\n  def m49_2\n    @x2 = session[:k2]\n  end\n  def m49_3\n    @x3 = session[:k3]\n  end\n  def m49_4\n    @x4 = session[:k4]\n  end\n  def m49_5\n    @x5 = session[:k5]\n  end\n  def m49_6\n    @x6 = session[:k6]\n  end\n  def m49_7\n    @x7 = session[:k7]\n  end\n  def m49_8\n    @x8 = session[:k8]\n  end\n  def m49_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod50.rb": "module Mod50\n  extend ActiveSupport::Concern\n  included do\n    before_action :m50_0\n  end\n  def m50_0\n    @x0 = session[:k0]\n  end\n  def m50_1\n    @x1 = session[:k1]\n  end\n  def m50_2\n    @x2 = session[:k2]\n  end\n  def m50_3\n    @x3 = session[:k3]\n  end\n  def m50_4\n    @x4 = session[:k4]\n  end\n  def m50_5\n    @x5 = session[:k5]\n  end\n  def m50_6\n    @x6 = session[:k6]\n  end\n  def m50_7\n    @x7 = session[:k7]\n  end\n  def m50_8\n    @x8 = session[:k8]\n  end\n  def m50_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod51.rb": "module Mod51\n  extend ActiveSupport::Concern\n  included do\n    before_action :m51_0\n  end\n  def m51_0\n    @x0 = session[:k0]\n  end\n  def m51_1\n    @x1 = session[:k1]\n  end\n  def m51_2\n    @x2 = session[:k2]\n  end\n  def m51_3\n    @x3 = session[:k3]\n  end\n  def m51_4\n    @x4 = session[:k4]\n  end\n  def m51_5\n    @x5 = session[:k5]\n  end\n  def m51_6\n    @x6 = session[:k6]\n  end\n  def m51_7\n    @x7 = session[:k7]\n  end\n  def m51_8\n    @x8 = session[:k8]\n  end\n  def m51_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod52.rb": "module Mod52\n  extend ActiveSupport::Concern\n  included do\n    before_action :m52_0\n  end\n  def m52_0\n    @x0 = session[:k0]\n  end\n  def m52_1\n    @x1 = session[:k1]\n  end\n  def m52_2\n    @x2 = session[:k2]\n  end\n  def m52_3\n    @x3 = session[:k3]\n  end\n  def m52_4\n    @x4 = session[:k4]\n  end\n  def m52_5\n    @x5 = session[:k5]\n  end\n  def m52_6\n    @x6 = session[:k6]\n  end\n  def m52_7\n    @x7 = session[:k7]\n  end\n  def m52_8\n    @x8 = session[:k8]\n  end\n  def m52_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod53.rb": "module Mod53\n  extend ActiveSupport::Concern\n  included do\n    before_action :m53_0\n  end\n  def m53_0\n    @x0 = session[:k0]\n  end\n  def m53_1\n    @x1 = session[:k1]\n  end\n  def m53_2\n    @x2 = session[:k2]\n  end\n  def m53_3\n    @x3 = session[:k3]\n  end\n  def m53_4\n    @x4 = session[:k4]\n  end\n  def m53_5\n    @x5 = session[:k5]\n  end\n  def m53_6\n    @x6 = session[:k6]\n  end\n  def m53_7\n    @x7 = session[:k7]\n  end\n  def m53_8\n    @x8 = session[:k8]\n  end\n  def m53_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod54.rb": "module Mod54\n  extend ActiveSupport::Concern\n  included do\n    before_action :m54_0\n  end\n  def m54_0\n    @x0 = session[:k0]\n  end\n  def m54_1\n    @x1 = session[:k1]\n  end\n  def m54_2\n    @x2 = session[:k2]\n  end\n  def m54_3\n    @x3 = session[:k3]\n  end\n  def m54_4\n    @x4 = session[:k4]\n  end\n  def m54_5\n    @x5 = session[:k5]\n  end\n  def m54_6\n    @x6 = session[:k6]\n  end\n  def m54_7\n    @x7 = session[:k7]\n  end\n  def m54_8\n    @x8 = session[:k8]\n  end\n  def m54_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod55.rb": "module Mod55\n  extend ActiveSupport::Concern\n  included do\n    before_action :m55_0\n  end\n  def m55_0\n    @x0 = session[:k0]\n  end\n  def m55_1\n    @x1 = session[:k1]\n  end\n  def m55_2\n    @x2 = session[:k2]\n  end\n  def m55_3\n    @x3 = session[:k3]\n  end\n  def m55_4\n    @x4 = session[:k4]\n  end\n  def m55_5\n    @x5 = session[:k5]\n  end\n  def m55_6\n    @x6 = session[:k6]\n  end\n  def m55_7\n    @x7 = session[:k7]\n  end\n  def m55_8\n    @x8 = session[:k8]\n  end\n  def m55_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod56.rb": "module Mod56\n  extend ActiveSupport::Concern\n  included do\n    before_action :m56_0\n  end\n  def m56_0\n    @x0 = session[:k0]\n  end\n  def m56_1\n    @x1 = session[:k1]\n  end\n  def m56_2\n    @x2 = session[:k2]\n  end\n  def m56_3\n    @x3 = session[:k3]\n  end\n  def m56_4\n    @x4 = session[:k4]\n  end\n  def m56_5\n    @x5 = session[:k5]\n  end\n  def m56_6\n    @x6 = session[:k6]\n  end\n  def m56_7\n    @x7 = session[:k7]\n  end\n  def m56_8\n    @x8 = session[:k8]\n  end\n  def m56_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod57.rb": "module Mod57\n  extend ActiveSupport::Concern\n  included do\n    before_action :m57_0\n  end\n  def m57_0\n    @x0 = session[:k0]\n  end\n  def m57_1\n    @x1 = session[:k1]\n  end\n  def m57_2\n    @x2 = session[:k2]\n  end\n  def m57_3\n    @x3 = session[:k3]\n  end\n  def m57_4\n    @x4 = session[:k4]\n  end\n  def m57_5\n    @x5 = session[:k5]\n  end\n  def m57_6\n    @x6 = session[:k6]\n  end\n  def m57_7\n    @x7 = session[:k7]\n  end\n  def m57_8\n    @x8 = session[:k8]\n  end\n  def m57_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod58.rb": "module Mod58\n  extend ActiveSupport::Concern\n  included do\n    before_action :m58_0\n  end\n  def m58_0\n    @x0 = session[:k0]\n  end\n  def m58_1\n    @x1 = session[:k1]\n  end\n  def m58_2\n    @x2 = session[:k2]\n  end\n  def m58_3\n    @x3 = session[:k3]\n  end\n  def m58_4\n    @x4 = session[:k4]\n  end\n  def m58_5\n    @x5 = session[:k5]\n  end\n  def m58_6\n    @x6 = session[:k6]\n  end\n  def m58_7\n    @x7 = session[:k7]\n  end\n  def m58_8\n    @x8 = session[:k8]\n  end\n  def m58_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod59.rb": "module Mod59\n  extend ActiveSupport::Concern\n  included do\n    before_action :m59_0\n  end\n  def m59_0\n    @x0 = session[:k0]\n  end\n  def m59_1\n    @x1 = session[:k1]\n  end\n  def m59_2\n    @x2 = session[:k2]\n  end\n  def m59_3\n    @x3 = session[:k3]\n  end\n  def m59_4\n    @x4 = session[:k4]\n  end\n  def m59_5\n    @x5 = session[:k5]\n  end\n  def m59_6\n    @x6 = session[:k6]\n  end\n  def m59_7\n    @x7 = session[:k7]\n  end\n  def m59_8\n    @x8 = session[:k8]\n  end\n  def m59_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod60.rb": "module Mod60\n  extend ActiveSupport::Concern\n  included do\n    before_action :m60_0\n  end\n  def m60_0\n    @x0 = session[:k0]\n  end\n  def m60_1\n    @x1 = session[:k1]\n  end\n  def m60_2\n    @x2 = session[:k2]\n  end\n  def m60_3\n    @x3 = session[:k3]\n  end\n  def m60_4\n    @x4 = session[:k4]\n  end\n  def m60_5\n    @x5 = session[:k5]\n  end\n  def m60_6\n    @x6 = session[:k6]\n  end\n  def m60_7\n    @x7 = session[:k7]\n  end\n  def m60_8\n    @x8 = session[:k8]\n  end\n  def m60_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod61.rb": "module Mod61\n  extend ActiveSupport::Concern\n  included do\n    before_action :m61_0\n  end\n  def m61_0\n    @x0 = session[:k0]\n  end\n  def m61_1\n    @x1 = session[:k1]\n  end\n  def m61_2\n    @x2 = session[:k2]\n  end\n  def m61_3\n    @x3 = session[:k3]\n  end\n  def m61_4\n    @x4 = session[:k4]\n  end\n  def m61_5\n    @x5 = session[:k5]\n  end\n  def m61_6\n    @x6 = session[:k6]\n  end\n  def m61_7\n    @x7 = session[:k7]\n  end\n  def m61_8\n    @x8 = session[:k8]\n  end\n  def m61_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod62.rb": "module Mod62\n  extend ActiveSupport::Concern\n  included do\n    before_action :m62_0\n  end\n  def m62_0\n    @x0 = session[:k0]\n  end\n  def m62_1\n    @x1 = session[:k1]\n  end\n  def m62_2\n    @x2 = session[:k2]\n  end\n  def m62_3\n    @x3 = session[:k3]\n  end\n  def m62_4\n    @x4 = session[:k4]\n  end\n  def m62_5\n    @x5 = session[:k5]\n  end\n  def m62_6\n    @x6 = session[:k6]\n  end\n  def m62_7\n    @x7 = session[:k7]\n  end\n  def m62_8\n    @x8 = session[:k8]\n  end\n  def m62_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod63.rb": "module Mod63\n  extend ActiveSupport::Concern\n  included do\n    before_action :m63_0\n  end\n  def m63_0\n    @x0 = session[:k0]\n  end\n  def m63_1\n    @x1 = session[:k1]\n  end\n  def m63_2\n    @x2 = session[:k2]\n  end\n  def m63_3\n    @x3 = session[:k3]\n  end\n  def m63_4\n    @x4 = session[:k4]\n  end\n  def m63_5\n    @x5 = session[:k5]\n  end\n  def m63_6\n    @x6 = session[:k6]\n  end\n  def m63_7\n    @x7 = session[:k7]\n  end\n  def m63_8\n    @x8 = session[:k8]\n  end\n  def m63_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod64.rb": "module Mod64\n  extend ActiveSupport::Concern\n  included do\n    before_action :m64_0\n  end\n  def m64_0\n    @x0 = session[:k0]\n  end\n  def m64_1\n    @x1 = session[:k1]\n  end\n  def m64_2\n    @x2 = session[:k2]\n  end\n  def m64_3\n    @x3 = session[:k3]\n  end\n  def m64_4\n    @x4 = session[:k4]\n  end\n  def m64_5\n    @x5 = session[:k5]\n  end\n  def m64_6\n    @x6 = session[:k6]\n  end\n  def m64_7\n    @x7 = session[:k7]\n  end\n  def m64_8\n    @x8 = session[:k8]\n  end\n  def m64_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod65.rb": "module Mod65\n  extend ActiveSupport::Concern\n  included do\n    before_action :m65_0\n  end\n  def m65_0\n    @x0 = session[:k0]\n  end\n  def m65_1\n    @x1 = session[:k1]\n  end\n  def m65_2\n    @x2 = session[:k2]\n  end\n  def m65_3\n    @x3 = session[:k3]\n  end\n  def m65_4\n    @x4 = session[:k4]\n  end\n  def m65_5\n    @x5 = session[:k5]\n  end\n  def m65_6\n    @x6 = session[:k6]\n  end\n  def m65_7\n    @x7 = session[:k7]\n  end\n  def m65_8\n    @x8 = session[:k8]\n  end\n  def m65_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod66.rb": "module Mod66\n  extend ActiveSupport::Concern\n  included do\n    before_action :m66_0\n  end\n  def m66_0\n    @x0 = session[:k0]\n  end\n  def m66_1\n    @x1 = session[:k1]\n  end\n  def m66_2\n    @x2 = session[:k2]\n  end\n  def m66_3\n    @x3 = session[:k3]\n  end\n  def m66_4\n    @x4 = session[:k4]\n  end\n  def m66_5\n    @x5 = session[:k5]\n  end\n  def m66_6\n    @x6 = session[:k6]\n  end\n  def m66_7\n    @x7 = session[:k7]\n  end\n  def m66_8\n    @x8 = session[:k8]\n  end\n  def m66_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod67.rb": "module Mod67\n  extend ActiveSupport::Concern\n  included do\n    before_action :m67_0\n  end\n  def m67_0\n    @x0 = session[:k0]\n  end\n  def m67_1\n    @x1 = session[:k1]\n  end\n  def m67_2\n    @x2 = session[:k2]\n  end\n  def m67_3\n    @x3 = session[:k3]\n  end\n  def m67_4\n    @x4 = session[:k4]\n  end\n  def m67_5\n    @x5 = session[:k5]\n  end\n  def m67_6\n    @x6 = session[:k6]\n  end\n  def m67_7\n    @x7 = session[:k7]\n  end\n  def m67_8\n    @x8 = session[:k8]\n  end\n  def m67_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod68.rb": "module Mod68\n  extend ActiveSupport::Concern\n  included do\n    before_action :m68_0\n  end\n  def m68_0\n    @x0 = session[:k0]\n  end\n  def m68_1\n    @x1 = session[:k1]\n  end\n  def m68_2\n    @x2 = session[:k2]\n  end\n  def m68_3\n    @x3 = session[:k3]\n  end\n  def m68_4\n    @x4 = session[:k4]\n  end\n  def m68_5\n    @x5 = session[:k5]\n  end\n  def m68_6\n    @x6 = session[:k6]\n  end\n  def m68_7\n    @x7 = session[:k7]\n  end\n  def m68_8\n    @x8 = session[:k8]\n  end\n  def m68_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod69.rb": "module Mod69\n  extend ActiveSupport::Concern\n  included do\n    before_action :m69_0\n  end\n  def m69_0\n    @x0 = session[:k0]\n  end\n  def m69_1\n    @x1 = session[:k1]\n  end\n  def m69_2\n    @x2 = session[:k2]\n  end\n  def m69_3\n    @x3 = session[:k3]\n  end\n  def m69_4\n    @x4 = session[:k4]\n  end\n  def m69_5\n    @x5 = session[:k5]\n  end\n  def m69_6\n    @x6 = session[:k6]\n  end\n  def m69_7\n    @x7 = session[:k7]\n  end\n  def m69_8\n    @x8 = session[:k8]\n  end\n  def m69_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod70.rb": "module Mod70\n  extend ActiveSupport::Concern\n  included do\n    before_action :m70_0\n  end\n  def m70_0\n    @x0 = session[:k0]\n  end\n  def m70_1\n    @x1 = session[:k1]\n  end\n  def m70_2\n    @x2 = session[:k2]\n  end\n  def m70_3\n    @x3 = session[:k3]\n  end\n  def m70_4\n    @x4 = session[:k4]\n  end\n  def m70_5\n    @x5 = session[:k5]\n  end\n  def m70_6\n    @x6 = session[:k6]\n  end\n  def m70_7\n    @x7 = session[:k7]\n  end\n  def m70_8\n    @x8 = session[:k8]\n  end\n  def m70_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod71.rb": "module Mod71\n  extend ActiveSupport::Concern\n  included do\n    before_action :m71_0\n  end\n  def m71_0\n    @x0 = session[:k0]\n  end\n  def m71_1\n    @x1 = session[:k1]\n  end\n  def m71_2\n    @x2 = session[:k2]\n  end\n  def m71_3\n    @x3 = session[:k3]\n  end\n  def m71_4\n    @x4 = session[:k4]\n  end\n  def m71_5\n    @x5 = session[:k5]\n  end\n  def m71_6\n    @x6 = session[:k6]\n  end\n  def m71_7\n    @x7 = session[:k7]\n  end\n  def m71_8\n    @x8 = session[:k8]\n  end\n  def m71_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod72.rb": "module Mod72\n  extend ActiveSupport::Concern\n  included do\n    before_action :m72_0\n  end\n  def m72_0\n    @x0 = session[:k0]\n  end\n  def m72_1\n    @x1 = session[:k1]\n  end\n  def m72_2\n    @x2 = session[:k2]\n  end\n  def m72_3\n    @x3 = session[:k3]\n  end\n  def m72_4\n    @x4 = session[:k4]\n  end\n  def m72_5\n    @x5 = session[:k5]\n  end\n  def m72_6\n    @x6 = session[:k6]\n  end\n  def m72_7\n    @x7 = session[:k7]\n  end\n  def m72_8\n    @x8 = session[:k8]\n  end\n  def m72_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod73.rb": "module Mod73\n  extend ActiveSupport::Concern\n  included do\n    before_action :m73_0\n  end\n  def m73_0\n    @x0 = session[:k0]\n  end\n  def m73_1\n    @x1 = session[:k1]\n  end\n  def m73_2\n    @x2 = session[:k2]\n  end\n  def m73_3\n    @x3 = session[:k3]\n  end\n  def m73_4\n    @x4 = session[:k4]\n  end\n  def m73_5\n    @x5 = session[:k5]\n  end\n  def m73_6\n    @x6 = session[:k6]\n  end\n  def m73_7\n    @x7 = session[:k7]\n  end\n  def m73_8\n    @x8 = session[:k8]\n  end\n  def m73_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod74.rb": "module Mod74\n  extend ActiveSupport::Concern\n  included do\n    before_action :m74_0\n  end\n  def m74_0\n    @x0 = session[:k0]\n  end\n  def m74_1\n    @x1 = session[:k1]\n  end\n  def m74_2\n    @x2 = session[:k2]\n  end\n  def m74_3\n    @x3 = session[:k3]\n  end\n  def m74_4\n    @x4 = session[:k4]\n  end\n  def m74_5\n    @x5 = session[:k5]\n  end\n  def m74_6\n    @x6 = session[:k6]\n  end\n  def m74_7\n    @x7 = session[:k7]\n  end\n  def m74_8\n    @x8 = session[:k8]\n  end\n  def m74_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod75.rb": "module Mod75\n  extend ActiveSupport::Concern\n  included do\n    before_action :m75_0\n  end\n  def m75_0\n    @x0 = session[:k0]\n  end\n  def m75_1\n    @x1 = session[:k1]\n  end\n  def m75_2\n    @x2 = session[:k2]\n  end\n  def m75_3\n    @x3 = session[:k3]\n  end\n  def m75_4\n    @x4 = session[:k4]\n  end\n  def m75_5\n    @x5 = session[:k5]\n  end\n  def m75_6\n    @x6 = session[:k6]\n  end\n  def m75_7\n    @x7 = session[:k7]\n  end\n  def m75_8\n    @x8 = session[:k8]\n  end\n  def m75_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod76.rb": "module Mod76\n  extend ActiveSupport::Concern\n  included do\n    before_action :m76_0\n  end\n  def m76_0\n    @x0 = session[:k0]\n  end\n  def m76_1\n    @x1 = session[:k1]\n  end\n  def m76_2\n    @x2 = session[:k2]\n  end\n  def m76_3\n    @x3 = session[:k3]\n  end\n  def m76_4\n    @x4 = session[:k4]\n  end\n  def m76_5\n    @x5 = session[:k5]\n  end\n  def m76_6\n    @x6 = session[:k6]\n  end\n  def m76_7\n    @x7 = session[:k7]\n  end\n  def m76_8\n    @x8 = session[:k8]\n  end\n  def m76_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod77.rb": "module Mod77\n  extend ActiveSupport::Concern\n  included do\n    before_action :m77_0\n  end\n  def m77_0\n    @x0 = session[:k0]\n  end\n  def m77_1\n    @x1 = session[:k1]\n  end\n  def m77_2\n    @x2 = session[:k2]\n  end\n  def m77_3\n    @x3 = session[:k3]\n  end\n  def m77_4\n    @x4 = session[:k4]\n  end\n  def m77_5\n    @x5 = session[:k5]\n  end\n  def m77_6\n    @x6 = session[:k6]\n  end\n  def m77_7\n    @x7 = session[:k7]\n  end\n  def m77_8\n    @x8 = session[:k8]\n  end\n  def m77_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod78.rb": "module Mod78\n  extend ActiveSupport::Concern\n  included do\n    before_action :m78_0\n  end\n  def m78_0\n    @x0 = session[:k0]\n  end\n  def m78_1\n    @x1 = session[:k1]\n  end\n  def m78_2\n    @x2 = session[:k2]\n  end\n  def m78_3\n    @x3 = session[:k3]\n  end\n  def m78_4\n    @x4 = session[:k4]\n  end\n  def m78_5\n    @x5 = session[:k5]\n  end\n  def m78_6\n    @x6 = session[:k6]\n  end\n  def m78_7\n    @x7 = session[:k7]\n  end\n  def m78_8\n    @x8 = session[:k8]\n  end\n  def m78_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "app/controllers/concerns/mod79.rb": "module Mod79\n  extend ActiveSupport::Concern\n  included do\n    before_action :m79_0\n  end\n  def m79_0\n    @x0 = session[:k0]\n  end\n  def m79_1\n    @x1 = session[:k1]\n  end\n  def m79_2\n    @x2 = session[:k2]\n  end\n  def m79_3\n    @x3 = session[:k3]\n  end\n  def m79_4\n    @x4 = session[:k4]\n  end\n  def m79_5\n    @x5 = session[:k5]\n  end\n  def m79_6\n    @x6 = session[:k6]\n  end\n  def m79_7\n    @x7 = session[:k7]\n  end\n  def m79_8\n    @x8 = session[:k8]\n  end\n  def m79_9\n    @x9 = session[:k9]\n  end\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  resources :things0, only: %i[show destroy]\n  resources :things1, only: %i[show destroy]\n  resources :things2, only: %i[show destroy]\n  resources :things3, only: %i[show destroy]\n  resources :things4, only: %i[show destroy]\n  resources :things5, only: %i[show destroy]\n  resources :things6, only: %i[show destroy]\n  resources :things7, only: %i[show destroy]\n  resources :things8, only: %i[show destroy]\n  resources :things9, only: %i[show destroy]\nend\n",
+   "app/controllers/things0_controller.rb": "class Things0Controller < ApplicationController\n  def show\n    render json: current_user.notes.find(params[:id])\n  end\n  def destroy\n    current_user.notes.find(params[:id]).destroy\n  end\nend\n",
+   "app/controllers/things1_controller.rb": "class Things1Controller < ApplicationController\n  def show\n    render json: current_user.notes.find(params[:id])\n  end\n  def destroy\n    current_user.notes.find(params[:id]).destroy\n  end\nend\n",
+   "app/controllers/things2_controller.rb": "class Things2Controller < ApplicationController\n  def show\n    render json: current_user.notes.find(params[:id])\n  end\n  def destroy\n    current_user.notes.find(params[:id]).destroy\n  end\nend\n",
+   "app/controllers/things3_controller.rb": "class Things3Controller < ApplicationController\n  def show\n    render json: current_user.notes.find(params[:id])\n  end\n  def destroy\n    current_user.notes.find(params[:id]).destroy\n  end\nend\n",
+   "app/controllers/things4_controller.rb": "class Things4Controller < ApplicationController\n  def show\n    render json: current_user.notes.find(params[:id])\n  end\n  def destroy\n    current_user.notes.find(params[:id]).destroy\n  end\nend\n",
+   "app/controllers/things5_controller.rb": "class Things5Controller < ApplicationController\n  def show\n    render json: current_user.notes.find(params[:id])\n  end\n  def destroy\n    current_user.notes.find(params[:id]).destroy\n  end\nend\n",
+   "app/controllers/things6_controller.rb": "class Things6Controller < ApplicationController\n  def show\n    render json: current_user.notes.find(params[:id])\n  end\n  def destroy\n    current_user.notes.find(params[:id]).destroy\n  end\nend\n",
+   "app/controllers/things7_controller.rb": "class Things7Controller < ApplicationController\n  def show\n    render json: current_user.notes.find(params[:id])\n  end\n  def destroy\n    current_user.notes.find(params[:id]).destroy\n  end\nend\n",
+   "app/controllers/things8_controller.rb": "class Things8Controller < ApplicationController\n  def show\n    render json: current_user.notes.find(params[:id])\n  end\n  def destroy\n    current_user.notes.find(params[:id]).destroy\n  end\nend\n",
+   "app/controllers/things9_controller.rb": "class Things9Controller < ApplicationController\n  def show\n    render json: current_user.notes.find(params[:id])\n  end\n  def destroy\n    current_user.notes.find(params[:id]).destroy\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/things0/:id",
+    "ownership": "scoped",
+    "why": "SLOW: 80 concerns (10 methods, one before_action each) included in ApplicationController: these 20 id routes take ~4.3 s (~0.2 s per id route). With a set_note/require_owner chain per controller, 40 id routes take 0.4/1.2/4.1/15.2 s at 10/20/40/80 concerns: quadratic in concerns that declare callbacks, linear without callbacks (0.24 s to 0.83 s). _Ownership.methods().find rebuilds RubyCode.module_methods' dict for every included module on every name lookup (387k rebuilds for 100 routes at 20 concerns), and each callback body's ivar/credential tracing does a lookup per identifier. A 300-controller / 1,500-route app with 25 concerns takes ~74 s"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/things9/:id",
+    "ownership": "scoped",
+    "why": "same"
+   }
+  ]
+ },
+ {
+  "case": "precision_r5",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  delete 'a/:id', to: 'pr_if#destroy'\n  delete 'b/:id', to: 'pr_turbo#destroy'\n  get 'c/:id', to: 'pr_respond#show'\n  get 'd/:id', to: 'pr_jb#show'\n  get 'e/:id', to: 'pr_signed#show'\nend\n",
+   "app/controllers/pr_if_controller.rb": "class PrIfController < ApplicationController\n  before_action :set_note\n  before_action :require_owner, if: :enforce_ownership?\n  def destroy\n    @note.destroy\n    head :no_content\n  end\n  private\n  def enforce_ownership?\n    true\n  end\n\n  def set_note\n    @note = Note.find(params[:id])\n  end\n\n  def require_owner\n    head :forbidden unless @note.user == current_user\n  end\nend\n",
+   "app/controllers/pr_turbo_controller.rb": "class PrTurboController < ApplicationController\n  before_action :set_note, :require_owner\n  def destroy\n    @note.destroy\n    head :no_content\n  end\n  private\n\n  def set_note\n    @note = Note.find(params[:id])\n  end\n  def require_owner\n    return if @note.user == current_user\n    render turbo_stream: turbo_stream.replace('flash', partial: 'shared/flash'), status: :forbidden\n  end\nend\n",
+   "app/controllers/pr_respond_controller.rb": "class PrRespondController < ApplicationController\n  respond_to :json\n  def show\n    respond_with current_user.notes.find(params[:id])\n  end\nend\n",
+   "app/controllers/pr_jb_controller.rb": "class PrJbController < ApplicationController\n  def show\n    @note = Note.find(params[:id])\n    render :forbidden, status: :forbidden and return unless @note.user == current_user\n  end\nend\n",
+   "app/views/pr_jb/forbidden.json.jbuilder": "json.error 'forbidden'\n",
+   "app/controllers/pr_signed_controller.rb": "class PrSignedController < ActionController::Base\n  before_action :authenticate\n  def show\n    render json: @viewer.notes.find(params[:id])\n  end\n  private\n  def authenticate\n    @viewer = User.find_by(id: cookies.signed.permanent[:uid])\n    head :unauthorized unless @viewer\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/a/:id",
+    "ownership": "unchecked",
+    "why": "PRECISION: `if: :enforce_ownership?` names a predicate that always returns true; any `if:` makes the callback conditional, so the owner check is ignored and the route is judged"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/b/:id",
+    "ownership": "unchecked",
+    "why": "PRECISION: a turbo_stream refusal that replaces the flash from a literal partial is treated as leaking (any call in a render value counts), so the halting 403 isn't a refusal and the route is judged"
+   },
+   {
+    "method": "GET",
+    "pattern": "/c/:id",
+    "ownership": "unknown",
+    "why": "PRECISION: `respond_with current_user.notes.find(params[:id])` (responders) reads as unknown; the scoped lookup as respond_with's argument isn't taken"
+   },
+   {
+    "method": "GET",
+    "pattern": "/d/:id",
+    "ownership": "unchecked",
+    "why": "reference (correct): an error view that shows no record"
+   },
+   {
+    "method": "GET",
+    "pattern": "/e/:id",
+    "ownership": "scoped",
+    "why": "reference (correct): `cookies.signed.permanent[:uid]` is verified"
+   }
+  ]
+ },
+ {
+  "case": "precision_reopened_class_first_file",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "\nRails.application.routes.draw do\n  resources :notes, only: :destroy\n  resources :memos, only: :destroy\nend\n",
+   "app/controllers/concerns/notes_reopen.rb": "class NotesController\n  helper_method :x\nend\n",
+   "app/controllers/notes_controller.rb": "class NotesController < ApplicationController\n  before_action :set_note\n\n  def destroy\n    @note.destroy\n    head :no_content\n  end\n\n  private\n\n  def set_note\n    @note = Note.find(params[:id])\n  end\nend\n",
+   "app/controllers/memos_controller.rb": "class MemosController < ApplicationController\n  before_action :set_note\n  def destroy\n    @note.destroy\n    head :no_content\n  end\n  private\n\n  def set_note\n    @note = Note.find(params[:id])\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/notes/:id",
+    "ownership": "caller-blind",
+    "why": "PRECISION/CORRECTNESS: a reopening of NotesController in a file that sorts first (app/controllers/concerns/\u2026) creates the _Controller with that file as `src`; the real file's methods are then read with the wrong file's bytes (`ctrl.src, ctrl.actions[name]` in find()), so set_note's lookup isn't recognised and the unscoped destroy reads unknown instead of judged"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/memos/:id",
+    "ownership": "caller-blind",
+    "why": "twin: the same controller, not reopened"
    }
   ]
  }
