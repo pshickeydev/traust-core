@@ -38,7 +38,15 @@ _VENDOR_NAMESPACE = {Ecosystem.RPM, Ecosystem.DEB, Ecosystem.APK}
 Component = tuple[str, str | None, str | None]  # (ref, purl, version)
 
 
-def parse_sbom(raw: bytes) -> SbomContents:
+def parse_sbom(
+    raw: bytes, declared_direct: frozenset[tuple[Ecosystem, str, str | None]] | None = None
+) -> SbomContents:
+    """`declared_direct` names packages a checkout's manifests declare, as (ecosystem,
+    name, version-or-None): syft's manifest scan emits no dependency edges for Go
+    (go.mod), Rust (Cargo.lock) or a requirements file's Python, so their direct set is
+    what the manifest declares, passed by the ingest door that holds the checkout. A None
+    version matches the name at any version (the manifest names constraints, not pins);
+    names compare as the ecosystem normalises them."""
     try:
         doc = json.loads(raw)
     except ValueError as e:
@@ -63,7 +71,18 @@ def parse_sbom(raw: bytes) -> SbomContents:
             skipped += 1
             continue
         key = (parsed[0], parsed[1], version)
-        entries[key] = entries.get(key, False) or ref in direct
+        claimed = ref in direct or (
+            declared_direct is not None
+            and (
+                (parsed[0], parsed[1], version) in declared_direct
+                or (parsed[0], parsed[1], None) in declared_direct
+                or (
+                    parsed[0] == Ecosystem.GO
+                    and (parsed[0], parsed[1], version.removeprefix("v")) in declared_direct
+                )
+            )
+        )
+        entries[key] = entries.get(key, False) or claimed
     return SbomContents(
         entries=tuple(
             SbomEntry(ecosystem=e, name=n, version=Version(v), direct=d)

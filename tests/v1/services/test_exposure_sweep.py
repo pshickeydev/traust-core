@@ -562,3 +562,59 @@ def test_a_query_that_cant_be_answered_raises(
 ) -> None:
     with pytest.raises(error, match=match):
         service(engine, lookup).package_advisories(ecosystem, "lodash", Version("4.17.20"))
+
+
+def test_a_gomods_requires_mark_go_dependencies_direct(engine: Engine, tmp_path: Path) -> None:
+    """syft's manifest scan emits no golang dependency edges, so the ingest door passes the
+    go.mod require block as the direct set; without it every Go package keys indirect."""
+    with SqlTraustUnitOfWork(engine) as uow:
+        ref = Seed(uow).repository_ref()
+        uow.commit()
+    assert ref.id is not None
+    (tmp_path / "go.mod").write_text(
+        "module github.com/example/widget\n\n"
+        "go 1.22\n\n"
+        "require (\n"
+        "\tgithub.com/google/uuid v1.6.0\n"
+        ")\n"
+    )
+    (tmp_path / "Cargo.toml").write_text(
+        '[package]\nname = "widget"\nversion = "0.1.0"\n\n'
+        '[dependencies]\nserde = "1.0"\n\n'
+        '[dev-dependencies]\nregex-syntax = "0.8"\n'
+    )
+    (tmp_path / "Cargo.lock").write_text(
+        'version = 3\n\n[[package]]\nname = "widget"\nversion = "0.1.0"\n'
+        'dependencies = ["serde 1.0.193"]\n\n'
+        '[[package]]\nname = "serde"\nversion = "1.0.193"\n'
+    )
+    (tmp_path / "requirements.txt").write_text("flask==3.0.0\n")
+    raw = json.dumps(
+        {
+            "bomFormat": "CycloneDX",
+            "specVersion": "1.6",
+            "components": [
+                {"bom-ref": "u", "purl": "pkg:golang/github.com/google/uuid@v1.6.0"},
+                {"bom-ref": "t", "purl": "pkg:golang/github.com/transitive/dep@v0.1.0"},
+                {"bom-ref": "s", "purl": "pkg:cargo/serde@1.0.193"},
+                {"bom-ref": "rt", "purl": "pkg:cargo/regex-syntax@0.8.2"},
+                {"bom-ref": "f", "purl": "pkg:pypi/flask@3.0.0"},
+                {"bom-ref": "j", "purl": "pkg:pypi/jinja2@3.1.2"},
+            ],
+            "dependencies": [],
+        }
+    ).encode()
+    exposure = service(engine, tool=FakeSbomTool(raw=raw))
+    exposure.ingest_dependencies(ref.id, tmp_path)
+    rows_ = {
+        (d.package.name, d.dependency.version, d.dependency.direct)
+        for d in exposure.dependencies(ref.id)
+    }
+    assert rows_ == {
+        ("github.com/google/uuid", "v1.6.0", True),
+        ("github.com/transitive/dep", "v0.1.0", False),
+        ("serde", "1.0.193", True),  # Cargo.lock pins the root's exact direct version
+        ("regex-syntax", "0.8.2", False),  # dev-dependencies are not the production set
+        ("flask", "3.0.0", True),  # requirements.txt holds direct dependencies only
+        ("jinja2", "3.1.2", False),
+    }
