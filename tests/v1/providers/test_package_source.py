@@ -22,6 +22,7 @@ from traust_core.v1.providers.package_source import (
     archive_url,
     cargo_requires,
     extract,
+    go_direct_requires,
     go_requires,
     importers,
     nuget_version,
@@ -516,10 +517,15 @@ def test_cargo_requires_reads_only_the_dependencies_table(tmp_path: Path) -> Non
     (tmp_path / "Cargo.toml").write_text(
         '[package]\nname = "widget"\nversion = "0.1.0"\n\n'
         '[dependencies]\nserde = { version = "1.0" }\nregex = "1.10"\n\n'
+        '[dependencies.clap]\nversion = "4"\n\n'
+        '[dependencies]\nserde_alias = { package = "serde_json", version = "1" }\n\n'
         '[dev-dependencies]\ncriterion = "0.5"\n\n'
+        '[dev-dependencies.tempfile]\nversion = "3"\n\n'
         '[build-dependencies]\ncc = "1.0"\n'
     )
-    assert cargo_requires(tmp_path) == ["serde", "regex"]
+    # the per-crate header names the crate; an inline package = "..." renames the key;
+    # dev-, build- and per-crate dev sections stay out of the production set
+    assert cargo_requires(tmp_path) == ["serde", "regex", "clap", "serde_json"]
 
 
 def test_requirements_names_reads_constraints_and_skips_options(tmp_path: Path) -> None:
@@ -527,4 +533,25 @@ def test_requirements_names_reads_constraints_and_skips_options(tmp_path: Path) 
         "# comment\nflask==3.0.0\nrequests >= 2.31\n-r other.txt\n--index-url https://x\n"
     )
     (tmp_path / "requirements-dev.txt").write_text("pytest>=8\n")
-    assert sorted(requirements_names(tmp_path)) == ["flask", "pytest", "requests"]
+    (tmp_path / "base-requirements.txt").write_text("urllib3>=2\n")
+    assert sorted(requirements_names(tmp_path)) == ["flask", "pytest", "requests", "urllib3"]
+
+
+def test_go_direct_requires_skips_indirect_and_walks_workspaces(tmp_path: Path) -> None:
+    (tmp_path / "go.mod").write_text(
+        "module github.com/example/widget\n\n"
+        "go 1.22\n\n"
+        "require (\n"
+        "\tgithub.com/google/uuid v1.6.0\n"
+        "\tgithub.com/transitive/dep v0.1.0 // indirect\n"
+        ")\n"
+    )
+    nested = tmp_path / "pkg" / "nested"
+    nested.mkdir(parents=True)
+    (nested / "go.mod").write_text(
+        "module github.com/example/widget/pkg/nested\n\nrequire gopkg.in/yaml.v3 v3.0.1\n"
+    )
+    assert sorted(go_direct_requires(tmp_path)) == [
+        ("github.com/google/uuid", "1.6.0"),
+        ("gopkg.in/yaml.v3", "3.0.1"),
+    ]

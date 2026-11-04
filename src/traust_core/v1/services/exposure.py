@@ -132,7 +132,7 @@ from traust_core.v1.providers.feeds import (
 )
 from traust_core.v1.providers.package_source import (
     cargo_requires,
-    go_requires,
+    go_direct_requires,
     requirements_names,
 )
 from traust_core.v1.providers.sources import CheckoutRequest, SourceError, SourceProvider
@@ -311,7 +311,13 @@ class ExposureService:
             uow.commit()
         return self.feed_status(feed)
 
-    def ingest_sbom(self, raw: bytes, repository_ref_id: UUID, *, declared_direct=None) -> Sbom:
+    def ingest_sbom(
+        self,
+        raw: bytes,
+        repository_ref_id: UUID,
+        *,
+        declared_direct: frozenset[tuple[Ecosystem, str, str | None]] | None = None,
+    ) -> Sbom:
         """A commit's manifest SBOM (CycloneDX / SPDX JSON from standard tools). The same package
         list again, in either format, is the same SBOM; only its first document is kept.
         `declared_direct`: (ecosystem, name, version-or-None) the checkout's manifests
@@ -450,7 +456,9 @@ class ExposureService:
         # manifests the archive keeps are the direct truth: go.mod requires (pinned),
         # Cargo.toml's [dependencies] crates and requirements files' packages (named,
         # matched at any version — the manifest states constraints, not pins).
-        declared = {(Ecosystem.GO, module, version) for module, version in go_requires(checkout)}
+        declared = {
+            (Ecosystem.GO, module, version) for module, version in go_direct_requires(checkout)
+        }
         declared |= {(Ecosystem.CARGO, crate, None) for crate in cargo_requires(checkout)}
         declared |= {
             (Ecosystem.PYPI, package_name(Ecosystem.PYPI, name), None)

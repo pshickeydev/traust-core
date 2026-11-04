@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import re
 import shutil
 import tarfile
@@ -33,6 +34,7 @@ from traust_core.v1.models.dependencies import Version
 from traust_core.v1.models.vocabulary import Ecosystem
 from traust_core.v1.providers.base import Readiness
 from traust_core.v1.providers.http import HttpFetcher
+from traust_core.v1.providers.tree import SKIP_DIRS
 
 MAX_BYTES = 200 * 1024 * 1024
 MAX_STRIP = 6  # a Maven module's sources sit under <module>/src/main/java/ in the repository
@@ -414,9 +416,30 @@ def go_requires(root: Path) -> list[tuple[str, Version]]:
     return [(m, Version(v.removeprefix("v"))) for m, v in found]
 
 
+def go_direct_requires(root: Path) -> list[tuple[str, Version]]:
+    """(module, version) for every require a checkout's go.mod files declare direct: every
+    go.mod the archive kept (a workspace's modules live under subdirectories, with no root
+    go.mod), minus the `// indirect` entries go.mod lists for reproducibility, which are
+    transitive dependencies, not the module's own."""
+    found: list[tuple[str, Version]] = []
+    for top, dirs, names in os.walk(root, followlinks=False):
+        dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS)
+        if "go.mod" not in names:
+            continue
+        text = (Path(top) / "go.mod").read_text(errors="replace")
+        for line in text.splitlines():
+            if "// indirect" in line:
+                continue
+            if match := re.match(r"(?m)^\s*(?:require\s+)?(\S+)\s+(v\S+)", line):
+                found.append((match.group(1), Version(match.group(2).removeprefix("v"))))
+    return found
+
+
 def cargo_requires(root: Path) -> list[str]:
     """Every crate named in a Cargo.toml's `[dependencies]` table: the direct set, as the
-    lockfile's versions can't be matched from the manifest's constraints."""
+    lockfile's versions can't be matched from the manifest's constraints. The per-crate
+    `[dependencies.<crate>]` header form declares the same, and an inline `package = "..."`
+    renames the key to the crate's published name."""
     manifest = root / "Cargo.toml"
     if not manifest.is_file():
         return []
@@ -425,20 +448,31 @@ def cargo_requires(root: Path) -> list[str]:
     for line in manifest.read_text(errors="replace").splitlines():
         header = re.match(r"(?m)^\s*\[([^\]]+)\]", line)
         if header:
-            # Only the plain table: dev-, build- and target-specific dependencies are not
-            # the production set the lane watches.
-            in_dependencies = header.group(1).strip() == "dependencies"
+            # Only the plain table and its per-crate form: dev-, build- and
+            # target-specific dependencies are not the production set the lane watches.
+            table = header.group(1).strip()
+            if table == "dependencies":
+                in_dependencies = True  # crate entries follow
+            elif table.startswith("dependencies."):
+                # the crate is the header; the lines that follow are its spec
+                names.append(table.partition(".")[2].strip().strip('"'))
+                in_dependencies = False
+            else:
+                in_dependencies = False
             continue
-        if in_dependencies and (crate := re.match(r"(?m)^\s*([A-Za-z0-9_-]+)\s*=", line)):
-            names.append(crate.group(1))
+        if in_dependencies and (crate := re.match(r"(?m)^\s*([A-Za-z0-9_-]+)\s*=\s*(.*)", line)):
+            published = re.search(r"(?m)\bpackage\s*=\s*\"([^\"]+)\"", crate.group(2))
+            names.append(published.group(1) if published else crate.group(1))
     return names
 
 
 def requirements_names(root: Path) -> list[str]:
-    """Every package named in a requirements file (`requirements*.txt`, PEP 508 lines): a
-    requirements file holds direct dependencies only, constraints unresolved."""
+    """Every package named in a requirements file (`requirements*.txt` and `*requirements.txt`,
+    PEP 508 lines): a requirements file holds direct dependencies only, constraints
+    unresolved."""
     names: list[str] = []
-    for path in sorted(root.glob("requirements*.txt")):
+    files = {*root.glob("requirements*.txt"), *root.glob("*requirements.txt")}
+    for path in sorted(files):
         for line in path.read_text(errors="replace").splitlines():
             spec = re.split(r"[<>=!~;\[\s]", line.strip(), maxsplit=1)[0]
             if spec and not spec.startswith(("#", "-")):
