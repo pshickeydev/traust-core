@@ -2158,8 +2158,8 @@
   },
   "method": "DELETE",
   "pattern": "/notes/:id",
-  "ownership": "scoped",
-  "why": "reference (correct): the session write, if any, is one the request can't choose"
+  "ownership": "unknown",
+  "why": "a block over the whole store may change the values it's handed: unknown"
  },
  {
   "case": "r10-devise_session_each",
@@ -2168,8 +2168,8 @@
   },
   "method": "DELETE",
   "pattern": "/notes/:id",
-  "ownership": "scoped",
-  "why": "reference (correct): the session write, if any, is one the request can't choose"
+  "ownership": "unknown",
+  "why": "a block over the whole store may change the values it's handed: unknown"
  },
  {
   "case": "r10-own_session_slice",

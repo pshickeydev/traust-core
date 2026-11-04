@@ -1185,7 +1185,7 @@ class _Action:
         self.unstable: set[str] = set()
         self.hop: CodeSpan | None = None
         self.caller_span: CodeSpan | None = None
-        self.reached = _reachable(steps, methods)
+        self.reached = _reachable(steps, methods, code=code)
         self.local_values: dict[str, list[tuple[Parsed, Node]]] = {}
         literal: dict[str, bool] = {}
         for step in self.reached:
@@ -2733,7 +2733,10 @@ def _helper_name(src: Parsed, node: Node) -> str:
 
 
 def _reachable(
-    steps: list[_Step], methods: Callable[[str], tuple[Parsed, Node] | None], limit: int = 2000
+    steps: list[_Step],
+    methods: Callable[[str], tuple[Parsed, Node] | None],
+    limit: int = 2000,
+    code: RubyCode | None = None,
 ) -> list[_Step]:
     """The steps and the bodies of the helpers they call, transitively; a caller's own
     definition (`def current_user`) is an authentication step."""
@@ -2747,6 +2750,8 @@ def _reachable(
             name = _helper_name(step.src, n)
             if not name or name in seen:
                 continue
+            if code is not None and n.type == "identifier" and _a_local(code, step.src, n):
+                continue  # a local there (`helper = "safe"`), not the method
             seen.add(name)
             found = methods(name)
             if found is not None:
@@ -2894,8 +2899,8 @@ def _scan(
                 a = args(n)
                 if call_name(src, n) in _SENDS and a and (name := symbol(src, a[0])):
                     names.append(name)
-            elif n.type == "identifier" and _helper_name(src, n):
-                names.append(src.text(n))
+            elif n.type == "identifier" and _helper_name(src, n) and not _a_local(code, src, n):
+                names.append(src.text(n))  # a bare name that isn't a local there
         code.scans[key] = (uses, names, ivars)
     return code.scans[key]
 
@@ -2916,8 +2921,16 @@ def _store_root(code: RubyCode, src: Parsed, n: Node) -> str | None:
         return {"session": "store", "session_options": "options"}.get(src.text(n), "jar")
     if n.type == "call" and call_name(src, n) in _STORE_ROOTS:
         receiver = unwrap(n.child_by_field_name("receiver"))
-        if receiver is not None and receiver.type in ("constant", "scope_resolution"):
-            return None  # `Current.session`: a model's attribute
+        if receiver is not None and not (
+            receiver.type == "self"
+            or re.fullmatch(r"@?_?(request|controller)", src.text(receiver).split(".")[-1])
+            or (
+                receiver.type == "identifier"
+                and (held := _local_at(code, src, receiver)) is not None
+                and held[1]  # a block's parameter: `before_action { |c| c.session[…] }`
+            )
+        ):
+            return None  # `account.session`, `Current.session`: another object's attribute
         name = call_name(src, n)
         return {"session": "store", "session_options": "options"}.get(name, "jar")
     if n.type == "call" and call_name(src, n) in _SENDS and args(n):
@@ -2974,7 +2987,10 @@ def _store_uses(code: RubyCode, src: Parsed, n: Node) -> list[_Use] | None:
         if _receives(parent, cur):
             name, a = call_name(src, parent), args(parent)
             if keyed:
-                return [_Use("read" if name in _VALUE_READS else "write", keys, None)]
+                if name in _VALUE_READS and parent.child_by_field_name("block") is None:
+                    cur = parent  # `session[:ids].first`: still the stored value
+                    continue
+                return [_Use("write", keys, None)]  # `.replace(…)`, `<<`, `.each { … }`
             if name == "permanent":
                 cur = parent
                 continue
@@ -2988,7 +3004,10 @@ def _store_uses(code: RubyCode, src: Parsed, n: Node) -> list[_Use] | None:
                 keyed, cur = True, parent
                 continue
             if name in _STORE_READS:
-                return [_Use("read", None, None)]
+                if parent.child_by_field_name("block") is not None:
+                    return unnamed  # `session.each { |k, v| v.replace(…) }`: the values handed on
+                keyed, keys, cur = True, None, parent  # `session.values.first.replace(…)`
+                continue
             if name in _STORE_DROPS:
                 return []
             if name in ("[]=", "store") and len(a) == 2:
@@ -3031,18 +3050,18 @@ def _receives(parent: Node | None, node: Node) -> bool:
     )
 
 
-def _key_patterns(code: RubyCode, src: Parsed, node: Node | None) -> tuple[str, ...] | None:
+def _key_patterns(
+    code: RubyCode, src: Parsed, node: Node | None, depth: int = 0
+) -> tuple[str, ...] | None:
     """The key a store is indexed by: `:user_id`, `"user_id"`, `"#{scope}_return_to"` as
     `*_return_to`, or a local holding only those; None when it can't be named."""
     node = unwrap(node)
-    if node is None:
-        return None
+    if node is None or depth > 8:
+        return None  # past a cycle of locals (`a = b; b = a` in a loop): any key
     if node.type == "string" and any(c.type == "escape_sequence" for c in node.named_children):
-        return None  # `"view\x5fas"`
+        return None  # `"view\x5fas"`: `symbol()` would drop the escape
     if (key := symbol(src, node)) is not None:
         return (key,)
-    if node.type == "string" and any(c.type == "escape_sequence" for c in node.named_children):
-        return None  # `"view\x5fas"`
     if node.type == "string":
         parts = [
             glob_escape(src.text(c)) if c.type == "string_content" else "*"
@@ -3055,7 +3074,7 @@ def _key_patterns(code: RubyCode, src: Parsed, node: Node | None) -> tuple[str, 
         )
     if node.type == "identifier" and (held := _local_at(code, src, node)) is not None:
         values, param = held
-        found = [_key_patterns(code, src, v) for v in values]
+        found = [_key_patterns(code, src, v, depth + 1) for v in values]
         if param or not found or None in found:
             return None
         return tuple(k for ks in found for k in ks)  # type: ignore[union-attr]
@@ -3265,6 +3284,18 @@ def _constant_only(src: Parsed, node: Node) -> bool:
         if n.type == "call" and n.child_by_field_name("receiver") is None:
             return False
     return True
+
+
+def _a_local(code: RubyCode, src: Parsed, node: Node) -> bool:
+    """A bare name that's a local where it stands: assigned there, or read after one."""
+    parent = node.parent
+    if (
+        parent is not None
+        and parent.type in ("assignment", "operator_assignment")
+        and parent.child_by_field_name("left") == node
+    ):
+        return True
+    return _local_at(code, src, node) is not None
 
 
 def _ancestors(node: Node) -> Iterator[Node]:

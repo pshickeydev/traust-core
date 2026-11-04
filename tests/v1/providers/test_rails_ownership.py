@@ -1305,3 +1305,51 @@ def test_what_the_session_reviews_found_stays_closed(tmp_path: Path, case: dict)
     files = {**_notes_app(""), **case["files"]}
     row = _row(_tree(tmp_path, files), case["method"], case["pattern"])
     assert row["ownership"] == case["ownership"], case["why"]
+
+
+@pytest.mark.parametrize(
+    "write",
+    [
+        "session.values.first.replace(params[:user_id])",
+        "session.to_h[:user_id].replace(params[:user_id])",
+        "session[:user_id].to_s.replace(params[:user_id])",
+        "session.each_value { |v| v.replace(params[:user_id]) }",
+    ],
+)
+def test_a_stored_value_mutated_through_a_read_is_a_write(tmp_path: Path, write: str) -> None:
+    controller = FORGED_SESSION.format(
+        write=write, helpers=SESSION_USER.format(read="session[:user_id]")
+    )
+    row = _row(_tree(tmp_path, _notes_app(controller)), "DELETE", "/notes/:id")
+    assert row["ownership"] != "scoped"
+
+
+def test_another_objects_session_is_not_the_requests(tmp_path: Path) -> None:
+    write = "@account = Account.first\n    @account.session.update(token: params[:t])"
+    controller = FORGED_SESSION.format(
+        write=write, helpers=SESSION_USER.format(read="session[:user_id]")
+    )
+    row = _row(_tree(tmp_path, _notes_app(controller)), "DELETE", "/notes/:id")
+    assert row["ownership"] == "scoped"
+
+
+def test_a_local_named_like_a_helper_calls_no_helper(tmp_path: Path) -> None:
+    controller = FORGED_SESSION.format(
+        write='helper = "safe"\n    logger.info(helper)',
+        helpers="  def helper\n    session[:user_id] = params[:user_id]\n  end\n\n"
+        + SESSION_USER.format(read="session[:user_id]"),
+    )
+    row = _row(_tree(tmp_path, _notes_app(controller)), "DELETE", "/notes/:id")
+    assert row["ownership"] == "scoped"
+
+
+def test_a_cycle_of_key_locals_in_a_loop_ends(tmp_path: Path) -> None:
+    write = (
+        "a = :x\n    b = :y\n    2.times do\n      a = b\n      b = a\n"
+        "      session[a] = params[:user_id]\n    end"
+    )
+    controller = FORGED_SESSION.format(
+        write=write, helpers=SESSION_USER.format(read="session[:user_id]")
+    )
+    row = _row(_tree(tmp_path, _notes_app(controller)), "DELETE", "/notes/:id")
+    assert row["ownership"] != "scoped"

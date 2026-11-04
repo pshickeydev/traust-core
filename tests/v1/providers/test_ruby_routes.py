@@ -435,6 +435,12 @@ def test_a_namespaces_path_option_renames_or_drops_its_segment(tmp_path):
             "a/<unresolved>/notes#show",
         ),
         (None, "namespace :admin, module: MODULE do", "<unresolved>/notes#show"),
+        # Rails 8.0 routes a nested `module: ''` to `a//notes`, which names no constant
+        (
+            "8.0.3",
+            "namespace :a do\n  namespace :admin, module: '' do",
+            "a/<unresolved>/notes#show",
+        ),
     ],
 )
 def test_a_namespace_without_its_module_follows_the_apps_rails(tmp_path, lock, routes, controller):
