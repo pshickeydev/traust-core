@@ -5028,7 +5028,7 @@
    {
     "method": "DELETE",
     "pattern": "/memos/:id",
-    "ownership": "unknown",
+    "ownership": "caller-blind",
     "why": "the app's Publicish skips the check in `included do`; spec/dummy defines its own empty Publicish, parsed later, which overwrites qualified['Publicish'] for every app root; body('Publicish') (cached by bare name) reads the dummy's"
    },
    {

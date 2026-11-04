@@ -251,10 +251,11 @@ class RubyCode:
 
     def __init__(self, sources: dict[str, Parsed]) -> None:
         self.sources = sources
+        self.roots = app_roots(list(sources))
         self.models: dict[str, _Model] = {}
         self.columns: dict[str, list[str]] = {}  # table -> columns
-        self.policies: dict[str, Node] = {}  # class name -> class node
-        self.policy_src: dict[str, Parsed] = {}
+        # `Admin::NotePolicy` -> its class; never keyed by the bare name several may share
+        self.policies: dict[str, tuple[Parsed, Node]] = {}
         self.modules: dict[str, list[tuple[Parsed, Node]]] = {}  # module name -> definitions
         self.ability: tuple[Parsed, Node] | None = None
         # `Api::Relaxed` -> every definition (a module reopened in another file)
@@ -291,8 +292,8 @@ class RubyCode:
             body = statements(n.child_by_field_name("body"))
             if name.endswith("Policy") or base.endswith("Policy") or name == "Scope":
                 if name.endswith("Policy"):
-                    self.policies[name] = n
-                    self.policy_src[name] = src
+                    written = src.text(n.child_by_field_name("name")).removeprefix("::")
+                    self.policies["::".join([*_lexical(src, n), written])] = (src, n)
             elif (
                 name == "Ability"
                 and any(s.type == "call" and call_name(src, s) == "include" for s in body)
@@ -457,7 +458,7 @@ class RubyCode:
             if len(found) > 1:
                 return UNREAD
             defs = self.qualified[found[0]]
-        roots = {_root(src.file.rel) for src, _ in defs}
+        roots = {root_of(src.file.rel, self.roots) for src, _ in defs}
         return defs if len(roots) == 1 else UNREAD  # `spec/dummy`'s and the app's
 
     def module(self, name: str) -> tuple[Parsed, Node] | object | None:
@@ -550,17 +551,32 @@ class RubyCode:
             found = self.models.get(found.base)
         return (policy or f"{model}Policy").removeprefix("::")
 
+    def policy(
+        self, name: str, lexical: tuple[str, ...] = (), exact: bool = False
+    ) -> tuple[Parsed, Node] | None:
+        """A policy class by the name it's written as, in its lexical scope first; a short
+        name several policies share (`NotePolicy`, `Admin::NotePolicy`) is unread unless one
+        is that exact name. `exact`: Pundit's own `<Model>Policy` lookup, the name alone."""
+        name = name.removeprefix("::")
+        for k in range(len(lexical), -1, -1):
+            if (q := "::".join([*lexical[:k], name])) in self.policies:
+                return self.policies[q]
+        if exact:
+            return None
+        found = [v for q, v in self.policies.items() if q == name or q.endswith(f"::{name}")]
+        return found[0] if len(found) == 1 else None
+
     def policy_method(
         self, model: str, query: str, policy: str | None = None
     ) -> tuple[Parsed, Node] | None:
         """`NotePolicy#destroy?` (through aliases and policy inheritance); None when it
         can't be read."""
         name = self.policy_name(model, policy)
-        cls = self.policies.get(name.rsplit("::", 1)[-1])
+        found = self.policy(name, exact=name == f"{model}Policy")
         seen: set[tuple[str, str]] = set()
-        while cls is not None and (name, query) not in seen:
-            seen.add((name, query))
-            src = self.policy_src[name.rsplit("::", 1)[-1]]
+        while found is not None and (id(found[1]), query) not in seen:
+            seen.add((id(found[1]), query))
+            src, cls = found
             # the last definition wins: a `def`, or an alias made after it
             last: Node | str | None = None
             for m in statements(cls.child_by_field_name("body")):
@@ -578,21 +594,19 @@ class RubyCode:
             if last is not None:
                 return src, last
             sup = cls.child_by_field_name("superclass")
-            name = (
-                src.text(sup.named_children[0]).rsplit("::", 1)[-1]
-                if sup is not None and sup.named_children
-                else ""
+            parent = (
+                src.text(sup.named_children[0]) if sup is not None and sup.named_children else ""
             )
-            cls = self.policies.get(name)
+            found = self.policy(parent, tuple(_lexical(src, cls))) if parent else None
         return None
 
     def policy_scope(self, model: str, scope: str | None = None) -> tuple[Parsed, Node] | None:
         """`NotePolicy::Scope#resolve`, or the `policy_scope_class:` named."""
         policy, _, inner = (scope or f"{self.policy_name(model)}::Scope").rpartition("::")
-        cls = self.policies.get(policy.rsplit("::", 1)[-1])
-        if cls is None:
+        found = self.policy(policy, exact=scope is None and policy == f"{model}Policy")
+        if found is None:
             return None
-        src = self.policy_src[policy.rsplit("::", 1)[-1]]
+        src, cls = found
         for n in walk(cls):
             if n.type == "class" and src.text(n.child_by_field_name("name")) == inner:
                 for m in statements(n.child_by_field_name("body")):
@@ -604,13 +618,20 @@ class RubyCode:
 UNREAD = object()  # a module several definitions share a name with
 
 
-def _root(rel: str) -> str:
-    """The app a file belongs to (`spec/dummy/` for `spec/dummy/app/…`)."""
-    for part in ("app/", "config/", "lib/"):
-        at = f"/{rel}".find(f"/{part}")
-        if at >= 0:
-            return rel[:at]
-    return ""
+def app_roots(rels: list[str]) -> list[str]:
+    """The apps a checkout holds, longest first: each directory with a `config/routes.rb`
+    or `config/application.rb` (an engine, `spec/dummy/`), and the top one ('')."""
+    roots = {""}
+    for rel in rels:
+        for marker in ("config/routes.rb", "config/application.rb"):
+            if rel == marker or rel.endswith(f"/{marker}"):
+                roots.add(rel[: len(rel) - len(marker)])
+    return sorted(roots, key=len, reverse=True)
+
+
+def root_of(rel: str, roots: list[str]) -> str:
+    """The app a file belongs to: the longest app root it lies under."""
+    return next((r for r in roots if rel.startswith(r)), "")
 
 
 def _lexical(src: Parsed, node: Node) -> list[str]:
@@ -1022,6 +1043,8 @@ class _Action:
             found = self.methods(name)
             if found is None and self.unread(name):
                 out.add(name)  # an app `current_user` we can't read may come from params
+            if found is not None and self._returns_unset(found):
+                out.add(name)  # `def current_user; @user; end` with `@user` from params
             if found is not None and any(
                 self._untrusted(s.src, s.node)
                 for s in _reachable(
@@ -1057,6 +1080,37 @@ class _Action:
                     ):
                         out.add("current_user")
         return out
+
+    def _returns_unset(self, found: tuple[Parsed, Node]) -> bool:
+        """Whether a caller helper reads an ivar it doesn't set itself (`@user`) that the
+        action's code sets from anything but a credential, or never sets."""
+        steps = _reachable(
+            [_Step(found[0], b, Kind.CALLBACK) for b in method_body(found[1])], self.methods
+        )
+        own = {
+            s.src.text(left)
+            for s in steps
+            for n in walk(s.node)
+            if n.type in ("assignment", "operator_assignment")
+            and (left := n.child_by_field_name("left")) is not None
+        }
+        read = {
+            s.src.text(n) for s in steps for n in walk(s.node) if n.type == "instance_variable"
+        } - own
+        for ivar in read:
+            values = [
+                (step.kind, step.src, n.child_by_field_name("right"))
+                for step in self.reached
+                for n in walk(step.node)
+                if n.type in ("assignment", "operator_assignment")
+                and step.src.text(n.child_by_field_name("left")) == ivar
+            ]
+            if not values or any(
+                kind is Kind.ACTION or not self._credential(src, value, self.caller_ivars)
+                for kind, src, value in values
+            ):
+                return True
+        return False
 
     def is_caller(self, src: Parsed, node: Node | None) -> bool:
         node = unwrap(node)

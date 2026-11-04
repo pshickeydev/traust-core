@@ -306,3 +306,71 @@ def test_routes_nested_past_any_real_file_neither_crash_nor_hang(tmp_path):
     )
     _write(tmp_path, "config/routes.rb", routes)
     assert ("GET", "/tags/:id") in _patterns(_enum(tmp_path), "rails")
+
+
+def test_a_guard_an_included_concern_declares_guards_the_route(tmp_path):
+    _write(
+        tmp_path,
+        "config/routes.rb",
+        "Rails.application.routes.draw do\n  resources :notes, only: [:show]\nend\n",
+    )
+    _write(
+        tmp_path,
+        "app/controllers/concerns/authenticated.rb",
+        "module Authenticated\n  extend ActiveSupport::Concern\n\n  included do\n"
+        "    before_action :authenticate_user!\n  end\nend\n",
+    )
+    _write(
+        tmp_path,
+        "app/controllers/notes_controller.rb",
+        "class NotesController < ActionController::Base\n  include Authenticated\n"
+        "  def show; end\nend\n",
+    )
+    assert _route(_enum(tmp_path), "GET", "/notes/:id")["guards"] == ["authenticate_user!"]
+
+
+def test_route_concerns_expand_every_name_their_on_option_and_only_in_their_app(tmp_path):
+    _write(
+        tmp_path,
+        "config/routes.rb",
+        "Rails.application.routes.draw do\n"
+        "  concern :commentable do\n    resources :comments, only: [:index]\n  end\n"
+        "  concern :previewable do\n    get :preview, on: :member\n"
+        "    get :drafts, on: :collection\n  end\n"
+        "  resources :posts, only: [:show] do\n    concerns :commentable, :previewable\n  end\n"
+        "end\n",
+    )
+    _write(
+        tmp_path,
+        "spec/dummy/config/routes.rb",
+        "Rails.application.routes.draw do\n"
+        "  resources :pages, only: [:show] do\n    concerns :commentable\n  end\nend\n",
+    )
+    patterns = _patterns(_enum(tmp_path), "rails")
+    assert {
+        ("GET", "/posts/:post_id/comments"),
+        ("GET", "/posts/:id/preview"),
+        ("GET", "/posts/drafts"),
+    } <= patterns
+    assert ("GET", "/pages/:page_id/comments") not in patterns  # the other app's concern
+
+
+def test_only_an_engines_own_routes_take_its_isolated_namespace(tmp_path):
+    _write(
+        tmp_path,
+        "config/routes.rb",
+        "Rails.application.routes.draw do\n  resources :invoices, only: [:show]\nend\n",
+    )
+    _write(
+        tmp_path,
+        "lib/billing/engine.rb",
+        "module Billing\n  class Engine < ::Rails::Engine\n    isolate_namespace Billing\n"
+        "  end\nend\n",
+    )
+    _write(
+        tmp_path,
+        "app/controllers/invoices_controller.rb",
+        "class InvoicesController < ActionController::Base\n  def show; end\nend\n",
+    )
+    row = _route(_enum(tmp_path), "GET", "/invoices/:id")
+    assert row["handler"]["path"] == "app/controllers/invoices_controller.rb"

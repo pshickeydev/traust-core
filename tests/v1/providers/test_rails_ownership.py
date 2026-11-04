@@ -769,3 +769,145 @@ def test_only_a_tamper_proof_cookie_names_the_caller(
         ),
     }
     assert _row(_tree(tmp_path, files), "GET", "/notes/:id")["ownership"] == ownership
+
+
+def _notes_app(controller: str, extra: dict[str, str] | None = None) -> dict[str, str]:
+    """An app whose `NotesController` destroys a note: `controller` is its body."""
+    return {
+        **MODELS,
+        "db/schema.rb": SCHEMA,
+        "config/routes.rb": (
+            "Rails.application.routes.draw do\n  resources :notes, only: [:destroy]\nend\n"
+        ),
+        "app/controllers/application_controller.rb": (
+            "class ApplicationController < ActionController::Base\n"
+            "  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n"
+        ),
+        "app/controllers/notes_controller.rb": controller,
+        **(extra or {}),
+    }
+
+
+OWNER_CHECK = """
+  before_action :set_note
+  before_action :require_owner
+
+  def destroy
+    @note.destroy
+  end
+
+  private
+
+  def set_note
+    @note = Note.find(params[:id])
+  end
+"""
+
+
+@pytest.mark.parametrize(
+    ("controller", "extra", "ownership"),
+    [
+        # a `current_user` helper returning an ivar the request picks is no caller
+        (
+            "class NotesController < ApplicationController\n"
+            "  before_action :load_user\n\n"
+            "  def destroy\n    current_user.notes.find(params[:id]).destroy\n  end\n\n"
+            "  private\n\n"
+            "  def load_user\n    @user = User.find(params[:user_id])\n  end\n\n"
+            "  def current_user\n    @user\n  end\nend\n",
+            {},
+            "caller-blind",
+        ),
+        # an alias copies the no-op it names at that point, not a later redefinition
+        (
+            "class NotesController < ApplicationController\n"
+            + OWNER_CHECK
+            + "  def check\n  end\n  alias_method :require_owner, :check\n\n"
+            "  def check\n    head :forbidden unless @note.user == current_user\n  end\nend\n",
+            {},
+            "caller-blind",
+        ),
+        # `define_method(:x, proc {})` replaces the refusing method with one we don't read
+        (
+            "class NotesController < ApplicationController\n"
+            + OWNER_CHECK
+            + "  def require_owner\n    head :forbidden unless @note.user == current_user\n"
+            "  end\n  define_method(:require_owner, proc {})\nend\n",
+            {},
+            "caller-blind",
+        ),
+        # a class body that may define the helper itself: never the module's refusing one
+        (
+            "class NotesController < ApplicationController\n  include Strict\n"
+            "  send(:define_method, :require_owner!) {}\n\n"
+            "  def destroy\n    @note = Note.find(params[:id])\n    require_owner!\n"
+            "    @note.destroy\n  end\nend\n",
+            {
+                "app/controllers/concerns/strict.rb": (
+                    "module Strict\n  def require_owner!\n"
+                    "    raise ActiveRecord::RecordNotFound unless @note.user == current_user\n"
+                    "  end\nend\n"
+                )
+            },
+            "caller-blind",
+        ),
+        # an `after_action`'s rescue clause acts on the record after the action refused
+        (
+            "class NotesController < ApplicationController\n"
+            "  after_action :touch_note\n\n"
+            "  def destroy\n    @note = Note.find(params[:id])\n"
+            "    head :forbidden and return unless @note.user == current_user\n"
+            "    @note.destroy\n  end\n\n  private\n\n"
+            "  def touch_note\n    raise 'skip'\n  rescue StandardError\n"
+            "    @note.update!(body: '')\n  end\nend\n",
+            {},
+            "unchecked",
+        ),
+        # `after_action :require_owner` replaces no `before_action :require_owner`
+        (
+            "class NotesController < ApplicationController\n"
+            + OWNER_CHECK
+            + "  after_action :require_owner\n\n"
+            "  def require_owner\n    head :forbidden unless @note.user == current_user\n"
+            "  end\nend\n",
+            {},
+            "checked",
+        ),
+    ],
+    ids=[
+        "caller-helper-ivar",
+        "alias-binds-early",
+        "define-method-callable",
+        "dynamic-class-first",
+        "after-action-rescue",
+        "after-action-kind",
+    ],
+)
+def test_what_qodo_found_stays_closed(
+    tmp_path: Path, controller: str, extra: dict[str, str], ownership: str
+) -> None:
+    result = _tree(tmp_path, _notes_app(controller, extra))
+    assert _row(result, "DELETE", "/notes/:id")["ownership"] == ownership
+
+
+def test_namespaced_policies_sharing_a_short_name_are_told_apart(tmp_path: Path) -> None:
+    # Pundit runs `NotePolicy` (anyone may destroy); `Zeta::NotePolicy` compares the owner
+    controller = (
+        "class NotesController < ApplicationController\n"
+        "  def destroy\n    @note = Note.find(params[:id])\n    authorize @note\n"
+        "    @note.destroy\n  end\nend\n"
+    )
+    extra = {
+        "app/policies/note_policy.rb": (
+            "class NotePolicy < ApplicationPolicy\n  def destroy?\n    true\n  end\nend\n"
+        ),
+        "app/policies/zeta/note_policy.rb": (
+            "module Zeta\n  class NotePolicy < ApplicationPolicy\n"
+            "    def destroy?\n      record.user == user\n    end\n  end\nend\n"
+        ),
+        "app/policies/application_policy.rb": (
+            "class ApplicationPolicy\n  attr_reader :user, :record\nend\n"
+        ),
+    }
+    result = _tree(tmp_path, _notes_app(controller, extra))
+    assert _row(result, "DELETE", "/notes/:id")["ownership"] == "caller-blind"
