@@ -911,3 +911,159 @@ def test_namespaced_policies_sharing_a_short_name_are_told_apart(tmp_path: Path)
     }
     result = _tree(tmp_path, _notes_app(controller, extra))
     assert _row(result, "DELETE", "/notes/:id")["ownership"] == "caller-blind"
+
+
+POLICY_BASE = {
+    "app/policies/application_policy.rb": (
+        "class ApplicationPolicy\n  attr_reader :user, :record\nend\n"
+    ),
+}
+AUTHORIZED = (
+    "class NotesController < ApplicationController\n"
+    "  def destroy\n    @note = Note.find(params[:id])\n    authorize @note\n"
+    "    @note.destroy\n  end\nend\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("controller", "extra", "ownership"),
+    [
+        # a policy alias is the permissive method it copied, not the target's later check
+        (
+            AUTHORIZED,
+            {
+                **POLICY_BASE,
+                "app/policies/note_policy.rb": (
+                    "class NotePolicy < ApplicationPolicy\n  def show?\n    true\n  end\n"
+                    "  alias_method :destroy?, :show?\n\n"
+                    "  def show?\n    record.user == user\n  end\nend\n"
+                ),
+            },
+            "caller-blind",
+        ),
+        # resetting a chain of the app's own leaves the action's authentication
+        (
+            "class NotesController < ApplicationController\n"
+            "  define_callbacks :sync\n  reset_callbacks :sync\n\n"
+            "  def destroy\n    current_user.notes.find(params[:id]).destroy\n  end\nend\n",
+            {},
+            "scoped",
+        ),
+        # an external admin guard that runs only for some requests isn't admin-only
+        (
+            "class NotesController < ApplicationController\n"
+            "  before_action :authenticate_admin!, if: :strict?\n\n"
+            "  def destroy\n    Note.find(params[:id]).destroy\n  end\nend\n",
+            {},
+            "caller-blind",
+        ),
+        # a user a request header names is no caller, even beside a constant token key
+        (
+            "class NotesController < ApplicationController\n"
+            "  def destroy\n    current_user.notes.find(params[:id]).destroy\n  end\n\n"
+            "  private\n\n  def current_user\n"
+            '    User.find_by(email: request.headers["X-Email"], token_type: "api")\n'
+            "  end\nend\n",
+            {},
+            "caller-blind",
+        ),
+        # a test's class_eval adds no guard to the app's controller
+        (
+            "class NotesController < ActionController::Base\n"
+            "  def destroy\n    Note.find(params[:id]).destroy\n  end\nend\n",
+            {
+                "spec/support/auth.rb": (
+                    "NotesController.class_eval { before_action :authenticate_user! }\n"
+                )
+            },
+            "n/a",
+        ),
+    ],
+    ids=["policy-alias", "reset-other-chain", "conditional-admin", "header-user", "spec-eval"],
+)
+def test_what_qodos_second_review_found_stays_closed(
+    tmp_path: Path, controller: str, extra: dict[str, str], ownership: str
+) -> None:
+    result = _tree(tmp_path, _notes_app(controller, extra))
+    assert _row(result, "DELETE", "/notes/:id")["ownership"] == ownership
+
+
+def test_a_header_token_lookup_still_names_the_caller(tmp_path: Path) -> None:
+    controller = (
+        "class NotesController < ApplicationController\n"
+        "  def destroy\n    current_user.notes.find(params[:id]).destroy\n  end\n\n"
+        "  private\n\n  def current_user\n"
+        '    AccessToken.find_by(token: request.headers["X-Token"])&.user\n  end\nend\n'
+    )
+    result = _tree(tmp_path, _notes_app(controller))
+    assert _row(result, "DELETE", "/notes/:id")["ownership"] == "scoped"
+
+
+def test_a_conditional_skip_of_the_login_guard_is_judged(tmp_path: Path) -> None:
+    controller = (
+        "class NotesController < ApplicationController\n"
+        "  skip_before_action :authenticate_user!, if: :public_note?\n\n"
+        "  def destroy\n    current_user.notes.find(params[:id]).destroy\n  end\nend\n"
+    )
+    row = _row(_tree(tmp_path, _notes_app(controller)), "DELETE", "/notes/:id")
+    assert row["judgement_required"]
+    assert "authenticate_user!" not in row["guards"]
+
+
+def test_cancancan_loads_by_its_id_param_and_find_by(tmp_path: Path) -> None:
+    files = {
+        **_notes_app(
+            "class NotesController < ApplicationController\n"
+            "  load_and_authorize_resource id_param: :slug, find_by: :slug\n\n"
+            "  def destroy\n    @note.destroy\n  end\nend\n"
+        ),
+        "config/routes.rb": (
+            "Rails.application.routes.draw do\n"
+            "  resources :notes, only: [:destroy], param: :slug\nend\n"
+        ),
+        "app/models/ability.rb": (
+            "class Ability\n  include CanCan::Ability\n  def initialize(user)\n"
+            "    can :destroy, Note, user_id: user.id\n  end\nend\n"
+        ),
+    }
+    result = _tree(tmp_path, files)
+    assert _row(result, "DELETE", "/notes/:slug")["ownership"] == "checked"
+
+
+def test_an_irregular_table_keeps_its_owner_column(tmp_path: Path) -> None:
+    files = {
+        **_notes_app(
+            "class NotesController < ApplicationController\n"
+            "  def destroy\n    Person.find(params[:id]).destroy\n  end\nend\n"
+        ),
+        "app/models/person.rb": "class Person < ApplicationRecord\n  belongs_to :user\nend\n",
+        "db/schema.rb": SCHEMA.replace(
+            '  create_table "holidays"',
+            '  create_table "people" do |t|\n    t.references "user"\n  end\n'
+            '  create_table "holidays"',
+        ),
+    }
+    row = _row(_tree(tmp_path, files), "DELETE", "/notes/:id")
+    assert (row["ownership"], row["ownership_evidence"]["owner_field"]) == (
+        "caller-blind",
+        "user_id",
+    )
+
+
+def test_another_apps_model_never_lends_an_association(tmp_path: Path) -> None:
+    # the host's notes are reached through memberships (never the caller's own, D18); a test
+    # app's `User` holding them directly mustn't make the host's lookup scoped
+    files = {
+        **_notes_app(
+            "class NotesController < ApplicationController\n"
+            "  def destroy\n    current_user.notes.find(params[:id]).destroy\n  end\nend\n"
+        ),
+        "app/models/user.rb": (
+            "class User < ApplicationRecord\n  has_many :memberships\n"
+            "  has_many :notes, through: :memberships\nend\n"
+        ),
+        "spec/dummy/config/routes.rb": "Rails.application.routes.draw do\nend\n",
+        "spec/dummy/app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\nend\n",
+    }
+    row = _row(_tree(tmp_path, files), "DELETE", "/notes/:id")
+    assert row["ownership"] != "scoped"

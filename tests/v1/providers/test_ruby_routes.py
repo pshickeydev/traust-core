@@ -374,3 +374,31 @@ def test_only_an_engines_own_routes_take_its_isolated_namespace(tmp_path):
     )
     row = _route(_enum(tmp_path), "GET", "/invoices/:id")
     assert row["handler"]["path"] == "app/controllers/invoices_controller.rb"
+
+
+def test_a_routes_file_drawn_under_two_scopes_gives_both_and_a_cycle_stops(tmp_path):
+    _write(
+        tmp_path,
+        "config/routes.rb",
+        "Rails.application.routes.draw do\n"
+        "  scope module: :admin, path: 'admin' do\n    draw :shared\n  end\n"
+        "  scope module: :api, path: 'api' do\n    draw :shared\n  end\nend\n",
+    )
+    _write(
+        tmp_path,
+        "config/routes/shared.rb",
+        "resources :notes, only: [:show]\ndraw :shared\n",
+    )
+    patterns = _patterns(_enum(tmp_path), "rails")
+    assert {("GET", "/admin/notes/:id"), ("GET", "/api/notes/:id")} <= patterns
+
+
+def test_a_singular_resources_collection_route_keeps_its_parent_id(tmp_path):
+    _write(
+        tmp_path,
+        "config/routes.rb",
+        "Rails.application.routes.draw do\n  resources :posts, only: [] do\n"
+        "    resource :comment, only: [] do\n      get :preview, on: :collection\n"
+        "    end\n  end\nend\n",
+    )
+    assert ("GET", "/posts/:post_id/comment/preview") in _patterns(_enum(tmp_path), "rails")

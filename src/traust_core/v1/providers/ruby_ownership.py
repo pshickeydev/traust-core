@@ -239,6 +239,7 @@ class _Model:
     policy: str | None = None  # `def self.policy_class`
     base: str = ""  # the class it inherits from
     users: list[str] = field(default_factory=list)  # `belongs_to :uploader, class_name: "User"`
+    table: str | None = None  # `self.table_name = "people"`
     children: list[str] = field(default_factory=list)  # the classes its `has_many`s hold
     scopes: dict[str, Node] = field(default_factory=dict)  # `scope :x, -> { … }`, `def self.x`
     polymorphic: set[str] = field(default_factory=set)  # `belongs_to :owner, polymorphic: true`
@@ -252,6 +253,8 @@ class RubyCode:
     def __init__(self, sources: dict[str, Parsed]) -> None:
         self.sources = sources
         self.roots = app_roots(list(sources))
+        self.model_roots: dict[str, set[str]] = {}  # a model several apps define: unread
+        self.table_roots: dict[str, set[str]] = {}
         self.models: dict[str, _Model] = {}
         self.columns: dict[str, list[str]] = {}  # table -> columns
         # `Admin::NotePolicy` -> its class; never keyed by the bare name several may share
@@ -309,6 +312,7 @@ class RubyCode:
                 ):
                     continue
                 model = self.models.setdefault(name, _Model(name))
+                self.model_roots.setdefault(name, set()).add(root_of(rel, self.roots))
                 model.qualified.add(
                     "::".join([*_lexical(src, n), src.text(n.child_by_field_name("name"))])
                 )
@@ -327,6 +331,10 @@ class RubyCode:
                         model.policy = src.text(found[-1]) if found else None
                     if s.type == "singleton_method":
                         model.scopes[src.text(s.child_by_field_name("name"))] = s
+                    if s.type == "assignment" and src.text(s.child_by_field_name("left")) in (
+                        "self.table_name",
+                    ):
+                        model.table = symbol(src, s.child_by_field_name("right")) or "?"
                     if s.type != "call" or not args(s):
                         continue
                     kind, first = call_name(src, s), symbol(src, args(s)[0])
@@ -374,6 +382,7 @@ class RubyCode:
             table = symbol(src, args(n)[0])
             if table is None:
                 continue
+            self.table_roots.setdefault(table, set()).add(root_of(src.file.rel, self.roots))
             block = n.child_by_field_name("block")
             columns = self.columns.setdefault(table, [])
             for c in walk(block) if block is not None else []:
@@ -406,10 +415,13 @@ class RubyCode:
                     users_hold.add(target)
                     queue.append(target)
         for name, model in self.models.items():
-            table = _table_of(name)
+            table = model.table or _table_of(name)
             # owned through a join (`has_many :users, through: :memberships`), or by a user
-            # under a name we don't read as an owner (`belongs_to :uploader`): not readable
+            # under a name we don't read as an owner (`belongs_to :uploader`): not readable;
+            # nor is a model or a table several apps in the checkout define
             if model.linked or model.members or table not in self.columns:
+                continue
+            if len(self.model_roots.get(name, ())) > 1 or len(self.table_roots.get(table, ())) > 1:
                 continue
             fields = tuple(dict.fromkeys([*self.columns[table], *model.belongs]))
             owned = any(OWNER_FIELD_RX.match(f) for f in fields)
@@ -530,7 +542,10 @@ class RubyCode:
         return next(iter(found)) if len(found) == 1 else None
 
     def association(self, model: str | None, name: str) -> str | None:
-        """The class a model's `has_many`/`has_one` association holds."""
+        """The class a model's `has_many`/`has_one` association holds; none for a model
+        several apps define (theirs may differ)."""
+        if len(self.model_roots.get(model or "", ())) > 1:
+            return None
         found = self.models.get(model or "")
         return found.associations.get(name) if found is not None else None
 
@@ -577,21 +592,26 @@ class RubyCode:
         while found is not None and (id(found[1]), query) not in seen:
             seen.add((id(found[1]), query))
             src, cls = found
-            # the last definition wins: a `def`, or an alias made after it
-            last: Node | str | None = None
+            # in order, as Ruby defines them: an alias copies what its target is at that point
+            # (a `def` above it, else an inherited method by that name)
+            defined: dict[str, Node | str] = {}
             for m in statements(cls.child_by_field_name("body")):
-                if m.type == "method" and src.text(m.child_by_field_name("name")) == query:
-                    last = m
+                if m.type == "method":
+                    defined[src.text(m.child_by_field_name("name"))] = m
+                pair: tuple[str | None, str | None] | None = None
                 if m.type == "call" and call_name(src, m) == "alias_method" and len(args(m)) == 2:
-                    new, old = (symbol(src, a) for a in args(m))
-                    last = old if new == query else last
+                    pair = (symbol(src, args(m)[0]), symbol(src, args(m)[1]))
                 if m.type == "alias" and len(m.named_children) == 2:
-                    new, old = (src.text(a).lstrip(":") for a in m.named_children)
-                    last = old if new == query else last
+                    pair = (
+                        src.text(m.named_children[0]).lstrip(":"),
+                        src.text(m.named_children[1]).lstrip(":"),
+                    )
+                if pair is not None and pair[0] and pair[1]:
+                    defined[pair[0]] = defined.get(pair[1], pair[1])
+            last = defined.get(query)
             if isinstance(last, str):
-                query = last
-                continue
-            if last is not None:
+                query = last  # an inherited method's name: read in the parent
+            elif last is not None:
                 return src, last
             sup = cls.child_by_field_name("superclass")
             parent = (
@@ -652,11 +672,21 @@ def _class_of(association: str) -> str:
     return "".join(p.capitalize() for p in singular.split("_"))
 
 
+_IRREGULAR = {"person": "people", "man": "men", "child": "children", "woman": "women"}
+
+
 def _table_of(model: str) -> str:
+    """Rails' default table for a model (`Person`: `people`, `Box`: `boxes`)."""
     snake = re.sub(r"(?<!^)(?=[A-Z])", "_", model).lower()
+    head, _, last = snake.rpartition("_")
+    prefix = f"{head}_" if head else ""
+    if last in _IRREGULAR:
+        return prefix + _IRREGULAR[last]
     if snake.endswith("y") and snake[-2:-1] not in "aeiou":
         return snake[:-1] + "ies"
-    return snake if snake.endswith("s") else snake + "s"
+    if snake.endswith(("s", "x", "z", "ch", "sh")):
+        return snake if snake.endswith("s") and not snake.endswith("ss") else snake + "es"
+    return snake + "s"
 
 
 # ---- truth tables: what a condition refuses
@@ -979,7 +1009,18 @@ class _Action:
         out = []
         for n in walk(node):
             parent = n.parent
-            token_key = n.type == "hash_key_symbol" and _TOKEN_KEY.search(src.text(n))
+            # a token key counts only when it's matched against a value, not a constant
+            # (`find_by(token: header)`, never `token_type: "api"`)
+            value = (
+                parent.child_by_field_name("value")
+                if parent is not None and parent.type == "pair"
+                else None
+            )
+            token_key = (
+                n.type == "hash_key_symbol"
+                and _TOKEN_KEY.search(src.text(n))
+                and not _is_literal(value)
+            )
             if token_key or n.type in ("constant", "instance_variable"):
                 out.append(src.text(n))
             elif n.type == "identifier":
@@ -1041,6 +1082,14 @@ class _Action:
         out: set[str] = set()
         for name in _CALLERS:
             found = self.methods(name)
+            if found is not None and any(
+                self._requested(s.src, s.node) and not self._credential(s.src, s.node, set())
+                for s in _reachable(
+                    [_Step(found[0], b, Kind.CALLBACK) for b in method_body(found[1])],
+                    self.methods,
+                )
+            ):
+                out.add(name)  # `User.find(request.headers["X-User-Id"])`
             if found is None and self.unread(name):
                 out.add(name)  # an app `current_user` we can't read may come from params
             if found is not None and self._returns_unset(found):
@@ -1437,7 +1486,7 @@ class _Action:
 
     def run(self) -> HandlerFacts:
         if self.cancan[0] and self.model is not None and self.path_ids:
-            self.cancan_load()
+            self.cancan_load()  # by the route's `id`, or the `id_param:` it names
         for index, step in enumerate(self.steps):
             self.position = index * 1000
             self.statement(step)
@@ -1507,13 +1556,15 @@ class _Action:
     def cancan_load(self) -> None:
         """`load_and_authorize_resource`: `@note = Note.find(params[:id])`, then
         `authorize!(action, @note)` against `Ability` (D15)."""
-        if "id" not in self.path_ids:
-            return
+        key, field_ = getattr(self, "cancan_key", ("id", "pk"))
         step = self.steps[0] if self.steps else None
         if step is None:
             return
+        if key not in self.path_ids:
+            self.handoff(step.src, step.node)  # `id_param:` a parameter the route doesn't hold
+            return
         lookup = Lookup(self.span(step.src, step.node), record_type=self.model)
-        k = self.add(step.src, step.node, lookup, {("id", self.model, "pk")}, True)  # type: ignore[arg-type]
+        k = self.add(step.src, step.node, lookup, {(key, self.model, field_)}, True)  # type: ignore[arg-type]
         self.records[f"@{_snake(self.model)}"] = _Record(k, self.model)  # type: ignore[arg-type]
         if not self.cancan[1]:
             return  # loaded, never authorized (`skip_authorize_resource`)
@@ -2841,11 +2892,12 @@ def prepare(
     model: str | None,
     cancan: tuple[bool, bool],
     raises: bool = True,
+    cancan_key: tuple[str, str] = ("id", "pk"),
 ) -> _Action:
     """An action read from the statements it runs in order (its callbacks', then its own):
     `forged` names the callers the request may choose; `facts()` gives its ownership facts.
     `cancan`: whether `load_resource` and `authorize_resource` run for it."""
-    return _Action(
+    walk_ = _Action(
         code,
         [_Step(s, n, kind) for s, n, kind in steps],
         path_ids,
@@ -2856,6 +2908,8 @@ def prepare(
         cancan,
         raises,
     )
+    walk_.cancan_key = cancan_key
+    return walk_
 
 
 def action_facts(

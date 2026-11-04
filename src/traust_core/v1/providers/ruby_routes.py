@@ -229,6 +229,7 @@ class _Scope:
     module: str = ""
     controller: str | None = None
     member: str | None = None  # the resource's member path, `/posts/:id`
+    collection: str | None = None  # its collection path, `/posts`
     guards: tuple[str, ...] = ()
     depth: int = 0
 
@@ -255,7 +256,7 @@ class _RailsRoutes:
     def __init__(self, sources: dict[str, _Source]) -> None:
         self.sources = sources
         self.routes: list[_Route] = []
-        self.drawn: set[str] = set()  # `draw :api` files, read once
+        self.drawn: set[str] = set()  # `draw :api` files being expanded
         # `concern :commentable`, by the routes directory that declares it
         self.concerns: dict[tuple[str, str], tuple[_Source, list[Node]]] = {}
         self.expanding: set[tuple[str, str]] = set()
@@ -358,8 +359,9 @@ class _RailsRoutes:
             rel = f"{config}routes/{first}.rb"
             included = self.sources.get(rel)
             if included is not None and rel not in self.drawn:
-                self.drawn.add(rel)
+                self.drawn.add(rel)  # drawing itself again (a cycle) stops; another scope doesn't
                 self._block(included, list(included.root.named_children), scope, config)
+                self.drawn.discard(rel)
 
     def _resource(
         self,
@@ -390,7 +392,7 @@ class _RailsRoutes:
                 self.routes.append(route)
         member = path if singular else f"{path}/:{key}"
         nested = f"{path}/:{_singular(name)}_{key}" if not singular else path
-        inner = replace(scope, path=nested, controller=controller, member=member)
+        inner = replace(scope, path=nested, controller=controller, member=member, collection=path)
         self._block(src, _body(call), inner, config)
         self._concerns(_names(src, opts.get("concerns")), inner, config)
 
@@ -428,8 +430,10 @@ class _RailsRoutes:
             target = f"{scope.controller}#{first}"  # `get :preview` inside a resource
         base = scope.path
         on = src.string(opts.get("on"))
-        if on in ("member", "collection") and scope.member is not None:
-            base = scope.member if on == "member" else scope.member.rsplit("/:", 1)[0]
+        if on == "member" and scope.member is not None:
+            base = scope.member
+        elif on == "collection" and scope.collection is not None:
+            base = scope.collection
         path = _join(base, first or "")
         verbs = (
             [name.upper()]
@@ -463,6 +467,7 @@ class _Callback:
     # a point in the chain, not a callback: `include:<M>`, `macro:<m>`, `reset`
     marker: str = ""
     node: Node | None = None  # the declaration (`load_and_authorize_resource class: "Memo"`)
+    skipped: bool = False  # a skip with `if:`/`unless:` may take it out
 
     def applies(self, action: str) -> bool:
         return (self.only is None or action in self.only) and action not in self.except_
@@ -546,7 +551,10 @@ def _controllers(sources: dict[str, _Source]) -> dict[str, _Controller]:
             if n.type != "call" or n.child_by_field_name("receiver") is None:
                 continue
             target = src.text(n.child_by_field_name("receiver")).removeprefix("::")
-            owners = {id(c): c for k, c in found.items() if k.endswith(f"|{target}")}.values()
+            here = _app_root(src.file.rel, roots)
+            if re.search(r"(^|/)(spec|test)/", src.file.rel[len(here) :]):
+                continue  # a test's `NotesController.class_eval { … }` changes no app
+            owners = {id(c): c for k, c in found.items() if k == f"{here}|{target}"}.values()
             if _method(src, n) in ("class_eval", "class_exec"):
                 for c in owners:
                     _read_class(src, _body(n), c)  # `NotesController.class_eval { … }`
@@ -733,7 +741,10 @@ def _callbacks(
         return []
     args = _args(stmt) if stmt.type == "call" else []
     if method == "reset_callbacks":
-        return [_Callback("", None, False, marker="reset")]
+        chain = src.string(args[0]) if args else None
+        if chain == "process_action":
+            return [_Callback("", None, False, marker="reset")]
+        return [] if chain else [_Callback("", None, False, marker="opaque")]  # unread
     if method == "skip_callback":  # `skip_callback :process_action, :before, :require_owner`
         names = [src.string(a) for a in args if a.type != "pair"]
         if len(names) >= 3 and names[0] == "process_action" and names[1] in ("before", "after"):
@@ -821,21 +832,28 @@ def _chain(controllers: dict[str, _Controller], c: _Controller) -> list[_Control
     return chain[::-1]
 
 
-def _cancan_model(src: _Source, node: Node | None) -> str | None:
-    """The model `load_and_authorize_resource` loads: "" for the controller's own, a named
-    one (`:note`, `class: "Memo"`), or None for options we don't read (`through:`)."""
+def _cancan_model(src: _Source, node: Node | None) -> tuple[str | None, str, str]:
+    """What `load_and_authorize_resource` loads: the model ("" for the controller's own, a
+    named one: `:note`, `class: "Memo"`; None for options we don't read: `through:`), the
+    parameter it reads (`id_param:`) and the column it finds by (`find_by:`)."""
     if node is None or node.type != "call":
-        return ""
+        return "", "id", "pk"
     opts = _options(src, node)
-    if set(opts) - {"only", "except", "if", "unless", "class", "parent"}:
-        return None
+    if set(opts) - {"only", "except", "if", "unless", "class", "parent", "id_param", "find_by"}:
+        return None, "id", "pk"
+    key = src.string(opts.get("id_param")) or "id"
+    field_ = src.string(opts.get("find_by")) or "pk"
+    if ("id_param" in opts and key == "id" and src.string(opts["id_param"]) is None) or (
+        "find_by" in opts and src.string(opts["find_by"]) is None
+    ):
+        return None, "id", "pk"  # an option we can't read
     if "class" in opts:
         named = src.string(opts["class"]) or src.text(opts["class"])
-        return named.rsplit("::", 1)[-1] if named else None
+        return (named.rsplit("::", 1)[-1] if named else None), key, field_
     names = [src.string(a) for a in _args(node) if a.type != "pair"]
     if names and names[0]:
-        return "".join(w.capitalize() for w in _singular(names[0]).split("_"))
-    return ""
+        return "".join(w.capitalize() for w in _singular(names[0]).split("_")), key, field_
+    return "", key, field_
 
 
 def _callback_body(node: Node) -> list[Node]:
@@ -870,11 +888,14 @@ def _rails_guards(
     unguard, judged."""
     removed: list[str] = []
     callbacks = ownership.callbacks(c, action, removed)
-    guard = [
-        cb.name
+    guarding = [
+        cb
         for cb in callbacks
         if not cb.after and not cb.around and (_is_guard(cb.name) or cb.name in _GUARD_CALLBACKS)
     ]
+    guard = [cb.name for cb in guarding if not cb.skipped]
+    # a skip that may take a guard out (`skip_before_action :x, if: :public?`) is an unguard
+    removed += [cb.name for cb in guarding if cb.skipped]
     skipped = [f"{SKIPPED}:{n}" for n in removed if _is_guard(n) or n in _GUARD_CALLBACKS]
     return _unique(guard), _unique(skipped)
 
@@ -1241,7 +1262,7 @@ class _Ownership:
                 kept = []
                 for x in out:
                     if _same(x, cb) and cb.conditional:
-                        kept.append(replace(x, conditional=True))
+                        kept.append(replace(x, conditional=True, skipped=True))
                     elif x.name == "load_and_authorize_resource" and cb.name in _SPLIT:
                         kept.append(replace(x, name=_SPLIT[cb.name]))
                     elif not _same(x, cb):
@@ -1288,9 +1309,13 @@ class _Ownership:
         gates: list[str] = []
         afters = [cb for cb in callbacks if cb.after]
         cancan_model: str | None = ""
+        cancan_key = ("id", "pk")
         for cb in [cb for cb in callbacks if not cb.after]:
             if cb.name in ("load_and_authorize_resource", "load_resource", "authorize_resource"):
-                cancan_model = _cancan_model(c.src if cb.node is None else cb.src or c.src, cb.node)
+                cancan_model, *key = _cancan_model(
+                    c.src if cb.node is None else cb.src or c.src, cb.node
+                )
+                cancan_key = (key[0], key[1])
             if cb.name in ("load_and_authorize_resource", "load_resource"):
                 load = True
             if cb.name in ("load_and_authorize_resource", "authorize_resource"):
@@ -1344,6 +1369,7 @@ class _Ownership:
             action=r.action,
             model=model if cancan_model == "" else cancan_model,
             cancan=(load, authorize),
+            cancan_key=cancan_key,
             raises=not self.handled(c, find),
         )
         forged = bool(walk_.forged & {"current_user", "current_admin"})
@@ -1352,8 +1378,10 @@ class _Ownership:
         for g in list(guards):
             # defined in the checkout but not where we can place it (`on_load`, a module
             # several share a name with): not read, so not trusted
+            sometimes = any(cb.name == g and cb.conditional for cb in callbacks)
             if privileged_only(g) and (
                 forged
+                or sometimes  # `before_action :authenticate_admin!, if: :x`
                 or ((found := find(g)) is not None and g not in gates)
                 or (found is None and g in self.code.defined)
             ):
