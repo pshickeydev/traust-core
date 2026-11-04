@@ -952,6 +952,7 @@ class Context:
                 findings.review,
                 comment_sources(self.forge_api, clock=self.clock),
                 StatementPolicy(),
+                settle_move=findings.settle_move,
             ),
             exposure=exposure,
             checkouts=self.checkouts,

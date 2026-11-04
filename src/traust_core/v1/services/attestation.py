@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from uuid import UUID
 
 from traust_core.v1.errors import ConfigError, ForbiddenError, ValidationError
@@ -36,6 +36,7 @@ from traust_core.v1.providers.collaboration import CommentSource
 from traust_core.v1.providers.comments import JIRA
 from traust_core.v1.repositories.traust.findings import FindingsUnitOfWork
 from traust_core.v1.services.findings.decisions import FindingDecisions
+from traust_core.v1.services.findings.intake import REBASELINE_MAPPING
 from traust_core.v1.services.findings.records import FindingRecords
 from traust_core.v1.services.findings.review import FindingReview
 
@@ -197,8 +198,12 @@ class AttestationService:
         review: FindingReview,
         comments: Mapping[str, CommentSource],
         policy: StatementPolicy,
+        *,
+        settle_move: Callable[[UUID], object] | None = None,
     ) -> None:
         self._uow = uow
+        # Applies a person's answer to a held re-audit move (FindingService.settle_move).
+        self._settle_move = settle_move
         # Reads only the findings section, the one this service may hold.
         self._records = FindingRecords(uow)  # type: ignore[arg-type]
         self._decisions = decisions
@@ -287,7 +292,11 @@ class AttestationService:
             if decision == AttestationDecision.CONFIRM
             else ReviewItemStatus.REJECTED
         )
-        return self._review.resolve(review_item_id, statement, principal, status=status)
+        item = self._review.resolve(review_item_id, statement, principal, status=status)
+        if item.reason == REBASELINE_MAPPING and self._settle_move is not None:
+            assert item.id is not None
+            self._settle_move(item.id)
+        return item
 
     def sources(self, finding_id: UUID) -> list[FindingExternalRef]:
         """Where people spoke about a finding: the comments and tickets imported for it."""

@@ -41,9 +41,6 @@ from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services.artifact_publishing import ArtifactPublisher, PublishSpec, PublishSpecs
 from traust_core.v1.services.assessment import AssessmentService
 from traust_core.v1.services.detection_quality import DetectionQualityService, _failed
-from traust_core.v1.services.findings.identity import IdentityPolicy
-from traust_core.v1.services.findings.intake import FindingIntake
-from traust_core.v1.services.findings.taxonomy import TaxonomyPolicy
 
 REPO = "https://github.com/org/x"
 FP = "f" * 64
@@ -121,8 +118,10 @@ def bench(engine: Engine) -> Bench:
         store,
         uow,
     )
-    service = DetectionQualityService(uow, finding_service(engine), publisher)
-    assessments = AssessmentService(uow, FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy()))
+    findings = finding_service(engine)
+    service = DetectionQualityService(uow, findings, publisher)
+    # a campaign audit holds re-audit identity moves, so recording it needs the finding service
+    assessments = AssessmentService(findings._uow, findings.intake, findings=findings)
     return Bench(uow, publisher, assessments, service, ref)
 
 

@@ -36,6 +36,7 @@ from traust_core.v1.models.artifacts import (
 from traust_core.v1.models.assessment import (
     ASSESSMENT_COMPLETED,
     ASSESSMENT_DEGRADED,
+    REBASELINED_KINDS,
     RECORDED_SCHEMAS,
     REPORTED_FINDINGS,
     Artifact,
@@ -532,6 +533,7 @@ class AssessmentService:
                 provenance.artifact,
                 FindingCandidate.of_report(doc.findings, ref.repository_id),
                 canonicalize_priorities=False,
+                hold_moves=True,
             )
             assert recorded.id is not None and artifact.id is not None
             return AssessmentRecordResult(
@@ -572,7 +574,13 @@ class AssessmentService:
             return self._record(doc, assessment, provenance.artifact)[0]
         candidates = stated(doc, ref.repository_id)
         if kind != AssessmentKind.FUZZ:
-            return self._record_findings(doc, assessment, provenance.artifact, candidates)[0]
+            return self._record_findings(
+                doc,
+                assessment,
+                provenance.artifact,
+                candidates,
+                hold_moves=kind in REBASELINED_KINDS,
+            )[0]
         return self._record_fuzz(doc, assessment, provenance.artifact, candidates)
 
     def _record_fuzz(
@@ -610,10 +618,15 @@ class AssessmentService:
         candidates: Sequence[FindingCandidate],
         *,
         canonicalize_priorities: bool = True,
+        hold_moves: bool = False,
     ) -> tuple[Assessment, Artifact, IntakeResult]:
-        """`_record` and the findings the document states, refused before anything is written."""
+        """`_record` and the findings the document states, refused before anything is written.
+        With `hold_moves`, a candidate that reports a recorded finding under another identity
+        waits for its rebaseline review (`FindingService.hold_moves`) instead of being admitted."""
         if self._intake is None:
             raise ConfigError(f"recording {assessment.kind} findings needs finding intake")
+        if hold_moves and self._findings is None:
+            raise ConfigError(f"recording {assessment.kind} findings needs the finding service")
         if self._intake._uow is not self._uow:
             raise ConfigError(
                 "recording findings needs assessment and intake to share a unit of work"
@@ -625,6 +638,10 @@ class AssessmentService:
                 doc, assessment, artifact, canonicalize_priorities=canonicalize_priorities
             )
             assert recorded.id is not None
+            if hold_moves:
+                assert self._findings is not None
+                held = {m.label for m in self._findings.hold_moves(repository_id, candidates)}
+                candidates = [c for c in candidates if c.label not in held]
             taken = self._intake.accept(recorded.id, candidates)
             uow.commit()
         return recorded, report, taken

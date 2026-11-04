@@ -8,12 +8,20 @@ from datetime import UTC, date, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
-from traust_core.v1.errors import NotFoundError, ValidationError
+from traust_core.v1.errors import ConflictError, NotFoundError, ValidationError
 from traust_core.v1.models.artifacts import (
     ANALYSIS_ARTIFACTS,
     CodeFactsArtifact,
     ImpactAnalysisArtifact,
     IsolationReviewArtifact,
+    ReportArtifact,
+    VulnFindingsArtifact,
+)
+from traust_core.v1.models.assessment import (
+    REBASELINED_KINDS,
+    RECORDED_SCHEMAS,
+    REPORTED_FINDINGS,
+    AssessmentKind,
 )
 from traust_core.v1.models.common import (
     Page,
@@ -34,6 +42,7 @@ from traust_core.v1.models.findings import (
     FindingState,
     FindingView,
     IdentityMove,
+    IntakeResult,
     Location,
     Occurrence,
     SurfaceCoverage,
@@ -44,6 +53,7 @@ from traust_core.v1.models.inventory import default_line
 from traust_core.v1.models.vocabulary import (
     DecisionReason,
     DispositionResolution,
+    ReviewItemStatus,
     ScannerSeverity,
     Severity,
     Validity,
@@ -70,9 +80,15 @@ from traust_core.v1.services.findings.intake import (
 from traust_core.v1.services.findings.precedents import FindingPrecedents
 from traust_core.v1.services.findings.rating import RatingPolicy
 from traust_core.v1.services.findings.records import FindingRecords
-from traust_core.v1.services.findings.review import FindingReview
+from traust_core.v1.services.findings.review import FindingReview, request
 from traust_core.v1.services.findings.views import FindingViewQuery
 from traust_core.v1.services.portfolio import Inventory
+
+_HELD_TIERS = frozenset({"path_cwe", "path_set"})
+_HELD_DOCUMENTS = {
+    ReportArtifact.schema: ReportArtifact,
+    VulnFindingsArtifact.schema: VulnFindingsArtifact,
+}
 
 
 class FindingService:
@@ -133,6 +149,65 @@ class FindingService:
                 return []
             ids = [fc.finding_id for fc in uow.finding_cwes.list_for_cwe(tagged.id)]  # type: ignore[arg-type]
             return self._views.views(uow, uow.findings.list_by_ids(ids), as_of=None) if ids else []
+
+    def hold_moves(
+        self, repository_id: UUID, candidates: Sequence[FindingCandidate]
+    ) -> list[IdentityMove]:
+        """A re-audit's candidates that report a recorded finding under another identity by
+        location (a title alone is too loose to hold one back), each with a pending
+        `rebaseline_mapping` review on that finding; the recorder admits only the others, so
+        a re-audit never opens a duplicate. Inside the caller's transaction."""
+        held = [
+            m
+            for m in self.intake.moves(
+                self.all(FindingFilter(repository_id=repository_id)), candidates
+            )
+            if m.matched_by in _HELD_TIERS
+        ]
+        with self._uow as uow:
+            for move in held:
+                request(uow, move.finding_id, REBASELINE_MAPPING)
+        return held
+
+    def settle_move(self, review_item_id: UUID) -> IntakeResult:
+        """After a person answers a held move's `rebaseline_mapping` review: accepted, the
+        recorded finding takes the re-audit's identity and its occurrence (same id, so its
+        decisions follow); rejected, the held candidate is admitted as a new finding. Settling
+        again admits nothing more."""
+        item = self.review.get(review_item_id)
+        if item.reason != REBASELINE_MAPPING:
+            raise ValidationError(f"review item {review_item_id} is not a rebaseline review")
+        if item.status == ReviewItemStatus.PENDING:
+            raise ConflictError(f"review item {review_item_id} is still pending")
+        held = self._held(item.finding_id)
+        if held is None:
+            return IntakeResult(findings={})
+        assessment_id, candidate, move = held
+        if item.status == ReviewItemStatus.ACCEPTED:
+            self.intake.rebaseline([move], review_item_id)
+        return self.intake.accept(assessment_id, [candidate])
+
+    def _held(self, finding_id: UUID) -> tuple[UUID, FindingCandidate, IdentityMove] | None:
+        """The newest re-audit candidate still held as a move of this finding."""
+        repository_id = self.intake.get(finding_id).repository_id
+        refs = [r.id for r in self._inventory.list_refs(repository_id) if r.id]
+        audits = [a for a in self._log.list_of(None, refs) if a.kind in REBASELINED_KINDS]
+        schemas = {RECORDED_SCHEMAS[AssessmentKind(a.kind)] for a in audits}
+        previous = self.all(FindingFilter(repository_id=repository_id))
+        with self._uow as uow:
+            reported = {o.assessment_id for o in uow.occurrences.list_for_finding(finding_id)}
+        for assessment, artifact in self._log.documents(audits, schemas):
+            if assessment.id in reported:
+                continue  # an audit that already reports this finding holds nothing for it
+            doc = _HELD_DOCUMENTS[artifact.kind].parse(stored_bytes(self._objects, artifact))
+            candidates = REPORTED_FINDINGS[AssessmentKind(assessment.kind)](doc, repository_id)
+            waiting = [c for c in candidates if self.intake.match(repository_id, c) is None]
+            for move in self.intake.moves(previous, waiting):
+                if move.finding_id == finding_id and move.matched_by in _HELD_TIERS:
+                    held = next(c for c in waiting if c.label == move.label)
+                    assert assessment.id is not None
+                    return assessment.id, held, move
+        return None
 
     def moves(
         self, repository_id: UUID, candidates: Sequence[FindingCandidate]
