@@ -1353,3 +1353,62 @@ def test_a_cycle_of_key_locals_in_a_loop_ends(tmp_path: Path) -> None:
     )
     row = _row(_tree(tmp_path, _notes_app(controller)), "DELETE", "/notes/:id")
     assert row["ownership"] != "scoped"
+
+
+@pytest.mark.parametrize(
+    ("write", "helpers"),
+    [
+        # the request through a local (`r = request`), or the store handed to a helper
+        ("r = request\n    r.session[:user_id] = params[:user_id]", ""),
+        (
+            "remember(session)",
+            "  def remember(session)\n    session[:user_id] = params[:id]\n  end\n\n",
+        ),
+        # a block assigning the outer key local
+        ("key = :locale\n    [1].each { key = :user_id }\n    session[key] = params[:user_id]", ""),
+        # `delete` returns the value it removes
+        ("session[:pending_uid] = params[:uid]", ""),
+        # signing in through `self` or `send`
+        ("self.sign_in(User.find(params[:user_id]))", ""),
+        ("send(:sign_in, User.find(params[:user_id]))", ""),
+    ],
+    ids=[
+        "request-alias",
+        "session-param",
+        "block-key",
+        "delete-read",
+        "self-sign-in",
+        "send-sign-in",
+    ],
+)
+def test_what_qodos_review_of_362_found_stays_closed(
+    tmp_path: Path, write: str, helpers: str
+) -> None:
+    read = "session.delete(:pending_uid)" if "pending_uid" in write else "session[:user_id]"
+    controller = FORGED_SESSION.format(
+        write=write, helpers=helpers + SESSION_USER.format(read=read)
+    )
+    if "sign_in" in write:
+        controller = FORGED_SESSION.format(write=write, helpers="")
+    row = _row(_tree(tmp_path, _notes_app(controller)), "DELETE", "/notes/:id")
+    assert row["ownership"] != "scoped"
+
+
+def test_a_method_an_action_defines_but_never_calls_runs_nothing(tmp_path: Path) -> None:
+    controller = FORGED_SESSION.format(
+        write="def later\n      session[:user_id] = params[:user_id]\n    end",
+        helpers=SESSION_USER.format(read="session[:user_id]"),
+    )
+    row = _row(_tree(tmp_path, _notes_app(controller)), "DELETE", "/notes/:id")
+    assert row["ownership"] == "scoped"
+
+
+def test_a_name_read_before_its_assignment_in_a_loop_is_the_method(tmp_path: Path) -> None:
+    write = "2.times do\n      forge\n      forge = 1\n    end"
+    controller = FORGED_SESSION.format(
+        write=write,
+        helpers="  def forge\n    session[:user_id] = params[:user_id]\n  end\n\n"
+        + SESSION_USER.format(read="session[:user_id]"),
+    )
+    row = _row(_tree(tmp_path, _notes_app(controller)), "DELETE", "/notes/:id")
+    assert row["ownership"] != "scoped"

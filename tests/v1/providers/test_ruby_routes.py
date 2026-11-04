@@ -378,7 +378,7 @@ def test_only_an_engines_own_routes_take_its_isolated_namespace(tmp_path):
     assert row["handler"]["path"] == "app/controllers/invoices_controller.rb"
 
 
-def test_a_routes_file_drawn_under_two_scopes_gives_both_and_a_cycle_stops(tmp_path):
+def test_a_routes_file_drawn_under_two_scopes_gives_both_and_a_cycle_stops(tmp_path: Path) -> None:
     _write(
         tmp_path,
         "config/routes.rb",
@@ -395,7 +395,7 @@ def test_a_routes_file_drawn_under_two_scopes_gives_both_and_a_cycle_stops(tmp_p
     assert {("GET", "/admin/notes/:id"), ("GET", "/api/notes/:id")} <= patterns
 
 
-def test_a_singular_resources_collection_route_keeps_its_parent_id(tmp_path):
+def test_a_singular_resources_collection_route_keeps_its_parent_id(tmp_path: Path) -> None:
     _write(
         tmp_path,
         "config/routes.rb",
@@ -406,7 +406,7 @@ def test_a_singular_resources_collection_route_keeps_its_parent_id(tmp_path):
     assert ("GET", "/posts/:post_id/comment/preview") in _patterns(_enum(tmp_path), "rails")
 
 
-def test_a_namespaces_path_option_renames_or_drops_its_segment(tmp_path):
+def test_a_namespaces_path_option_renames_or_drops_its_segment(tmp_path: Path) -> None:
     _write(
         tmp_path,
         "config/routes.rb",
@@ -443,7 +443,9 @@ def test_a_namespaces_path_option_renames_or_drops_its_segment(tmp_path):
         ),
     ],
 )
-def test_a_namespace_without_its_module_follows_the_apps_rails(tmp_path, lock, routes, controller):
+def test_a_namespace_without_its_module_follows_the_apps_rails(
+    tmp_path: Path, lock: str | None, routes: str, controller: str
+) -> None:
     ends = "  end\n" * routes.count(" do")
     _write(
         tmp_path,
@@ -457,7 +459,7 @@ def test_a_namespace_without_its_module_follows_the_apps_rails(tmp_path, lock, r
     assert _route(_enum(tmp_path), "GET", pattern)["handler"]["expr"] == controller
 
 
-def test_a_namespace_with_an_empty_module_routes_to_the_top_level(tmp_path):
+def test_a_namespace_with_an_empty_module_routes_to_the_top_level(tmp_path: Path) -> None:
     _write(
         tmp_path,
         "config/routes.rb",

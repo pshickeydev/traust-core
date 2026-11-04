@@ -858,7 +858,7 @@
   },
   "method": "DELETE",
   "pattern": "/notes/:id",
-  "ownership": "caller-blind",
+  "ownership": "unknown",
   "why": "a request-chosen value reaches the caller, or a write we can't name: judged or unknown, never scoped"
  },
  {
@@ -898,7 +898,7 @@
   },
   "method": "DELETE",
   "pattern": "/notes/:id",
-  "ownership": "caller-blind",
+  "ownership": "unknown",
   "why": "a request-chosen value reaches the caller, or a write we can't name: judged or unknown, never scoped"
  },
  {
@@ -1028,7 +1028,7 @@
   },
   "method": "DELETE",
   "pattern": "/notes/:id",
-  "ownership": "caller-blind",
+  "ownership": "unknown",
   "why": "a request-chosen value reaches the caller, or a write we can't name: judged or unknown, never scoped"
  },
  {
@@ -2848,7 +2848,7 @@
   },
   "method": "DELETE",
   "pattern": "/notes/:id",
-  "ownership": "caller-blind",
+  "ownership": "unknown",
   "why": "a request-chosen value reaches the caller, or a write we can't name: judged or unknown, never scoped"
  },
  {
@@ -3724,7 +3724,7 @@
   },
   "method": "DELETE",
   "pattern": "/notes/:id",
-  "ownership": "unknown",
+  "ownership": "caller-blind",
   "why": "a request-chosen value reaches the caller, or a write we can't name: judged or unknown, never scoped"
  },
  {
@@ -3734,7 +3734,7 @@
   },
   "method": "DELETE",
   "pattern": "/notes/:id",
-  "ownership": "unknown",
+  "ownership": "caller-blind",
   "why": "a request-chosen value reaches the caller, or a write we can't name: judged or unknown, never scoped"
  },
  {
@@ -3744,7 +3744,7 @@
   },
   "method": "DELETE",
   "pattern": "/notes/:id",
-  "ownership": "unknown",
+  "ownership": "caller-blind",
   "why": "a request-chosen value reaches the caller, or a write we can't name: judged or unknown, never scoped"
  },
  {
@@ -3814,7 +3814,7 @@
   },
   "method": "DELETE",
   "pattern": "/notes/:id",
-  "ownership": "unknown",
+  "ownership": "caller-blind",
   "why": "a request-chosen value reaches the caller, or a write we can't name: judged or unknown, never scoped"
  },
  {
@@ -3824,7 +3824,7 @@
   },
   "method": "DELETE",
   "pattern": "/notes/:id",
-  "ownership": "unknown",
+  "ownership": "caller-blind",
   "why": "a request-chosen value reaches the caller, or a write we can't name: judged or unknown, never scoped"
  },
  {
@@ -4599,7 +4599,7 @@
   },
   "method": "DELETE",
   "pattern": "/notes/:id",
-  "ownership": "unknown",
+  "ownership": "caller-blind",
   "why": "a request-chosen value may reach the caller: judged or unknown, never scoped"
  },
  {

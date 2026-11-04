@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from fnmatch import fnmatchcase
 from glob import escape as glob_escape
+from typing import Literal
 
 from traust_core.v1.models.common import CodeSpan, RepoPath
 from traust_core.v1.providers.route_ownership import (
@@ -286,7 +287,6 @@ _VIEW_KEYS = {"action", "template"}
 _BODY_KEYS = {"json", "plain", "html", "body", "xml", "js", "text", "nothing", "inline", "partial"}
 # `JWT.decode(token, nil, false)`: a token read without its signature
 _UNVERIFIED = re.compile(r"\bdecode\s*\([^)]*,\s*(false|nil)\s*(,|\))|verify(_signature)?:\s*false")
-_SIGN_IN = {"sign_in", "bypass_sign_in", "login", "log_in", "auto_login", "set_user"}
 _CONVERSIONS = {"to_i", "to_s", "to_param", "presence"}
 _INERT = {"logger", "Rails", "puts", "p", "pp", "flash", "notice", "alert", "t", "I18n"}
 _MAX_DEPTH = 64
@@ -454,7 +454,7 @@ class RubyCode:
             tuple[str, int, int], tuple[list[_Use], list[str], list[tuple[str, Node | None]]]
         ] = {}
         self.scope_locals: dict[tuple[str, int, int], _Locals] = {}
-        self.locals_at: dict[tuple[str, int, int], tuple[list[Node], bool] | None] = {}
+        self.locals_at: dict[tuple[str, int, int, bool], tuple[list[Node], bool] | None] = {}
         self.defined: set[str] = set()  # every method name the checkout defines
         for rel, src in sources.items():
             self._index(rel, src)
@@ -1394,7 +1394,8 @@ class _Action:
         route reads as writing a session key we can't name."""
         out: list[tuple[Parsed, Node, Kind]] = []
         seen: set[str] = set()
-        queue = [(s.src, s.node, s.kind) for s in steps]
+        # a `def` among the statements defines a method, and runs nothing until it's called
+        queue = [(s.src, s.node, s.kind) for s in steps if s.node.type not in _DEFS]
         while queue:
             if len(out) >= _MAX_CLOSURE:
                 self.capped = True
@@ -2844,21 +2845,13 @@ def _caller_group(text: str) -> str | None:
     return name if name in _CALLERS else None
 
 
-def _signs_in(src: Parsed, node: Node) -> bool:
-    name = call_name(src, node)
-    receiver = node.child_by_field_name("receiver")
-    if name == "set_user":
-        return receiver is not None and src.text(receiver) == "warden"
-    return name in _SIGN_IN and receiver is None
-
-
 @dataclass(frozen=True)
 class _Use:
     """A statement's use of the session (`read`, `write`) or of a caller's setter
     (`caller`). `keys`: the store keys (`*_return_to` patterns) or the caller groups; None
     for any. `value`: what it writes; None for one that's never clean."""
 
-    kind: str
+    kind: Literal["read", "write", "caller"]
     keys: tuple[str, ...] | None
     value: Node | None
     gem: bool = False  # a gem's own setter (`sign_in`, `auto_login`)
@@ -2868,6 +2861,7 @@ class _Use:
 class _Locals:
     params: frozenset[str]
     assigned: tuple[tuple[str, int, int, Node], ...]  # (name, start, end, value), this scope
+    inner: tuple[tuple[str, Node], ...] = ()  # (name, value) assigned in its blocks
 
 
 _SCOPES = ("block", "do_block", "lambda", "method", "singleton_method")
@@ -2885,7 +2879,7 @@ def _scan(
         uses: list[_Use] = []
         names: list[str] = []
         ivars: list[tuple[str, Node | None]] = []
-        for n in walk(node):
+        for n in _walk_body(node):
             if n.type in ("assignment", "operator_assignment"):
                 left = n.child_by_field_name("left")
                 if left is not None and left.type == "instance_variable":
@@ -2905,6 +2899,18 @@ def _scan(
     return code.scans[key]
 
 
+def _walk_body(node: Node) -> Iterator[Node]:
+    """Every node under `node`, except the bodies of methods it defines (`def x` inside an
+    action runs only when called, and the closure follows it then)."""
+    stack = [node]
+    while stack:
+        n = stack.pop()
+        yield n
+        if n is not node and n.type in _DEFS:
+            continue
+        stack.extend(reversed(n.children))
+
+
 def _store_root(code: RubyCode, src: Parsed, n: Node) -> str | None:
     """ "store" for the session, "jar" for the cookie jar, "*" for one reached in a way we
     don't follow (`send(:session)`, `env["rack.session"]`), None for anything else."""
@@ -2916,19 +2922,15 @@ def _store_root(code: RubyCode, src: Parsed, n: Node) -> str | None:
             and (parent.child_by_field_name("method") == n)
         ):
             return None  # the call is the mention
-        if _local_at(code, src, n) is not None:
-            return None  # a local or a parameter named `session`
+        if _local_at(code, src, n, strict=True) is not None and not _holds_store(code, src, n):
+            return None  # a local named `session` that holds something else
         return {"session": "store", "session_options": "options"}.get(src.text(n), "jar")
     if n.type == "call" and call_name(src, n) in _STORE_ROOTS:
         receiver = unwrap(n.child_by_field_name("receiver"))
         if receiver is not None and not (
             receiver.type == "self"
             or re.fullmatch(r"@?_?(request|controller)", src.text(receiver).split(".")[-1])
-            or (
-                receiver.type == "identifier"
-                and (held := _local_at(code, src, receiver)) is not None
-                and held[1]  # a block's parameter: `before_action { |c| c.session[…] }`
-            )
+            or (receiver.type == "identifier" and _holds_store(code, src, receiver))
         ):
             return None  # `account.session`, `Current.session`: another object's attribute
         name = call_name(src, n)
@@ -3008,6 +3010,8 @@ def _store_uses(code: RubyCode, src: Parsed, n: Node) -> list[_Use] | None:
                     return unnamed  # `session.each { |k, v| v.replace(…) }`: the values handed on
                 keyed, keys, cur = True, None, parent  # `session.values.first.replace(…)`
                 continue
+            if name == "delete" and a:
+                return [_Use("read", _key_patterns(code, src, a[0]), None)]  # returns the value
             if name in _STORE_DROPS:
                 return []
             if name in ("[]=", "store") and len(a) == 2:
@@ -3081,17 +3085,23 @@ def _key_patterns(
     return None
 
 
-def _local_at(code: RubyCode, src: Parsed, node: Node) -> tuple[list[Node], bool] | None:
-    """What a bare name holds where it's read, if it's a local there: the values its
-    earlier assignments in the scopes around it give, and whether it's also a parameter
-    (whose value we don't know); None when it's no local there (a method call)."""
-    key = (src.file.rel, node.start_byte, node.end_byte)
+def _local_at(
+    code: RubyCode, src: Parsed, node: Node, strict: bool = False
+) -> tuple[list[Node], bool] | None:
+    """What a bare name may hold where it's read, if it's a local there: the values of its
+    assignments in the scopes around it (earlier ones, later ones in a loop around the read,
+    and a block's that set the outer local), and whether it's also a parameter (whose value
+    we don't know); None when it's no local there (a method call). `strict`: whether Ruby
+    parses it as a local, an assignment or parameter before it."""
+    key = (src.file.rel, node.start_byte, node.end_byte, strict)
     if key not in code.locals_at:
-        code.locals_at[key] = _find_local(code, src, node)
+        code.locals_at[key] = _find_local(code, src, node, strict)
     return code.locals_at[key]
 
 
-def _find_local(code: RubyCode, src: Parsed, node: Node) -> tuple[list[Node], bool] | None:
+def _find_local(
+    code: RubyCode, src: Parsed, node: Node, strict: bool
+) -> tuple[list[Node], bool] | None:
     name = src.text(node)
     values: list[Node] = []
     loops = [
@@ -3104,14 +3114,21 @@ def _find_local(code: RubyCode, src: Parsed, node: Node) -> tuple[list[Node], bo
     while scope is not None:
         if scope.type in _SCOPES or scope.type in _BOUNDARIES:
             found = _scope_locals(code, src, scope)
-            values += [
+            here = [
                 v
                 for n, start, end, v in found.assigned
                 if n == name
                 and not start <= node.start_byte < end  # `key = key` reads the earlier one
-                # earlier, or later in a loop around the read (its next pass)
-                and (end <= node.start_byte or any(_inside_span(start, lp) for lp in loops))
+                # earlier; unless strict, also later in a loop around the read (its next pass)
+                and (
+                    end <= node.start_byte
+                    or (not strict and any(_inside_span(start, lp) for lp in loops))
+                )
             ]
+            values += here
+            if not strict and (here or name in found.params):
+                # a block assigning the local it sees sets this one (`[1].each { key = x }`)
+                values += [v for n, v in found.inner if n == name]
             if name in found.params:
                 return values, True
             if scope.type in _BOUNDARIES:
@@ -3136,11 +3153,14 @@ def _scope_locals(code: RubyCode, src: Parsed, scope: Node) -> _Locals:
             if params
             else frozenset()
         )
-        assigned: list[tuple[str, int, Node]] = []
+        assigned: list[tuple[str, int, int, Node]] = []
+        inner: list[tuple[str, Node]] = []
         stack = [c for c in scope.named_children if c != params]
         while stack:
             n = stack.pop()
             if n.type in _SCOPES or n.type in _BOUNDARIES:
+                if n.type in ("block", "do_block", "lambda"):
+                    inner += _block_assignments(src, n)
                 continue  # its own scope
             if n.type in ("assignment", "operator_assignment"):
                 left = n.child_by_field_name("left")
@@ -3155,7 +3175,7 @@ def _scope_locals(code: RubyCode, src: Parsed, scope: Node) -> _Locals:
                     right = n.child_by_field_name("right")
                     assigned.append((src.text(t), n.start_byte, n.end_byte, right))
             stack += n.named_children
-        code.scope_locals[key] = _Locals(names, tuple(assigned))
+        code.scope_locals[key] = _Locals(names, tuple(assigned), tuple(inner))
     return code.scope_locals[key]
 
 
@@ -3189,6 +3209,13 @@ def _caller_uses(src: Parsed, n: Node) -> list[_Use] | None:
             return [_Use("caller", None, a[1])]
         group = _caller_group(ivar)
         return [_Use("caller", (group,), a[1])] if group else None
+    if (
+        name in _SENDS
+        and a
+        and (receiver is None or receiver.type == "self")
+        and _SIGN_IN_CALLS.match(symbol(src, a[0]) or "")
+    ):
+        return [_Use("caller", ("current_user",), n.child_by_field_name("arguments"), gem=True)]
     if name in _SENDS and a:
         setter = symbol(src, a[0])
         on = src.text(receiver).removeprefix("::") if receiver is not None else "self"
@@ -3215,7 +3242,7 @@ def _caller_uses(src: Parsed, n: Node) -> list[_Use] | None:
             if groups is not False:
                 uses.append(_Use("caller", groups, value))  # type: ignore[arg-type]
         return uses
-    if receiver is None and _SIGN_IN_CALLS.match(name):
+    if (receiver is None or receiver.type == "self") and _SIGN_IN_CALLS.match(name):
         return [_Use("caller", ("current_user",), n.child_by_field_name("arguments"), gem=True)]
     return None
 
@@ -3286,6 +3313,36 @@ def _constant_only(src: Parsed, node: Node) -> bool:
     return True
 
 
+def _holds_store(code: RubyCode, src: Parsed, name: Node) -> bool:
+    """Whether a local may hold the request, the controller or the store: a parameter
+    (`|c| c.session`, `def remember(session)`), or a value naming one (`r = request`)."""
+    held = _local_at(code, src, name)
+    if held is None:
+        return False
+    values, param = held
+    return param or any(
+        re.search(r"\b(request|controller|self|session|cookies|cookie_jar)\b", src.text(v))
+        for v in values
+        if v is not None
+    )
+
+
+def _block_assignments(src: Parsed, block: Node) -> list[tuple[str, Node]]:
+    """Every `name = value` inside a block, its nested blocks included (not its methods)."""
+    out = []
+    stack = list(block.named_children)
+    while stack:
+        n = stack.pop()
+        if n.type in _BOUNDARIES:
+            continue
+        if n.type in ("assignment", "operator_assignment"):
+            left = n.child_by_field_name("left")
+            if left is not None and left.type == "identifier":
+                out.append((src.text(left), n.child_by_field_name("right")))
+        stack += n.named_children
+    return out
+
+
 def _a_local(code: RubyCode, src: Parsed, node: Node) -> bool:
     """A bare name that's a local where it stands: assigned there, or read after one."""
     parent = node.parent
@@ -3295,7 +3352,7 @@ def _a_local(code: RubyCode, src: Parsed, node: Node) -> bool:
         and parent.child_by_field_name("left") == node
     ):
         return True
-    return _local_at(code, src, node) is not None
+    return _local_at(code, src, node, strict=True) is not None
 
 
 def _ancestors(node: Node) -> Iterator[Node]:
