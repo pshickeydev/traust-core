@@ -1441,3 +1441,34 @@ def test_what_qodos_third_review_of_362_keeps_scoped(tmp_path: Path, write: str)
     )
     row = _row(_tree(tmp_path, _notes_app(controller)), "DELETE", "/notes/:id")
     assert row["ownership"] == "scoped"
+
+
+@pytest.mark.parametrize(
+    ("write", "helpers"),
+    [
+        # the action redefines a clean helper, then calls it
+        (
+            "def remember\n      session[:user_id] = params[:user_id]\n    end\n    remember",
+            "  def remember\n    nil\n  end\n\n",
+        ),
+        # the request handed to a parameter of any name, or a block's
+        (
+            "forge(request)",
+            "  def forge(store)\n    store.session[:user_id] = params[:user_id]\n  end\n\n",
+        ),
+        (
+            "forge(env: request)",
+            "  def forge(env:)\n    env.session[:user_id] = params[:user_id]\n  end\n\n",
+        ),
+        ("[request].each { |r| r.session[:user_id] = params[:user_id] }", ""),
+    ],
+    ids=["redefined-helper", "param-store", "keyword-param", "block-param"],
+)
+def test_what_qodos_review_of_6c6fd55_found_stays_closed(
+    tmp_path: Path, write: str, helpers: str
+) -> None:
+    controller = FORGED_SESSION.format(
+        write=write, helpers=helpers + SESSION_USER.format(read="session[:user_id]")
+    )
+    row = _row(_tree(tmp_path, _notes_app(controller)), "DELETE", "/notes/:id")
+    assert row["ownership"] != "scoped"

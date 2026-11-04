@@ -456,6 +456,7 @@ class RubyCode:
         ] = {}
         self.scope_locals: dict[tuple[str, int, int], _Locals] = {}
         self.locals_at: dict[tuple[str, int, int, bool], tuple[list[Node], bool] | None] = {}
+        self._calls: dict[str, list[tuple[Parsed, Node]]] | None = None
         self.defined: set[str] = set()  # every method name the checkout defines
         for rel, src in sources.items():
             self._index(rel, src)
@@ -508,6 +509,23 @@ class RubyCode:
             if "<differs>" not in roots:
                 self.table_roots[table] = {next(iter(roots))}
         self.fields = self._fields()
+
+    def calls_to(self, name: str) -> list[tuple[Parsed, Node]]:
+        """Every call in the checkout that may run the method `name`: `name(…)`, `self.name(…)`
+        and `send(:name, …)`."""
+        if self._calls is None:
+            self._calls = {}
+            for src in self.sources.values():
+                for n in walk(src.root):
+                    if n.type != "call":
+                        continue
+                    receiver = n.child_by_field_name("receiver")
+                    called = call_name(src, n)
+                    if called in _SENDS and args(n) and (sent := symbol(src, args(n)[0])):
+                        self._calls.setdefault(sent, []).append((src, n))
+                    elif receiver is None or receiver.type == "self":
+                        self._calls.setdefault(called, []).append((src, n))
+        return self._calls.get(name, [])
 
     def _index(self, rel: str, src: Parsed) -> None:
         if test_file(rel, self.roots):
@@ -1398,6 +1416,7 @@ class _Action:
         # a `def` among the statements defines a method, and runs nothing until it's called
         queue = [(s.src, s.node, s.kind) for s in steps if s.node.type not in _DEFS]
         called: set[str] = set()
+        redefined: set[str] = set()
         # methods defined inside a statement (`def later` in an action): found when called
         nested: dict[str, tuple[Parsed, Node, Kind]] = {
             s.src.text(name): (s.src, s.node, s.kind)
@@ -1415,16 +1434,16 @@ class _Action:
                 nested.setdefault(name, (src, defined, kind))
             called |= set(scan[1])
             for name in [*scan[1], *nested]:
-                if name in seen or name not in called:
+                if name not in called:
                     continue
-                found = self.methods(name)
-                if found is None and name in nested:
-                    found = nested[name][:2]
-                if found is None:
-                    continue
-                seen.add(name)
                 inner = Kind.CALLBACK if name in _CALLERS else kind
-                queue.append((found[0], found[1], inner))  # the whole method, scanned once
+                if name not in seen and (found := self.methods(name)) is not None:
+                    seen.add(name)
+                    queue.append((found[0], found[1], inner))  # the whole method, scanned once
+                if name in nested and name not in redefined:
+                    # the action's own `def` replaces the class's once it runs: either may
+                    redefined.add(name)
+                    queue.append((nested[name][0], nested[name][1], inner))
         return out
 
     def _session_writes(self) -> set[str]:
@@ -3342,16 +3361,79 @@ def _holds_store(code: RubyCode, src: Parsed, name: Node) -> bool:
     if held is None:
         return False
     values, param = held
-    if param and (_STORE_NAME.fullmatch(src.text(name)) or _callback_block_param(src, name)):
-        return True  # `def remember(session)`, `before_action { |c| c.session }`
-    return any(
-        re.search(r"\b(request|controller|self|session|cookies|cookie_jar)\b", src.text(v))
-        for v in values
-        if v is not None
-    )
+    if param and (
+        _STORE_NAME.fullmatch(src.text(name))
+        or _callback_block_param(src, name)
+        or _passed_a_store(code, src, name)
+    ):
+        return True  # `def remember(session)`, `before_action { |c| … }`, `forge(request)`
+    return any(_STORE_TEXT.search(src.text(v)) for v in values if v is not None)
 
 
 _STORE_NAME = re.compile(r"_?(request|req|controller|ctrl|session|cookies|cookie_jar)")
+_STORE_TEXT = re.compile(r"\b(request|controller|self|session|cookies|cookie_jar)\b")
+
+
+def _passed_a_store(code: RubyCode, src: Parsed, name: Node) -> bool:
+    """Whether a parameter may be handed the request, the controller or the store: a block's
+    whose call names one (`[request].each { |r| … }`), or a method's that some call in the
+    app passes one in its place, or a splat it can't place (`forge(request)` for `def
+    forge(store)`)."""
+    text = src.text(name)
+    for scope in _ancestors(name):
+        if scope.type in ("block", "do_block"):
+            params = next((c for c in scope.named_children if c.type == "block_parameters"), None)
+            if params is None or text not in {
+                src.text(p) for p in walk(params) if p.type == "identifier"
+            }:
+                continue
+            call = scope.parent
+            if call is None or call.type != "call":
+                return True  # a block we can't place
+            receiver = call.child_by_field_name("receiver")
+            outside = [receiver, *args(call)]
+            return any(x is not None and _STORE_TEXT.search(src.text(x)) for x in outside)
+        if scope.type in _DEFS:
+            params = scope.child_by_field_name("parameters")
+            names = [
+                p
+                for p in (params.named_children if params is not None else [])
+                if p.type != "comment"
+            ]
+            position = next(
+                (
+                    i
+                    for i, p in enumerate(names)
+                    if text in {src.text(x) for x in walk(p) if x.type == "identifier"}
+                ),
+                None,
+            )
+            if position is None:
+                return False
+            keyword = names[position].type == "keyword_parameter"
+            method = src.text(scope.child_by_field_name("name"))
+            for s, call in code.calls_to(method):
+                given = args(call)
+                if call_name(s, call) in _SENDS:
+                    given = given[1:]  # `send(:forge, request)`
+                if any(g.type in ("splat_argument", "hash_splat_argument") for g in given):
+                    return True
+                if keyword:
+                    picked = [
+                        g.child_by_field_name("value")
+                        for h in given
+                        for g in (h.named_children if h.type == "hash" else [h])
+                        if g.type == "pair" and symbol(s, g.child_by_field_name("key")) == text
+                    ]
+                else:
+                    positional = [g for g in given if g.type != "pair"]
+                    picked = [positional[position]] if position < len(positional) else []
+                if any(p is not None and _STORE_TEXT.search(s.text(p)) for p in picked):
+                    return True
+            return False
+        if scope.type in _BOUNDARIES:
+            return False
+    return False
 
 
 def _callback_block_param(src: Parsed, name: Node) -> bool:
