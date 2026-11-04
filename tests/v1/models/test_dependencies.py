@@ -4,6 +4,7 @@ version tests of tests/test_run_impact_analysis.py (traust-engine main)."""
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from itertools import pairwise
 from uuid import uuid4
 
 import pytest
@@ -60,13 +61,13 @@ TWO_SPANS = package(span("0", "1.5.0"), span("2.0.0", "2.3.0"))
     ("version", "ecosystem", "same_as"),
     [
         ("v1.64.1", GO, "1.64.1"),
-        ("v1.2.3-rc1", GO, "1.2.3"),
+        ("v1.2.3+incompatible", GO, "1.2.3"),
         ("v1.2.3", NPM, "1.2.3"),
         ("1.2.3.4", NPM, "1.2.3"),
         ("1.0.0.Final", MAVEN, "1"),
         ("5.3.2-RELEASE", MAVEN, "5.3.2"),
         ("1!2.3.4", PYPI, "2.3.4"),
-        ("2.3.4rc1", PYPI, "2.3.4"),
+        ("2.3.4+local.7", PYPI, "2.3.4"),
         ("1.2.0", PYPI, "1.2"),
         ("13.0.1", Ecosystem.NUGET, "13.0.1"),
     ],
@@ -79,6 +80,58 @@ def test_version_key_normalises_per_ecosystem(version: str, ecosystem: Ecosystem
 @pytest.mark.parametrize("version", ["latest", "", "  "])
 def test_unorderable_versions_have_no_key(version: str, ecosystem: Ecosystem) -> None:
     assert version_key(version, ecosystem) is None
+
+
+@pytest.mark.parametrize(
+    ("ecosystem", "ascending"),
+    [
+        (GO, ["v1.2.3", "v1.2.4-0.20210101000000-abcdef123456", "v1.2.4-rc.1", "v1.2.4"]),
+        (NPM, ["2.0.0-alpha", "2.0.0-alpha.1", "2.0.0-alpha.beta", "2.0.0-beta.2"]),
+        (NPM, ["2.0.0-beta.2", "2.0.0-beta.11", "2.0.0-rc.1", "2.0.0", "2.0.1-rc.1"]),
+        (Ecosystem.CARGO, ["1.0.0-alpha", "1.0.0"]),
+        (Ecosystem.NUGET, ["1.0.0-beta.1", "1.0.0"]),
+        (PYPI, ["2.0.dev1", "2.0a1.dev1", "2.0a1", "2.0b1", "2.0rc1", "2.0"]),
+        (PYPI, ["2.0rc1", "2.0rc1.post1.dev1", "2.0rc1.post1", "2.0"]),
+        (PYPI, ["2.0", "2.0.post1.dev1", "2.0.post1", "2.0.1"]),
+    ],
+)
+def test_pre_releases_sort_below_their_release(ecosystem: Ecosystem, ascending: list[str]) -> None:
+    keys = [version_key(v, ecosystem) for v in ascending]
+    assert all(a < b for a, b in pairwise(keys))  # type: ignore[operator]
+
+
+@pytest.mark.parametrize(
+    ("version", "ecosystem", "same_as"),
+    [
+        ("2.0-1", PYPI, "2.0.post1"),
+        ("2.0r1", PYPI, "2.0.post1"),
+        ("2.0.0RC1", PYPI, "2.0rc1"),
+        ("1.0.0-RC1", Ecosystem.NUGET, "1.0.0-rc1"),  # NuGet compares pre-release case-blind
+    ],
+)
+def test_spellings_of_one_version_are_equal(
+    version: str, ecosystem: Ecosystem, same_as: str
+) -> None:
+    assert version_key(version, ecosystem) == version_key(same_as, ecosystem)
+
+
+def test_a_pre_release_of_the_fix_is_still_affected() -> None:
+    fixed_in_2 = package(span("0", "2.0.0"), ecosystem=NPM)
+    assert fixed_in_2.affects(Version("2.0.0-rc.1")) is True
+    assert fixed_in_2.affects(Version("2.0.0")) is False
+
+
+def test_a_pre_release_fixed_with_its_own_post_release_still_affects_the_pre_release() -> None:
+    """A PyPI fix at 2.0rc1.post1 must not treat an installed 2.0rc1 as fixed (its key
+    ordered equal before the post segment joined the pre-release's stage)."""
+    fixed_at = package(span("0", "2.0rc1.post1"), ecosystem=PYPI)
+    assert fixed_at.affects(Version("2.0rc1")) is True
+    assert fixed_at.affects(Version("2.0rc1.post1")) is False
+    assert fixed_at.affects(Version("2.0rc1.post1.dev1")) is True
+
+
+def test_semver_pre_release_case_still_orders_outside_nuget() -> None:
+    assert version_key("1.0.0-RC1", NPM) < version_key("1.0.0-rc1", NPM)  # type: ignore[operator]
 
 
 def test_go_needs_three_components_and_orders_numerically() -> None:
