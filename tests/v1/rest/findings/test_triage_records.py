@@ -394,6 +394,7 @@ def test_in_process_protected_triage_also_denies_an_unrelated_runner(world: Tria
     [
         ("repository", 403),
         ("asset", 403),
+        ("remediation lease", 403),
         ("expired", 409),
         ("finished", 409),
         ("run-id", 422),
@@ -406,7 +407,30 @@ def test_triage_authority_and_provenance_refusals_precede_all_report_mutations(
 ) -> None:
     body = json.loads(json.dumps(world.body))
     ops = world.context.services().ops
-    if fault in {"repository", "asset"}:
+    if fault == "remediation lease":
+        # The remediation door shares the triage allowlist (NEED: contracts has no
+        # recording.remediation section yet), so the operator's triage list carries
+        # the remediation asset — a remediation order's lease must still be refused
+        # here: only a triage order records triage.
+        world.context.config = world.context.config.model_copy(
+            update={
+                "recording": world.context.config.recording.model_copy(
+                    update={"triage": ("triage", "triage_again", "remediation")}
+                )
+            }
+        )
+        with SqlTraustUnitOfWork(world.context.database) as uow:
+            source = uow.assessments.get(world.assessment_id)
+            repository_id = uow.repository_refs.get(source.repository_ref_id).repository_id
+        order = ops.start(
+            OrderRequest(asset="remediation", priority=1, repository_id=repository_id),
+            world.principal,
+            WorkerId(world.principal.ref),
+            timedelta(minutes=10),
+        )
+        body["run_order_id"] = str(order.id)
+        body["provenance"]["run_id"] = str(order.id)
+    elif fault in {"repository", "asset"}:
         with SqlTraustUnitOfWork(world.context.database) as uow:
             source = uow.assessments.get(world.assessment_id)
             repository_id = uow.repository_refs.get(source.repository_ref_id).repository_id

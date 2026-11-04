@@ -143,6 +143,7 @@ ASSESSOR = "skill:remediate-finding"
 FLEET_FIX = AssessmentKind.FLEET_FIX
 FLEET_FIX_ASSESSOR = "skill:fleet-fix"
 FLEET_FIX_ORDER = AssetName("fleet-fix")
+REMEDIATION_RECORD = AssetName("remediation")
 _FLEET_FIX_CONFIG = "fleet-fix:"
 _FINAL = frozenset({"merged", "abandoned"})
 _READY = frozenset({"checks_passed", "revalidated_fixed", "pr_opened"})
@@ -245,6 +246,7 @@ class RemediationService:
         validation: ValidationService,
         applier: FleetFixApplier | None = None,
         goldens: GoldenRunner | None = None,
+        recording: OpsService | None = None,
     ) -> None:
         self._uow = uow
         self._inventory = Inventory(uow, forks.hosts)
@@ -261,6 +263,7 @@ class RemediationService:
         self._validation = validation
         self._applier = applier
         self._goldens = goldens
+        self._recording = recording
 
     def open(self, finding_ids: Sequence[UUID], repository_ref_id: UUID) -> WorkItem:
         """A work item for confirmed, open findings of the commit's repository (legacy manifest
@@ -530,6 +533,50 @@ class RemediationService:
             "NEED(remediation-evidence): no contracts schema holds evidence before the report; "
             f"record {evidence.kind} evidence in work item {work_item_id}'s remediation report"
         )
+
+    def record_order(
+        self,
+        doc: RemediationArtifact,
+        provenance: Provenance,
+        run_order_id: UUID,
+        principal: Principal,
+    ) -> WorkItem:
+        """A runner's remediation report under its leased order's authorization: the lease is
+        a remediation order's, and every finding the report covers is on the repository that
+        lease names — the work item is chosen from the findings, so either mismatch would
+        write another lane's resolutions under this order."""
+        if self._recording is None:
+            raise ConfigError("remediation recording requires operations authorization")
+        repository = self._inventory.find_repository(doc.metadata.repository)
+        if repository is None or repository.id is None:
+            raise NotFoundError(f"repository {doc.metadata.repository}")
+        with self._recording.recording(
+            order_id=run_order_id,
+            principal=principal,
+            kind="remediation",
+            repository_id=repository.id,
+            provenance=provenance,
+        ) as order:
+            # NEED(contracts: remediation recording section): the door shares the triage
+            # allowlist until contracts lands a remediation section, so the allowlist alone
+            # would admit a triage order's lease here; only a remediation order records.
+            if order.asset != REMEDIATION_RECORD:
+                raise ForbiddenError(
+                    f"order {run_order_id}: remediation recording requires a"
+                    f" {REMEDIATION_RECORD} order, not {order.asset}"
+                )
+            wanted = tuple(
+                sorted({_finding_id(s.finding_ref) for s in doc.source_findings}, key=str)
+            )
+            covered = {view.finding.repository_id for view in self._findings.list_by_ids(wanted)}
+            # A report over several repositories is record()'s payload refusal; one repository
+            # other than the lease's is this order trying to write outside its scope.
+            if len(covered) == 1 and repository.id not in covered:
+                raise ForbiddenError(
+                    f"order {run_order_id}: remediation report covers findings of another"
+                    " repository"
+                )
+            return self.record(doc, provenance)
 
     @overload
     def record(

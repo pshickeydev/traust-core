@@ -774,7 +774,13 @@ class Context:
                 *(g.value for g in GapReason),
             ),
             spend=spend,
-            recording_assets=self.config.recording.model_dump(exclude={"start"}),
+            recording_assets={
+                **self.config.recording.model_dump(exclude={"start"}),
+                # NEED(contracts: remediation recording section): contracts' traust config
+                # has no remediation key yet; the door shares the triage allowlist until
+                # one lands, then reads its own section here.
+                "remediation": self.config.recording.triage,
+            },
             recording_starts=self.config.recording.start,
             inventory=Inventory(uow, hosts),
             assessments=AssessmentLog(uow),
@@ -973,6 +979,7 @@ class Context:
             validation=validation,
             applier=self.fleet_fix_applier,
             goldens=self.fleet_fix_goldens,
+            recording=ops,
         )
         detection_quality = DetectionQualityService(
             uow,

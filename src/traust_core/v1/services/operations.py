@@ -85,6 +85,9 @@ _RECORDING_SOURCES = {
     "triage": SourceType.TRIAGE_REPORT,
     "validation": SourceType.VALIDATION_REPORT,
     "verification": SourceType.VERIFICATION_REPORT,
+    # NEED(contracts: remediation source type): contracts' source-type has no remediation
+    # value; the remediation report records under its triage source until one lands.
+    "remediation": SourceType.TRIAGE_REPORT,
 }
 
 S = TypeVar("S", contravariant=True)
