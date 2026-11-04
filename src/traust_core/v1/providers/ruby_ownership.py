@@ -451,7 +451,8 @@ class RubyCode:
         # what each statement does with the session and the caller's setters, and the app
         # methods it may call; each scope's locals
         self.scans: dict[
-            tuple[str, int, int], tuple[list[_Use], list[str], list[tuple[str, Node | None]]]
+            tuple[str, int, int],
+            tuple[list[_Use], list[str], list[tuple[str, Node | None]], list[tuple[str, Node]]],
         ] = {}
         self.scope_locals: dict[tuple[str, int, int], _Locals] = {}
         self.locals_at: dict[tuple[str, int, int, bool], tuple[list[Node], bool] | None] = {}
@@ -1396,14 +1397,30 @@ class _Action:
         seen: set[str] = set()
         # a `def` among the statements defines a method, and runs nothing until it's called
         queue = [(s.src, s.node, s.kind) for s in steps if s.node.type not in _DEFS]
+        called: set[str] = set()
+        # methods defined inside a statement (`def later` in an action): found when called
+        nested: dict[str, tuple[Parsed, Node, Kind]] = {
+            s.src.text(name): (s.src, s.node, s.kind)
+            for s in steps
+            if s.node.type in _DEFS and (name := s.node.child_by_field_name("name")) is not None
+        }
         while queue:
             if len(out) >= _MAX_CLOSURE:
                 self.capped = True
                 break
             src, node, kind = queue.pop()
             out.append((src, node, kind))
-            for name in _scan(self.code, src, node)[1]:
-                if name in seen or (found := self.methods(name)) is None:
+            scan = _scan(self.code, src, node)
+            for name, defined in scan[3]:
+                nested.setdefault(name, (src, defined, kind))
+            called |= set(scan[1])
+            for name in [*scan[1], *nested]:
+                if name in seen or name not in called:
+                    continue
+                found = self.methods(name)
+                if found is None and name in nested:
+                    found = nested[name][:2]
+                if found is None:
                     continue
                 seen.add(name)
                 inner = Kind.CALLBACK if name in _CALLERS else kind
@@ -2871,15 +2888,20 @@ _BOUNDARIES = ("method", "singleton_method", "class", "module", "singleton_class
 
 def _scan(
     code: RubyCode, src: Parsed, node: Node
-) -> tuple[list[_Use], list[str], list[tuple[str, Node | None]]]:
+) -> tuple[list[_Use], list[str], list[tuple[str, Node | None]], list[tuple[str, Node]]]:
     """What a statement does with the session and the callers' setters, the names of the
-    app methods it may call, and the instance variables it assigns."""
+    app methods it may call, the instance variables it assigns, and the methods it
+    defines."""
     key = (src.file.rel, node.start_byte, node.end_byte)
     if key not in code.scans:
         uses: list[_Use] = []
         names: list[str] = []
         ivars: list[tuple[str, Node | None]] = []
+        defs: list[tuple[str, Node]] = []
         for n in _walk_body(node):
+            if n is not node and n.type in _DEFS and (name_node := n.child_by_field_name("name")):
+                defs.append((src.text(name_node), n))
+                continue
             if n.type in ("assignment", "operator_assignment"):
                 left = n.child_by_field_name("left")
                 if left is not None and left.type == "instance_variable":
@@ -2895,7 +2917,7 @@ def _scan(
                     names.append(name)
             elif n.type == "identifier" and _helper_name(src, n) and not _a_local(code, src, n):
                 names.append(src.text(n))  # a bare name that isn't a local there
-        code.scans[key] = (uses, names, ivars)
+        code.scans[key] = (uses, names, ivars, defs)
     return code.scans[key]
 
 
@@ -3320,26 +3342,62 @@ def _holds_store(code: RubyCode, src: Parsed, name: Node) -> bool:
     if held is None:
         return False
     values, param = held
-    return param or any(
+    if param and (_STORE_NAME.fullmatch(src.text(name)) or _callback_block_param(src, name)):
+        return True  # `def remember(session)`, `before_action { |c| c.session }`
+    return any(
         re.search(r"\b(request|controller|self|session|cookies|cookie_jar)\b", src.text(v))
         for v in values
         if v is not None
     )
 
 
+_STORE_NAME = re.compile(r"_?(request|req|controller|ctrl|session|cookies|cookie_jar)")
+
+
+def _callback_block_param(src: Parsed, name: Node) -> bool:
+    """A parameter of a callback's block (`before_action { |c| … }`): the controller."""
+    for block in _ancestors(name):
+        if block.type not in ("block", "do_block"):
+            continue
+        params = next((c for c in block.named_children if c.type == "block_parameters"), None)
+        if params is None or not any(
+            p.type == "identifier" and src.text(p) == src.text(name) for p in walk(params)
+        ):
+            continue
+        call = block.parent
+        return (
+            call is not None
+            and call.type == "call"
+            and bool(re.fullmatch(r"\w+_(action|filter)", call_name(src, call)))
+        )
+    return False
+
+
 def _block_assignments(src: Parsed, block: Node) -> list[tuple[str, Node]]:
-    """Every `name = value` inside a block, its nested blocks included (not its methods)."""
+    """Every `name = value` inside a block, its nested blocks included (not its methods),
+    except to a name a block takes as its own parameter (`each { |key| key = … }`)."""
     out = []
-    stack = list(block.named_children)
+    stack: list[tuple[Node, frozenset[str]]] = [(block, frozenset())]
     while stack:
-        n = stack.pop()
+        n, shadowed = stack.pop()
         if n.type in _BOUNDARIES:
             continue
+        if n.type in ("block", "do_block", "lambda"):
+            params = next(
+                (
+                    c
+                    for c in n.named_children
+                    if c.type in ("block_parameters", "lambda_parameters")
+                ),
+                None,
+            )
+            if params is not None:
+                shadowed |= {src.text(p) for p in walk(params) if p.type == "identifier"}
         if n.type in ("assignment", "operator_assignment"):
             left = n.child_by_field_name("left")
-            if left is not None and left.type == "identifier":
+            if left is not None and left.type == "identifier" and src.text(left) not in shadowed:
                 out.append((src.text(left), n.child_by_field_name("right")))
-        stack += n.named_children
+        stack += [(c, shadowed) for c in n.named_children]
     return out
 
 

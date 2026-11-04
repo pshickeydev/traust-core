@@ -1412,3 +1412,32 @@ def test_a_name_read_before_its_assignment_in_a_loop_is_the_method(tmp_path: Pat
     )
     row = _row(_tree(tmp_path, _notes_app(controller)), "DELETE", "/notes/:id")
     assert row["ownership"] != "scoped"
+
+
+def test_a_method_an_action_defines_and_calls_runs(tmp_path: Path) -> None:
+    write = "def later\n      session[:user_id] = params[:user_id]\n    end\n    later"
+    controller = FORGED_SESSION.format(
+        write=write, helpers=SESSION_USER.format(read="session[:user_id]")
+    )
+    row = _row(_tree(tmp_path, _notes_app(controller)), "DELETE", "/notes/:id")
+    assert row["ownership"] != "scoped"
+
+
+@pytest.mark.parametrize(
+    "write",
+    [
+        # another object's session, through a helper's parameter
+        "touch(Account.first)\n  end\n\n"
+        "  def touch(account)\n    account.session.update(token: params[:t])",
+        # a block's own parameter isn't the outer key
+        "key = :return_to\n    [1].each { |key| key = params[:user_id] }\n"
+        "    session[key] = request.fullpath",
+    ],
+    ids=["helper-param-session", "shadowed-key"],
+)
+def test_what_qodos_third_review_of_362_keeps_scoped(tmp_path: Path, write: str) -> None:
+    controller = FORGED_SESSION.format(
+        write=write, helpers=SESSION_USER.format(read="session[:user_id]")
+    )
+    row = _row(_tree(tmp_path, _notes_app(controller)), "DELETE", "/notes/:id")
+    assert row["ownership"] == "scoped"
