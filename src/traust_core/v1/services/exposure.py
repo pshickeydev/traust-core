@@ -459,7 +459,9 @@ class ExposureService:
         declared = {
             (Ecosystem.GO, module, version) for module, version in go_direct_requires(checkout)
         }
-        declared |= {(Ecosystem.CARGO, crate, None) for crate in cargo_requires(checkout)}
+        declared |= {
+            (Ecosystem.CARGO, crate, version) for crate, version in cargo_requires(checkout)
+        }
         declared |= {
             (Ecosystem.PYPI, package_name(Ecosystem.PYPI, name), None)
             for name in requirements_names(checkout)

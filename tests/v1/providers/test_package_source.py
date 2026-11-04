@@ -524,23 +524,49 @@ def test_cargo_requires_reads_only_the_dependencies_table(tmp_path: Path) -> Non
         '[build-dependencies]\ncc = "1.0"\n'
     )
     # the per-crate header names the crate; an inline package = "..." renames the key;
-    # dev-, build- and per-crate dev sections stay out of the production set
-    assert cargo_requires(tmp_path) == ["serde", "regex", "clap", "serde_json"]
+    # dev-, build- and per-crate dev sections stay out of the production set; without a
+    # lockfile the names match any scanned version
+    assert cargo_requires(tmp_path) == [
+        ("serde", None),
+        ("regex", None),
+        ("clap", None),
+        ("serde_json", None),
+    ]
+
+
+def test_cargo_requires_pins_the_lockfiles_root_versions(tmp_path: Path) -> None:
+    """A lock can hold two semver-incompatible versions of one crate; only the root
+    package's pinned version is direct."""
+    (tmp_path / "Cargo.toml").write_text(
+        '[package]\nname = "widget"\nversion = "0.1.0"\n\n[dependencies]\nbitflags = "1"\n'
+    )
+    (tmp_path / "Cargo.lock").write_text(
+        "version = 3\n\n"
+        '[[package]]\nname = "widget"\nversion = "0.1.0"\ndependencies = [\n'
+        ' "bitflags 1.3.2",\n]\n\n'
+        '[[package]]\nname = "bitflags"\nversion = "1.3.2"\n\n'
+        '[[package]]\nname = "bitflags"\nversion = "2.6.0"\n'
+    )
+    assert cargo_requires(tmp_path) == [("bitflags", "1.3.2")]
 
 
 def test_requirements_names_reads_constraints_and_skips_options(tmp_path: Path) -> None:
     (tmp_path / "requirements.txt").write_text(
         "# comment\nflask==3.0.0\nrequests >= 2.31\n-r other.txt\n--index-url https://x\n"
+        "django==4.2 # via -r requirements.in\nasgiref==3.7.2 # via django\n"
     )
     (tmp_path / "requirements-dev.txt").write_text("pytest>=8\n")
+    (tmp_path / "test-requirements.txt").write_text("coverage>=7\n")
     (tmp_path / "base-requirements.txt").write_text("urllib3>=2\n")
     nested = tmp_path / "services" / "api"
     nested.mkdir(parents=True)
     (nested / "base-requirements.txt").write_text("jinja2>=3\n")
+    # dev/test files stay out (as Cargo's dev-dependencies do); pip-compile's `# via`
+    # transitives stay out, its `# via -r` source pins stay direct
     assert sorted(requirements_names(tmp_path)) == [
+        "django",
         "flask",
         "jinja2",
-        "pytest",
         "requests",
         "urllib3",
     ]

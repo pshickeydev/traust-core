@@ -583,6 +583,11 @@ def test_a_gomods_requires_mark_go_dependencies_direct(engine: Engine, tmp_path:
         '[dependencies]\nserde = "1.0"\n\n'
         '[dev-dependencies]\nregex-syntax = "0.8"\n'
     )
+    (tmp_path / "Cargo.lock").write_text(
+        'version = 3\n\n[[package]]\nname = "widget"\nversion = "0.1.0"\n'
+        'dependencies = ["serde 1.0.193"]\n\n'
+        '[[package]]\nname = "serde"\nversion = "1.0.193"\n'
+    )
     (tmp_path / "requirements.txt").write_text("flask==3.0.0\n")
     raw = json.dumps(
         {
@@ -608,7 +613,7 @@ def test_a_gomods_requires_mark_go_dependencies_direct(engine: Engine, tmp_path:
     assert rows_ == {
         ("github.com/google/uuid", "v1.6.0", True),
         ("github.com/transitive/dep", "v0.1.0", False),
-        ("serde", "1.0.193", True),  # Cargo.toml [dependencies]
+        ("serde", "1.0.193", True),  # Cargo.lock pins the root's exact direct version
         ("regex-syntax", "0.8.2", False),  # dev-dependencies are not the production set
         ("flask", "3.0.0", True),  # requirements.txt holds direct dependencies only
         ("jinja2", "3.1.2", False),

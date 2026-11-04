@@ -428,32 +428,36 @@ def go_direct_requires(root: Path) -> list[tuple[str, Version]]:
             continue
         text = (Path(top) / "go.mod").read_text(errors="replace")
         # Only require directives: a replace, exclude or retract block names modules and
-        # versions too, and none of them declares a direct dependency.
+        # versions too, and none of them declares a direct dependency. The indirect check
+        # reads the original line — a reconstructed entry drops the trailing comment.
         entries: list[str] = []
         for block in re.findall(r"(?ms)^require\s*\((.*?)^\)", text):
             entries += block.splitlines()
         entries += [
-            f"{m.group(1)} {m.group(2)}"
+            line.strip()
             for line in text.splitlines()
-            if (m := re.match(r"(?m)^\s*require\s+(\S+)\s+(v\S+)", line))
+            if re.match(r"(?m)^\s*require\s+\S+\s+v\S+", line)
         ]
         for line in entries:
             if "// indirect" in line:
                 continue
-            if match := re.match(r"(?m)^\s*(\S+)\s+(v\S+)", line):
+            if match := re.match(r"(?m)^\s*(?:require\s+)?(\S+)\s+(v\S+)", line):
                 found.append((match.group(1), Version(match.group(2).removeprefix("v"))))
     return found
 
 
-def cargo_requires(root: Path) -> list[str]:
-    """Every crate named in a Cargo.toml's `[dependencies]` table: the direct set, as the
-    lockfile's versions can't be matched from the manifest's constraints. The per-crate
-    `[dependencies.<crate>]` header form declares the same, and an inline `package = "..."`
-    renames the key to the crate's published name."""
+def cargo_requires(root: Path) -> list[tuple[str, str | None]]:
+    """Every crate a Cargo.toml's `[dependencies]` table declares, as (crate, version-or-None):
+    the version is the exact pin Cargo.lock records for the root package's dependency — a
+    lock can hold two semver-incompatible versions of one crate (a direct 1.x and a
+    transitive 2.x), and only the pinned one is direct. Without a lock the manifest's name
+    is all there is (its constraints can't be matched to pins), and the name matches every
+    scanned version. The per-crate `[dependencies.<crate>]` header form declares the same,
+    and an inline `package = "..."` renames the key to the crate's published name."""
     manifest = root / "Cargo.toml"
     if not manifest.is_file():
         return []
-    names: list[str] = []
+    names: list[tuple[str, str | None]] = []
     in_dependencies = False
     for line in manifest.read_text(errors="replace").splitlines():
         header = re.match(r"(?m)^\s*\[([^\]]+)\]", line)
@@ -465,25 +469,65 @@ def cargo_requires(root: Path) -> list[str]:
                 in_dependencies = True  # crate entries follow
             elif table.startswith("dependencies."):
                 # the crate is the header; the lines that follow are its spec
-                names.append(table.partition(".")[2].strip().strip('"'))
+                names.append((table.partition(".")[2].strip().strip('"'), None))
                 in_dependencies = False
             else:
                 in_dependencies = False
             continue
         if in_dependencies and (crate := re.match(r"(?m)^\s*([A-Za-z0-9_-]+)\s*=\s*(.*)", line)):
-            published = re.search(r"(?m)\bpackage\s*=\s*\"([^\"]+)\"", crate.group(2))
-            names.append(published.group(1) if published else crate.group(1))
-    return names
+            published = re.search(r'(?m)\bpackage\s*=\s*"([^"]+)"', crate.group(2))
+            names.append((published.group(1) if published else crate.group(1), None))
+    return _cargo_pins(root, names)
+
+
+def _cargo_pins(root: Path, declared: list[tuple[str, str | None]]) -> list[tuple[str, str | None]]:
+    """Resolve declared crate names to the versions Cargo.lock pins for the root package's
+    own dependencies; unresolvable names keep their None (any-version) match."""
+    lock = root / "Cargo.lock"
+    own = _cargo_own_crates(root / "Cargo.toml")
+    if not lock.is_file() or not own:
+        return declared
+    text = lock.read_text(errors="replace")
+    pinned: dict[str, str] = {}
+    for package in re.findall(r"(?ms)^\[\[package\]\]\s*(.*?)(?=^\[\[|\Z)", text):
+        name = re.search(r'(?m)^name\s*=\s*"([^"]+)"', package)
+        if not name or name.group(1) not in own:
+            continue
+        for dep in re.findall(r"(?ms)^dependencies\s*=\s*\[(.*?)\]", package):
+            for entry in re.findall(r'"([^"]+)"', dep):
+                crate, _, version = entry.rpartition(" ")
+                if crate and version:
+                    pinned[crate] = version
+    return [(crate, pinned.get(crate, version)) for crate, version in declared]
+
+
+def _cargo_own_crates(manifest: Path) -> set[str]:
+    """The crate names this Cargo.toml defines ([package] name, plus a workspace's members):
+    the packages whose Cargo.lock dependency lists are the direct set."""
+    text = manifest.read_text(errors="replace")
+    own = set(re.findall(r'(?m)^name\s*=\s*"([^"]+)"', text))
+    for members in re.findall(r"(?ms)^members\s*=\s*\[(.*?)\]", text):
+        own |= {m.strip().strip('"/') for m in members.split(",") if m.strip()}
+    return own
 
 
 def requirements_names(root: Path) -> list[str]:
-    """Every package named in a requirements file (`requirements*.txt` and `*requirements.txt`,
-    PEP 508 lines): a requirements file holds direct dependencies only, constraints
-    unresolved."""
+    """Every package named in a production requirements file (`requirements*.txt` and
+    `*requirements.txt`, PEP 508 lines): a requirements file holds direct dependencies only,
+    constraints unresolved. Development and test files (`requirements-dev.txt`,
+    `test-requirements.txt`, …) stay out, as Cargo's dev-dependencies do; a pip-compile
+    output's transitive pins carry `# via <parent>` (direct pins: `# via -r`/`-c`) and
+    stay out too."""
     names: list[str] = []
     files = {*root.rglob("requirements*.txt"), *root.rglob("*requirements.txt")}
     for path in sorted(files):
+        if re.search(r"(dev|test)", path.stem, re.IGNORECASE):
+            continue
         for line in path.read_text(errors="replace").splitlines():
+            # pip-compile marks each transitive with its parent; -r/-c point back at the
+            # source file, which keeps the pin direct.
+            if re.search(r"#\s*via\s+(?!-\w)", line):
+                continue
             spec = re.split(r"[<>=!~;\[\s]", line.strip(), maxsplit=1)[0]
             if spec and not spec.startswith(("#", "-")):
                 names.append(spec)
