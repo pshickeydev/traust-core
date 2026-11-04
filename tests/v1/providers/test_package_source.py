@@ -519,18 +519,21 @@ def test_cargo_requires_reads_only_the_dependencies_table(tmp_path: Path) -> Non
         '[dependencies]\nserde = { version = "1.0" }\nregex = "1.10"\n\n'
         '[dependencies.clap]\nversion = "4"\n\n'
         '[dependencies]\nserde_alias = { package = "serde_json", version = "1" }\n\n'
+        '[dependencies.renamed]\npackage = "chrono"\nversion = "0.4"\n\n'
         '[dev-dependencies]\ncriterion = "0.5"\n\n'
         '[dev-dependencies.tempfile]\nversion = "3"\n\n'
         '[build-dependencies]\ncc = "1.0"\n'
     )
-    # the per-crate header names the crate; an inline package = "..." renames the key;
-    # dev-, build- and per-crate dev sections stay out of the production set; without a
-    # lockfile the names match any scanned version
+    # the per-crate header names the crate; a package = "..." (inline or in that table)
+    # renames the declaration to the published name; dev-, build- and per-crate dev
+    # sections stay out of the production set; without a lockfile the names match any
+    # scanned version (the manifest's constraint disambiguates only against a lock)
     assert cargo_requires(tmp_path) == [
         ("serde", None),
         ("regex", None),
         ("clap", None),
         ("serde_json", None),
+        ("chrono", None),
     ]
 
 
@@ -557,6 +560,7 @@ def test_requirements_names_reads_constraints_and_skips_options(tmp_path: Path) 
     )
     (tmp_path / "requirements-dev.txt").write_text("pytest>=8\n")
     (tmp_path / "test-requirements.txt").write_text("coverage>=7\n")
+    (tmp_path / "requirements-latest.txt").write_text("httpx>=0.27\n")
     (tmp_path / "base-requirements.txt").write_text("urllib3>=2\n")
     nested = tmp_path / "services" / "api"
     nested.mkdir(parents=True)
@@ -566,6 +570,7 @@ def test_requirements_names_reads_constraints_and_skips_options(tmp_path: Path) 
     assert sorted(requirements_names(tmp_path)) == [
         "django",
         "flask",
+        "httpx",
         "jinja2",
         "requests",
         "urllib3",

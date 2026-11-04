@@ -449,16 +449,19 @@ def go_direct_requires(root: Path) -> list[tuple[str, Version]]:
 def cargo_requires(root: Path) -> list[tuple[str, str | None]]:
     """Every crate a Cargo.toml's `[dependencies]` table declares, as (crate, version-or-None):
     the version is the exact pin Cargo.lock records for the root package's dependency — a
-    lock can hold two semver-incompatible versions of one crate (a direct 1.x and a
-    transitive 2.x), and only the pinned one is direct. Without a lock the manifest's name
-    is all there is (its constraints can't be matched to pins), and the name matches every
-    scanned version. The per-crate `[dependencies.<crate>]` header form declares the same,
-    and an inline `package = "..."` renames the key to the crate's published name."""
+    lock can hold two semver-incompatible versions of one crate (a production 1.x and a
+    development 2.x), and only the pinned one matching the manifest's constraint is direct.
+    Without a lock the manifest's name is all there is (its constraints can't be matched to
+    pins), and the name matches every scanned version. The per-crate `[dependencies.<crate>]`
+    header form declares the same; a `package = "..."` key (inline or in that table) renames
+    the declaration to the crate's published name."""
     manifest = root / "Cargo.toml"
     if not manifest.is_file():
         return []
-    names: list[tuple[str, str | None]] = []
+    # (crate, constraint): the constraint's leading number disambiguates versions below
+    declared: list[tuple[str, str | None]] = []
     in_dependencies = False
+    table_crate: str | None = None
     for line in manifest.read_text(errors="replace").splitlines():
         header = re.match(r"(?m)^\s*\[([^\]]+)\]", line)
         if header:
@@ -467,28 +470,44 @@ def cargo_requires(root: Path) -> list[tuple[str, str | None]]:
             table = header.group(1).strip()
             if table == "dependencies":
                 in_dependencies = True  # crate entries follow
+                table_crate = None
             elif table.startswith("dependencies."):
                 # the crate is the header; the lines that follow are its spec
-                names.append((table.partition(".")[2].strip().strip('"'), None))
+                table_crate = table.partition(".")[2].strip().strip('"')
+                declared.append((table_crate, None))
                 in_dependencies = False
             else:
                 in_dependencies = False
+                table_crate = None
+            continue
+        published = re.search(r'(?m)^\s*package\s*=\s*"([^"]+)"', line)
+        if published and (in_dependencies or table_crate is not None):
+            if table_crate is not None and declared:
+                # a renamed table dependency: the published name replaces the alias
+                declared[-1] = (published.group(1), declared[-1][1])
             continue
         if in_dependencies and (crate := re.match(r"(?m)^\s*([A-Za-z0-9_-]+)\s*=\s*(.*)", line)):
-            published = re.search(r'(?m)\bpackage\s*=\s*"([^"]+)"', crate.group(2))
-            names.append((published.group(1) if published else crate.group(1), None))
-    return _cargo_pins(root, names)
+            spec = crate.group(2)
+            # an inline package = "..." renames the key to the published crate name
+            rename = re.search(r'\bpackage\s*=\s*"([^"]+)"', spec)
+            version = re.search(r'"(\d[^"]*)"', spec)
+            name = rename.group(1) if rename else crate.group(1)
+            declared.append((name, version.group(1) if version else None))
+    return _cargo_pins(root, declared)
 
 
 def _cargo_pins(root: Path, declared: list[tuple[str, str | None]]) -> list[tuple[str, str | None]]:
     """Resolve declared crate names to the versions Cargo.lock pins for the root package's
-    own dependencies; unresolvable names keep their None (any-version) match."""
+    own dependencies; unresolvable names keep their None (any-version) match. A name the
+    root pins at two versions (a production and a development semver line) resolves to the
+    one matching the manifest constraint's leading number; an ambiguous or absent
+    constraint keeps None."""
     lock = root / "Cargo.lock"
     own = _cargo_own_crates(root / "Cargo.toml")
     if not lock.is_file() or not own:
-        return declared
+        return [(crate, None) for crate, _ in declared]
     text = lock.read_text(errors="replace")
-    pinned: dict[str, str] = {}
+    pinned: dict[str, list[str]] = {}
     for package in re.findall(r"(?ms)^\[\[package\]\]\s*(.*?)(?=^\[\[|\Z)", text):
         name = re.search(r'(?m)^name\s*=\s*"([^"]+)"', package)
         if not name or name.group(1) not in own:
@@ -497,8 +516,21 @@ def _cargo_pins(root: Path, declared: list[tuple[str, str | None]]) -> list[tupl
             for entry in re.findall(r'"([^"]+)"', dep):
                 crate, _, version = entry.rpartition(" ")
                 if crate and version:
-                    pinned[crate] = version
-    return [(crate, pinned.get(crate, version)) for crate, version in declared]
+                    pinned.setdefault(crate, []).append(version)
+    resolved: list[tuple[str, str | None]] = []
+    for crate, constraint in declared:
+        versions = pinned.get(crate, [])
+        if len(versions) == 1:
+            resolved.append((crate, versions[0]))
+            continue
+        if constraint and constraint[:1].isdigit() and versions:
+            major = constraint.split(".")[0]
+            matching = [v for v in versions if v.split(".")[0] == major]
+            if len(matching) == 1:
+                resolved.append((crate, matching[0]))
+                continue
+        resolved.append((crate, None))  # ambiguous: the name matches any scanned version
+    return resolved
 
 
 def _cargo_own_crates(manifest: Path) -> set[str]:
@@ -521,7 +553,10 @@ def requirements_names(root: Path) -> list[str]:
     names: list[str] = []
     files = {*root.rglob("requirements*.txt"), *root.rglob("*requirements.txt")}
     for path in sorted(files):
-        if re.search(r"(dev|test)", path.stem, re.IGNORECASE):
+        # dev/test as a whole filename token: requirements-latest.txt is production,
+        # requirements-dev.txt and test-requirements.txt are not.
+        tokens = re.split(r"[-_.]", path.stem)
+        if any(token in ("dev", "test", "tests") for token in tokens):
             continue
         for line in path.read_text(errors="replace").splitlines():
             # pip-compile marks each transitive with its parent; -r/-c point back at the
