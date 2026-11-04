@@ -5,8 +5,10 @@ admitted or listed with the reason it isn't (connectivity audit 2026-11-03)."""
 
 from __future__ import annotations
 
+import ast
 import importlib
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -65,6 +67,10 @@ NOT_ADMITTED = {
     ("pqc-blockers", "findings"): "a derived projection of readiness remediations",
     ("compliance-assessment", "results"): "control results, not findings",
     ("adapter-result", "findings"): "tool hits `run_tools` hands to the auditing session",
+    (
+        "benchmark-target",
+        "targets[].expected",
+    ): "the benchmark's answer key, scored against by detection quality, never admitted",
 }
 
 # Arrays of new findings no door admits yet: each is an open gap with its tracking note.
@@ -92,15 +98,47 @@ def _resolve(schema: dict[str, Any], node: Any, depth: int = 0) -> Any:
     return _resolve(schema, target, depth + 1)
 
 
+def _item_fields(schema: dict[str, Any], node: Any, depth: int = 0) -> set[str]:
+    """An array item's field names, following `$ref`s and composed schemas (`allOf` unions its
+    branches; `anyOf`/`oneOf` conservatively union theirs)."""
+    node = _resolve(schema, node, depth)
+    if not isinstance(node, dict) or depth > 8:
+        return set()
+    fields = set(node.get("properties", {}))
+    for key in ("allOf", "anyOf", "oneOf"):
+        for branch in node.get(key, ()) or ():
+            fields |= _item_fields(schema, branch, depth + 2)
+    return fields
+
+
 def _finding_shaped(schema: dict[str, Any], node: dict[str, Any]) -> bool:
     """An array whose items are findings by their fields, whatever the array is called."""
-    items = _resolve(schema, node.get("items", {}))
-    fields = set(items.get("properties", {})) if isinstance(items, dict) else set()
+    fields = _item_fields(schema, node.get("items", {}))
     return "title" in fields and bool(fields & {"severity", "cwe", "cwes", "locations"})
 
 
+def _nested(schema: dict[str, Any], properties: Any, prefix: str, depth: int = 0) -> set[str]:
+    """Finding-shaped arrays nested inside objects, as dotted paths (`box.items.findings`)."""
+    found = set()
+    if depth > 3 or not isinstance(properties, dict):
+        return found
+    for key, node in properties.items():
+        if not isinstance(node, dict):
+            continue
+        node = _resolve(schema, node)
+        if not isinstance(node, dict):
+            continue
+        if node.get("type") == "array" and _finding_shaped(schema, node):
+            found.add(f"{prefix}{key}")
+        found |= _nested(schema, node.get("properties"), f"{prefix}{key}.", depth + 1)
+        inner = node.get("items") if node.get("type") == "array" else None
+        if isinstance(inner, dict):
+            found |= _nested(schema, inner.get("properties"), f"{prefix}{key}[].", depth + 1)
+    return found
+
+
 def _arrays() -> set[tuple[str, str]]:
-    """Every array named for findings, or holding finding-shaped items."""
+    """Every array named for findings, or holding finding-shaped items, nested or not."""
     found = set()
     for name in contracts.schema_names():
         schema = contracts.schema(name)
@@ -114,6 +152,7 @@ def _arrays() -> set[tuple[str, str]]:
                 "finding" in key or key in ("crashers", "results") or _finding_shaped(schema, node)
             )
         }
+        found |= {(name, path) for path in _nested(schema, schema.get("properties"), "")}
     return found
 
 
@@ -135,6 +174,15 @@ def test_a_recorded_kind_with_a_reported_array_admits_it() -> None:
     assert {RECORDED_SCHEMAS[k] for k in REPORTED_FINDINGS} == schemas
 
 
+def test_every_exempted_kind_is_recorded_and_admitted_elsewhere() -> None:
+    """An exemption is only real while its kind is recorded and its schema's findings array is
+    admitted by a named door; a stale exemption fails here."""
+    for kind, why in UNREPORTED_KINDS.items():
+        assert kind in RECORDED_SCHEMAS, (kind, why)
+        schema = RECORDED_SCHEMAS[kind]
+        assert (schema, "findings") in REPORTED | ADMITTED_ELSEWHERE.keys(), (kind, why)
+
+
 @pytest.mark.parametrize("array", sorted(ADMITTED_ELSEWHERE), ids="/".join)
 def test_each_named_door_takes_every_entry_of_its_array(array: tuple[str, str]) -> None:
     door = ADMITTED_ELSEWHERE[array]
@@ -147,8 +195,12 @@ def test_each_named_door_takes_every_entry_of_its_array(array: tuple[str, str]) 
 
 
 @pytest.mark.parametrize("array", sorted(ADMITTED_ELSEWHERE), ids="/".join)
-def test_each_named_door_has_a_service_test_that_records_it(array: tuple[str, str]) -> None:
+def test_each_named_door_has_a_running_service_test_that_records_it(array: tuple[str, str]) -> None:
     """The converter alone isn't the connection: a service test records a document through the
-    door and asserts its findings are rows, and must keep existing."""
+    door and asserts its findings are rows. It must exist and not be skipped or xfailed."""
     path, test = ADMITTED_ELSEWHERE[array].proven_by.split("::")
-    assert f"def {test}(" in (TESTS / path).read_text()
+    tree = ast.parse((TESTS / path).read_text())
+    (definition,) = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == test]
+    for decorator in definition.decorator_list:
+        tokens = set(re.split(r"[^\w]+", ast.unparse(decorator)))
+        assert not {"skip", "xfail"} & tokens, ast.unparse(decorator)
