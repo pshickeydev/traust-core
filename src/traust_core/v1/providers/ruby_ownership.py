@@ -113,6 +113,7 @@ _TENANT = re.compile(
     r"tenant|project)(_?id)?$"
 )
 _BY_USER = re.compile(r"(?i)_by(_id)?$|_user_id$")
+_REQUEST_VALUE = re.compile(r"\brequest\.(headers|env|raw_post|body)\b")
 _TOKEN_KEY = re.compile(r"(?i)token|api_key|digest|secret|jti")
 _PARAMS = {"params", "request.path_parameters", "request.params", "request.parameters"}
 # a `render` naming a view (`render :show`, `template:`) may print the record
@@ -256,7 +257,8 @@ class RubyCode:
         self.policy_src: dict[str, Parsed] = {}
         self.modules: dict[str, list[tuple[Parsed, Node]]] = {}  # module name -> definitions
         self.ability: tuple[Parsed, Node] | None = None
-        self.qualified: dict[str, tuple[Parsed, Node]] = {}  # `Api::Relaxed` -> module
+        # `Api::Relaxed` -> every definition (a module reopened in another file)
+        self.qualified: dict[str, list[tuple[Parsed, Node]]] = {}
         self.method_cache: dict[tuple[str, int, int], dict[str, Node]] = {}
         self.defined: set[str] = set()  # every method name the checkout defines
         for rel, src in sources.items():
@@ -275,7 +277,12 @@ class RubyCode:
             if n.type == "module" and n.is_named:
                 written = src.text(n.child_by_field_name("name"))
                 self.modules.setdefault(written.rsplit("::", 1)[-1], []).append((src, n))
-                self.qualified["::".join([*_lexical(src, n), written])] = (src, n)
+                key = (
+                    written[2:]
+                    if written.startswith("::")
+                    else "::".join([*_lexical(src, n), written])
+                )
+                self.qualified.setdefault(key, []).append((src, n))
             if n.type != "class" or not n.is_named:
                 continue
             name = src.text(n.child_by_field_name("name")).rsplit("::", 1)[-1]
@@ -431,17 +438,32 @@ class RubyCode:
                     queue.append(m.name)
         return out
 
-    def module(self, name: str) -> tuple[Parsed, Node] | object | None:
-        """A module by the name it's included as: its definition, None when the checkout
-        doesn't define it, or UNREAD when several share the name."""
+    def module_defs(self, name: str) -> list[tuple[Parsed, Node]] | object | None:
+        """A module's definitions by the name it's included as: None when the checkout
+        doesn't define it, UNREAD when several modules (or apps) share the name."""
         if name in self.qualified:
-            return self.qualified[name]
-        if "::" in name and not any(q.endswith(f"::{name}") for q in self.qualified):
-            return None  # `Pundit::Authorization`: a gem's, not the app's `Authorization`
-        found = self.modules.get(name.rsplit("::", 1)[-1], [])
-        if not found:
-            return None
-        return found[0] if len(found) == 1 else UNREAD
+            defs = self.qualified[name]
+        elif "::" in name:
+            found = [q for q in self.qualified if q.endswith(f"::{name}")]
+            if not found:
+                return None  # `Pundit::Authorization`: a gem's, not the app's `Authorization`
+            if len(found) > 1:
+                return UNREAD
+            defs = self.qualified[found[0]]
+        else:
+            found = [q for q in self.qualified if q.rsplit("::", 1)[-1] == name]
+            if not found:
+                return None
+            if len(found) > 1:
+                return UNREAD
+            defs = self.qualified[found[0]]
+        roots = {_root(src.file.rel) for src, _ in defs}
+        return defs if len(roots) == 1 else UNREAD  # `spec/dummy`'s and the app's
+
+    def module(self, name: str) -> tuple[Parsed, Node] | object | None:
+        """A module's first definition (see `module_defs`)."""
+        found = self.module_defs(name)
+        return found[0] if isinstance(found, list) else found  # type: ignore[return-value]
 
     def _owned(self, model: str) -> bool:
         cols = self.columns.get(_table_of(model), [])
@@ -477,7 +499,10 @@ class RubyCode:
             found = self.module_methods(src, module).get(name)
             return (src, found) if found is not None else None
         for n in walk(module):
-            if n.type == "call" and call_name(src, n) == "class_methods":
+            nested = (
+                n.type == "module" and src.text(n.child_by_field_name("name")) == "ClassMethods"
+            )
+            if (n.type == "call" and call_name(src, n) == "class_methods") or nested:
                 for m in walk(n):
                     if m.type == "method" and src.text(m.child_by_field_name("name")) == name:
                         return src, m
@@ -577,6 +602,15 @@ class RubyCode:
 
 
 UNREAD = object()  # a module several definitions share a name with
+
+
+def _root(rel: str) -> str:
+    """The app a file belongs to (`spec/dummy/` for `spec/dummy/app/…`)."""
+    for part in ("app/", "config/", "lib/"):
+        at = f"/{rel}".find(f"/{part}")
+        if at >= 0:
+            return rel[:at]
+    return ""
 
 
 def _lexical(src: Parsed, node: Node) -> list[str]:
@@ -871,6 +905,30 @@ class _Action:
                 out += [(found[0], body[-1])] if body else []
         return out
 
+    def chosen(self, src: Parsed, call: Node) -> bool:
+        """A record the request picks by a value other than the path id (`Note.destroy(
+        params[:x])`), anywhere down the chain (`Locator.locate(params[:x]).destroy`); a
+        record's own write (`@note.update(note_params)`) or a credential lookup
+        (`AccessToken.find_by(token: request.headers[…])`) isn't one."""
+        node: Node | None = call
+        for _ in range(_MAX_DEPTH):
+            if node is None or node.type != "call":
+                return False
+            name = call_name(src, node)
+            receiver = unwrap(node.child_by_field_name("receiver"))
+            requested = _finder(name) and any(self._requested(src, a) for a in args(node))
+            own_write = name in _CLASS_WRITES and (
+                receiver is None or receiver.type not in ("constant", "scope_resolution")
+            )
+            if requested and not own_write and not self._credential(src, node, self.caller_ivars):
+                return True
+            node = receiver
+        return False
+
+    def _requested(self, src: Parsed, node: Node) -> bool:
+        """A value the request picks: its parameters, headers or environment."""
+        return self._untrusted(src, node) or bool(_REQUEST_VALUE.search(code_text(src, node)))
+
     def _credential(self, src: Parsed, node: Node | None, ivars: set[str], depth: int = 0) -> bool:
         """From the session, a cookie, a verified token or the caller (D17, D20); an app
         helper counts by what it returns, never by its name (`decoded_token`)."""
@@ -962,6 +1020,8 @@ class _Action:
         out: set[str] = set()
         for name in _CALLERS:
             found = self.methods(name)
+            if found is None and self.unread(name):
+                out.add(name)  # an app `current_user` we can't read may come from params
             if found is not None and any(
                 self._untrusted(s.src, s.node)
                 for s in _reachable(
@@ -1198,10 +1258,7 @@ class _Action:
         else:
             return None, False
         if not chain[start:] or not any(self.mentions(src, c) for c in chain[start:]):
-            if any(
-                _finder(call_name(src, c)) and any(self._untrusted(src, a) for a in args(c))
-                for c in chain[start:]
-            ):
+            if any(self.chosen(src, c) for c in chain[start:]):
                 # a record the request names some other way (`Note.find(note_params[:id])`):
                 # handed on, so nothing else in the action vouches for it
                 self.handoff(src, call)
@@ -1319,6 +1376,11 @@ class _Action:
         return _narrows(self.code, src, last, model)
 
     # -- the walk
+    def facts(self, guarded: bool) -> HandlerFacts:
+        """The ownership facts; `guarded`: an authenticating callback runs first (D17)."""
+        self.guarded = guarded
+        return self.run()
+
     def run(self) -> HandlerFacts:
         if self.cancan[0] and self.model is not None and self.path_ids:
             self.cancan_load()
@@ -1592,6 +1654,8 @@ class _Action:
                 continue
             if self.mentions(src, c) and self.exact(src, c) is None:
                 self.other_call(src, c)
+            elif self.chosen(src, c):
+                self.handoff(src, c)  # `GlobalID::Locator.locate(params[:x])`: handed on
         if made is None and unwrap(node) is not None and unwrap(node).type == "call":
             return None
         return made
@@ -1670,7 +1734,19 @@ class _Action:
         name = _helper_name(src, node) if node is not None else ""
         if name.endswith("?") and (found := self.methods(name)) is not None:
             body = method_body(found[1])
-            if len(body) == 1 and body[0].type not in ("assignment", "operator_assignment"):
+            params = found[1].child_by_field_name("parameters")
+            # `note` in `owner?` is its helper, maybe not the action's local `note`
+            clash = (
+                any(n.type == "identifier" and src.text(n) in self.locals for n in walk(body[0]))
+                if body
+                else True
+            )
+            if (
+                len(body) == 1
+                and body[0].type not in ("assignment", "operator_assignment")
+                and not (params is not None and params.named_children)
+                and not clash
+            ):
                 return found[0], body[0], negated != flip
         return src, condition, negated
 
@@ -1695,11 +1771,13 @@ class _Action:
             and not any(
                 _render_leaks(src, n, self.literals, self.action)
                 if call_name(src, n) == "render"
+                else any(not _is_literal(x) for x in args(n)[1:])  # a header with a value
+                if call_name(src, n) == "head"
                 else _redirect_leaks(src, n, self.literals)
                 for s in stmts
                 for n in walk(s)
                 if n.type == "call"
-                and call_name(src, n) in ("render", "redirect_to", "redirect_back")
+                and call_name(src, n) in ("render", "redirect_to", "redirect_back", "head")
             )
         ):
             return True
@@ -1842,12 +1920,18 @@ class _Action:
             node = receiver
         return None
 
+    def unread(self, name: str) -> bool:
+        """Whether the chain may define `name` where it can't be read (an ambiguous module,
+        a dynamic definition, a `delegate`)."""
+        check = getattr(self.methods, "unread", None)
+        return bool(check(name)) if check is not None else False
+
     def library(self, name: str) -> bool:
         """Whether `authorize`/`authorize!` is the library's: the app doesn't define it, or
         only wraps it (`def authorize(*) = super`)."""
         found = self.methods(name)
         if found is None:
-            return True
+            return not self.unread(name)  # one we can't read may be anything
         body = method_body(found[1])
         return len(body) == 1 and body[0].type in ("super", "zsuper") and not args(body[0])
 
@@ -2099,10 +2183,28 @@ def _writes(src: Parsed, node: Node | None) -> bool:
 
 
 def _finder(name: str) -> bool:
-    """An ActiveRecord read of a record by a value (`find`, `find_by_slug!`, `where`)."""
-    return name in ("find", "find!", "where", "find_sole_by", "exists?") or name.startswith(
-        ("find_by", "destroy_by", "delete_by")
+    """A read or write of a record by a value (`find`, `find_by_slug!`, `where`,
+    `Note.destroy(id)`, `GlobalID::Locator.locate`)."""
+    return name in _FINDERS or name.startswith(
+        ("find_by", "destroy_by", "delete_by", "find_or_", "create_or_find", "locate")
     )
+
+
+# writes by id on the class (`Note.update(params[:x], …)`), not a record's own
+_CLASS_WRITES = {"destroy", "delete", "update", "update!"}
+_FINDERS = {
+    "find",
+    "find!",
+    "where",
+    "find_sole_by",
+    "exists?",
+    "find_signed",
+    "find_signed!",
+    "destroy",
+    "delete",
+    "update",
+    "update!",
+}
 
 
 def _is_receiver(node: Node) -> bool:
@@ -2138,7 +2240,9 @@ def _responds(
     a = args(node)
     if name == "head" and a:
         status = symbol(src, a[0]) or src.text(a[0])
-        return status in _REFUSING_STATUS or status in _REFUSING_CODES
+        # `head :forbidden, "X-Note-Title" => @note.title`: headers carrying a value
+        extra = [x for x in a[1:] if not _is_literal(x)]
+        return (status in _REFUSING_STATUS or status in _REFUSING_CODES) and not extra
     if name == "render":
         statuses = [
             symbol(src, p.child_by_field_name("value")) or src.text(p.child_by_field_name("value"))
@@ -2204,10 +2308,20 @@ def _redirect_leaks(src: Parsed, node: Node, safe: set[str]) -> bool:
     """A redirect carrying a value in its flash (`alert: "#{@note.body}"`, `flash: {…}`)."""
     for x in args(node):
         for p in x.named_children if x.type == "hash" else [x]:
-            key = symbol(src, p.child_by_field_name("key")) if p.type == "pair" else None
-            if p.type != "pair" or key in ("status", "fallback_location"):
+            if p.type in ("hash_splat_argument", "splat_argument", "block_argument"):
+                return True  # `**{alert: @note.body}`
+            if p.type != "pair":
+                if _carries(src, p):
+                    return True  # a URL built from the record's fields
+                continue
+            key = symbol(src, p.child_by_field_name("key"))
+            if key == "status":
                 continue
             value = p.child_by_field_name("value")
+            if key == "fallback_location":
+                if value is not None and _carries(src, value):
+                    return True
+                continue
             if value is None or not (
                 _is_literal(value)
                 or (value.type == "identifier" and src.text(value) in safe)
@@ -2221,12 +2335,44 @@ def _redirect_leaks(src: Parsed, node: Node, safe: set[str]) -> bool:
     return False
 
 
+def _carries(src: Parsed, node: Node) -> bool:
+    """A redirect target that carries a record's fields (`"/x?t=#{@note.body}"`); a record or
+    its path (`@note`, `note_path(@note)`) carries only its id."""
+    for n in walk(node):
+        if n.type == "call" and n.child_by_field_name("receiver") is not None:
+            receiver = unwrap(n.child_by_field_name("receiver"))
+            if (
+                receiver is not None
+                and receiver.type in ("instance_variable", "identifier")
+                and (call_name(src, n) not in ("id", "to_param", "slug"))
+            ):
+                return True
+    return False
+
+
 def uses_record(
     src: Parsed, node: Node, methods: Callable[[str], tuple[Parsed, Node] | None], depth: int = 0
 ) -> bool:
     """Whether code may send or act on a record: an instance variable, an exception's record
-    (`e.record`, `exception.subject`), or a helper doing so."""
+    (`e.record`, `exception.subject`), the exception itself in a response (`e.note`,
+    `e.message`), or a helper doing so."""
+    params = node.child_by_field_name("parameters")
+    raised = (
+        {src.text(x).lstrip("*&") for x in params.named_children} if params is not None else set()
+    )
     for n in walk(node):
+        if (
+            raised
+            and n.type == "identifier"
+            and src.text(n) in raised
+            and n.parent is not None
+            and (
+                n.parent.type != "method_parameters"
+                and n.parent.type != "block_parameters"
+                and n.parent.type != "lambda_parameters"
+            )
+        ):
+            return True
         if n.type == "instance_variable":
             return True
         if n.type == "call" and call_name(src, n) in ("record", "subject", "resource", "object"):
@@ -2631,25 +2777,31 @@ def early_return(src: Parsed, node: Node) -> bool:
     )
 
 
-def caller_forged(
+def prepare(
     code: RubyCode,
     steps: list[tuple[Parsed, Node, Kind]],
+    path_ids: set[str],
+    *,
     methods: Callable[[str], tuple[Parsed, Node] | None],
-    action: tuple[Parsed, Node] | None,
-) -> bool:
-    """Whether the request may choose `current_user` for this action (D17)."""
-    body = [(action[0], s, Kind.ACTION) for s in method_body(action[1])] if action else []
-    walk_ = _Action(
+    action: str,
+    model: str | None,
+    cancan: tuple[bool, bool],
+    raises: bool = True,
+) -> _Action:
+    """An action read from the statements it runs in order (its callbacks', then its own):
+    `forged` names the callers the request may choose; `facts()` gives its ownership facts.
+    `cancan`: whether `load_resource` and `authorize_resource` run for it."""
+    return _Action(
         code,
-        [_Step(s, n, kind) for s, n, kind in [*steps, *body]],
-        set(),
+        [_Step(s, n, kind) for s, n, kind in steps],
+        path_ids,
         True,
         methods,
-        "",
-        None,
-        (False, False),
+        action,
+        model,
+        cancan,
+        raises,
     )
-    return bool(walk_.forged & {"current_user", "current_admin"})
 
 
 def action_facts(
@@ -2664,17 +2816,15 @@ def action_facts(
     cancan: tuple[bool, bool],
     raises: bool = True,
 ) -> HandlerFacts:
-    """An action's ownership facts from the statements it runs in order (its callbacks', then
-    its own). `cancan`: whether `load_resource` and `authorize_resource` run for it."""
-    walk_ = _Action(
+    """An action's ownership facts (see `prepare`)."""
+    walk_ = prepare(
         code,
-        [_Step(s, n, kind) for s, n, kind in steps],
+        steps,
         path_ids,
-        guarded,
-        methods,
-        action,
-        model,
-        cancan,
-        raises,
+        methods=methods,
+        action=action,
+        model=model,
+        cancan=cancan,
+        raises=raises,
     )
-    return walk_.run()
+    return walk_.facts(guarded)

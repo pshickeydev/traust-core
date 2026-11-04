@@ -697,7 +697,7 @@ AUTH = {
           end
 
           def current_account
-            @current_account ||= Account.find(params[:account_id])
+            @current_account ||= params[:account_id]
           end
         end
     """,
