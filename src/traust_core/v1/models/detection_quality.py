@@ -672,21 +672,25 @@ class CheckPrecision(Model):
     check_id: str
     fired: int
     dismissed: int
+    gate: float = Field(default=COMPLIANCE_PRECISION_GATE, ge=0, le=1)
 
+    @computed_field  # type: ignore[prop-decorator]
     @property
     def precision(self) -> float | None:
         return _ratio(self.fired - self.dismissed, self.fired)
 
+    @computed_field  # type: ignore[prop-decorator]
     @property
     def flagged(self) -> bool:
         """At or under the gate: a candidate for demotion to evidence_review (a reviewed change)."""
-        return self.precision is not None and self.precision <= COMPLIANCE_PRECISION_GATE
+        return self.precision is not None and self.precision <= self.gate
 
 
 class ComplianceCalibration(Model):
     framework: ComplianceFramework
     assessments: int
     checks: tuple[CheckPrecision, ...] = ()
+    gate: float = Field(default=COMPLIANCE_PRECISION_GATE, ge=0, le=1)
 
 
 # Semantic precedent cards: a confirmed finding generalised into a code-facts enumerator, a

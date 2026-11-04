@@ -48,10 +48,11 @@ from traust_core.v1.models.findings import (
     Occurrence,
     ReviewItem,
     SurfaceCoverage,
+    VerifiedFixMtta,
     normalize_decision,
 )
 from traust_core.v1.models.integrity import FingerprintInput
-from traust_core.v1.models.inventory import default_line
+from traust_core.v1.models.inventory import default_line, ref_line
 from traust_core.v1.models.vocabulary import (
     DecisionReason,
     DispositionResolution,
@@ -283,6 +284,18 @@ class FindingService:
             )
         return sorted((v for v in views if filter.keeps(v)), key=_newest_first)
 
+    def on_ref(self, repository_ref_id: UUID) -> list[FindingView]:
+        """Findings reported on this named line, with resolution folded on that line."""
+        with self._uow as uow:
+            ref = self._inventory.get_ref(repository_ref_id)
+            line = ref_line(ref, self._inventory.list_refs(ref.repository_id))
+            findings = uow.findings.list_for_repository(ref.repository_id)
+            if not findings:
+                return []
+            facts = FindingFacts.load(uow, findings, None, repository_ref_id)
+            kept = [f for f in findings if f.id is not None and not facts.off_line(f.id, line)]
+            return self._views.views(uow, kept, facts=facts)
+
     def review_surfaces(
         self, repository_id: UUID, as_of: datetime | None = None
     ) -> dict[str, SurfaceCoverage]:
@@ -426,6 +439,47 @@ class FindingService:
         return sorted(
             (finding_rollup(key, views) for key, views in groups.items()),
             key=lambda r: (-r.findings, r.key is None, r.key or ""),
+        )
+
+    def verified_fix_mtta(self, filter: FindingFilter) -> list[VerifiedFixMtta]:
+        """First activity to the first standing validation/verification-backed fix."""
+        with self._uow as uow:
+            findings = uow.findings.list_for_repository(filter.repository_id)
+            facts = FindingFacts.load(uow, findings, until=filter.as_of)
+        groups: defaultdict[ScannerSeverity, list[float]] = defaultdict(list)
+        for finding in findings:
+            assert finding.id is not None
+            reported = facts.reported_by(finding.id, filter.as_of)
+            view = self._views.view(facts, finding, filter.as_of, {})
+            if not reported or view is None or not filter.keeps(view):
+                continue
+            decisions = facts.decided_by(finding.id, filter.as_of)
+            fixed = [
+                decision.occurred_at
+                for decision in _standing(decisions)
+                if decision.resolution == _RESOLVED
+                and decision.assessment_id is not None
+                and facts.assessments[decision.assessment_id].kind in {"validation", "verification"}
+            ]
+            if not fixed:
+                continue
+            first = min(
+                facts.at[reported[0].assessment_id],
+                min(decision.occurred_at for decision in decisions),
+            )
+            days = (min(fixed) - first).total_seconds() / 86400
+            severity = ScannerSeverity(view.effective_severity or ScannerSeverity.UNRATED)
+            groups[severity].append(days)
+        return sorted(
+            (
+                VerifiedFixMtta(
+                    severity=severity,
+                    findings=len(days),
+                    mtta_days=round(sum(days) / len(days), 1),
+                )
+                for severity, days in groups.items()
+            ),
+            key=lambda row: (-row.mtta_days, row.severity),
         )
 
     def timeline(self, filter: FindingFilter, bucket: TimeBucket) -> list[FindingSeriesPoint]:

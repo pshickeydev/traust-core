@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from collections.abc import Sequence
 from datetime import datetime
+from html import escape
 from typing import Protocol
 
 from traust_core.v1.models.base import Model
@@ -42,19 +43,19 @@ class MarkdownRenderer:
         # hostile value cannot fabricate headings, bullets or rows. Section body is
         # view-authored prose and keeps its paragraphs.
         lines = [
-            f"# {inline(report.title)}",
+            f"# {markdown_text(report.title)}",
             "",
             f"_Generated {report.generated_at.isoformat()}_",
             "",
         ]
         for s in report.sections:
-            lines += [f"## {inline(s.heading)}", ""]
+            lines += [f"## {markdown_text(s.heading)}", ""]
             if s.body:
                 lines += [s.body, ""]
             if s.table:
                 lines += [*markdown_table(s.table.columns, s.table.rows), ""]
         if report.sources:
-            lines += ["## Sources", "", *(f"- {inline(src)}" for src in report.sources), ""]
+            lines += ["## Sources", "", *(f"- {markdown_text(src)}" for src in report.sources), ""]
         return "\n".join(lines).encode()
 
 
@@ -69,8 +70,14 @@ def inline(value: object) -> str:
     return " ".join(_HOSTILE.sub("", "" if value is None else str(value)).split())
 
 
+def markdown_text(value: object) -> str:
+    """Render untrusted text literally, without HTML, links or inline formatting."""
+    text = re.sub(r"([\\`*\[\]{}~])", r"\\\1", escape(inline(value), quote=False))
+    return re.sub(r"(?<!\w)_|_(?!\w)", r"\_", text)
+
+
 def markdown_table(columns: Sequence[str], rows: Sequence[Sequence[str]]) -> list[str]:
-    esc = lambda v: inline(v).replace("|", "\\|")  # noqa: E731
+    esc = lambda v: markdown_text(v).replace("|", "\\|")  # noqa: E731
     return [
         "| " + " | ".join(map(esc, columns)) + " |",
         "|" + "---|" * len(columns),

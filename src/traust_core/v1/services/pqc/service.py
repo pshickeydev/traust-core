@@ -28,9 +28,10 @@ from traust_core.v1.models.assessment import (
     AssessmentKind,
 )
 from traust_core.v1.models.code_facts import CryptoProbeId
-from traust_core.v1.models.common import Provenance, ToolRequest
+from traust_core.v1.models.common import Provenance, ToolRequest, every_item
 from traust_core.v1.models.findings import FindingContext, SubjectRef
 from traust_core.v1.models.integrity import sha256_hex
+from traust_core.v1.models.inventory import RepositoryFilter
 from traust_core.v1.models.pqc import (
     PqcBlocker,
     PqcDimension,
@@ -40,6 +41,7 @@ from traust_core.v1.models.pqc import (
     PqcReadinessInput,
     PqcRollup,
     PqcRoute,
+    PqcScanState,
     PqcSite,
     PqcVendorClaims,
 )
@@ -240,6 +242,48 @@ class PqcService:
         refs = self._refs(filter)
         found = self._readiness(refs) if refs is None or refs else []
         return [r for r in found if not filter.buckets or r.bucket in filter.buckets]
+
+    def scan_states(self, filter: PqcFilter) -> list[PqcScanState]:
+        """The latest scan's basis and pack freshness for every registered commit in scope."""
+        refs = self._refs(filter)
+        if refs is None:
+            repositories = every_item(
+                lambda page: self._portfolio.list_repositories(RepositoryFilter(), page)
+            )
+            refs = [
+                ref.id
+                for ref in self._portfolio.inventory.list_refs_of(
+                    [repository.id for repository in repositories if repository.id is not None]
+                )
+                if ref.id is not None
+            ]
+        else:
+            refs = [
+                ref.id
+                for ref in self._portfolio.inventory.list_refs_by_ids(refs)
+                if ref.id is not None
+            ]
+        newest = self._newest(refs, [PqcFactsArtifact]) if refs else {}
+        stamps = self._scanner.stamps() if self._scanner is not None and newest else None
+        states = []
+        for ref_id in refs:
+            held = newest.get(ref_id, {}).get(PqcFactsArtifact.schema)
+            if held is None:
+                states.append(PqcScanState(repository_ref_id=ref_id))
+                continue
+            assessment, artifact_id = held
+            doc = self._publisher.read(artifact_id, PqcFactsArtifact)
+            states.append(
+                PqcScanState(
+                    repository_ref_id=ref_id,
+                    assessment_id=assessment.id,
+                    basis=doc.coverage.assessment_basis,
+                    current=None
+                    if stamps is None
+                    else pqc_facts.read_stamps(doc).same_pack(stamps),
+                )
+            )
+        return states
 
     def sites(self, filter: PqcFilter) -> list[PqcSite]:
         """The group pins and below-default Go toolchains in each in-scope commit's latest facts."""

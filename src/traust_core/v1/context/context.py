@@ -3,12 +3,13 @@ from __future__ import annotations
 import csv
 import hashlib
 import shutil
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
 from typing import Any, TypeVar
+from uuid import UUID
 
 import pydantic
 import sqlalchemy as sa
@@ -46,7 +47,7 @@ from traust_core.v1.context.tools import (
     load_toolchain,
     scanner_tools,
 )
-from traust_core.v1.errors import ConfigError, DocumentError
+from traust_core.v1.errors import ConfigError, DocumentError, NotFoundError, ValidationError
 from traust_core.v1.models.artifacts import (
     ARTIFACT_FOR_KIND,
     AdrRegistryArtifact,
@@ -135,6 +136,7 @@ from traust_core.v1.providers.syft import SyftSbom
 from traust_core.v1.providers.symbols import SymbolIndex
 from traust_core.v1.providers.tools import ToolInspector, ToolProvider
 from traust_core.v1.providers.tools.adapter import AdapterTool
+from traust_core.v1.providers.tools.compliance_sources import DocsTarget
 from traust_core.v1.providers.tools.detection_quality import OpengrepRuleSweep
 from traust_core.v1.providers.tools.opengrep import SupplementalPack
 from traust_core.v1.providers.tools.safe_exec import SafeExec
@@ -185,6 +187,7 @@ from traust_core.v1.services.insight import (
     AttackCoverageView,
     CensusView,
     ComplianceDashboardView,
+    ContainerFindingsView,
     CoverageView,
     DependencyReachView,
     ExecutiveSummaryView,
@@ -609,10 +612,21 @@ class Context:
             self.config.process.keep_env, self.clock, self.checkouts
         )
 
-    def register_compliance_sources(self) -> None:
-        """Read ADR registers from GitHub and product docs from docs.redhat.com."""
+    def register_compliance_sources(self, targets: Mapping[UUID, DocsTarget] | None = None) -> None:
+        """Register ADR and official-document sources for explicitly mapped products."""
+        targets = {} if targets is None else targets
+        if targets:
+            portfolio = PortfolioService(
+                SqlTraustUnitOfWork(self.database), PortfolioPolicy(), clock=self.clock
+            )
+            for product_id, target in targets.items():
+                try:
+                    target.validate()
+                    portfolio.get_product(product_id)
+                except (NotFoundError, ValidationError) as e:
+                    raise ConfigError(f"compliance target for product {product_id}: {e}") from e
         self.adr_source, self.doc_source = compliance_sources(
-            self.config.process.keep_env, self.forge_api, self.http, self.clock
+            self.config.process.keep_env, self.forge_api, self.http, self.clock, targets
         )
 
     def register_rule_pack(self, pack: Path, allowlist: Path | None = None) -> None:
@@ -765,6 +779,21 @@ class Context:
             rating,
             self.object_store,
         )
+        assessment_publisher = ArtifactPublisher(
+            PublishSpecs(
+                PublishSpec(CloudConfigAuditArtifact),
+                PublishSpec(ReportArtifact),
+                PublishSpec(SecurityAuditArtifact),
+                PublishSpec(VulnFindingsArtifact),
+                PublishSpec(ThreatModelArtifact),
+                PublishSpec(IsolationReviewArtifact),
+                PublishSpec(PrivProfileArtifact),
+                PublishSpec(CodeFactsArtifact),
+                PublishSpec(FuzzReportArtifact),
+            ),
+            self.object_store,
+            uow,
+        )
         assessment = AssessmentService(
             uow,
             intake,
@@ -772,21 +801,7 @@ class Context:
             hosts=hosts,
             tools=self.tools,
             decisions=decisions,
-            publisher=ArtifactPublisher(
-                PublishSpecs(
-                    PublishSpec(CloudConfigAuditArtifact),
-                    PublishSpec(ReportArtifact),
-                    PublishSpec(SecurityAuditArtifact),
-                    PublishSpec(VulnFindingsArtifact),
-                    PublishSpec(ThreatModelArtifact),
-                    PublishSpec(IsolationReviewArtifact),
-                    PublishSpec(PrivProfileArtifact),
-                    PublishSpec(CodeFactsArtifact),
-                    PublishSpec(FuzzReportArtifact),
-                ),
-                self.object_store,
-                uow,
-            ),
+            publisher=assessment_publisher,
             findings=findings,
             git=self.git,
             symbols=self.symbols,
@@ -933,7 +948,23 @@ class Context:
         freshness = FreshnessQuery(catalog, exposure, self.clock)
         trend = FindingsTrendView(findings, portfolio, self.clock)
         threats = ThreatRegisterView(assessment, compliance, portfolio, rating, self.clock)
-        executive = ExecutiveSummaryView(findings, portfolio, assessment, code_facts, exposure)
+        attack = AttackCoverageView(
+            assessment, findings, portfolio, self.attack_catalog, self.clock
+        )
+        census = CensusView(findings, assessment, portfolio, self.clock)
+        pqc_portfolio = PqcPortfolioView(pqc, code_facts, portfolio)
+        executive = ExecutiveSummaryView(
+            findings,
+            portfolio,
+            assessment,
+            code_facts,
+            exposure,
+            attack=attack,
+            pqc=pqc_portfolio,
+            threats=threats,
+            census=census,
+            clock=self.clock,
+        )
         sla_policies = ArtifactPublisher(
             PublishSpecs(PublishSpec(SlaPolicyArtifact)), self.object_store, uow
         )
@@ -1026,25 +1057,32 @@ class Context:
                 (
                     FindingsRollupView(findings, portfolio, assessment),
                     InsecurePatternsView(findings, portfolio),
+                    ContainerFindingsView(
+                        findings,
+                        portfolio,
+                        assessment,
+                        rating,
+                        assessment_publisher,
+                    ),
                     trend,
                     ProgramView(spend, ops, self.assets.names),
                     CoverageView(assessment, portfolio, self.clock),
                     ExposureView(exposure),
                     DependencyReachView(exposure, portfolio),
                     PqcView(pqc),
-                    PqcPortfolioView(pqc, code_facts, portfolio),
+                    pqc_portfolio,
                     PqcVendorsView(pqc, exposure, portfolio),
                     ComplianceDashboardView(compliance),
                     OscalExport(compliance),
                     threats,
-                    LocView(code_facts, portfolio, findings),
+                    LocView(code_facts, portfolio, findings, clock=self.clock),
                     RemediationIndexView(remediation, portfolio),
                     FreshnessView(freshness, catalog, assessment, portfolio, self.clock),
                     executive,
                     ScoreboardView(executive, trend, threats, findings, self.clock),
                     PrivilegesView(assessment, portfolio),
                     ValidationFuzzView(assessment, portfolio, validation),
-                    CensusView(findings, assessment, portfolio, self.clock),
+                    census,
                     ReviewCardView(findings, portfolio),
                     TriageView(
                         ArtifactPublisher(
@@ -1067,9 +1105,7 @@ class Context:
                         self.model_catalog,
                         self.invoices,
                     ),
-                    AttackCoverageView(
-                        assessment, findings, portfolio, self.attack_catalog, self.clock
-                    ),
+                    attack,
                 ),
                 self.clock,
                 sla_policies=sla_policies,

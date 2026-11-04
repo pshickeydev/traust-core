@@ -518,15 +518,21 @@ class PortfolioService:
         pushed_at = json.loads(doc.payload).get("pushed_at")
         return SeenHead(branch=ref.name, pushed_at=pushed_at, head=ref.sha)
 
-    def default_ref(self, repository_id: UUID) -> RepositoryRef | None:
+    def default_ref(
+        self, repository_id: UUID, as_of: datetime | None = None
+    ) -> RepositoryRef | None:
         """The head from the latest completed default-branch observation."""
-        return self.default_refs([repository_id]).get(repository_id)
+        return self.default_refs([repository_id], as_of).get(repository_id)
 
-    def default_refs(self, repository_ids: Collection[UUID]) -> dict[UUID, RepositoryRef]:
+    def default_refs(
+        self, repository_ids: Collection[UUID], as_of: datetime | None = None
+    ) -> dict[UUID, RepositoryRef]:
         """`default_ref` for many repositories at once; one never observed is absent."""
         if self._assessment is None:
             raise ConfigError("default-branch head requires AssessmentService")
-        latest = self._assessment.latest_on_default_lines(repository_ids, AssessmentKind.REPO_STATE)
+        latest = self._assessment.latest_on_default_lines(
+            repository_ids, AssessmentKind.REPO_STATE, as_of
+        )
         refs = self.inventory.list_refs_by_ids({a.repository_ref_id for a in latest.values()})
         by_id = {r.id: r for r in refs}
         return {repository_id: by_id[a.repository_ref_id] for repository_id, a in latest.items()}

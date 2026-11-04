@@ -460,6 +460,8 @@ class AssessmentService:
         raw: bytes,
         format: CandidateFormat,
         provenance: Provenance,
+        *,
+        include_suppressed: bool = False,
     ) -> tuple[Assessment, IntakeResult]:
         """Third-party scanner output (SARIF, Dependabot, govulncheck) as an assessment of the
         commit and its findings; the same output again is the same assessment and adds nothing."""
@@ -473,7 +475,12 @@ class AssessmentService:
             name, version = candidate_formats.scanner(format.value, raw)
             ref, repository = self._inventory.resolve(repository_ref_id)
             candidates = FindingCandidate.parse_many(
-                raw, format, ref.repository_id, repository_url=repository.url, sha=ref.sha
+                raw,
+                format,
+                ref.repository_id,
+                repository_url=repository.url,
+                sha=ref.sha,
+                include_suppressed=include_suppressed,
             )
             assessment = uow.assessments.find_scan(repository_ref_id, name, provenance.occurred_at)
             if assessment is None:
@@ -829,11 +836,21 @@ class AssessmentService:
         return self._read(self._log.get(assessment_id))
 
     def latest(
-        self, repository_ref_id: UUID, kind: AssessmentKind, *, status: str | None = None
+        self,
+        repository_ref_id: UUID,
+        kind: AssessmentKind,
+        *,
+        status: str | None = None,
+        as_of: datetime | None = None,
     ) -> Assessment | None:
+        if as_of is not None and as_of.utcoffset() is None:
+            raise ValidationError("as_of must be timezone-aware")
         spellings = self._kind_spellings(kind)
         with self._uow as uow:
-            rows = [uow.assessments.latest(repository_ref_id, value, status) for value in spellings]
+            rows = [
+                uow.assessments.latest(repository_ref_id, value, status, as_of=as_of)
+                for value in spellings
+            ]
             found = max(
                 (row for row in rows if row is not None),
                 key=lambda row: (row.occurred_at, row.created_at, row.id),
@@ -981,10 +998,20 @@ class AssessmentService:
         return self.latest_on_default_lines([repository_id], kind).get(repository_id)
 
     def latest_on_default_lines(
-        self, repository_ids: Collection[UUID], kind: AssessmentKind
+        self,
+        repository_ids: Collection[UUID],
+        kind: AssessmentKind,
+        as_of: datetime | None = None,
     ) -> dict[UUID, Assessment]:
         """Each repository's latest completed assessment of `kind` on its default line; a
         repository with none is absent. A few statements per batch, not per repository."""
+        if as_of is not None:
+            held = self._held(
+                as_of, AssessmentFilter(kind=kind, status=ASSESSMENT_COMPLETED), repository_ids
+            )
+            return {
+                repository_id: rows[-1] for (repository_id, _), (rows, _) in held.items() if rows
+            }
         refs = self._inventory.list_refs_of(repository_ids)
         owner = {r.id: r.repository_id for r in refs}
         with self._uow as uow:
@@ -1181,6 +1208,30 @@ class AssessmentService:
             assert row.id is not None
             documents.append((latest[a.id], a, self._publisher.read(row.id, artifact)))
         return len(latest), documents
+
+    def isolation_reviews(
+        self, repository_ids: Collection[UUID], as_of: datetime | None = None
+    ) -> list[tuple[UUID, Assessment, IsolationReviewArtifact]]:
+        """Each repository's latest completed default-line isolation review by the cutoff."""
+        return self._latest_documents(
+            AssessmentFilter(
+                kind=AssessmentKind.ISOLATION_REVIEW_CANONICAL, status=ASSESSMENT_COMPLETED
+            ),
+            repository_ids,
+            IsolationReviewArtifact,
+            as_of,
+        )[1]
+
+    def cloud_config_audits(
+        self, repository_ids: Collection[UUID], as_of: datetime | None = None
+    ) -> list[tuple[UUID, Assessment, CloudConfigAuditArtifact]]:
+        """Each repository's latest default-line declared audit, including explicit gaps."""
+        return self._latest_documents(
+            AssessmentFilter(kind=AssessmentKind.CLOUD_CONFIG_CANONICAL),
+            repository_ids,
+            CloudConfigAuditArtifact,
+            as_of,
+        )[1]
 
     def coverage(self, filter: AssessmentFilter, repository_ids: Collection[UUID]) -> Coverage:
         """What the repositories' latest default-line audits (`filter.kind`, secure-code when

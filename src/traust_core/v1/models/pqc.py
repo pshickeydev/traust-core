@@ -234,6 +234,13 @@ class PqcReadinessInput(SkillInput):
     prior: PqcReadiness | None = None
 
 
+class PqcScanState(Model):
+    repository_ref_id: UUID
+    assessment_id: UUID | None = None
+    basis: str | None = None
+    current: bool | None = None
+
+
 class PqcVendorPackage(Model):
     name: str
     ecosystem: Ecosystem | None = None

@@ -101,6 +101,8 @@ from traust_core.v1.models.vocabulary import (
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.collaboration import AdrSource, DocSource
 from traust_core.v1.providers.runtime import CloudInventoryProvider
+from traust_core.v1.rendering.compliance import assessment_report
+from traust_core.v1.rendering.markdown import MarkdownRenderer
 from traust_core.v1.repositories.objects import ObjectKey, ObjectStore
 from traust_core.v1.repositories.traust.assessments import AssessmentsUnitOfWork
 from traust_core.v1.services.artifact_publishing import (
@@ -686,6 +688,17 @@ class ComplianceService:
     def export_oscal(self, artifact_id: UUID) -> JsonObject:
         """A recorded compliance assessment's 800-53-spine results as OSCAL assessment-results."""
         return oscal_assessment_results(
+            self._publisher.read(artifact_id, ComplianceAssessmentArtifact)
+        )
+
+    @staticmethod
+    def render_assessment(document: ComplianceAssessmentArtifact) -> bytes:
+        """Human-readable coverage, control verdicts, reasons and citations for one run."""
+        return MarkdownRenderer().render(assessment_report(document))
+
+    def export_markdown(self, artifact_id: UUID) -> bytes:
+        """Render one recorded assessment, not an aggregate posture."""
+        return self.render_assessment(
             self._publisher.read(artifact_id, ComplianceAssessmentArtifact)
         )
 

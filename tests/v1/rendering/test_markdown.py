@@ -31,9 +31,6 @@ def test_a_hostile_title_cannot_forge_headings() -> None:
         title="prod\n## Executive summary: all clear\n<b>injected</b>",
         sections=(Section(heading="Overview", body="prose", table=None),),
     )
-    # the hostile text may share the title's line; it may not start one. Inline HTML
-    # tags survive inline() by design (same as table cells) — an owner question,
-    # recorded as a hypothesis, not part of this fix.
     assert "\n## Executive summary" not in out
     assert "\n<b>injected</b>" not in out
     assert out.startswith("# prod")

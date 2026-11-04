@@ -13,6 +13,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from traust_core.v1 import contracts
+from traust_core.v1.models.ledger import DocumentVerification
 from traust_core.v1.providers.report_files import ReportFiles
 from traust_core.v1.services.artifact_publishing import RedactionPolicy
 
@@ -92,7 +93,13 @@ _NON_AUDIT = (
     "adapter-result",
     "impact-analysis",
 )
-_SCHEMA_ONLY = ("refuted-register", "operator-priv-profile", "pqc-readiness", "adapter-result")
+_SCHEMA_ONLY = (
+    "layer",
+    "refuted-register",
+    "operator-priv-profile",
+    "pqc-readiness",
+    "adapter-result",
+)
 
 
 @dataclass
@@ -102,6 +109,7 @@ class ReportValidation:
     file_path: str
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    integrity: DocumentVerification | None = None
 
     def error(self, msg: str) -> None:
         self.errors.append(msg)

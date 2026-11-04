@@ -11,6 +11,7 @@ from traust_core.v1.errors import ConfigError, DocumentError, Issue, ValidationE
 from traust_core.v1.models.artifacts import (
     ArtifactDocument,
     CloudConfigAuditArtifact,
+    FindingsLayerArtifact,
     RenderFormat,
     ReportArtifact,
     ThreatModelArtifact,
@@ -23,6 +24,7 @@ from traust_core.v1.providers.sources import WorkspaceFiles
 from traust_core.v1.rendering import HtmlRenderer, MarkdownRenderer
 from traust_core.v1.services.artifact_publishing import RedactionPolicy
 from traust_core.v1.services.insight import SarifExport, TriageView
+from traust_core.v1.services.ledger import LedgerService
 from traust_core.v1.services.lint import Lint, LintContext, LintReport
 from traust_core.v1.services.reporting.checks import (
     CheckContext,
@@ -76,12 +78,9 @@ class ReportingService:
         strict: bool = False,
         schema: str | None = None,
         canonical_write: bool = False,
+        signing_pubkey: Path | None = None,
     ) -> list[ReportValidation]:
-        """Every report file at `path` against its contract and content checks.
-
-        `canonical_write` applies the named schema's new-write contract instead of its historical
-        read contract.
-        """
+        """Check reports and, with a public key, historical layer integrity."""
         if canonical_write and schema is None:
             raise ValidationError("canonical-write validation requires an explicit schema")
         if canonical_write and "canonical_write" not in contracts.schema(schema).get("$defs", {}):
@@ -100,7 +99,23 @@ class ReportingService:
                 continue
             name = schema or detect_schema(file, text, self._files)
             contract = f"{name}#/$defs/canonical_write" if canonical_write else name
-            results.append(validate_report(str(file), text, contract, context, strict=strict))
+            result = validate_report(str(file), text, contract, context, strict=strict)
+            if (
+                signing_pubkey is not None
+                and name == FindingsLayerArtifact.schema
+                and result.passed
+            ):
+                try:
+                    document = FindingsLayerArtifact.parse(text.encode("utf-8"))
+                except DocumentError as error:
+                    result.errors.extend(f"{issue.path}: {issue.message}" for issue in error.issues)
+                else:
+                    result.integrity = LedgerService.verify_document(
+                        document, public_key_path=signing_pubkey
+                    )
+                    result.errors.extend(issue.message for issue in result.integrity.errors)
+                    result.warnings.extend(issue.message for issue in result.integrity.warnings)
+            results.append(result)
         return results
 
     def lint(self, document: ArtifactDocument, files: WorkspaceFiles | None = None) -> LintReport:

@@ -40,6 +40,32 @@ All modules live under `traust_core.v1` (see [Versioning](#versioning)).
 | **Deps and SBOM scanners** | `providers.tools.osv`, `providers.tools.osv_sbom`, `providers.tools.grype` | registered by `scanner_tools`: `grype` over a checkout or SBOM path, database frozen by default; `osv`, a checkout's declared packages looked up through `ctx.advisories` with coverage reported, `osv.scan_api(..., resolver=ctx.deps_dev)` for the full candidates document; `osv_sbom`, an image's syft JSON language packages not installed by an OS package, with `mark_grype_duplicates` / `grype_os_installed_matches` and the air-gapped osv-scanner path; CVSS through `models.dependencies.cvss_base_score` | `adapters/{osv,osv_sbom,grype}.py`, `osv/` (client: reuses `providers.osv`) |
 | **Config + Context** | `context`, `context.documents` (the YAML codec: `yaml_documents`, `yaml_documents_with_lines`, `yaml_text`, passed to providers, which don't import yaml), `context.preflight` | one `traust.yaml`; `Context` builds everything ([ledger and identity sections](docs/configuration.md)). The deployment config home: `resolve_config_home(explicit)` (`$TRAUST_CONFIG_HOME`, else `~/.traust/config` when it exists), `config_path(name)` (`DeploymentConfigMissing` naming the file and its template), `optional_config_path(name)`, `config_completeness_audit()` (`(errors, warnings)` for `install_traust --doctor`). `Context.preflight(requirements)` (`context.preflight`): one readiness door the engine's start gate, the platform doors and `traust doctor` call — a `Requirement` (`models.operations`, the pack schema's `requires:` vocabulary: tools, config keys, recorded facts, feed sources, secrets) is checked against `Toolchain.preflight`, the traust.yaml keys `Config.provided` records, the recorded facts, the enabled feed sources, the environment and the config home audit, raising `PreflightError` with every gap and its fix; `schema_dir()` / `schema_path(name)` / `validate_config(name, document)` and the ops types consumers annotate with (`OpsService`, `SpendService`, `FeedQuery`, `Router`, `Clock`) re-exported for consumers | `os.environ`, scattered config files, `traust_contracts.config` |
 
+## Native consumer reads and reports
+
+These doors operate on the current core models; they do not restore path-keyed inventory,
+stored dashboard snapshots, or a second owner for findings and evidence.
+
+| Door | Behavior |
+|---|---|
+| `DetectionQualityService.bootstrap_benchmark(limit=)` | Confirmed fixes become unadmitted answer-key candidates; generation records nothing. `rendering.benchmark_markdown` and `scorecards_markdown` render the results. |
+| `DetectionQualityService.calibrate_compliance(framework, gate=)` | Inclusive precision gate; computed `precision` and `flagged` survive serialization. Unmeasured precision remains null. `rendering.compliance_precision_markdown` renders the review worklist. |
+| `FindingService.on_ref(ref_id)` / `verified_fix_mtta(filter)` | Finding population and resolution follow the requested code line; fix timing requires standing validation/verification evidence. Bare commits imply no ancestry. |
+| `Context.register_compliance_sources(targets)` | An explicit mapping of registered product UUIDs to `providers.tools.compliance_sources.DocsTarget`; invalid targets/products fail before transport. Omitting the map retains ADR reads but declares no official-document targets. The pinned configuration contract has no `compliance:` YAML section. |
+| `ComplianceService.render_assessment(document)` | Markdown for a draft or recorded compliance assessment, preserving coverage, verdicts, evidence and skipped-framework reasons. Its pure report builder is `rendering.compliance.assessment_report`. |
+| `ExposureService.export_impacts(identifier)` | Typed retained advisory/alias evidence, independent by commit, ecosystem, package and version; no feed refresh. |
+| `VerificationService.sweep(repository_ids, include_branches=)` | A read-only worklist from observed default heads, optionally including branches, never tags. `sweep_markdown` delegates to `rendering.verification.verification_sweep`. |
+| `ReportingService.validate_reports(path, signing_pubkey=)` | Historical layer schemas are checked as layers, not audit reports. An explicit key adds Merkle/signature verification through `LedgerService.verify_document`, with typed failures and no payload rewriting. |
+| `ViewFilter.executive_panels`, `compare_as_of`, `first_party_divisor` | Executive panels compose domain reads. LoC selects historical heads and measurements; comparisons exclude coverage changes, and estimates require an explicit positive divisor. Historical PQC remains explicitly unavailable rather than using current data. |
+| `ViewName.CONTAINER_FINDINGS` with `ViewFilter.artifact_id` | A registered single-item view anchored to an attached container report. Image-family findings accumulate; absence from a later report never resolves them. |
+| `PqcService.scan_states(filter)` | Read scan basis/freshness for registered commits, including unscanned ones, without executing a scanner. |
+| `AssessmentService.record_scan(..., include_suppressed=True)` | Explicit SARIF suppression opt-in; retained claims still receive no suppression verdict. Replay preserves assessment/finding identity. |
+| `models.redaction.SecretDetector` | The single secret-pattern owner, shared with publication's `RedactionPolicy` and evidence-rule consumers. |
+
+Structured Markdown values escape active HTML and formatting; view-authored body prose remains
+Markdown. Historical layer verification proves the supplied document's signed bytes, not a new
+binding between legacy signatures and operational database rows.
+
+
 ## Repository checkouts
 
 Use `ctx.checkouts` to acquire a pinned commit and release its workspace when finished.

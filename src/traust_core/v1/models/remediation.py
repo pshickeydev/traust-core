@@ -891,10 +891,19 @@ class SweepSkip(StrEnum):
     HEAD_UNCHANGED = "head_unchanged"  # nothing landed since the findings were last judged
 
 
+class SweepHeadSource(StrEnum):
+    OBSERVED_DEFAULT = "observed_default"
+    OBSERVED_BRANCH = "observed_branch"
+    REGISTERED_BRANCH = "registered_branch"
+
+
 class SweepEntry(Model):
     """Whether a repository is worth re-verifying, and how urgently; the sweep routes only."""
 
     repository_id: UUID
+    repository_ref_id: UUID | None = None
+    ref_name: str | None = None
+    head_source: SweepHeadSource = SweepHeadSource.OBSERVED_DEFAULT
     head_sha: str | None = None
     pinned_sha: str | None = None
     verified_at_head: bool = False

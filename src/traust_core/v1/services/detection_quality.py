@@ -31,6 +31,7 @@ from traust_core.v1.models.assessment import ASSESSMENT_COMPLETED, Assessment, A
 from traust_core.v1.models.code_facts import CodeFactKind, ConfigFact, SanitizerFact, SymbolFact
 from traust_core.v1.models.common import Page, PageRequest, Provenance, TimeWindow, ToolRequest
 from traust_core.v1.models.detection_quality import (
+    COMPLIANCE_PRECISION_GATE,
     RULEABLE_LANGS,
     UNSPECIFIED_LANGUAGE,
     BenchmarkFilter,
@@ -79,7 +80,7 @@ from traust_core.v1.models.detection_quality import (
     guess_language,
 )
 from traust_core.v1.models.findings import FindingFilter, FindingFix, FindingState
-from traust_core.v1.models.integrity import FingerprintInput, FingerprintLocation
+from traust_core.v1.models.integrity import FingerprintInput, FingerprintLocation, sha256_hex
 from traust_core.v1.models.inventory import RepositoryRef, default_line
 from traust_core.v1.models.rule_mining import (
     PRECISION_GATE,
@@ -230,6 +231,70 @@ class DetectionQualityService:
                 )
             )
         return result
+
+    def bootstrap_benchmark(self, *, limit: int = 100) -> BenchmarkTargetArtifact:
+        """Harvest confirmed fixes as unadmitted answer-key candidates; nothing is recorded."""
+        if limit < 1:
+            raise ValidationError("benchmark bootstrap limit must be positive")
+        targets: dict[str, dict[str, Any]] = {}
+        for fix in sorted(
+            self._findings.fixes(Validity.CONFIRMED),
+            key=lambda f: (f.view.finding.fingerprint, str(f.view.finding.id)),
+        ):
+            view = fix.view
+            fingerprint = view.finding.fingerprint
+            paths = sorted({canon_path(loc.path) for loc in view.locations if loc.path})
+            if (
+                not paths
+                or not view.cwes
+                or view.finding.kind == "weakness"
+                or fingerprint in targets
+                or view.effective_severity is None
+            ):
+                continue
+            repository = self._inventory.get_repository(view.finding.repository_id)
+            before = self._inventory.get_ref(fix.reported_ref_id)
+            after = self._inventory.get_ref(fix.fixed_ref_id)
+            if not repository.url.startswith("https://") or before.sha == after.sha:
+                continue
+            identity = sha256_hex(fingerprint.encode())
+            targets[fingerprint] = {
+                "id": f"bt-self-{identity}",
+                "repo_url": repository.url,
+                "fix_commit": after.sha,
+                "pre_fix_sha": before.sha,
+                "provenance": "self_replay",
+                "evidence": {
+                    "kind": "ledger_event",
+                    "ref": f"finding:{view.finding.id}/fix:{fix.fixed_ref_id}",
+                    "excerpt": (fix.rationale or "")[:600],
+                },
+                "language": guess_language(paths),
+                "embargo": "internal",
+                "held_out": int(identity[:8], 16) % 5 == 0,
+                "admitted": False,
+                "expected": [
+                    {
+                        "source_finding": str(view.finding.id),
+                        "fingerprint": fingerprint
+                        if re.fullmatch("[0-9a-f]{64}", fingerprint)
+                        else None,
+                        "cwes": sorted(view.cwes),
+                        "paths": paths,
+                        "severity": str(view.effective_severity),
+                        "title": view.finding.title[:200],
+                    }
+                ],
+            }
+            if len(targets) == limit:
+                break
+        return BenchmarkTargetArtifact.from_document(
+            {
+                "version": 1,
+                "updated": self._clock.now().date().isoformat(),
+                "targets": list(targets.values()),
+            }
+        )
 
     def build_canaries(self, provenance: Provenance) -> list[Canary]:
         """Materialise every canary source and record them as seeded targets of a new answer key."""
@@ -492,8 +557,12 @@ class DetectionQualityService:
             )
         return sorted(misses, key=_miss_key)
 
-    def calibrate_compliance(self, framework: ComplianceFramework) -> ComplianceCalibration:
+    def calibrate_compliance(
+        self, framework: ComplianceFramework, *, gate: float = COMPLIANCE_PRECISION_GATE
+    ) -> ComplianceCalibration:
         """Per-check field precision over every recorded compliance assessment of the framework."""
+        if not 0 <= gate <= 1:
+            raise ValidationError("compliance precision gate must be between zero and one")
         # The run-twice idempotence gate and the seeded efficacy target are
         # ComplianceService.calibrate (its answer key is a NEED(contracts) there).
         kind = ComplianceAssessmentArtifact
@@ -519,8 +588,9 @@ class DetectionQualityService:
         return ComplianceCalibration(
             framework=framework,
             assessments=assessed,
+            gate=gate,
             checks=tuple(
-                CheckPrecision(check_id=c, fired=n["fired"], dismissed=n["dismissed"])
+                CheckPrecision(check_id=c, fired=n["fired"], dismissed=n["dismissed"], gate=gate)
                 for c, n in sorted(tally.items())
             ),
         )

@@ -78,6 +78,21 @@ def default_line(refs: Iterable[RepositoryRef]) -> set[UUID]:
     }
 
 
+def ref_line(ref: RepositoryRef, refs: Iterable[RepositoryRef]) -> set[UUID]:
+    """A ref's named line, with bare commits matched only by SHA, never inferred ancestry."""
+    refs = [r for r in refs if r.repository_id == ref.repository_id]
+    default = default_line(refs)
+    if ref.id in default:
+        return default
+    named = [r for r in refs if ref.name is not None and r.name == ref.name]
+    shas = {r.sha for r in named} | {ref.sha}
+    return {
+        r.id
+        for r in refs
+        if r.id is not None and (r in named or (r.name is None and r.sha in shas))
+    }
+
+
 class Team(Entity):
     name: str
 
