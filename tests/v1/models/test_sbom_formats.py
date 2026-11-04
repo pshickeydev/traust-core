@@ -206,8 +206,11 @@ def test_golang_direct_comes_from_the_gomod_requires_when_syft_emits_no_edges() 
             {"bom-ref": "y", "purl": "pkg:golang/gopkg.in/yaml.v3@v3.0.1"},
             {"bom-ref": "t", "purl": "pkg:golang/github.com/transitive/dep@v0.1.0"},
         ),
-        direct_golang=frozenset(
-            {("github.com/google/uuid", "1.6.0"), ("gopkg.in/yaml.v3", "3.0.1")}
+        declared_direct=frozenset(
+            {
+                ("go", "github.com/google/uuid", "1.6.0"),
+                ("go", "gopkg.in/yaml.v3", "3.0.1"),
+            }
         ),
     )
     assert rows(contents) == {
@@ -217,10 +220,32 @@ def test_golang_direct_comes_from_the_gomod_requires_when_syft_emits_no_edges() 
     }
 
 
-def test_golang_direct_set_is_ignored_for_other_ecosystems_and_absent_sets() -> None:
+def test_declared_names_without_versions_mark_any_version_direct() -> None:
+    """Rust (Cargo.toml constraints) and requirements-file Python declare names, not pins;
+    a None version matches the name at whatever the SBOM resolved."""
+    contents = parse_sbom(
+        cyclonedx(
+            {"bom-ref": "s", "purl": "pkg:cargo/serde@1.0.193"},
+            {"bom-ref": "r", "purl": "pkg:cargo/regex-syntax@0.8.2"},
+            {"bom-ref": "f", "purl": "pkg:pypi/Flask@3.0.0"},
+            {"bom-ref": "j", "purl": "pkg:pypi/jinja2@3.1.2"},
+        ),
+        declared_direct=frozenset({("cargo", "serde", None), ("pypi", "flask", None)}),
+    )
+    assert rows(contents) == {
+        ("cargo", "serde", "1.0.193", True),
+        ("cargo", "regex-syntax", "0.8.2", False),
+        ("pypi", "flask", "3.0.0", True),
+        ("pypi", "jinja2", "3.1.2", False),
+    }
+
+
+def test_declared_direct_set_stays_within_its_ecosystem() -> None:
+    """The door declares direct sets only for the manifest ecosystems syft's graph omits;
+    npm keeps claiming through the graph (a name collision across ecosystems never leaks)."""
     contents = parse_sbom(
         cyclonedx({"bom-ref": "a", "purl": "pkg:npm/a@1"}),
-        direct_golang=frozenset({("a", "1")}),
+        declared_direct=frozenset({("cargo", "a", None)}),
     )
     assert rows(contents) == {("npm", "a", "1", False)}
     assert rows(parse_sbom(cyclonedx({"bom-ref": "g", "purl": "pkg:golang/g@v1"}))) == {

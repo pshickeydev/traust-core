@@ -414,6 +414,38 @@ def go_requires(root: Path) -> list[tuple[str, Version]]:
     return [(m, Version(v.removeprefix("v"))) for m, v in found]
 
 
+def cargo_requires(root: Path) -> list[str]:
+    """Every crate named in a Cargo.toml's `[dependencies]` table: the direct set, as the
+    lockfile's versions can't be matched from the manifest's constraints."""
+    manifest = root / "Cargo.toml"
+    if not manifest.is_file():
+        return []
+    names: list[str] = []
+    in_dependencies = False
+    for line in manifest.read_text(errors="replace").splitlines():
+        header = re.match(r"(?m)^\s*\[([^\]]+)\]", line)
+        if header:
+            # Only the plain table: dev-, build- and target-specific dependencies are not
+            # the production set the lane watches.
+            in_dependencies = header.group(1).strip() == "dependencies"
+            continue
+        if in_dependencies and (crate := re.match(r"(?m)^\s*([A-Za-z0-9_-]+)\s*=", line)):
+            names.append(crate.group(1))
+    return names
+
+
+def requirements_names(root: Path) -> list[str]:
+    """Every package named in a requirements file (`requirements*.txt`, PEP 508 lines): a
+    requirements file holds direct dependencies only, constraints unresolved."""
+    names: list[str] = []
+    for path in sorted(root.glob("requirements*.txt")):
+        for line in path.read_text(errors="replace").splitlines():
+            spec = re.split(r"[<>=!~;\[\s]", line.strip(), maxsplit=1)[0]
+            if spec and not spec.startswith(("#", "-")):
+                names.append(spec)
+    return names
+
+
 def importers(
     ecosystem: Ecosystem, dependency: str, files: Sequence[Path], root: Path
 ) -> list[str]:

@@ -130,7 +130,11 @@ from traust_core.v1.providers.feeds import (
     rh_cve_records,
     validate_payload,
 )
-from traust_core.v1.providers.package_source import go_requires
+from traust_core.v1.providers.package_source import (
+    cargo_requires,
+    go_requires,
+    requirements_names,
+)
 from traust_core.v1.providers.sources import CheckoutRequest, SourceError, SourceProvider
 from traust_core.v1.providers.syft import MANIFESTS, unresolved_manifests
 from traust_core.v1.providers.tools import ToolProvider, ToolRequest
@@ -307,13 +311,14 @@ class ExposureService:
             uow.commit()
         return self.feed_status(feed)
 
-    def ingest_sbom(self, raw: bytes, repository_ref_id: UUID, *, direct_golang=None) -> Sbom:
+    def ingest_sbom(self, raw: bytes, repository_ref_id: UUID, *, declared_direct=None) -> Sbom:
         """A commit's manifest SBOM (CycloneDX / SPDX JSON from standard tools). The same package
         list again, in either format, is the same SBOM; only its first document is kept.
-        `direct_golang`: go.mod requires (module, version), the direct set syft's graph
-        omits for Go."""
+        `declared_direct`: (ecosystem, name, version-or-None) the checkout's manifests
+        declare, the direct set syft's graph omits for Go, Rust and requirements-file
+        Python."""
         portfolio = self._require_portfolio()
-        contents = parse_sbom(raw, direct_golang)
+        contents = parse_sbom(raw, declared_direct)
         with self._uow as uow:
             sbom = uow.sboms.find_by_digest(contents.digest) or self._add_sbom(uow, raw, contents)
             uow.commit()
@@ -439,11 +444,20 @@ class ExposureService:
                     reuse=False,
                 )
                 uow.commit()
-        # syft's manifest scan emits no golang dependency edges (verified against a
-        # go.mod-only tree: an empty dependencies graph), so every Go package would key
-        # indirect. The go.mod the archive keeps is the direct truth: its require block.
+        # syft's manifest scan emits no dependency edges for Go (go.mod), Rust
+        # (Cargo.lock) or a requirements file's Python (verified: each tree's
+        # dependencies graph is empty), so every such package would key indirect. The
+        # manifests the archive keeps are the direct truth: go.mod requires (pinned),
+        # Cargo.toml's [dependencies] crates and requirements files' packages (named,
+        # matched at any version — the manifest states constraints, not pins).
+        declared = {(Ecosystem.GO, module, version) for module, version in go_requires(checkout)}
+        declared |= {(Ecosystem.CARGO, crate, None) for crate in cargo_requires(checkout)}
+        declared |= {
+            (Ecosystem.PYPI, package_name(Ecosystem.PYPI, name), None)
+            for name in requirements_names(checkout)
+        }
         sbom = self.ingest_sbom(
-            scanned.data, repository_ref_id, direct_golang=frozenset(go_requires(checkout))
+            scanned.data, repository_ref_id, declared_direct=frozenset(declared)
         )
 
         return DependencyIngest(

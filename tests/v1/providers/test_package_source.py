@@ -20,11 +20,13 @@ from traust_core.v1.providers.package_source import (
     SourceHosts,
     anchor,
     archive_url,
+    cargo_requires,
     extract,
     go_requires,
     importers,
     nuget_version,
     presence,
+    requirements_names,
     root_of,
 )
 
@@ -508,3 +510,21 @@ def test_an_unparseable_registry_answer_is_refused(tmp_path: Path) -> None:
         sources({"https://pypi.org/pypi/p/1.0/json": b"[]"}).source(
             Ecosystem.PYPI, "p", "1.0", tmp_path
         )
+
+
+def test_cargo_requires_reads_only_the_dependencies_table(tmp_path: Path) -> None:
+    (tmp_path / "Cargo.toml").write_text(
+        '[package]\nname = "widget"\nversion = "0.1.0"\n\n'
+        '[dependencies]\nserde = { version = "1.0" }\nregex = "1.10"\n\n'
+        '[dev-dependencies]\ncriterion = "0.5"\n\n'
+        '[build-dependencies]\ncc = "1.0"\n'
+    )
+    assert cargo_requires(tmp_path) == ["serde", "regex"]
+
+
+def test_requirements_names_reads_constraints_and_skips_options(tmp_path: Path) -> None:
+    (tmp_path / "requirements.txt").write_text(
+        "# comment\nflask==3.0.0\nrequests >= 2.31\n-r other.txt\n--index-url https://x\n"
+    )
+    (tmp_path / "requirements-dev.txt").write_text("pytest>=8\n")
+    assert sorted(requirements_names(tmp_path)) == ["flask", "pytest", "requests"]
