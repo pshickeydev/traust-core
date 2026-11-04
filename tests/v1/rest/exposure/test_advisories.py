@@ -46,6 +46,9 @@ def test_advisory_reads_need_a_token(context: Context, client: TestClient) -> No
     assert client.get(f"/v1/advisories/{advisory.id}").status_code == 401
 
 
+AT = datetime(2026, 11, 3, tzinfo=UTC)
+
+
 class Lookup:
     name = "osv"
 
@@ -54,7 +57,7 @@ class Lookup:
 
     def record(self, identifier: AdvisoryIdentifier) -> Result[AdvisoryRecord | None]:
         found = self.records.get(identifier)
-        return Result(found, Acquisition(provider="osv", acquired_at=datetime.now(UTC)))
+        return Result(found, Acquisition(provider="osv", acquired_at=AT))
 
 
 def osv(identifier: str) -> AdvisoryRecord:

@@ -901,7 +901,7 @@ class ExposureService:
         record = self._require_lookup().record(parse_advisory_identifier(identifier)).data
         if record is None:
             return None
-        if not record.affected:
+        if not record.affected and not record.withdrawn:
             record = self._with_alias_packages(record)
         with self._uow as uow:
             advisory = self._keep_advisory(uow, record)
@@ -919,14 +919,16 @@ class ExposureService:
             for name in record.aliases
             if is_advisory_identifier(name)
             and (alias := lookup.record(name).data)
+            and alias.identifier.upper() == name.upper()
             and alias.affected
             and not alias.withdrawn
         ]
+        # Two aliases may state one package with different spans: keep every span, so a version
+        # only one of them covers is still in range.
         packages: dict[tuple[Ecosystem, str], AffectedPackage] = {}
         for p in (p for alias in named for p in alias.affected):
             kept = packages.get((p.ecosystem, p.name))
-            if kept is None or (p.symbols and not kept.symbols):
-                packages[(p.ecosystem, p.name)] = p
+            packages[(p.ecosystem, p.name)] = p if kept is None else _joined(kept, p)
         return record.model_copy(
             update={
                 "affected": tuple(packages.values()),
@@ -1463,6 +1465,16 @@ def _sbom_packages(uow: TraustUnitOfWork, sbom_id: UUID) -> list[RefDependency]:
     packages = {p.id: p for p in uow.packages.list_by_ids({d.package_id for d in rows})}
     listed = [RefDependency(dependency=d, package=packages[d.package_id]) for d in rows]
     return sorted(listed, key=lambda r: (r.package.ecosystem, r.package.name, r.dependency.version))
+
+
+def _joined(a: AffectedPackage, b: AffectedPackage) -> AffectedPackage:
+    """One package as two aliases state it: every span, listed version, import and symbol."""
+    return a.model_copy(
+        update={
+            field: tuple(dict.fromkeys((*getattr(a, field), *getattr(b, field))))
+            for field in ("spans", "versions", "imports", "symbols")
+        }
+    )
 
 
 def _in_range(
