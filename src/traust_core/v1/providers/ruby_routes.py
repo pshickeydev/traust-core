@@ -245,6 +245,15 @@ class _Route:
     scope_guards: tuple[str, ...] = ()
 
 
+# a module the routes name that we can't tell: matches no controller, so the route reads unknown
+_UNRESOLVED = "<unresolved>"
+
+
+def _rails_version(lock: str | None) -> tuple[int, int] | None:
+    found = re.search(r"^    actionpack \((\d+)\.(\d+)", lock or "", re.M)
+    return (int(found.group(1)), int(found.group(2))) if found else None
+
+
 def _join(*parts: str) -> str:
     segments = [p.strip("/") for p in parts if p.strip("/")]
     return "/" + "/".join(segments)
@@ -253,8 +262,15 @@ def _join(*parts: str) -> str:
 class _RailsRoutes:
     """`config/routes.rb` (and the files it `draw`s) as (verb, path, controller#action) rows."""
 
-    def __init__(self, sources: dict[str, _Source]) -> None:
+    def __init__(self, sources: dict[str, _Source], locks: dict[str, str]) -> None:
         self.sources = sources
+        self.roots = app_roots(list(sources))
+        # the Rails each app runs, from its Gemfile.lock (or the checkout's)
+        self.rails = {
+            root: _rails_version(locks.get(f"{root}Gemfile.lock"))
+            or _rails_version(locks.get("Gemfile.lock"))
+            for root in self.roots
+        }
         self.routes: list[_Route] = []
         self.drawn: set[str] = set()  # `draw :api` files being expanded
         self.expanded: set[tuple[object, _Scope]] = set()  # (file or concern, scope) expanded
@@ -313,6 +329,31 @@ class _RailsRoutes:
             if c.type == "call":
                 self._call(src, c, inner, config)
 
+    def _namespace_module(self, src: _Source, scope: _Scope, name: str, given: Node | None) -> str:
+        """The module `namespace :name, module: …` routes to. `module: nil` (or false) drops
+        it before Rails 8.1, which defaults it to the name again (`options[:module] ||=
+        name`); with the version unknown, or a module we can't read, no controller matches."""
+        if given is None:
+            return f"{scope.module}{name}/"
+        if (module := src.string(given)) is not None:
+            if not module.strip("/"):
+                return "" if not scope.module else f"{scope.module}{_UNRESOLVED}/"
+            return f"{scope.module}{module}/"
+        version = (
+            self.rails.get(root_of(src.file.rel, self.roots))
+            if given.type
+            in (
+                "nil",
+                "false",
+            )
+            else None
+        )
+        if version is not None and version >= (8, 1):
+            return f"{scope.module}{name}/"
+        if version is not None and not scope.module:
+            return ""
+        return f"{scope.module}{_UNRESOLVED}/"
+
     def _controller(self, scope: _Scope, name: str) -> str:
         return f"{scope.module}{name}" if "/" not in name else name
 
@@ -325,8 +366,15 @@ class _RailsRoutes:
             for res in [v for a in args if (v := src.string(a)) is not None and a.type != "pair"]:
                 self._resource(src, call, scope, config, res, name == "resource", opts)
         elif name == "namespace" and first:
-            module = f"{scope.module}{src.string(opts.get('module')) or first}/"
-            inner = replace(scope, path=_join(scope.path, first), module=module)
+            given = opts.get("path")
+            path = first if given is None else src.string(given)
+            if given is not None and given.type == "nil":
+                path = ""
+            inner = replace(
+                scope,
+                path=_join(scope.path, first if path is None else path),
+                module=self._namespace_module(src, scope, first, opts.get("module")),
+            )
             self._block(src, _body(call), inner, config)
         elif name == "scope":
             positional = first is not None and args[0].type != "pair"
@@ -953,12 +1001,12 @@ def _body_guard_calls(src: _Source, stmts: list[Node]) -> list[str]:
     return [f"call:{n}" for n in names if _is_guard(n)]
 
 
-def _rails_rows(sources: dict[str, _Source]) -> list[_Row]:
+def _rails_rows(sources: dict[str, _Source], locks: dict[str, str]) -> list[_Row]:
     controllers = _controllers(sources)
     ownership = _Ownership(sources, controllers)
     rows = []
     roots = app_roots(list(sources))
-    for r in _RailsRoutes(sources).routes:
+    for r in _RailsRoutes(sources, locks).routes:
         c = _lookup(controllers, _app_root(r.src.file.rel, roots), f"route:{r.controller}")
         guards: list[str] = []
         unguards: list[str] = []
@@ -1559,7 +1607,8 @@ def ruby_rows(files: list[TreeFile]) -> RubyRoutes:
     for f in ruby:
         data = f.text.encode("utf-8")
         sources[f.rel] = _Source(f, available.parse(data).root_node, data)
-    rows = _rails_rows(sources) if RouteFamily.RAILS in evidence else []
+    locks = {f.rel: f.text for f in files if f.name == "Gemfile.lock"}
+    rows = _rails_rows(sources, locks) if RouteFamily.RAILS in evidence else []
     for src in sources.values():
         if SINATRA_USE.search(src.file.text):
             rows += _sinatra_rows(src)

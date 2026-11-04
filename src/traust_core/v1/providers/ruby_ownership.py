@@ -10,6 +10,8 @@ import re
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from enum import Enum
+from fnmatch import fnmatchcase
+from glob import escape as glob_escape
 
 from traust_core.v1.models.common import CodeSpan, RepoPath
 from traust_core.v1.providers.route_ownership import (
@@ -99,6 +101,159 @@ _CREDENTIAL = re.compile(
     r"\b(session|cookies|warden|\w*authenticat\w*|verif\w*|decode\w*|\w*bearer\w*|\w*token\w*|"
     r"jwt\w*)\b",
     re.I,
+)
+# where the server keeps what it trusts across requests (D20 amended): the session and the
+# cookie jar (only its signed and encrypted cookies count)
+_STORE_ROOTS = {"session", "cookies", "cookie_jar", "session_options"}
+_MAX_CLOSURE = 4000  # statements and methods read for one route's session writes
+_PURE_CONSTANTS = {"Time", "Date", "DateTime", "SecureRandom", "Float", "Integer", "Digest"}
+_SENDS = {"send", "public_send", "__send__", "try", "method"}
+# what a store's methods do: read a key, read the whole store, or drop keys; any other may
+# write it, or hand it on (`session.tap`, `session.send(:[]=, …)`)
+_STORE_KEY_READS = {"fetch", "dig", "key?", "has_key?", "include?", "member?"}
+_STORE_READS = {
+    "to_h",
+    "to_hash",
+    "keys",
+    "values",
+    "id",
+    "loaded?",
+    "empty?",
+    "present?",
+    "blank?",
+    "any?",
+    "exists?",
+    "inspect",
+    "each",
+    "each_pair",
+    "each_key",
+    "slice",
+    "except",
+    "select",
+    "reject",
+    "to_json",
+    "as_json",
+    "to_a",
+    "nil?",
+    "enabled?",
+    "map",
+    "count",
+    "size",
+    "length",
+    "with_indifferent_access",
+}
+_STORE_DROPS = {"delete", "clear", "destroy"}
+# what reading a value kept in the store may do without changing it
+_VALUE_READS = {
+    "to_i",
+    "to_s",
+    "to_sym",
+    "to_a",
+    "to_h",
+    "to_param",
+    "present?",
+    "blank?",
+    "nil?",
+    "presence",
+    "first",
+    "last",
+    "size",
+    "length",
+    "count",
+    "empty?",
+    "any?",
+    "include?",
+    "key?",
+    "has_key?",
+    "fetch",
+    "dig",
+    "==",
+    "!=",
+    "eql?",
+    "with_indifferent_access",
+    "symbolize_keys",
+    "stringify_keys",
+    "as_json",
+    "to_json",
+    "inspect",
+    "id",
+}
+# `Current` attributes that name no caller (`Current.request_id = request.uuid`)
+_CURRENT_PLAIN = {
+    "request_id",
+    "request_uuid",
+    "user_agent",
+    "ip_address",
+    "ip",
+    "remote_ip",
+    "request",
+    "host",
+    "url",
+    "path",
+    "locale",
+    "time_zone",
+    "timezone",
+    "referer",
+    "referrer",
+    "controller",
+    "action",
+    "started_at",
+    "organization",
+    "tenant",
+    "workspace",
+    "team",
+    "site",
+    "company",
+    "region",
+    "country",
+    "subdomain",
+    "domain",
+    "beta",
+}
+_SIGN_IN_CALLS = re.compile(
+    r"^(sign_in(_and_redirect)?|bypass_sign_in|log_?in|login_user|log_in_user|auto_login|"
+    r"remember_me|set_user)$"
+)
+# session and cookie keys a gem's caller reads (Devise's warden keys and remember cookie)
+_GEM_KEYS = ("warden*", "remember_*token*", "*remember_token*")
+# session keys that hold the interface's state, never a caller a gem reads
+_UI_KEYS = (
+    "locale",
+    "theme",
+    "*return_to*",
+    "forwarding_url",
+    "*_url",
+    "ip",
+    "remote_ip",
+    "user_agent",
+    "flash",
+    "filter*",
+    "*_filter*",
+    "sort*",
+    "page",
+    "per_page",
+    "tab",
+    "redirect*",
+    "prefs",
+    "preferences",
+    "q",
+    "search*",
+    "view*",
+    "layout",
+    "time_zone",
+    "timezone",
+    "currency",
+    "lang",
+    "language",
+    "referer",
+    "referrer",
+    "utm_*",
+    "cart*",
+    "visit*",
+    "tracking*",
+    "_csrf_token",
+    "previous_url",
+    "last_*",
 )
 _UNTRUSTED = re.compile(
     r"\bparams\b|\brequest\.(params|parameters|query_parameters|request_parameters|"
@@ -293,6 +448,13 @@ class RubyCode:
         # `Api::Relaxed` -> every definition (a module reopened in another file)
         self.qualified: dict[str, list[tuple[Parsed, Node]]] = {}
         self.method_cache: dict[tuple[str, int, int], dict[str, Node]] = {}
+        # what each statement does with the session and the caller's setters, and the app
+        # methods it may call; each scope's locals
+        self.scans: dict[
+            tuple[str, int, int], tuple[list[_Use], list[str], list[tuple[str, Node | None]]]
+        ] = {}
+        self.scope_locals: dict[tuple[str, int, int], _Locals] = {}
+        self.locals_at: dict[tuple[str, int, int], tuple[list[Node], bool] | None] = {}
         self.defined: set[str] = set()  # every method name the checkout defines
         for rel, src in sources.items():
             self._index(rel, src)
@@ -1041,7 +1203,51 @@ class _Action:
         self.request_uses: dict[tuple[str, int, int], str | None] = {}
         self.unread_caller = False
         self.credentials: dict[tuple[str, int, int, int], bool] = {}
-        self.caller_ivars = self._caller_ivars()
+        # the session keys written from the request and the caller ivars depend on each
+        # other (`session[:uid] = @user.id`): repeat until neither moves
+        self.written: set[str] = set()
+        self.cleans: dict[tuple[str, int, int], bool] = {}
+        self.capped = False
+        self.closure = self._closure(self.reached)
+        for _ in range(8):
+            self.caller_ivars = self._caller_ivars()
+            written = self._session_writes()
+            if written == self.written:
+                break
+            self.written = written
+            self.credentials.clear()
+            self.cleans.clear()
+            self.request_uses.clear()
+        else:
+            self.written = {"*"}
+            self.credentials.clear()
+            self.cleans.clear()
+            self.request_uses.clear()
+            self.caller_ivars = self._caller_ivars()
+        # a key written that a gem's caller may read: Devise's own (`warden.*`, its remember
+        # cookie), or any but the interface's unless the app builds its caller itself (its
+        # own `current_user`, or a setter that copies no gem's caller: `Current.session ||=
+        # find_session_by_cookie`, not `Current.user = current_user`); we can't tell
+        gem = {n for n in _CALLERS if self.methods(n) is None}
+        app_caller = self.methods("current_user") is not None or any(
+            use.kind == "caller"
+            and not use.gem
+            and (use.keys is None or "current_user" in use.keys)  # the caller routes read
+            and use.value is not None
+            and not any(
+                (x.type == "identifier" and src.text(x) in gem) or src.text(x) == "warden"
+                for x in walk(use.value)
+            )
+            for src, node, _ in self.closure
+            for use in _scan(self.code, src, node)[0]
+        )
+        if any(
+            w == "*"
+            or any(fnmatchcase(w, k) for k in _GEM_KEYS)
+            or (not app_caller and not any(fnmatchcase(w, k) for k in _UI_KEYS))
+            for w in self.written
+        ):
+            self.unread_caller = True
         # what each caller ivar stands for: the user, or the caller's tenant (`@account =
         # current_user.account`)
         kinds = self._ivar_kinds()
@@ -1151,6 +1357,11 @@ class _Action:
         header naming the user is no credential, whatever else the expression reads."""
         if node is None or self._untrusted(src, node):
             return False
+        written = self._reads_written(src, node)
+        if written == "forged":
+            return False
+        if written == "unknown":
+            self.unread_caller = True  # it may read a key the route wrote: unknown
         use = self._request_use(src, node)
         if use == "identity":
             return False
@@ -1175,6 +1386,166 @@ class _Action:
             )
         )
         self.credentials[key] = found
+        return found
+
+    def _closure(self, steps: list[_Step]) -> list[tuple[Parsed, Node, Kind]]:
+        """The steps and the bodies of every app method they may call, with arguments or
+        not, however spelled (`self.x(…)`, `send(:x, …)`, a bare `x`). Past the cap, the
+        route reads as writing a session key we can't name."""
+        out: list[tuple[Parsed, Node, Kind]] = []
+        seen: set[str] = set()
+        queue = [(s.src, s.node, s.kind) for s in steps]
+        while queue:
+            if len(out) >= _MAX_CLOSURE:
+                self.capped = True
+                break
+            src, node, kind = queue.pop()
+            out.append((src, node, kind))
+            for name in _scan(self.code, src, node)[1]:
+                if name in seen or (found := self.methods(name)) is None:
+                    continue
+                seen.add(name)
+                inner = Kind.CALLBACK if name in _CALLERS else kind
+                queue.append((found[0], found[1], inner))  # the whole method, scanned once
+        return out
+
+    def _session_writes(self) -> set[str]:
+        """The session or signed-cookie keys (`*_return_to` patterns) the route may write
+        from anything but a literal or a credential (`session[:user_id] = params[:id]`);
+        "*" for a write it can't name, the store handed on, or code past the cap."""
+        if self.capped:
+            return {"*"}
+        out: set[str] = set()
+        for src, node, _ in self.closure:
+            for use in _scan(self.code, src, node)[0]:
+                if use.kind != "write" or (use.keys is not None and out.issuperset(use.keys)):
+                    continue  # a key already written from the request
+                if not self._clean(src, use.value):
+                    if use.keys is None:
+                        return {"*"}
+                    out |= set(use.keys)
+        return out
+
+    def _clean(self, src: Parsed, node: Node | None, depth: int = 0) -> bool:
+        """Whether a written value is a literal or a credential the analyzer reads (an unread
+        one isn't): `nil`, `current_user.id`, `{ value: current_user.id, httponly: true }`.
+        None: a value it can't tell."""
+        node = unwrap(node)
+        if node is None or depth > 8:
+            return False
+        key = (src.file.rel, node.start_byte, node.end_byte)
+        if key not in self.cleans:
+            self.cleans[key] = False  # a cycle through locals reads as unclean
+            self.cleans[key] = self._clean_value(src, node, depth)
+        return self.cleans[key]
+
+    def _clean_value(self, src: Parsed, node: Node, depth: int) -> bool:
+        if _is_literal(node) or _constant_only(src, node):
+            return True
+        if node.type in ("hash", "right_assignment_list", "array", "argument_list"):
+            items = [c for c in node.named_children if c.type != "comment"]
+            return all(
+                self._clean(
+                    src, c.child_by_field_name("value") if c.type == "pair" else c, depth + 1
+                )
+                for c in items
+            )
+        # a name is what it holds where it's read: a parameter, a binding we don't follow
+        # (`rescue => token`) or a method we can't read holds anything
+        opaque = False  # an app method or an instance variable: only a credential is clean
+        for n in walk(node):
+            if n.type in (
+                "instance_variable",
+                "class_variable",
+                "global_variable",
+                "element_reference",
+                "self",
+            ) or (
+                n.type in ("constant", "scope_resolution")
+                and src.text(n) not in _PURE_CONSTANTS
+                and (n.parent is None or n.parent.type != "scope_resolution")
+            ):
+                opaque = True  # `@cart`, `Thread.current[:uid]`, `User.first`: state kept elsewhere
+            elif n.type == "call" and (
+                ((receiver := n.child_by_field_name("receiver")) is None and args(n))
+                or (receiver is not None and receiver.type == "self")
+            ):
+                if self.methods(call_name(src, n)) is None:
+                    return False  # a gem's helper (`t(".x")`): it may return anything
+                opaque = True
+            if n.type != "identifier" or not _helper_name(src, n):
+                continue
+            held = _local_at(self.code, src, n)
+            if held is not None:
+                values, param = held
+                if param or not all(self._clean(src, v, depth + 1) for v in values):
+                    return False
+            elif self.methods(src.text(n)) is not None and src.text(n) not in _CALLERS:
+                opaque = True
+            elif src.text(n) not in _CALLERS:
+                return False
+        if self._untrusted(src, node):
+            return False
+        if not opaque:
+            return True  # literals, constants, clean locals and the caller (`current_user.id`)
+        # a credential the analyzer reads; one from code it can't read isn't clean, and the
+        # check leaves no answer behind for the caller's own reading
+        saved = (dict(self.credentials), dict(self.request_uses), self.unread_caller)
+        self.unread_caller = False
+        ok = self._credential(src, node, self.caller_ivars) and not self.unread_caller
+        self.credentials, self.request_uses, self.unread_caller = (
+            saved[0],
+            saved[1],
+            saved[2],
+        )
+        return ok
+
+    def _trusted(self, src: Parsed, node: Node | None, depth: int = 0) -> bool:
+        """Whether a caller's setter is given a literal or a credential; one from code we
+        can't read counts, and makes the result unknown (as `_credential`)."""
+        node = unwrap(node)
+        if node is None or depth > 8:
+            return False
+        if node.type in ("hash", "right_assignment_list", "array", "argument_list"):
+            return all(
+                self._trusted(
+                    src, c.child_by_field_name("value") if c.type == "pair" else c, depth + 1
+                )
+                for c in node.named_children
+                if c.type != "comment"
+            )
+        for n in walk(node):
+            if n.type != "call" or not args(n):
+                continue
+            receiver = n.child_by_field_name("receiver")
+            found = (
+                self.methods(call_name(src, n))
+                if receiver is None or receiver.type == "self"
+                else None
+            )
+            if found is not None and any(
+                self._untrusted(s, b) or self._request_use(s, b) == "identity"
+                for s, b, _ in self._closure(
+                    [_Step(found[0], b, Kind.CALLBACK) for b in method_body(found[1])]
+                )
+            ):
+                return False  # `find_user(cookies.signed[:id])` that reads `params[:as]`
+        return _is_literal(node) or self._credential(src, node, self.caller_ivars)
+
+    def _reads_written(self, src: Parsed, node: Node) -> str | None:
+        """Whether a value reads the session where the route wrote what the request chose
+        (D20): "forged" for a key it wrote, "unknown" when it may (a key it can't name, the
+        whole store, after a write it can't name)."""
+        if not self.written:
+            return None
+        found = None
+        for use in _scan(self.code, src, node)[0]:
+            if use.kind != "read":
+                continue
+            if use.keys is None or "*" in self.written or any("*" in k for k in use.keys):
+                found = "unknown"
+            elif any(fnmatchcase(k, w) for k in use.keys for w in self.written):
+                return "forged"
         return found
 
     def _words(self, src: Parsed, node: Node) -> str:
@@ -1208,6 +1579,8 @@ class _Action:
                 bare = not named or parent.child_by_field_name("receiver") is None  # type: ignore[union-attr]
                 if bare and (name in self.local_values or self.methods(name) is not None):
                     continue  # read through what it holds or returns
+                if not named and (held := _local_at(self.code, src, n)) is not None and held[1]:
+                    continue  # a parameter (`|token|`): whatever it was passed, not its name
                 out.append(name)
         return " ".join(out)
 
@@ -1229,14 +1602,14 @@ class _Action:
         User.find_by(session_token: session[:u])`, D20): the caller too, unless set anywhere
         from the request's parameters or in the action."""
         assigned: dict[str, list[tuple[Kind, Parsed, Node | None]]] = {}
-        for step in self.reached:
-            for n in walk(step.node):
-                if n.type in ("assignment", "operator_assignment"):
-                    left = n.child_by_field_name("left")
-                    if left is not None and left.type == "instance_variable":
-                        assigned.setdefault(step.src.text(left), []).append(
-                            (step.kind, step.src, n.child_by_field_name("right"))
-                        )
+        for src, node, kind in self.closure:  # helpers taking arguments set ivars too
+            params = node.child_by_field_name("parameters") if node.type in _DEFS else None
+            for name, right in _scan(self.code, src, node)[2]:
+                # set by a helper that takes arguments: from what the call site passed,
+                # which we don't read
+                assigned.setdefault(name, []).append(
+                    (kind, src, None if params is not None and params.named_children else right)
+                )
         found: set[str] = set()
         for _ in range(2):  # `@resource = @token.owner` after `@token = …`
             found = {
@@ -1257,6 +1630,22 @@ class _Action:
         out: set[str] = set()
         for name in _CALLERS:
             found = self.methods(name)
+            reads = (
+                {
+                    self._reads_written(s, n)
+                    for s, n, _ in self._closure(
+                        [_Step(found[0], b, Kind.CALLBACK) for b in method_body(found[1])]
+                    )
+                }
+                if found is not None
+                else set()
+            )
+            if self.capped:
+                self.unread_caller = True
+            if "forged" in reads:
+                out.add(name)  # `def current_user = User.find_by(id: session[:user_id])`
+            elif "unknown" in reads:
+                self.unread_caller = True
             if found is not None and any(
                 self._request_use(s.src, s.node) == "identity"
                 or (
@@ -1281,32 +1670,16 @@ class _Action:
                 )
             ):
                 out.add(name)
-        for step in self.reached:
-            for n in walk(step.node):
-                if n.type in ("assignment", "operator_assignment"):
-                    group = _caller_group(chain_text(step.src, n.child_by_field_name("left")))
-                    if group is not None and (
-                        step.kind is Kind.ACTION
-                        or not self._credential(
-                            step.src, n.child_by_field_name("right"), self.caller_ivars
-                        )
-                    ):
-                        out.add(group)
-                elif (
-                    n.type == "call"
-                    and call_name(step.src, n) == "instance_variable_set"
-                    and len(args(n)) == 2
-                    and _caller_group(step.src.text(args(n)[0]).lstrip(":"))
-                ):
-                    if step.kind is Kind.ACTION or not self._credential(
-                        step.src, args(n)[1], self.caller_ivars
-                    ):
-                        out.add(_caller_group(step.src.text(args(n)[0]).lstrip(":")))  # type: ignore[arg-type]
-                elif n.type == "call" and _signs_in(step.src, n):
-                    if step.kind is Kind.ACTION or not all(
-                        self._credential(step.src, a, self.caller_ivars) for a in args(n)
-                    ):
-                        out.add("current_user")
+        for src, node, kind in self.closure:
+            for use in _scan(self.code, src, node)[0]:
+                if use.kind != "caller":
+                    continue
+                if kind is not Kind.ACTION and self._trusted(src, use.value):
+                    continue
+                if use.keys is None:
+                    self.unread_caller = True  # a setter we can't name may set any caller
+                else:
+                    out |= set(use.keys)
         return out
 
     def _returns_unset(self, found: tuple[Parsed, Node]) -> bool:
@@ -2472,6 +2845,441 @@ def _signs_in(src: Parsed, node: Node) -> bool:
     if name == "set_user":
         return receiver is not None and src.text(receiver) == "warden"
     return name in _SIGN_IN and receiver is None
+
+
+@dataclass(frozen=True)
+class _Use:
+    """A statement's use of the session (`read`, `write`) or of a caller's setter
+    (`caller`). `keys`: the store keys (`*_return_to` patterns) or the caller groups; None
+    for any. `value`: what it writes; None for one that's never clean."""
+
+    kind: str
+    keys: tuple[str, ...] | None
+    value: Node | None
+    gem: bool = False  # a gem's own setter (`sign_in`, `auto_login`)
+
+
+@dataclass(frozen=True)
+class _Locals:
+    params: frozenset[str]
+    assigned: tuple[tuple[str, int, int, Node], ...]  # (name, start, end, value), this scope
+
+
+_SCOPES = ("block", "do_block", "lambda", "method", "singleton_method")
+_DEFS = ("method", "singleton_method")
+_BOUNDARIES = ("method", "singleton_method", "class", "module", "singleton_class", "program")
+
+
+def _scan(
+    code: RubyCode, src: Parsed, node: Node
+) -> tuple[list[_Use], list[str], list[tuple[str, Node | None]]]:
+    """What a statement does with the session and the callers' setters, the names of the
+    app methods it may call, and the instance variables it assigns."""
+    key = (src.file.rel, node.start_byte, node.end_byte)
+    if key not in code.scans:
+        uses: list[_Use] = []
+        names: list[str] = []
+        ivars: list[tuple[str, Node | None]] = []
+        for n in walk(node):
+            if n.type in ("assignment", "operator_assignment"):
+                left = n.child_by_field_name("left")
+                if left is not None and left.type == "instance_variable":
+                    ivars.append((src.text(left), n.child_by_field_name("right")))
+            uses += _store_uses(code, src, n) or []
+            uses += _caller_uses(src, n) or []
+            if n.type == "call":
+                receiver = n.child_by_field_name("receiver")
+                if receiver is None or receiver.type == "self":
+                    names.append(call_name(src, n))
+                a = args(n)
+                if call_name(src, n) in _SENDS and a and (name := symbol(src, a[0])):
+                    names.append(name)
+            elif n.type == "identifier" and _helper_name(src, n):
+                names.append(src.text(n))
+        code.scans[key] = (uses, names, ivars)
+    return code.scans[key]
+
+
+def _store_root(code: RubyCode, src: Parsed, n: Node) -> str | None:
+    """ "store" for the session, "jar" for the cookie jar, "*" for one reached in a way we
+    don't follow (`send(:session)`, `env["rack.session"]`), None for anything else."""
+    if n.type == "identifier" and src.text(n) in _STORE_ROOTS:
+        parent = n.parent
+        if (
+            parent is not None
+            and parent.type == "call"
+            and (parent.child_by_field_name("method") == n)
+        ):
+            return None  # the call is the mention
+        if _local_at(code, src, n) is not None:
+            return None  # a local or a parameter named `session`
+        return {"session": "store", "session_options": "options"}.get(src.text(n), "jar")
+    if n.type == "call" and call_name(src, n) in _STORE_ROOTS:
+        receiver = unwrap(n.child_by_field_name("receiver"))
+        if receiver is not None and receiver.type in ("constant", "scope_resolution"):
+            return None  # `Current.session`: a model's attribute
+        name = call_name(src, n)
+        return {"session": "store", "session_options": "options"}.get(name, "jar")
+    if n.type == "call" and call_name(src, n) in _SENDS and args(n):
+        return "*" if symbol(src, args(n)[0]) in _STORE_ROOTS else None
+    if n.type == "string_content" and "rack.session" in src.text(n):
+        return "*"
+    if n.type == "scope_resolution" and src.text(n).endswith("RACK_SESSION"):
+        return "*"  # `request.env[Rack::RACK_SESSION]`
+    if n.type == "self" and n.parent is not None and n.parent.type in ("argument_list", "pair"):
+        return "*"  # `Impersonator.call(self, …)`: the controller, session and all
+    return None
+
+
+def _store_uses(code: RubyCode, src: Parsed, n: Node) -> list[_Use] | None:
+    """What a mention of the session or the cookie jar does, climbing the expression it's
+    in: a read of a key, a write of a key and its value, or a write we can't name."""
+    root = _store_root(code, src, n)
+    if root is None:
+        return None
+    unnamed = [_Use("write", None, None)]
+    if root == "*":
+        return unnamed
+    cur = n
+    if root == "jar":
+        parent = cur.parent
+        while _receives(parent, cur) and call_name(src, parent) == "permanent":  # type: ignore[arg-type]
+            cur, parent = parent, parent.parent  # type: ignore[union-attr]
+        if _receives(parent, cur) and call_name(src, parent) in ("signed", "encrypted"):  # type: ignore[arg-type]
+            cur = parent  # type: ignore[assignment]
+        elif (
+            parent is not None
+            and parent.type == "element_reference"
+            and parent.child_by_field_name("object") == cur
+        ) or (
+            _receives(parent, cur) and call_name(src, parent) in ("delete", "[]=", "fetch", "key?")
+        ):  # type: ignore[arg-type]
+            return []  # a plain cookie: the client sets it anyway (D20 amended)
+        else:
+            return unnamed  # the jar handed on: `c = cookies`
+    keyed, keys = False, None
+    if root == "options":
+        keyed, keys = True, ("*",)  # `request.session_options[:id] = sid`: any key, any read
+    for _ in range(_MAX_DEPTH):
+        parent = cur.parent
+        if parent is None:
+            break
+        if parent.type == "element_reference" and parent.child_by_field_name("object") == cur:
+            if not keyed:
+                index = [c for c in parent.named_children if c != cur]
+                keys = _key_patterns(code, src, index[0]) if len(index) == 1 else None
+                keyed = True
+            cur = parent
+            continue
+        if _receives(parent, cur):
+            name, a = call_name(src, parent), args(parent)
+            if keyed:
+                return [_Use("read" if name in _VALUE_READS else "write", keys, None)]
+            if name == "permanent":
+                cur = parent
+                continue
+            if name == "options":
+                keyed, keys, cur = True, ("*",), parent  # `session.options[:id] = sid`
+                continue
+            if name in _STORE_KEY_READS:
+                keys = _key_patterns(code, src, a[0]) if a else None
+                if name not in ("fetch", "dig"):
+                    return [_Use("read", keys, None)]
+                keyed, cur = True, parent
+                continue
+            if name in _STORE_READS:
+                return [_Use("read", None, None)]
+            if name in _STORE_DROPS:
+                return []
+            if name in ("[]=", "store") and len(a) == 2:
+                return [_Use("write", _key_patterns(code, src, a[0]), a[1])]
+            found = pairs(src, a) if name in ("update", "merge!", "replace") else None
+            if found is not None and parent.child_by_field_name("block") is None:
+                return [_Use("write", (k,), v) for k, v in found]
+            return unnamed  # `session.tap { … }`, `session.send(:[]=, …)`
+        if parent.type in (
+            "left_assignment_list",
+            "destructured_left_assignment",
+            "rest_assignment",
+        ):
+            cur = parent
+            continue
+        if parent.type in ("assignment", "operator_assignment") and _inside(
+            cur, parent.child_by_field_name("left")
+        ):
+            if not keyed:
+                return unnamed
+            whole = parent.child_by_field_name("left") == cur
+            return [_Use("write", keys, parent.child_by_field_name("right") if whole else None)]
+        if (
+            parent.type == "binary"
+            and parent.child_by_field_name("left") == cur
+            and src.text(parent.child_by_field_name("operator")) == "<<"
+        ):
+            return [_Use("write", keys if keyed else None, None)]  # `session[:ids] << id`
+        if keyed or parent.type == "interpolation":
+            return [_Use("read", keys if keyed else None, None)]
+        return unnamed  # the store handed on: `s = session`, `Cart.new(session)`
+    return unnamed
+
+
+def _receives(parent: Node | None, node: Node) -> bool:
+    return (
+        parent is not None
+        and parent.type == "call"
+        and parent.child_by_field_name("receiver") == node
+    )
+
+
+def _key_patterns(code: RubyCode, src: Parsed, node: Node | None) -> tuple[str, ...] | None:
+    """The key a store is indexed by: `:user_id`, `"user_id"`, `"#{scope}_return_to"` as
+    `*_return_to`, or a local holding only those; None when it can't be named."""
+    node = unwrap(node)
+    if node is None:
+        return None
+    if node.type == "string" and any(c.type == "escape_sequence" for c in node.named_children):
+        return None  # `"view\x5fas"`
+    if (key := symbol(src, node)) is not None:
+        return (key,)
+    if node.type == "string" and any(c.type == "escape_sequence" for c in node.named_children):
+        return None  # `"view\x5fas"`
+    if node.type == "string":
+        parts = [
+            glob_escape(src.text(c)) if c.type == "string_content" else "*"
+            for c in node.named_children
+        ]
+        return (
+            ("".join(parts),)
+            if any(c.type == "string_content" for c in node.named_children)
+            else None
+        )
+    if node.type == "identifier" and (held := _local_at(code, src, node)) is not None:
+        values, param = held
+        found = [_key_patterns(code, src, v) for v in values]
+        if param or not found or None in found:
+            return None
+        return tuple(k for ks in found for k in ks)  # type: ignore[union-attr]
+    return None
+
+
+def _local_at(code: RubyCode, src: Parsed, node: Node) -> tuple[list[Node], bool] | None:
+    """What a bare name holds where it's read, if it's a local there: the values its
+    earlier assignments in the scopes around it give, and whether it's also a parameter
+    (whose value we don't know); None when it's no local there (a method call)."""
+    key = (src.file.rel, node.start_byte, node.end_byte)
+    if key not in code.locals_at:
+        code.locals_at[key] = _find_local(code, src, node)
+    return code.locals_at[key]
+
+
+def _find_local(code: RubyCode, src: Parsed, node: Node) -> tuple[list[Node], bool] | None:
+    name = src.text(node)
+    values: list[Node] = []
+    loops = [
+        a
+        for a in _ancestors(node)
+        if a.type
+        in ("while", "until", "for", "block", "do_block", "while_modifier", "until_modifier")
+    ]
+    scope = node.parent
+    while scope is not None:
+        if scope.type in _SCOPES or scope.type in _BOUNDARIES:
+            found = _scope_locals(code, src, scope)
+            values += [
+                v
+                for n, start, end, v in found.assigned
+                if n == name
+                and not start <= node.start_byte < end  # `key = key` reads the earlier one
+                # earlier, or later in a loop around the read (its next pass)
+                and (end <= node.start_byte or any(_inside_span(start, lp) for lp in loops))
+            ]
+            if name in found.params:
+                return values, True
+            if scope.type in _BOUNDARIES:
+                break
+        scope = scope.parent
+    return (values, False) if values else None
+
+
+def _scope_locals(code: RubyCode, src: Parsed, scope: Node) -> _Locals:
+    key = (src.file.rel, scope.start_byte, scope.end_byte)
+    if key not in code.scope_locals:
+        params = next(
+            (
+                c
+                for c in scope.named_children
+                if c.type in ("block_parameters", "method_parameters", "lambda_parameters")
+            ),
+            None,
+        )
+        names = (
+            frozenset(src.text(p) for p in walk(params) if p.type == "identifier")
+            if params
+            else frozenset()
+        )
+        assigned: list[tuple[str, int, Node]] = []
+        stack = [c for c in scope.named_children if c != params]
+        while stack:
+            n = stack.pop()
+            if n.type in _SCOPES or n.type in _BOUNDARIES:
+                continue  # its own scope
+            if n.type in ("assignment", "operator_assignment"):
+                left = n.child_by_field_name("left")
+                targets = (
+                    [left]
+                    if left is not None and left.type == "identifier"
+                    else [t for t in walk(left) if t.type == "identifier"]
+                    if left is not None and left.type == "left_assignment_list"
+                    else []
+                )
+                for t in targets:
+                    right = n.child_by_field_name("right")
+                    assigned.append((src.text(t), n.start_byte, n.end_byte, right))
+            stack += n.named_children
+        code.scope_locals[key] = _Locals(names, tuple(assigned))
+    return code.scope_locals[key]
+
+
+def _caller_uses(src: Parsed, n: Node) -> list[_Use] | None:
+    """A setter of a caller: `@current_user =`, `Current.user =`, `self.current_user =`,
+    `instance_variable_set`, a `send` of one, `warden.set_user`, `sign_in`; a `Current`
+    attribute we can't name sets any caller (`Current.session =`)."""
+    if n.type in ("assignment", "operator_assignment"):
+        left = unwrap(n.child_by_field_name("left"))
+        if left is None:
+            return None
+        targets = (
+            [t for t in left.named_children] if left.type == "left_assignment_list" else [left]
+        )
+        whole = len(targets) == 1
+        out = []
+        for t in targets:
+            groups = _caller_target(src, t)
+            if groups is not False:
+                out.append(
+                    _Use("caller", groups, n.child_by_field_name("right") if whole else None)
+                )  # type: ignore[arg-type]
+        return out
+    if n.type != "call":
+        return None
+    name, a = call_name(src, n), args(n)
+    receiver = unwrap(n.child_by_field_name("receiver"))
+    if name == "instance_variable_set" and len(a) == 2:
+        ivar = symbol(src, a[0])
+        if ivar is None:
+            return [_Use("caller", None, a[1])]
+        group = _caller_group(ivar)
+        return [_Use("caller", (group,), a[1])] if group else None
+    if name in _SENDS and a:
+        setter = symbol(src, a[0])
+        on = src.text(receiver).removeprefix("::") if receiver is not None else "self"
+        if setter is None and (on == "self" or on.startswith("Current")):
+            return [_Use("caller", None, None)]
+        if setter is not None and setter.endswith("="):
+            groups = _setter_groups(f"{on}.{setter[:-1]}")
+            if groups is not False:
+                return [_Use("caller", groups, a[1] if len(a) > 1 else None)]  # type: ignore[arg-type]
+        return None
+    if name in ("set_user", "store") and receiver is not None and "warden" in src.text(receiver):
+        return [_Use("caller", ("current_user",), a[0] if a else None)]
+    if (
+        name == "set"
+        and receiver is not None
+        and (src.text(receiver).removeprefix("::") in ("Current", "Current.instance"))
+    ):
+        found = pairs(src, a)
+        if found is None:
+            return [_Use("caller", None, None)]  # `Current.set(h)`, `Current.set(**h)`
+        uses = []
+        for key, value in found:
+            groups = _setter_groups(f"Current.{key}")
+            if groups is not False:
+                uses.append(_Use("caller", groups, value))  # type: ignore[arg-type]
+        return uses
+    if receiver is None and _SIGN_IN_CALLS.match(name):
+        return [_Use("caller", ("current_user",), n.child_by_field_name("arguments"), gem=True)]
+    return None
+
+
+def _caller_target(src: Parsed, target: Node) -> tuple[str, ...] | bool | None:
+    """The callers an assignment target sets: a tuple of groups, None for any, False for
+    none (a local, another object's attribute)."""
+    target = unwrap(target) or target
+    if target.type == "instance_variable":
+        group = _caller_group(src.text(target))
+        return (group,) if group else False
+    if target.type == "call":
+        return _setter_groups(chain_text(src, target))
+    if target.type == "element_reference":
+        obj = src.text(target.child_by_field_name("object")).removeprefix("::")
+        index = [c for c in target.named_children if c != target.child_by_field_name("object")]
+        if obj.startswith("Current"):
+            key = symbol(src, index[0]) if len(index) == 1 else None
+            return _setter_groups(f"Current.{key}") if key else None
+    return False
+
+
+def _setter_groups(chain: str) -> tuple[str, ...] | bool | None:
+    chain = chain.removeprefix("::")
+    if not chain:
+        return False
+    if (group := _caller_group(chain)) is not None:
+        return (group,)
+    head, _, rest = chain.partition(".")
+    if head != "Current" or not rest:
+        return False
+    attr = rest.removeprefix("instance.").removeprefix("attributes.")
+    if (group := _caller_group(f"Current.{attr}")) is not None:
+        return (group,)
+    return False if attr in _CURRENT_PLAIN else None
+
+
+def _constant_only(src: Parsed, node: Node) -> bool:
+    """Built from literals, time and randomness alone (`30.minutes.from_now`,
+    `SecureRandom.hex`): no local, parameter, variable, request, bare call, or a store
+    another class keeps (`Thread.current[:uid]`, `Rails.cache.read`, `Current.x`)."""
+    for n in walk(node):
+        if n.type in (
+            "instance_variable",
+            "class_variable",
+            "global_variable",
+            "self",
+            "element_reference",
+        ):
+            return False
+        if (
+            n.type in ("constant", "scope_resolution")
+            and src.text(n) not in _PURE_CONSTANTS
+            and (n.parent is None or n.parent.type != "scope_resolution")
+        ):
+            return False  # `Thread.current`, `Rails.cache`, `Current`: state kept elsewhere
+        if n.type == "identifier":
+            parent = n.parent
+            if not (
+                parent is not None
+                and parent.type == "call"
+                and parent.child_by_field_name("method") == n
+                and parent.child_by_field_name("receiver") is not None
+            ):
+                return False
+        if n.type == "call" and n.child_by_field_name("receiver") is None:
+            return False
+    return True
+
+
+def _ancestors(node: Node) -> Iterator[Node]:
+    parent = node.parent
+    while parent is not None:
+        yield parent
+        parent = parent.parent
+
+
+def _inside_span(at: int, outer: Node) -> bool:
+    return outer.start_byte <= at < outer.end_byte
+
+
+def _inside(node: Node, outer: Node | None) -> bool:
+    return outer is not None and outer.start_byte <= node.start_byte < outer.end_byte
 
 
 def _is_literal(node: Node | None) -> bool:

@@ -5,6 +5,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from traust_core.v1.providers import ruby_routes
 from traust_core.v1.providers.route_guards import route_guards
 from traust_core.v1.providers.tree import tree_files
@@ -402,3 +404,58 @@ def test_a_singular_resources_collection_route_keeps_its_parent_id(tmp_path):
         "    end\n  end\nend\n",
     )
     assert ("GET", "/posts/:post_id/comment/preview") in _patterns(_enum(tmp_path), "rails")
+
+
+def test_a_namespaces_path_option_renames_or_drops_its_segment(tmp_path):
+    _write(
+        tmp_path,
+        "config/routes.rb",
+        "Rails.application.routes.draw do\n"
+        "  namespace :api, path: nil do\n    resources :posts, only: [:show]\n  end\n"
+        "  namespace :v1, path: 'version-1' do\n    resources :tags, only: [:show]\n  end\n"
+        "  namespace :v2, path: '' do\n    resources :users, only: [:show]\n  end\nend\n",
+    )
+    result = _enum(tmp_path)
+    assert _route(result, "GET", "/posts/:id")["handler"]["expr"] == "api/posts#show"
+    assert _route(result, "GET", "/version-1/tags/:id")["handler"]["expr"] == "v1/tags#show"
+    assert _route(result, "GET", "/users/:id")["handler"]["expr"] == "v2/users#show"
+
+
+@pytest.mark.parametrize(
+    ("lock", "routes", "controller"),
+    [
+        # Rails 8.0 merges `module: nil` over the default; 8.1 defaults it to the name again
+        ("8.0.3", "namespace :admin, module: nil do", "notes#show"),
+        ("8.0.3", "namespace :admin, module: false do", "notes#show"),
+        ("8.1.1", "namespace :admin, module: nil do", "admin/notes#show"),
+        (None, "namespace :admin, module: nil do", "<unresolved>/notes#show"),
+        (
+            "8.0.3",
+            "namespace :a do\n  namespace :admin, module: nil do",
+            "a/<unresolved>/notes#show",
+        ),
+        (None, "namespace :admin, module: MODULE do", "<unresolved>/notes#show"),
+    ],
+)
+def test_a_namespace_without_its_module_follows_the_apps_rails(tmp_path, lock, routes, controller):
+    ends = "  end\n" * routes.count(" do")
+    _write(
+        tmp_path,
+        "config/routes.rb",
+        f"Rails.application.routes.draw do\n{routes}\n"
+        f"  resources :notes, only: [:show]\n{ends}end\n",
+    )
+    if lock:
+        _write(tmp_path, "Gemfile.lock", f"GEM\n  specs:\n    actionpack ({lock})\n")
+    pattern = "/a/admin/notes/:id" if routes.startswith("namespace :a ") else "/admin/notes/:id"
+    assert _route(_enum(tmp_path), "GET", pattern)["handler"]["expr"] == controller
+
+
+def test_a_namespace_with_an_empty_module_routes_to_the_top_level(tmp_path):
+    _write(
+        tmp_path,
+        "config/routes.rb",
+        "Rails.application.routes.draw do\n"
+        "  namespace :api, module: '' do\n    resources :posts, only: [:show]\n  end\nend\n",
+    )
+    assert _route(_enum(tmp_path), "GET", "/api/posts/:id")["handler"]["expr"] == "posts#show"
