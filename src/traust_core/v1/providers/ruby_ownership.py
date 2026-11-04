@@ -4,6 +4,7 @@ counts only from allow-listed shapes (D8, D15-D18)."""
 
 from __future__ import annotations
 
+import dataclasses
 import itertools
 import re
 from collections.abc import Callable, Iterator
@@ -119,9 +120,9 @@ _REQUEST_VALUE = re.compile(
 _WARDEN = re.compile(r"""request\.env\[\s*["']warden["']\s*\]""")  # Devise's session
 # calls that verify a request-supplied secret (`JWT.decode(t, key)`, `find_by(token: t)`)
 _VERIFYING = re.compile(
-    r"(?i)^(decode|verify\w*|authenticate\w*|valid\w*|secure_compare|find_by_token\w*|"
-    r"digest)$"
+    r"(?i)^(verify\w*|authenticate\w*|valid\w*|secure_compare|find_by_token\w*|digest)$"
 )
+_MAX_CLIMB = 64  # levels a request value is followed up its expression
 _TOKEN_KEY = re.compile(r"(?i)token|api_key|digest|secret|jti")
 _PARAMS = {"params", "request.path_parameters", "request.params", "request.parameters"}
 # a `render` naming a view (`render :show`, `template:`) may print the record
@@ -280,10 +281,12 @@ class RubyCode:
         self.table_roots: dict[str, set[str]] = {}
         self.models: dict[str, _Model] = {}
         self.by_root: dict[tuple[str, str], _Model] = {}  # (model, app) -> its definition
+        self.model_texts: dict[tuple[str, str], list[str]] = {}  # its source, to compare apps
+        self.ambiguous: set[str] = set()  # models several apps define differently
         self.columns: dict[str, list[str]] = {}  # table -> columns
         self.columns_by_root: dict[tuple[str, str], list[str]] = {}
         # `Admin::NotePolicy` -> its class; never keyed by the bare name several may share
-        self.policies: dict[str, tuple[Parsed, Node]] = {}
+        self.policies: dict[str, list[tuple[Parsed, Node]]] = {}
         self.modules: dict[str, list[tuple[Parsed, Node]]] = {}  # module name -> definitions
         self.ability: tuple[Parsed, Node] | None = None
         self.abilities: dict[str, list[tuple[Parsed, Node]]] = {}  # `Ability`, `Admin::Ability`
@@ -302,7 +305,18 @@ class RubyCode:
         top = self.abilities.get("Ability", [])
         reopened = any(
             n.type == "call"
-            and call_name(src, n) in ("class_eval", "class_exec", "prepend", "include")
+            and call_name(src, n)
+            in (
+                "class_eval",
+                "class_exec",
+                "module_eval",
+                "instance_eval",
+                "prepend",
+                "include",
+                "send",
+                "public_send",
+                "__send__",
+            )
             and src.text(n.child_by_field_name("receiver")).removeprefix("::") == "Ability"
             for rel, src in sources.items()
             if not test_file(rel, self.roots)
@@ -313,11 +327,16 @@ class RubyCode:
         # a model (or table) several apps define alike is one; defined differently, unread
         for (name, _root), model in self.by_root.items():
             self.models.setdefault(name, model)
-            if _signature(model) != _signature(self.models[name]):
+            if self.model_texts.get((name, _root)) != self.model_texts.get(
+                (name, next(r for (m, r) in self.by_root if m == name))
+            ):
                 self.model_roots[name] |= {"<differs>"}
         for name, roots in self.model_roots.items():
             if "<differs>" not in roots:
                 self.model_roots[name] = {next(iter(roots))}
+            else:  # several apps define it differently: nothing about it is read
+                self.models[name] = _Model(name, linked=True)
+                self.ambiguous.add(name)
         for (table, _root), columns in self.columns_by_root.items():
             first = self.columns.setdefault(table, columns)
             if sorted(first) != sorted(columns):
@@ -351,10 +370,19 @@ class RubyCode:
             if name.endswith("Policy") or base.endswith("Policy") or name == "Scope":
                 if name.endswith("Policy"):
                     written = src.text(n.child_by_field_name("name")).removeprefix("::")
-                    self.policies["::".join([*_lexical(src, n), written])] = (src, n)
+                    key = (
+                        written
+                        if written.startswith("::")
+                        else "::".join([*_lexical(src, n), written])
+                    )
+                    self.policies.setdefault(key.removeprefix("::"), []).append((src, n))
             elif name == "Ability":
-                written = src.text(n.child_by_field_name("name")).removeprefix("::")
-                key = "::".join([*_lexical(src, n), written])
+                written = src.text(n.child_by_field_name("name"))
+                key = (
+                    written[2:]
+                    if written.startswith("::")
+                    else "::".join([*_lexical(src, n), written])
+                )
                 self.abilities.setdefault(key, []).append((src, n))
             elif "/app/" in f"/{rel}" and (
                 base in ("ApplicationRecord", "ActiveRecord::Base") or "/app/models/" in f"/{rel}"
@@ -367,6 +395,11 @@ class RubyCode:
                     continue
                 root = root_of(rel, self.roots)
                 model = self.by_root.setdefault((name, root), _Model(name))
+                # its full name and source: `Billing::Note` is never `Note`, however alike
+                qualified = "::".join([*_lexical(src, n), src.text(n.child_by_field_name("name"))])
+                self.model_texts.setdefault((name, root), []).append(
+                    f"{qualified} {' '.join(src.text(n).split())}"
+                )
                 self.model_roots.setdefault(name, set()).add(root)
                 model.qualified.add(
                     "::".join([*_lexical(src, n), src.text(n.child_by_field_name("name"))])
@@ -630,19 +663,25 @@ class RubyCode:
         return (policy or self.default_policy(model)).removeprefix("::")
 
     def policy(
-        self, name: str, lexical: tuple[str, ...] = (), exact: bool = False
+        self, name: str, scopes: tuple[str, ...] = (), exact: bool = False
     ) -> tuple[Parsed, Node] | None:
-        """A policy class by the name it's written as, in its lexical scope first; a short
-        name several policies share (`NotePolicy`, `Admin::NotePolicy`) is unread unless one
-        is that exact name. `exact`: Pundit's own `<Model>Policy` lookup, the name alone."""
+        """A policy class by the name it's written as, resolved in Ruby's constant scopes
+        (`_scopes`) then at the top; a short name several policies share is unread unless one
+        is that exact name; a policy several apps define differently is unread. `exact`:
+        Pundit's own `<Model>Policy` lookup, the name alone."""
         name = name.removeprefix("::")
-        for k in range(len(lexical), -1, -1):
-            if (q := "::".join([*lexical[:k], name])) in self.policies:
-                return self.policies[q]
+        for q in [*(f"{s}::{name}" for s in scopes if s), name]:
+            if q in self.policies:
+                return self._one(self.policies[q])
         if exact:
             return None
-        found = [v for q, v in self.policies.items() if q == name or q.endswith(f"::{name}")]
-        return found[0] if len(found) == 1 else None
+        found = [q for q in self.policies if q == name or q.endswith(f"::{name}")]
+        return self._one(self.policies[found[0]]) if len(found) == 1 else None
+
+    def _one(self, defs: list[tuple[Parsed, Node]]) -> tuple[Parsed, Node] | None:
+        """A class defined once, or alike wherever it's defined; else unread."""
+        texts = {" ".join(src.text(n).split()) for src, n in defs}
+        return defs[0] if len(texts) == 1 else None
 
     def policy_method(
         self,
@@ -653,6 +692,8 @@ class RubyCode:
     ) -> tuple[Parsed, Node] | None:
         """`NotePolicy#destroy?` (through aliases, included modules and policy inheritance);
         None when it can't be read. `lexical`: where a `policy_class:` is written."""
+        if model in self.ambiguous and policy is None:
+            return None  # which app's model, and so which policy, isn't read
         name = self.policy_name(model, policy)
         # Pundit's own lookup by the model's name; a `policy_class:` resolves where written
         default = policy is None and name == self.default_policy(model)
@@ -666,7 +707,7 @@ class RubyCode:
             defined: dict[str, Node | str] = {}
             includes: list[str] = []
             for m in statements(cls.child_by_field_name("body")):
-                if m.type == "call" and call_name(src, m) == "include":
+                if m.type == "call" and call_name(src, m) in ("include", "prepend", "extend"):
                     includes += [src.text(a).removeprefix("::") for a in reversed(args(m))]
                 if m.type == "method":
                     defined[src.text(m.child_by_field_name("name"))] = m
@@ -680,24 +721,21 @@ class RubyCode:
                     )
                 if pair is not None and pair[0] and pair[1]:
                     defined[pair[0]] = defined.get(pair[1], pair[1])
+            if includes:
+                # its modules aren't read: an included one's `included do`, or a prepended one,
+                # may define the method ahead of the class's own
+                return None
             last = defined.get(query)
             if isinstance(last, str):
-                query = last  # an inherited method's name: read in its modules and parent
+                query = last  # an inherited method's name: read in its parent
             elif last is not None:
                 return src, last
-            # its modules, the last included first (`include Permissive` beats the parent)
-            for name in reversed(includes):
-                defs = self.module_defs(name)
-                if not isinstance(defs, list):
-                    return None  # a module we can't read (a gem's, an ambiguous one)
-                for msrc, module in defs:
-                    if query in (ms := self.module_methods(msrc, module)):
-                        return msrc, ms[query]
             sup = cls.child_by_field_name("superclass")
             parent = (
                 src.text(sup.named_children[0]) if sup is not None and sup.named_children else ""
             )
-            found = self.policy(parent, tuple(_lexical(src, cls))) if parent else None
+            # a superclass resolves in the scopes around the class, not the class itself
+            found = self.policy(parent, tuple(_scopes(src, cls)[1:])) if parent else None
         return None
 
     def policy_scope(self, model: str, scope: str | None = None) -> tuple[Parsed, Node] | None:
@@ -732,6 +770,25 @@ def app_roots(rels: list[str]) -> list[str]:
 def root_of(rel: str, roots: list[str]) -> str:
     """The app a file belongs to: the longest app root it lies under."""
     return next((r for r in roots if rel.startswith(r)), "")
+
+
+def _scopes(src: Parsed, node: Node) -> list[str]:
+    """Ruby's constant scopes at a node, innermost first: each class or module around it (or
+    it, if it is one), by the name it's written as. `module Admin; class NotesController`
+    opens `Admin::NotesController` then `Admin`; a compact `class Admin::NotesController`
+    opens only `Admin::NotesController`."""
+    written: list[str] = []
+    current: Node | None = node
+    while current is not None:
+        if current.type in ("class", "module") and current.is_named:
+            written.append(src.text(current.child_by_field_name("name")))
+        current = current.parent
+    out: list[str] = []
+    outer = ""
+    for name in reversed(written):  # outermost first
+        outer = name[2:] if name.startswith("::") else (f"{outer}::{name}" if outer else name)
+        out.append(outer)
+    return out[::-1]
 
 
 def test_file(rel: str, roots: list[str]) -> bool:
@@ -981,6 +1038,8 @@ class _Action:
         self.literals = {name for name, ok in literal.items() if ok}
         self.guarded = guarded
         self.taint: dict[tuple[str, int, int], bool] = {}
+        self.request_uses: dict[tuple[str, int, int], str | None] = {}
+        self.unread_caller = False
         self.credentials: dict[tuple[str, int, int, int], bool] = {}
         self.caller_ivars = self._caller_ivars()
         # what each caller ivar stands for: the user, or the caller's tenant (`@account =
@@ -1062,6 +1121,26 @@ class _Action:
             node = receiver
         return False
 
+    def _request_use(self, src: Parsed, node: Node, depth: int = 0) -> str | None:
+        """`_request_use`, through the locals an expression reads (`uid = request.headers[…];
+        User.find_by(id: uid)`)."""
+        key = (src.file.rel, node.start_byte, node.end_byte)
+        if key in self.request_uses:
+            return self.request_uses[key]
+        self.request_uses[key] = None
+        found = _request_use(src, node)
+        if found != "identity" and depth < 3:
+            for n in walk(node):
+                if n.type == "identifier" and src.text(n) in self.local_values:
+                    for s, v in self.local_values[src.text(n)]:
+                        inner = self._request_use(s, v, depth + 1) if v is not None else None
+                        if inner == "identity":
+                            found = "identity"
+                        elif inner == "unread" and found is None:
+                            found = "unread"
+        self.request_uses[key] = found
+        return found
+
     def _requested(self, src: Parsed, node: Node) -> bool:
         """A value the request picks: its parameters, headers or environment."""
         return self._untrusted(src, node) or bool(_REQUEST_VALUE.search(code_text(src, node)))
@@ -1070,8 +1149,14 @@ class _Action:
         """From the session, a cookie, a verified token or the caller (D17, D20); an app
         helper counts by what it returns, never by its name (`decoded_token`); a request
         header naming the user is no credential, whatever else the expression reads."""
-        if node is None or self._untrusted(src, node) or _request_identity(src, node):
+        if node is None or self._untrusted(src, node):
             return False
+        use = self._request_use(src, node)
+        if use == "identity":
+            return False
+        if use == "unread":
+            self.unread_caller = True  # the caller comes from code we don't read: unknown
+            return True
         if _WARDEN.search(src.text(node)):
             return True
         key = (src.file.rel, node.start_byte, node.end_byte, len(ivars))
@@ -1173,7 +1258,11 @@ class _Action:
         for name in _CALLERS:
             found = self.methods(name)
             if found is not None and any(
-                self._requested(s.src, s.node) and not self._credential(s.src, s.node, set())
+                self._request_use(s.src, s.node) == "identity"
+                or (
+                    (self._requested(s.src, s.node) and not self._credential(s.src, s.node, set()))
+                    and self._request_use(s.src, s.node) != "unread"
+                )
                 for s in _reachable(
                     [_Step(found[0], b, Kind.CALLBACK) for b in method_body(found[1])],
                     self.methods,
@@ -1590,9 +1679,15 @@ class _Action:
 
     # -- the walk
     def facts(self, guarded: bool) -> HandlerFacts:
-        """The ownership facts; `guarded`: an authenticating callback runs first (D17)."""
+        """The ownership facts; `guarded`: an authenticating callback runs first (D17). A
+        caller built by code we can't read (a gem's token decoder) makes the result unknown,
+        never protected."""
         self.guarded = guarded
-        return self.run()
+        found = self.run()
+        if self.unread_caller and found.handoff is None and self.steps:
+            span = self.span(self.steps[0].src, self.steps[0].node)
+            found = dataclasses.replace(found, handoff=span)
+        return found
 
     def run(self) -> HandlerFacts:
         if self.cancan[0] and self.model is not None and self.path_ids:
@@ -2178,7 +2273,7 @@ class _Action:
             return
         query = symbol(src, a[1]) if len(a) > 1 else f"{self.action}?"
         policy = src.text(options["policy_class"]) if "policy_class" in options else None
-        written_in = tuple(_lexical(src, call))
+        written_in = tuple(_scopes(src, call))
         if "current_user" in self.forged and not (
             not cancan and self.methods("pundit_user") is not None
         ):
@@ -2398,10 +2493,22 @@ def _writes(src: Parsed, node: Node | None) -> bool:
     )
 
 
-def _request_identity(src: Parsed, node: Node) -> bool:
-    """A request header or env value used as who the caller is (`User.find(request.headers[
-    "X-User-Id"] || session[:id])`), not as a secret a lookup verifies (`find_by(token:
-    request.headers["X-Token"])`, `JWT.decode(request.authorization, key)`)."""
+def _verifies(src: Parsed, call: Node) -> bool:
+    """A call that checks a request-supplied secret: `verify…`/`authenticate…`, or a decode
+    given a key (`JWT.decode(t, key)`, never `JSON.decode(t)` or `JWT.decode(t, nil, false)`)."""
+    name = call_name(src, call)
+    if _VERIFYING.match(name):
+        return True
+    a = args(call)
+    return name == "decode" and len(a) >= 2 and a[1].type not in ("nil", "false")
+
+
+def _request_use(src: Parsed, node: Node, code: RubyCode | None = None) -> str | None:
+    """How an expression uses a request header or env value: "identity" when it names the
+    caller (`User.find(request.headers["X-User-Id"] || session[:id])`), "unread" when it
+    passes through code we don't read (`TokenDecoder.new.call(…)`, an app's
+    `decode_token`), None when only a verification reads it (`find_by(token: …)`)."""
+    found: str | None = None
     for n in walk(node):
         if n.type not in ("call", "element_reference") or not _REQUEST_VALUE.search(src.text(n)):
             continue
@@ -2410,18 +2517,33 @@ def _request_identity(src: Parsed, node: Node) -> bool:
         outer = n.parent if n.parent is not None else n
         if _WARDEN.search(src.text(n)) or _WARDEN.search(src.text(outer)):
             continue  # `request.env["warden"]`: Devise's session
-        child, parent, verified = n, n.parent, False
-        while parent is not None and child != node:
+        child, parent, use = n, n.parent, "identity"
+        for _ in range(_MAX_CLIMB):
+            if parent is None or child == node:
+                break
             if parent.type == "pair" and _TOKEN_KEY.search(
                 src.text(parent.child_by_field_name("key"))
             ):
-                verified = True
-            if parent.type == "call" and _VERIFYING.match(call_name(src, parent)):
-                verified = True
+                use = ""
+                break
+            if parent.type == "call" and child != parent.child_by_field_name("receiver"):
+                if _verifies(src, parent):
+                    use = ""
+                    break
+                name = call_name(src, parent)
+                if not _finder(name) and name not in _PASS_THROUGH:
+                    use = "unread"  # a call we don't read decides what it yields
+                    break
             child, parent = parent, parent.parent
-        if not verified:
-            return True
-    return False
+        if use == "identity":
+            return "identity"
+        if use == "unread":
+            found = "unread"
+    return found
+
+
+# calls a value passes through unchanged for identity purposes
+_PASS_THROUGH = {"to_i", "to_s", "presence", "strip", "downcase", "split", "first", "last", "[]"}
 
 
 def _finder(name: str) -> bool:
@@ -2803,6 +2925,12 @@ def _ability(code: RubyCode, action: str, model: str) -> bool | None:
     sup = cls.child_by_field_name("superclass")
     if sup is not None or any(n.type in ("super", "zsuper") for n in walk(cls)):
         return None  # `class Ability < BaseAbility`, `super`: rules a parent adds (ORed in)
+    if any(
+        n.type == "call"
+        and call_name(src, n) in ("send", "public_send", "__send__", "instance_eval")
+        for n in walk(cls)
+    ):
+        return None  # `send(:can, :manage, Note)`: rules we don't read
     if any(n.type == "call" and call_name(src, n) == "merge" for n in walk(cls)) or any(
         s.type == "call"
         and call_name(src, s) == "include"
