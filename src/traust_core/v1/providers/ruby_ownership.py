@@ -2648,6 +2648,9 @@ def _ability(code: RubyCode, action: str, model: str) -> bool | None:
     if code.ability is None:
         return None
     src, cls = code.ability
+    sup = cls.child_by_field_name("superclass")
+    if sup is not None or any(n.type in ("super", "zsuper") for n in walk(cls)):
+        return None  # `class Ability < BaseAbility`, `super`: rules a parent adds (ORed in)
     if any(n.type == "call" and call_name(src, n) == "merge" for n in walk(cls)) or any(
         s.type == "call"
         and call_name(src, s) == "include"
@@ -2757,6 +2760,7 @@ def admin_gate(src: Parsed, method: Node) -> bool:
         and unwrap(body[0].child_by_field_name("body")).type == "return"  # type: ignore[union-attr]
         and _user_flag(src, body[0].child_by_field_name("condition"))
         and (_halts(src, body[1]) or _raises(src, body[1]))
+        and not _sends(src, body[1])
     ):
         return True  # `return if current_user.admin?`, then `head :forbidden`
     if not body:
@@ -2774,6 +2778,7 @@ def admin_gate(src: Parsed, method: Node) -> bool:
         not stmts
         or not all(_raises(src, s) or _halts(src, s) or s.type == "return" for s in stmts)
         or not any(_raises(src, s) or _halts(src, s) for s in stmts)
+        or any(_sends(src, s) for s in stmts)  # `render json: @note unless current_user.admin?`
     ):
         return False
 
@@ -2791,6 +2796,22 @@ def admin_gate(src: Parsed, method: Node) -> bool:
     refuse = first.type in ("if_modifier", "if")
     cond = first.child_by_field_name("condition")
     return "admin" in _atoms(src, cond, atom) and holds(src, cond, atom, {"admin": False}, refuse)
+
+
+def _sends(src: Parsed, node: Node) -> bool:
+    """A response that may carry the record: a `render` of a value or a view, a redirect
+    carrying it, a `head` with a valued header (the checks D19 applies to a refusal)."""
+    for n in walk(node):
+        if n.type != "call" or n.child_by_field_name("receiver") is not None:
+            continue
+        name = call_name(src, n)
+        if name == "render" and _render_leaks(src, n, set()):
+            return True
+        if name in ("redirect_to", "redirect_back") and _redirect_leaks(src, n, set()):
+            return True
+        if name == "head" and any(not _is_literal(x) for x in args(n)[1:]):
+            return True
+    return False
 
 
 def _user_flag(src: Parsed, node: Node | None) -> bool:

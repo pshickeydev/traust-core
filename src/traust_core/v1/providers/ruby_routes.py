@@ -891,12 +891,20 @@ def _rails_guards(
     guarding = [
         cb
         for cb in callbacks
-        if not cb.after and not cb.around and (_is_guard(cb.name) or cb.name in _GUARD_CALLBACKS)
+        if not cb.after
+        and not cb.around
+        and cb.body
+        is None  # a block's synthetic name (`<block:admin_controller.rb:3>`) names no guard
+        and (_is_guard(cb.name) or cb.name in _GUARD_CALLBACKS)
     ]
     guard = [cb.name for cb in guarding if not cb.skipped]
     # a skip that may take a guard out (`skip_before_action :x, if: :public?`) is an unguard
     removed += [cb.name for cb in guarding if cb.skipped]
-    skipped = [f"{SKIPPED}:{n}" for n in removed if _is_guard(n) or n in _GUARD_CALLBACKS]
+    skipped = [
+        f"{SKIPPED}:{n}"
+        for n in removed
+        if not n.startswith("<") and (_is_guard(n) or n in _GUARD_CALLBACKS)
+    ]
     return _unique(guard), _unique(skipped)
 
 

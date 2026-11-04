@@ -1067,3 +1067,58 @@ def test_another_apps_model_never_lends_an_association(tmp_path: Path) -> None:
     }
     row = _row(_tree(tmp_path, files), "DELETE", "/notes/:id")
     assert row["ownership"] != "scoped"
+
+
+def test_a_block_callback_in_an_admin_named_file_is_no_admin_gate(tmp_path: Path) -> None:
+    files = {
+        **_notes_app("class NotesController; end\n"),
+        "config/routes.rb": (
+            "Rails.application.routes.draw do\n"
+            "  resources :notes, only: [:destroy], controller: 'admin'\nend\n"
+        ),
+        "app/controllers/admin_controller.rb": (
+            "class AdminController < ApplicationController\n"
+            "  before_action { @started = Time.current }\n\n"
+            "  def destroy\n    Note.find(params[:id]).destroy\n  end\nend\n"
+        ),
+    }
+    assert _row(_tree(tmp_path, files), "DELETE", "/notes/:id")["ownership"] == "caller-blind"
+
+
+def test_an_ability_whose_parent_adds_rules_is_unread(tmp_path: Path) -> None:
+    files = _notes_app(
+        "class NotesController < ApplicationController\n  load_and_authorize_resource\n\n"
+        "  def destroy\n    @note.destroy\n  end\nend\n",
+        {
+            "app/models/base_ability.rb": (
+                "class BaseAbility\n  include CanCan::Ability\n"
+                "  def initialize(user)\n    can :manage, Note\n  end\nend\n"
+            ),
+            "app/models/ability.rb": (
+                "class Ability < BaseAbility\n  include CanCan::Ability\n"
+                "  def initialize(user)\n    super\n"
+                "    can :destroy, Note, user_id: user.id\n  end\nend\n"
+            ),
+        },
+    )
+    assert _row(_tree(tmp_path, files), "DELETE", "/notes/:id")["ownership"] == "unknown"
+
+
+@pytest.mark.parametrize(
+    "refusal",
+    [
+        "render json: @note unless current_user.admin?",
+        "render :show unless current_user.admin?",
+        "redirect_to notes_path, alert: @note.body unless current_user.admin?",
+    ],
+)
+def test_an_admin_gate_that_sends_the_record_is_none(tmp_path: Path, refusal: str) -> None:
+    controller = (
+        "class NotesController < ApplicationController\n"
+        "  before_action :set_note\n  before_action :require_admin\n\n"
+        "  def destroy\n    @note.destroy\n  end\n\n  private\n\n"
+        "  def set_note\n    @note = Note.find(params[:id])\n  end\n\n"
+        f"  def require_admin\n    {refusal}\n  end\nend\n"
+    )
+    row = _row(_tree(tmp_path, _notes_app(controller)), "DELETE", "/notes/:id")
+    assert row["ownership"] not in ("n/a", "checked", "scoped", "none")
