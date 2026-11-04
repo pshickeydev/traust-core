@@ -534,7 +534,16 @@ def test_requirements_names_reads_constraints_and_skips_options(tmp_path: Path) 
     )
     (tmp_path / "requirements-dev.txt").write_text("pytest>=8\n")
     (tmp_path / "base-requirements.txt").write_text("urllib3>=2\n")
-    assert sorted(requirements_names(tmp_path)) == ["flask", "pytest", "requests", "urllib3"]
+    nested = tmp_path / "services" / "api"
+    nested.mkdir(parents=True)
+    (nested / "base-requirements.txt").write_text("jinja2>=3\n")
+    assert sorted(requirements_names(tmp_path)) == [
+        "flask",
+        "jinja2",
+        "pytest",
+        "requests",
+        "urllib3",
+    ]
 
 
 def test_go_direct_requires_skips_indirect_and_walks_workspaces(tmp_path: Path) -> None:

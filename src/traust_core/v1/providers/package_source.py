@@ -427,10 +427,20 @@ def go_direct_requires(root: Path) -> list[tuple[str, Version]]:
         if "go.mod" not in names:
             continue
         text = (Path(top) / "go.mod").read_text(errors="replace")
-        for line in text.splitlines():
+        # Only require directives: a replace, exclude or retract block names modules and
+        # versions too, and none of them declares a direct dependency.
+        entries: list[str] = []
+        for block in re.findall(r"(?ms)^require\s*\((.*?)^\)", text):
+            entries += block.splitlines()
+        entries += [
+            f"{m.group(1)} {m.group(2)}"
+            for line in text.splitlines()
+            if (m := re.match(r"(?m)^\s*require\s+(\S+)\s+(v\S+)", line))
+        ]
+        for line in entries:
             if "// indirect" in line:
                 continue
-            if match := re.match(r"(?m)^\s*(?:require\s+)?(\S+)\s+(v\S+)", line):
+            if match := re.match(r"(?m)^\s*(\S+)\s+(v\S+)", line):
                 found.append((match.group(1), Version(match.group(2).removeprefix("v"))))
     return found
 
@@ -471,7 +481,7 @@ def requirements_names(root: Path) -> list[str]:
     PEP 508 lines): a requirements file holds direct dependencies only, constraints
     unresolved."""
     names: list[str] = []
-    files = {*root.glob("requirements*.txt"), *root.glob("*requirements.txt")}
+    files = {*root.rglob("requirements*.txt"), *root.rglob("*requirements.txt")}
     for path in sorted(files):
         for line in path.read_text(errors="replace").splitlines():
             spec = re.split(r"[<>=!~;\[\s]", line.strip(), maxsplit=1)[0]
