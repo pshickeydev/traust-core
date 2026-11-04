@@ -130,6 +130,7 @@ from traust_core.v1.providers.feeds import (
     rh_cve_records,
     validate_payload,
 )
+from traust_core.v1.providers.package_source import go_requires
 from traust_core.v1.providers.sources import CheckoutRequest, SourceError, SourceProvider
 from traust_core.v1.providers.syft import MANIFESTS, unresolved_manifests
 from traust_core.v1.providers.tools import ToolProvider, ToolRequest
@@ -306,11 +307,13 @@ class ExposureService:
             uow.commit()
         return self.feed_status(feed)
 
-    def ingest_sbom(self, raw: bytes, repository_ref_id: UUID) -> Sbom:
+    def ingest_sbom(self, raw: bytes, repository_ref_id: UUID, *, direct_golang=None) -> Sbom:
         """A commit's manifest SBOM (CycloneDX / SPDX JSON from standard tools). The same package
-        list again, in either format, is the same SBOM; only its first document is kept."""
+        list again, in either format, is the same SBOM; only its first document is kept.
+        `direct_golang`: go.mod requires (module, version), the direct set syft's graph
+        omits for Go."""
         portfolio = self._require_portfolio()
-        contents = parse_sbom(raw)
+        contents = parse_sbom(raw, direct_golang)
         with self._uow as uow:
             sbom = uow.sboms.find_by_digest(contents.digest) or self._add_sbom(uow, raw, contents)
             uow.commit()
@@ -436,7 +439,13 @@ class ExposureService:
                     reuse=False,
                 )
                 uow.commit()
-        sbom = self.ingest_sbom(scanned.data, repository_ref_id)
+        # syft's manifest scan emits no golang dependency edges (verified against a
+        # go.mod-only tree: an empty dependencies graph), so every Go package would key
+        # indirect. The go.mod the archive keeps is the direct truth: its require block.
+        sbom = self.ingest_sbom(
+            scanned.data, repository_ref_id, direct_golang=frozenset(go_requires(checkout))
+        )
+
         return DependencyIngest(
             repository_ref_id=repository_ref_id,
             sbom=sbom,

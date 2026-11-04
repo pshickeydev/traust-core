@@ -562,3 +562,40 @@ def test_a_query_that_cant_be_answered_raises(
 ) -> None:
     with pytest.raises(error, match=match):
         service(engine, lookup).package_advisories(ecosystem, "lodash", Version("4.17.20"))
+
+
+def test_a_gomods_requires_mark_go_dependencies_direct(engine: Engine, tmp_path: Path) -> None:
+    """syft's manifest scan emits no golang dependency edges, so the ingest door passes the
+    go.mod require block as the direct set; without it every Go package keys indirect."""
+    with SqlTraustUnitOfWork(engine) as uow:
+        ref = Seed(uow).repository_ref()
+        uow.commit()
+    assert ref.id is not None
+    (tmp_path / "go.mod").write_text(
+        "module github.com/example/widget\n\n"
+        "go 1.22\n\n"
+        "require (\n"
+        "\tgithub.com/google/uuid v1.6.0\n"
+        ")\n"
+    )
+    raw = json.dumps(
+        {
+            "bomFormat": "CycloneDX",
+            "specVersion": "1.6",
+            "components": [
+                {"bom-ref": "u", "purl": "pkg:golang/github.com/google/uuid@v1.6.0"},
+                {"bom-ref": "t", "purl": "pkg:golang/github.com/transitive/dep@v0.1.0"},
+            ],
+            "dependencies": [],
+        }
+    ).encode()
+    exposure = service(engine, tool=FakeSbomTool(raw=raw))
+    exposure.ingest_dependencies(ref.id, tmp_path)
+    rows_ = {
+        (d.package.name, d.dependency.version, d.dependency.direct)
+        for d in exposure.dependencies(ref.id)
+    }
+    assert rows_ == {
+        ("github.com/google/uuid", "v1.6.0", True),
+        ("github.com/transitive/dep", "v0.1.0", False),
+    }

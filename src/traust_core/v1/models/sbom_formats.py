@@ -38,7 +38,11 @@ _VENDOR_NAMESPACE = {Ecosystem.RPM, Ecosystem.DEB, Ecosystem.APK}
 Component = tuple[str, str | None, str | None]  # (ref, purl, version)
 
 
-def parse_sbom(raw: bytes) -> SbomContents:
+def parse_sbom(raw: bytes, direct_golang: frozenset[tuple[str, str]] | None = None) -> SbomContents:
+    """`direct_golang` names Go modules a checkout's go.mod requires, as (module, version)
+    with the version's leading `v` stripped: syft's manifest scan emits no golang dependency
+    edges (a go.mod-only tree's dependencies graph is empty), so Go's direct set is the
+    require block, passed by the ingest door that holds the checkout."""
     try:
         doc = json.loads(raw)
     except ValueError as e:
@@ -63,7 +67,12 @@ def parse_sbom(raw: bytes) -> SbomContents:
             skipped += 1
             continue
         key = (parsed[0], parsed[1], version)
-        entries[key] = entries.get(key, False) or ref in direct
+        claimed = ref in direct or (
+            direct_golang is not None
+            and parsed[0] == Ecosystem.GO
+            and (parsed[1], version.removeprefix("v")) in direct_golang
+        )
+        entries[key] = entries.get(key, False) or claimed
     return SbomContents(
         entries=tuple(
             SbomEntry(ecosystem=e, name=n, version=Version(v), direct=d)

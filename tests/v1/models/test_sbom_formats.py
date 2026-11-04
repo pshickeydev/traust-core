@@ -194,3 +194,35 @@ def test_package_names_normalise_only_where_the_ecosystem_does(
     ecosystem: Ecosystem, name: str, stored: str
 ) -> None:
     assert package_name(ecosystem, name) == stored
+
+
+def test_golang_direct_comes_from_the_gomod_requires_when_syft_emits_no_edges() -> None:
+    """syft's manifest scan emits no golang dependency edges (a go.mod-only tree's
+    dependencies graph is empty), so Go's direct set is the go.mod require block the
+    ingest door passes; found by the rig's live sweep: every Go package keyed indirect."""
+    contents = parse_sbom(
+        cyclonedx(
+            {"bom-ref": "u", "purl": "pkg:golang/github.com/google/uuid@v1.6.0"},
+            {"bom-ref": "y", "purl": "pkg:golang/gopkg.in/yaml.v3@v3.0.1"},
+            {"bom-ref": "t", "purl": "pkg:golang/github.com/transitive/dep@v0.1.0"},
+        ),
+        direct_golang=frozenset(
+            {("github.com/google/uuid", "1.6.0"), ("gopkg.in/yaml.v3", "3.0.1")}
+        ),
+    )
+    assert rows(contents) == {
+        ("go", "github.com/google/uuid", "v1.6.0", True),
+        ("go", "gopkg.in/yaml.v3", "v3.0.1", True),
+        ("go", "github.com/transitive/dep", "v0.1.0", False),
+    }
+
+
+def test_golang_direct_set_is_ignored_for_other_ecosystems_and_absent_sets() -> None:
+    contents = parse_sbom(
+        cyclonedx({"bom-ref": "a", "purl": "pkg:npm/a@1"}),
+        direct_golang=frozenset({("a", "1")}),
+    )
+    assert rows(contents) == {("npm", "a", "1", False)}
+    assert rows(parse_sbom(cyclonedx({"bom-ref": "g", "purl": "pkg:golang/g@v1"}))) == {
+        ("go", "g", "v1", False)
+    }
