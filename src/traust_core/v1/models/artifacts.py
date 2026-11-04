@@ -287,6 +287,11 @@ class RepoStateArtifact(
 class CodeFactsArtifact(ArtifactDocument, name="code-facts", schema="code-facts"): ...
 
 
+class ManifestCoverageArtifact(
+    ArtifactDocument, name="manifest-coverage", schema="manifest-coverage"
+): ...
+
+
 class RunManifestArtifact(ArtifactDocument, name="run-manifest", schema="run-manifest"): ...
 
 
