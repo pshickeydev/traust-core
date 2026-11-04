@@ -13,6 +13,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from traust_core.v1 import contracts
+from traust_core.v1.models.ledger import DocumentVerification
 from traust_core.v1.providers.report_files import ReportFiles
 from traust_core.v1.services.artifact_publishing import RedactionPolicy
 
@@ -102,6 +103,7 @@ class ReportValidation:
     file_path: str
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    integrity: DocumentVerification | None = None
 
     def error(self, msg: str) -> None:
         self.errors.append(msg)
@@ -1335,6 +1337,8 @@ def validate_report(
             cross_validate_cloud_config_current(report, result)
         elif "cloud-config-audit" in sid:
             pass  # run_checkov.py --validate-report is that family's content gate
+        elif "layer" in sid:
+            pass  # Historical layer cryptography is opt-in through LedgerService.
         elif "validation" in sid:
             cross_validate_validation(report, result, context.files)
         elif "threat-model" in sid:

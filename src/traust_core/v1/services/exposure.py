@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from uuid import UUID
 
-from pydantic import computed_field
+from pydantic import JsonValue, TypeAdapter, computed_field
 
 from traust_core.v1.errors import (
     ConfigError,
@@ -61,6 +61,8 @@ from traust_core.v1.models.dependencies import (
     Image,
     ImpactAnalysis,
     ImpactEvidence,
+    ImpactExport,
+    ImpactExportRepo,
     ImpactFilter,
     ImpactInput,
     ImpactQuery,
@@ -1228,6 +1230,58 @@ class ExposureService:
         kept = [r for r in rows if after is None or r.at < after][: page.limit + 1]
         at = {r.analysis.assessment_id: r.at for r in kept}
         return Page.of([r.analysis for r in kept], page.limit, key=lambda a: at[a.assessment_id])
+
+    def export_impacts(self, identifier: AdvisoryIdentifier | UUID) -> ImpactExport:
+        """Export kept evidence for one advisory, without refreshing its source."""
+        with self._uow as uow:
+            known = (
+                uow.advisories.get(identifier)
+                if isinstance(identifier, UUID)
+                else uow.advisories.find_by_identifier(parse_advisory_identifier(identifier))
+            )
+            if known is None:
+                raise NotFoundError(f"advisory {identifier}: no recorded advisory")
+            canonical = uow.advisories.get(known.alias_of_id) if known.alias_of_id else known
+        assert canonical.id is not None
+        rows = sorted(
+            _latest(self._recorded(ImpactFilter(advisory_id=canonical.id)), None),
+            key=lambda row: row.at,
+            reverse=True,
+        )
+        exported = []
+        documents = TypeAdapter(dict[str, JsonValue])
+        repo_documents = TypeAdapter(list[dict[str, JsonValue]])
+        for row in rows:
+            [entry] = row.doc.repos
+            metadata = row.doc.metadata
+            document = documents.validate_json(row.doc.payload)
+            [native] = repo_documents.validate_python(document["repos"])
+            ref, repository = self._inventory.resolve(row.analysis.repository_ref_id)
+            exported.append(
+                ImpactExportRepo(
+                    **row.analysis.model_dump(),
+                    repo=entry.repo,
+                    repository_url=repository.url,
+                    sha=ref.sha,
+                    ecosystem=Ecosystem(metadata.ecosystem) if metadata.ecosystem else None,
+                    module=metadata.module,
+                    version=entry.version,
+                    evidence=ImpactEvidence.model_validate(native["evidence"]),
+                    document=document,
+                )
+            )
+        return ImpactExport(
+            advisory_id=canonical.id,
+            advisory=AdvisoryIdentifier(canonical.identifier),
+            generated_at=self._clock.now(),
+            commits=len({row.repository_ref_id for row in exported}),
+            analyses=len(exported),
+            classifications={
+                verdict: sum(row.classification == verdict for row in exported)
+                for verdict in ImpactClassification
+            },
+            repos=tuple(exported),
+        )
 
     def summary(self, filter: ExposureFilter, group_by: ExposureDimension) -> list[ExposureRollup]:
         """The latest impact analysis of each commit for each advisory (as of `as_of`), counted

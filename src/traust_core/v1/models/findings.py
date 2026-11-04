@@ -206,6 +206,14 @@ class FindingRollup(Model):
     open_by_severity: Mapping[ScannerSeverity, int]
 
 
+class VerifiedFixMtta(Model):
+    """Elapsed days to the first validation/verification-backed fix, grouped by severity."""
+
+    severity: ScannerSeverity
+    findings: int
+    mtta_days: float
+
+
 LIKELIHOOD_FACTORS = (
     "skill_level",
     "motive",
@@ -366,14 +374,22 @@ class FindingCandidate(Model):
         *,
         repository_url: str | None = None,
         sha: str | None = None,
+        include_suppressed: bool = False,
     ) -> list[FindingCandidate]:
         """Third-party scanner output as candidates; labels are made unique within the document."""
+        if include_suppressed and format != CandidateFormat.SARIF:
+            raise ValidationError("include_suppressed applies only to SARIF")
         parse = {
             CandidateFormat.DEPENDABOT: candidate_formats.dependabot,
             CandidateFormat.GOVULNCHECK: candidate_formats.govulncheck,
         }
         fields = (
-            candidate_formats.sarif(raw, repository_url=repository_url, sha=sha)
+            candidate_formats.sarif(
+                raw,
+                repository_url=repository_url,
+                sha=sha,
+                include_suppressed=include_suppressed,
+            )
             if format == CandidateFormat.SARIF
             else parse[format](raw)
         )

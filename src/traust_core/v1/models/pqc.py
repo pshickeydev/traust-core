@@ -214,6 +214,16 @@ class PqcSite(Model):
     fact: PqcFact
 
 
+class PqcScanState(Model):
+    """A commit's newest pqc-facts scan, and whether the current pack produced it (None: no
+    scanner to compare against, or no scan)."""
+
+    repository_ref_id: UUID
+    assessment_id: UUID | None = None
+    basis: str | None = None
+    current: bool | None = None
+
+
 class PqcPrescan(Model):
     """Layer 1 for one commit: its facts, the templated report when the scan found nothing, and
     the scan's CBOM (derived output for the caller to write; never stored)."""
