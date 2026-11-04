@@ -292,10 +292,14 @@ class AttestationService:
             if decision == AttestationDecision.CONFIRM
             else ReviewItemStatus.REJECTED
         )
-        item = self._review.resolve(review_item_id, statement, principal, status=status)
-        if item.reason == REBASELINE_MAPPING and self._settle_move is not None:
-            assert item.id is not None
-            self._settle_move(item.id)
+        # A rebaseline answer and its settlement commit together: a failed settle leaves the
+        # review pending, so answering again retries it.
+        with self._uow.write() as uow:
+            item = self._review.resolve(review_item_id, statement, principal, status=status)
+            if item.reason == REBASELINE_MAPPING and self._settle_move is not None:
+                assert item.id is not None
+                self._settle_move(item.id)
+            uow.commit()
         return item
 
     def sources(self, finding_id: UUID) -> list[FindingExternalRef]:

@@ -634,14 +634,16 @@ class AssessmentService:
         with self._uow as uow:
             repository_id = self._inventory.get_ref(assessment.repository_ref_id).repository_id
             self._intake.check(repository_id, candidates)
+            if hold_moves:
+                # Before the audit row: its review then predates it, which is how settling
+                # finds the audits it holds (`FindingService._held`).
+                assert self._findings is not None
+                held = {m.label for m in self._findings.hold_moves(repository_id, candidates)}
+                candidates = [c for c in candidates if c.label not in held]
             recorded, report = self._record(
                 doc, assessment, artifact, canonicalize_priorities=canonicalize_priorities
             )
             assert recorded.id is not None
-            if hold_moves:
-                assert self._findings is not None
-                held = {m.label for m in self._findings.hold_moves(repository_id, candidates)}
-                candidates = [c for c in candidates if c.label not in held]
             taken = self._intake.accept(recorded.id, candidates)
             uow.commit()
         return recorded, report, taken

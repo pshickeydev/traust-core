@@ -27,6 +27,7 @@ from traust_core.v1.models.findings import RecordDecision
 from traust_core.v1.models.identity import IdentitySource, Principal, Role
 from traust_core.v1.models.vocabulary import ActorKind, ReviewItemStatus, Severity, SourceType
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
+from traust_core.v1.repositories.objects import ObjectKey
 
 FIXTURES = Path(__file__).parents[2] / "fixtures"
 BODY = json.loads((FIXTURES / "reporting/widget-report.json").read_text())
@@ -185,3 +186,63 @@ def test_only_a_rebaseline_review_settles_a_move(services: Any, engine: Engine, 
     item = services.findings.review.request_signoff(old.id, "severity_proposal")
     with pytest.raises(ValidationError, match="not a rebaseline review"):
         services.findings.settle_move(item.id)
+
+
+def reported_by(engine: Engine, assessment_id: UUID) -> set[UUID]:
+    with SqlTraustUnitOfWork(engine) as uow:
+        return {o.finding_id for o in uow.occurrences.list_for_assessment(assessment_id)}
+
+
+def test_every_reaudit_held_before_the_answer_lands_on_the_moved_finding(
+    services: Any, engine: Engine, ref: UUID
+) -> None:
+    record(services, ref, report(20), 20)
+    old = first_finding(engine, ref)
+    first = record(services, ref, report(21, "pkg/db/third.go"), 21)
+    second = record(services, ref, report(22, "pkg/db/fourth.go"), 22)
+    [item] = mapping_reviews(services, old.id)
+    answer(services, item.id, old.id, AttestationDecision.CONFIRM)
+    assert old.id in reported_by(engine, first) and old.id in reported_by(engine, second)
+    assert len(findings(engine, ref)) == len(BODY["findings"])
+    assert services.findings.settle_move(item.id).findings == {}
+
+
+def test_an_unreadable_older_audit_does_not_block_settling(
+    services: Any, engine: Engine, ref: UUID
+) -> None:
+    record(services, ref, report(20), 20)
+    old = first_finding(engine, ref)
+    # dated after the re-audit but recorded before its review opened: not one it holds
+    without = json.loads(report(25).payload)
+    without["findings"] = without["findings"][1:]
+    unrelated = record(services, ref, SecurityAuditArtifact.from_document(without), 25)
+    with SqlTraustUnitOfWork(engine) as uow:
+        [artifact] = uow.artifacts.list_for_assessment(unrelated)
+    services.findings._objects.put(ObjectKey.parse(artifact.uri), b"not the recorded bytes")
+    again = record(services, ref, report(21, "pkg/db/third.go"), 21)
+    [item] = mapping_reviews(services, old.id)
+    answer(services, item.id, old.id, AttestationDecision.CONFIRM)
+    assert old.id in reported_by(engine, again)
+
+
+def test_a_failed_settle_leaves_the_review_pending_for_a_retry(
+    services: Any, engine: Engine, ref: UUID, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    record(services, ref, report(20), 20)
+    old = first_finding(engine, ref)
+    again = record(services, ref, report(21, "pkg/db/third.go"), 21)
+    [item] = mapping_reviews(services, old.id)
+    intake = services.findings.intake
+
+    def fail(*_: Any) -> Any:
+        raise RuntimeError("intake down")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(intake, "accept", fail)
+        with pytest.raises(RuntimeError):
+            answer(services, item.id, old.id, AttestationDecision.CONFIRM)
+    [still] = mapping_reviews(services, old.id)
+    assert still.status == ReviewItemStatus.PENDING
+    assert first_finding(engine, ref).fingerprint == old.fingerprint
+    answer(services, item.id, old.id, AttestationDecision.CONFIRM)
+    assert old.id in reported_by(engine, again)
