@@ -85,23 +85,25 @@ UNREPORTED_KINDS = {
 }
 
 
-def _resolve(schema: dict[str, Any], node: Any, depth: int = 0) -> Any:
-    """`node` with local and cross-schema `$ref`s followed (enough to see an item's fields)."""
+def _resolve(schema: dict[str, Any], node: Any, depth: int = 0) -> tuple[dict[str, Any], Any]:
+    """`node` with local and cross-schema `$ref`s followed, and the schema it now sits in (its
+    own local `$ref`s resolve there). A pointer to nothing fails: it would hide the array."""
     if not isinstance(node, dict) or depth > 8 or "$ref" not in node:
-        return node
+        return schema, node
     name, _, fragment = node["$ref"].partition("#")
     if name:
         schema = contracts.schema(name.split(".")[0])
     target: Any = schema
     for part in filter(None, fragment.split("/")):
-        target = target.get(part, {})
+        assert isinstance(target, dict) and part in target, f"unresolved $ref {node['$ref']}"
+        target = target[part]
     return _resolve(schema, target, depth + 1)
 
 
 def _item_fields(schema: dict[str, Any], node: Any, depth: int = 0) -> set[str]:
     """An array item's field names, following `$ref`s and composed schemas (`allOf` unions its
     branches; `anyOf`/`oneOf` conservatively union theirs)."""
-    node = _resolve(schema, node, depth)
+    schema, node = _resolve(schema, node, depth)
     if not isinstance(node, dict) or depth > 8:
         return set()
     fields = set(node.get("properties", {}))
@@ -125,15 +127,16 @@ def _nested(schema: dict[str, Any], properties: Any, prefix: str, depth: int = 0
     for key, node in properties.items():
         if not isinstance(node, dict):
             continue
-        node = _resolve(schema, node)
+        at, node = _resolve(schema, node)
         if not isinstance(node, dict):
             continue
-        if node.get("type") == "array" and _finding_shaped(schema, node):
+        if node.get("type") == "array" and _finding_shaped(at, node):
             found.add(f"{prefix}{key}")
-        found |= _nested(schema, node.get("properties"), f"{prefix}{key}.", depth + 1)
-        inner = node.get("items") if node.get("type") == "array" else None
-        if isinstance(inner, dict):
-            found |= _nested(schema, inner.get("properties"), f"{prefix}{key}[].", depth + 1)
+        found |= _nested(at, node.get("properties"), f"{prefix}{key}.", depth + 1)
+        if node.get("type") == "array":
+            inner_at, inner = _resolve(at, node.get("items"))
+            if isinstance(inner, dict):
+                found |= _nested(inner_at, inner.get("properties"), f"{prefix}{key}[].", depth + 1)
     return found
 
 
@@ -179,6 +182,7 @@ def test_every_exempted_kind_is_recorded_and_admitted_elsewhere() -> None:
     admitted by a named door; a stale exemption fails here."""
     for kind, why in UNREPORTED_KINDS.items():
         assert kind in RECORDED_SCHEMAS, (kind, why)
+        assert kind not in REPORTED_FINDINGS, (kind, why)
         schema = RECORDED_SCHEMAS[kind]
         assert (schema, "findings") in REPORTED | ADMITTED_ELSEWHERE.keys(), (kind, why)
 
@@ -203,4 +207,17 @@ def test_each_named_door_has_a_running_service_test_that_records_it(array: tuple
     (definition,) = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == test]
     for decorator in definition.decorator_list:
         tokens = set(re.split(r"[^\w]+", ast.unparse(decorator)))
-        assert not {"skip", "xfail"} & tokens, ast.unparse(decorator)
+        assert not {"skip", "skipif", "xfail"} & tokens, ast.unparse(decorator)
+    calls = {
+        n.func.attr
+        for n in ast.walk(definition)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+    }
+    assert not {"skip", "xfail"} & calls, f"{test} skips itself"
+    body = [
+        n
+        for n in definition.body
+        if not isinstance(n, ast.Pass)
+        and not (isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant))
+    ]
+    assert body, f"{test} has no body"
