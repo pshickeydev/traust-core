@@ -113,7 +113,15 @@ _TENANT = re.compile(
     r"tenant|project)(_?id)?$"
 )
 _BY_USER = re.compile(r"(?i)_by(_id)?$|_user_id$")
-_REQUEST_VALUE = re.compile(r"\brequest\.(headers|env|raw_post|body)\b")
+_REQUEST_VALUE = re.compile(
+    r"\brequest\.(headers|env|raw_post|body|get_header|fetch_header|authorization)\b"
+)
+_WARDEN = re.compile(r"""request\.env\[\s*["']warden["']\s*\]""")  # Devise's session
+# calls that verify a request-supplied secret (`JWT.decode(t, key)`, `find_by(token: t)`)
+_VERIFYING = re.compile(
+    r"(?i)^(decode|verify\w*|authenticate\w*|valid\w*|secure_compare|find_by_token\w*|"
+    r"digest)$"
+)
 _TOKEN_KEY = re.compile(r"(?i)token|api_key|digest|secret|jti")
 _PARAMS = {"params", "request.path_parameters", "request.params", "request.parameters"}
 # a `render` naming a view (`render :show`, `template:`) may print the record
@@ -246,6 +254,21 @@ class _Model:
     qualified: set[str] = field(default_factory=set)  # `Note`, `Archive::Note`
 
 
+def _signature(model: _Model) -> tuple[object, ...]:
+    return (
+        sorted(model.associations.items()),
+        sorted(model.belongs.items()),
+        sorted(model.members),
+        model.linked,
+        model.policy,
+        model.base,
+        sorted(model.users),
+        model.table,
+        sorted(model.polymorphic),
+        sorted(model.scopes),
+    )
+
+
 class RubyCode:
     """A checkout's ActiveRecord models (associations from the model, columns from
     `db/schema.rb`), Pundit policies and the CanCanCan `Ability`."""
@@ -256,11 +279,14 @@ class RubyCode:
         self.model_roots: dict[str, set[str]] = {}  # a model several apps define: unread
         self.table_roots: dict[str, set[str]] = {}
         self.models: dict[str, _Model] = {}
+        self.by_root: dict[tuple[str, str], _Model] = {}  # (model, app) -> its definition
         self.columns: dict[str, list[str]] = {}  # table -> columns
+        self.columns_by_root: dict[tuple[str, str], list[str]] = {}
         # `Admin::NotePolicy` -> its class; never keyed by the bare name several may share
         self.policies: dict[str, tuple[Parsed, Node]] = {}
         self.modules: dict[str, list[tuple[Parsed, Node]]] = {}  # module name -> definitions
         self.ability: tuple[Parsed, Node] | None = None
+        self.abilities: dict[str, list[tuple[Parsed, Node]]] = {}  # `Ability`, `Admin::Ability`
         # `Api::Relaxed` -> every definition (a module reopened in another file)
         self.qualified: dict[str, list[tuple[Parsed, Node]]] = {}
         self.method_cache: dict[tuple[str, int, int], dict[str, Node]] = {}
@@ -272,9 +298,38 @@ class RubyCode:
                 for m in walk(src.root)
                 if m.type in ("method", "singleton_method")
             }
+        # CanCanCan's own `Ability` (top level), unless reopened or `class_eval`'d somewhere
+        top = self.abilities.get("Ability", [])
+        reopened = any(
+            n.type == "call"
+            and call_name(src, n) in ("class_eval", "class_exec", "prepend", "include")
+            and src.text(n.child_by_field_name("receiver")).removeprefix("::") == "Ability"
+            for rel, src in sources.items()
+            if not test_file(rel, self.roots)
+            for n in walk(src.root)
+        )
+        if len(top) == 1 and not reopened:
+            self.ability = top[0]
+        # a model (or table) several apps define alike is one; defined differently, unread
+        for (name, _root), model in self.by_root.items():
+            self.models.setdefault(name, model)
+            if _signature(model) != _signature(self.models[name]):
+                self.model_roots[name] |= {"<differs>"}
+        for name, roots in self.model_roots.items():
+            if "<differs>" not in roots:
+                self.model_roots[name] = {next(iter(roots))}
+        for (table, _root), columns in self.columns_by_root.items():
+            first = self.columns.setdefault(table, columns)
+            if sorted(first) != sorted(columns):
+                self.table_roots[table] |= {"<differs>"}
+        for table, roots in self.table_roots.items():
+            if "<differs>" not in roots:
+                self.table_roots[table] = {next(iter(roots))}
         self.fields = self._fields()
 
     def _index(self, rel: str, src: Parsed) -> None:
+        if test_file(rel, self.roots):
+            return  # a test double (`spec/support/note_policy.rb`) is no app's
         if rel.endswith("db/schema.rb"):
             self._schema(src)
         for n in walk(src.root):
@@ -297,11 +352,10 @@ class RubyCode:
                 if name.endswith("Policy"):
                     written = src.text(n.child_by_field_name("name")).removeprefix("::")
                     self.policies["::".join([*_lexical(src, n), written])] = (src, n)
-            elif (
-                name == "Ability"
-                and any(s.type == "call" and call_name(src, s) == "include" for s in body)
-            ) or (name == "Ability" and "CanCan" in src.text(n)):
-                self.ability = (src, n)
+            elif name == "Ability":
+                written = src.text(n.child_by_field_name("name")).removeprefix("::")
+                key = "::".join([*_lexical(src, n), written])
+                self.abilities.setdefault(key, []).append((src, n))
             elif "/app/" in f"/{rel}" and (
                 base in ("ApplicationRecord", "ActiveRecord::Base") or "/app/models/" in f"/{rel}"
             ):  # never a migration's or a task's stub (`db/migrate`: `class Account < …`)
@@ -311,8 +365,9 @@ class RubyCode:
                     or name.endswith("Controller")
                 ):
                     continue
-                model = self.models.setdefault(name, _Model(name))
-                self.model_roots.setdefault(name, set()).add(root_of(rel, self.roots))
+                root = root_of(rel, self.roots)
+                model = self.by_root.setdefault((name, root), _Model(name))
+                self.model_roots.setdefault(name, set()).add(root)
                 model.qualified.add(
                     "::".join([*_lexical(src, n), src.text(n.child_by_field_name("name"))])
                 )
@@ -382,9 +437,10 @@ class RubyCode:
             table = symbol(src, args(n)[0])
             if table is None:
                 continue
-            self.table_roots.setdefault(table, set()).add(root_of(src.file.rel, self.roots))
+            root = root_of(src.file.rel, self.roots)
+            self.table_roots.setdefault(table, set()).add(root)
             block = n.child_by_field_name("block")
-            columns = self.columns.setdefault(table, [])
+            columns = self.columns_by_root.setdefault((table, root), [])
             for c in walk(block) if block is not None else []:
                 if c.type == "call" and args(c) and (col := symbol(src, args(c)[0])):
                     kind = call_name(src, c)
@@ -556,6 +612,13 @@ class RubyCode:
             cols |= set(found.belongs) | {f"{b}_id" for b in found.belongs}
         return {c for c in cols if OWNER_CHECK_RX.match(c)}
 
+    def default_policy(self, model: str) -> str:
+        """Pundit's own name for a model's policy: its full name and `Policy`
+        (`Billing::NotePolicy` for `Billing::Note`)."""
+        found = self.models.get(model)
+        names = found.qualified if found is not None else set()
+        return f"{next(iter(names))}Policy" if len(names) == 1 else f"{model}Policy"
+
     def policy_name(self, model: str, policy: str | None = None) -> str:
         """The policy Pundit uses: the one named, a `policy_class` the model or a class it
         inherits from defines, else `<Model>Policy`."""
@@ -564,7 +627,7 @@ class RubyCode:
             seen.add(found.name)
             policy = found.policy
             found = self.models.get(found.base)
-        return (policy or f"{model}Policy").removeprefix("::")
+        return (policy or self.default_policy(model)).removeprefix("::")
 
     def policy(
         self, name: str, lexical: tuple[str, ...] = (), exact: bool = False
@@ -582,12 +645,18 @@ class RubyCode:
         return found[0] if len(found) == 1 else None
 
     def policy_method(
-        self, model: str, query: str, policy: str | None = None
+        self,
+        model: str,
+        query: str,
+        policy: str | None = None,
+        lexical: tuple[str, ...] = (),
     ) -> tuple[Parsed, Node] | None:
-        """`NotePolicy#destroy?` (through aliases and policy inheritance); None when it
-        can't be read."""
+        """`NotePolicy#destroy?` (through aliases, included modules and policy inheritance);
+        None when it can't be read. `lexical`: where a `policy_class:` is written."""
         name = self.policy_name(model, policy)
-        found = self.policy(name, exact=name == f"{model}Policy")
+        # Pundit's own lookup by the model's name; a `policy_class:` resolves where written
+        default = policy is None and name == self.default_policy(model)
+        found = self.policy(name, () if default else lexical, exact=default)
         seen: set[tuple[str, str]] = set()
         while found is not None and (id(found[1]), query) not in seen:
             seen.add((id(found[1]), query))
@@ -595,7 +664,10 @@ class RubyCode:
             # in order, as Ruby defines them: an alias copies what its target is at that point
             # (a `def` above it, else an inherited method by that name)
             defined: dict[str, Node | str] = {}
+            includes: list[str] = []
             for m in statements(cls.child_by_field_name("body")):
+                if m.type == "call" and call_name(src, m) == "include":
+                    includes += [src.text(a).removeprefix("::") for a in reversed(args(m))]
                 if m.type == "method":
                     defined[src.text(m.child_by_field_name("name"))] = m
                 pair: tuple[str | None, str | None] | None = None
@@ -610,9 +682,17 @@ class RubyCode:
                     defined[pair[0]] = defined.get(pair[1], pair[1])
             last = defined.get(query)
             if isinstance(last, str):
-                query = last  # an inherited method's name: read in the parent
+                query = last  # an inherited method's name: read in its modules and parent
             elif last is not None:
                 return src, last
+            # its modules, the last included first (`include Permissive` beats the parent)
+            for name in reversed(includes):
+                defs = self.module_defs(name)
+                if not isinstance(defs, list):
+                    return None  # a module we can't read (a gem's, an ambiguous one)
+                for msrc, module in defs:
+                    if query in (ms := self.module_methods(msrc, module)):
+                        return msrc, ms[query]
             sup = cls.child_by_field_name("superclass")
             parent = (
                 src.text(sup.named_children[0]) if sup is not None and sup.named_children else ""
@@ -623,7 +703,7 @@ class RubyCode:
     def policy_scope(self, model: str, scope: str | None = None) -> tuple[Parsed, Node] | None:
         """`NotePolicy::Scope#resolve`, or the `policy_scope_class:` named."""
         policy, _, inner = (scope or f"{self.policy_name(model)}::Scope").rpartition("::")
-        found = self.policy(policy, exact=scope is None and policy == f"{model}Policy")
+        found = self.policy(policy, exact=scope is None and policy == self.default_policy(model))
         if found is None:
             return None
         src, cls = found
@@ -652,6 +732,12 @@ def app_roots(rels: list[str]) -> list[str]:
 def root_of(rel: str, roots: list[str]) -> str:
     """The app a file belongs to: the longest app root it lies under."""
     return next((r for r in roots if rel.startswith(r)), "")
+
+
+def test_file(rel: str, roots: list[str]) -> bool:
+    """A file of a test suite (`spec/support/…`), not of an app; a test app's own files
+    (`spec/dummy/app/…`) are its app's."""
+    return bool(re.search(r"(^|/)(spec|test)/", rel[len(root_of(rel, roots)) :]))
 
 
 def _lexical(src: Parsed, node: Node) -> list[str]:
@@ -982,9 +1068,12 @@ class _Action:
 
     def _credential(self, src: Parsed, node: Node | None, ivars: set[str], depth: int = 0) -> bool:
         """From the session, a cookie, a verified token or the caller (D17, D20); an app
-        helper counts by what it returns, never by its name (`decoded_token`)."""
-        if node is None or self._untrusted(src, node):
+        helper counts by what it returns, never by its name (`decoded_token`); a request
+        header naming the user is no credential, whatever else the expression reads."""
+        if node is None or self._untrusted(src, node) or _request_identity(src, node):
             return False
+        if _WARDEN.search(src.text(node)):
+            return True
         key = (src.file.rel, node.start_byte, node.end_byte, len(ivars))
         if key in self.credentials:
             return self.credentials[key]
@@ -1020,6 +1109,7 @@ class _Action:
                 n.type == "hash_key_symbol"
                 and _TOKEN_KEY.search(src.text(n))
                 and not _is_literal(value)
+                and (value is None or value.type not in ("constant", "scope_resolution"))
             )
             if token_key or n.type in ("constant", "instance_variable"):
                 out.append(src.text(n))
@@ -1144,7 +1234,10 @@ class _Action:
             and (left := n.child_by_field_name("left")) is not None
         }
         read = {
-            s.src.text(n) for s in steps for n in walk(s.node) if n.type == "instance_variable"
+            s.src.text(n)
+            for s in steps
+            for n in walk(s.node)
+            if n.type == "instance_variable" and not self._narrows_within(s.src, n)
         } - own
         for ivar in read:
             values = [
@@ -1160,6 +1253,23 @@ class _Action:
             ):
                 return True
         return False
+
+    def _narrows_within(self, src: Parsed, ivar: Node) -> bool:
+        """`@tenant.users.find_by(id: session[:user_id])`: the ivar only narrows a lookup
+        keyed by a credential; the user still comes from the credential."""
+        top: Node = ivar
+        while (
+            top.parent is not None
+            and top.parent.type == "call"
+            and (top.parent.child_by_field_name("receiver") == top)
+        ):
+            top = top.parent
+        return (
+            top != ivar
+            and _finder(call_name(src, top))
+            and bool(args(top))
+            and all(self._credential(src, a, self.caller_ivars) for a in args(top))
+        )
 
     def is_caller(self, src: Parsed, node: Node | None) -> bool:
         node = unwrap(node)
@@ -2068,6 +2178,7 @@ class _Action:
             return
         query = symbol(src, a[1]) if len(a) > 1 else f"{self.action}?"
         policy = src.text(options["policy_class"]) if "policy_class" in options else None
+        written_in = tuple(_lexical(src, call))
         if "current_user" in self.forged and not (
             not cancan and self.methods("pundit_user") is not None
         ):
@@ -2089,7 +2200,7 @@ class _Action:
             # a row of an STI subclass is asked of its own policy (`Draft < Note`)
             verdicts = (
                 [
-                    _policy_refuses(self.code, m, query or "", policy)
+                    _policy_refuses(self.code, m, query or "", policy, lexical=written_in)
                     for m in self.code.descendants(record.model)
                 ]
                 if record.model
@@ -2287,6 +2398,32 @@ def _writes(src: Parsed, node: Node | None) -> bool:
     )
 
 
+def _request_identity(src: Parsed, node: Node) -> bool:
+    """A request header or env value used as who the caller is (`User.find(request.headers[
+    "X-User-Id"] || session[:id])`), not as a secret a lookup verifies (`find_by(token:
+    request.headers["X-Token"])`, `JWT.decode(request.authorization, key)`)."""
+    for n in walk(node):
+        if n.type not in ("call", "element_reference") or not _REQUEST_VALUE.search(src.text(n)):
+            continue
+        if not src.text(n).startswith("request."):
+            continue
+        outer = n.parent if n.parent is not None else n
+        if _WARDEN.search(src.text(n)) or _WARDEN.search(src.text(outer)):
+            continue  # `request.env["warden"]`: Devise's session
+        child, parent, verified = n, n.parent, False
+        while parent is not None and child != node:
+            if parent.type == "pair" and _TOKEN_KEY.search(
+                src.text(parent.child_by_field_name("key"))
+            ):
+                verified = True
+            if parent.type == "call" and _VERIFYING.match(call_name(src, parent)):
+                verified = True
+            child, parent = parent, parent.parent
+        if not verified:
+            return True
+    return False
+
+
 def _finder(name: str) -> bool:
     """A read or write of a record by a value (`find`, `find_by_slug!`, `where`,
     `Note.destroy(id)`, `GlobalID::Locator.locate`)."""
@@ -2400,10 +2537,18 @@ def _render_leaks(src: Parsed, node: Node, safe: set[str], action: str = "") -> 
                 n.type == "identifier" and not method and src.text(n) not in safe
             ):
                 return True
-            if n.type == "call" and not (
-                call_name(src, n) in ("t", "translate")
-                and chain_text(src, n.child_by_field_name("receiver")) in ("", "I18n")
-                and all(_is_literal(a) for a in args(n))
+            if (
+                n.type == "call"
+                and not (
+                    call_name(src, n) in ("t", "translate")
+                    and chain_text(src, n.child_by_field_name("receiver")) in ("", "I18n")
+                    and all(_is_literal(a) for a in args(n))
+                )
+                and not (  # `{ error: "Forbidden" }.to_json`
+                    call_name(src, n) in ("to_json", "to_s", "freeze", "to_h")
+                    and _is_literal(n.child_by_field_name("receiver"))
+                    and not args(n)
+                )
             ):
                 return True
     return False
@@ -2606,12 +2751,17 @@ def _owner_atom(src: Parsed, node: Node | None, records: tuple[str, ...]) -> _At
 
 
 def _policy_refuses(
-    code: RubyCode, model: str, query: str, policy: str | None = None, depth: int = 0
+    code: RubyCode,
+    model: str,
+    query: str,
+    policy: str | None = None,
+    depth: int = 0,
+    lexical: tuple[str, ...] = (),
 ) -> bool | None:
     """Whether `<Model>Policy#<query>` is false for every user who doesn't own the record
     (an admin aside, D10): `record.user == user`, `record.user_id == user.id`; None when the
     policy can't be read."""
-    found = code.policy_method(model, query, policy)
+    found = code.policy_method(model, query, policy, lexical)
     if not found:
         return None
     src, method = found
@@ -2624,7 +2774,9 @@ def _policy_refuses(
     if len(body) > 1:
         return None  # more than one expression: not read
     if expr.type == "identifier" and src.text(expr).endswith("?") and depth < 3:
-        return _policy_refuses(code, model, src.text(expr), policy, depth + 1)  # `= update?`
+        return _policy_refuses(
+            code, model, src.text(expr), policy, depth + 1, lexical
+        )  # `= update?`
     return holds(
         src,
         expr,
@@ -2663,7 +2815,15 @@ def _ability(code: RubyCode, action: str, model: str) -> bool | None:
         for n in walk(cls)
     ):
         return None  # `NoteSharing.grant(self, user)`: rules added elsewhere
-    rules = [n for n in walk(cls) if n.type == "call" and n.child_by_field_name("receiver") is None]
+    rules = [
+        n
+        for n in walk(cls)
+        if n.type == "call"
+        and (
+            n.child_by_field_name("receiver") is None
+            or src.text(n.child_by_field_name("receiver")) == "self"  # `self.can :manage, …`
+        )
+    ]
     aliases = {k: set(v) for k, v in _CANCAN_ALIASES.items()}
     for rule in rules:
         if call_name(src, rule) == "alias_action":
@@ -2761,6 +2921,7 @@ def admin_gate(src: Parsed, method: Node) -> bool:
         and _user_flag(src, body[0].child_by_field_name("condition"))
         and (_halts(src, body[1]) or _raises(src, body[1]))
         and not _sends(src, body[1])
+        and (_stops(src, body[1]) or all(_inert(src, s) for s in body[2:]))
     ):
         return True  # `return if current_user.admin?`, then `head :forbidden`
     if not body:
@@ -2779,6 +2940,8 @@ def admin_gate(src: Parsed, method: Node) -> bool:
         or not all(_raises(src, s) or _halts(src, s) or s.type == "return" for s in stmts)
         or not any(_raises(src, s) or _halts(src, s) for s in stmts)
         or any(_sends(src, s) for s in stmts)  # `render json: @note unless current_user.admin?`
+        # the callback runs on after a response with no `return`: what follows still acts
+        or (not any(_stops(src, s) for s in stmts) and not all(_inert(src, s) for s in body[1:]))
     ):
         return False
 
@@ -2796,6 +2959,11 @@ def admin_gate(src: Parsed, method: Node) -> bool:
     refuse = first.type in ("if_modifier", "if")
     cond = first.child_by_field_name("condition")
     return "admin" in _atoms(src, cond, atom) and holds(src, cond, atom, {"admin": False}, refuse)
+
+
+def _stops(src: Parsed, node: Node) -> bool:
+    """A statement that leaves the method: a `return` or a `raise` in it."""
+    return any(n.type == "return" or _raises(src, n) for n in walk(node))
 
 
 def _sends(src: Parsed, node: Node) -> bool:

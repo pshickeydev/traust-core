@@ -5737,5 +5737,569 @@
     "why": "SLOW: ApplicationController with 20 before_actions of 10 statements each (200 lines). Each id route rebuilds two _Action walks over the whole chain (caller_forged and action_facts), with _caller_ivars / _credential dominating; nothing is shared between routes of the same controller. ~80\u00b5s per route \u00d7 chain statement: this case (400 routes) ~6.5s; 2,000 routes 32s; 2,000 routes with 10\u00d75 callbacks 8.3s, with none 0.9s"
    }
   ]
+ },
+ {
+  "case": "r7-header-callers",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "Rails.application.routes.draw do\n  resources :alphas, only: [:destroy]\n  resources :betas, only: [:destroy]\n  resources :gammas, only: [:destroy]\n  resources :deltas, only: [:destroy]\n  resources :twins, only: [:destroy]\nend\n",
+   "app/controllers/alphas_controller.rb": "class AlphasController < ApplicationController\n  def destroy\n    current_user.notes.find(params[:id]).destroy\n  end\n\n  private\n\n  def current_user\n    User.find(request.headers[\"X-User-Id\"] || session[:user_id])\n  end\nend\n",
+   "app/controllers/betas_controller.rb": "class BetasController < ApplicationController\n  def destroy\n    current_user.notes.find(params[:id]).destroy\n  end\n\n  private\n\n  def current_user\n    User.find_by(email: request.headers[\"X-Email\"], token_type: API_TYPE)\n  end\nend\n",
+   "app/controllers/gammas_controller.rb": "class GammasController < ApplicationController\n  def destroy\n    current_user.notes.find(params[:id]).destroy\n  end\n\n  private\n\n  def current_user\n    User.with_api_token.find(request.headers[\"X-User-Id\"])\n  end\nend\n",
+   "app/controllers/deltas_controller.rb": "class DeltasController < ApplicationController\n  def destroy\n    current_user.notes.find(params[:id]).destroy\n  end\n\n  private\n\n  def current_user\n    User.find(request.get_header(\"HTTP_X_USER_ID\"))\n  end\nend\n",
+   "app/controllers/twins_controller.rb": "class TwinsController < ApplicationController\n  def destroy\n    current_user.notes.find(params[:id]).destroy\n  end\n\n  private\n\n  def current_user\n    User.find_by(api_token: request.get_header(\"HTTP_X_TOKEN\"), token_type: API_TYPE)\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/alphas/:id",
+    "ownership": "caller-blind",
+    "why": "_forged's header check exempts any statement _credential accepts; `|| session[:user_id]` makes the whole header-first lookup a credential, so any signed-in user picks current_user with X-User-Id"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/betas/:id",
+    "ownership": "caller-blind",
+    "why": "_words counts a token key whose value is a constant (`token_type: API_TYPE`); only literals are excluded, so a header-named user reads as a token lookup"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/gammas/:id",
+    "ownership": "caller-blind",
+    "why": "a scope whose name contains `token` (`with_api_token`) makes _credential true though the id comes from a header"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/deltas/:id",
+    "ownership": "caller-blind",
+    "why": "`request.get_header(...)` is a request header but _REQUEST_VALUE only matches `request.headers|env`, so the header check never fires"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/twins/:id",
+    "ownership": "scoped",
+    "why": "twin: the user is found by an API token read from the header (a verified credential, D17)"
+   }
+  ]
+ },
+ {
+  "case": "r7-engine-decorators",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "engines/billing/config/routes.rb": "Billing::Engine.routes.draw do\n  resources :notes, only: [:destroy]\n  resources :memos, only: [:destroy]\n  resources :tasks, only: [:destroy]\n  resources :chores, only: [:destroy]\nend\n",
+   "engines/billing/lib/billing/engine.rb": "module Billing\n  class Engine < ::Rails::Engine\n    isolate_namespace Billing\n  end\nend\n",
+   "config/routes.rb": "Rails.application.routes.draw do\n  mount Billing::Engine, at: '/billing'\nend\n",
+   "engines/billing/app/controllers/billing/notes_controller.rb": "module Billing\n  class NotesController < ApplicationController\n    before_action :set_note\n    before_action :require_owner\n\n    def destroy\n      @note.destroy\n    end\n\n    private\n\n    def set_note\n      @note = Note.find(params[:id])\n    end\n\n    def require_owner\n      head :forbidden unless @note.user == current_user\n    end\n  end\nend\n",
+   "engines/billing/app/controllers/billing/memos_controller.rb": "module Billing\n  class MemosController < ApplicationController\n    before_action :set_note\n    before_action :require_owner\n\n    def destroy\n      @note.destroy\n    end\n\n    private\n\n    def set_note\n      @note = Note.find(params[:id])\n    end\n\n    def require_owner\n      head :forbidden unless @note.user == current_user\n    end\n  end\nend\n",
+   "engines/billing/app/controllers/billing/tasks_controller.rb": "module Billing\n  class TasksController < ActionController::Base\n    before_action :set_note\n\n    def destroy\n      @note.destroy\n    end\n\n    private\n\n    def set_note\n      @note = Note.find(params[:id])\n    end\n  end\nend\n",
+   "engines/billing/app/controllers/billing/chores_controller.rb": "module Billing\n  class ChoresController < ApplicationController\n    before_action :set_note\n    before_action :require_owner\n\n    def destroy\n      @note.destroy\n    end\n\n    private\n\n    def set_note\n      @note = Note.find(params[:id])\n    end\n\n    def require_owner\n      head :forbidden unless @note.user == current_user\n    end\n  end\nend\n",
+   "app/decorators/billing_decorators.rb": "Billing::NotesController.class_eval do\n  def require_owner\n  end\nend\n\nBilling::TasksController.class_eval do\n  before_action :authenticate_user!\nend\n",
+   "config/initializers/billing.rb": "Billing::MemosController.skip_before_action :require_owner\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/notes/:id",
+    "ownership": "caller-blind",
+    "why": "INTRODUCED: class_eval now only applies within the file's own app root; the host's decorator that replaces the engine controller's require_owner with a no-op is ignored (base: caller-blind)"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/memos/:id",
+    "ownership": "unchecked",
+    "why": "INTRODUCED: the host initializer's `skip_before_action :require_owner` on the engine controller is ignored by the same root filter (base: unchecked + skip marker)"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/tasks/:id",
+    "ownership": "caller-blind",
+    "why": "INTRODUCED: the host decorator adds authenticate_user! to an engine controller; ignored, so the route reads as unauthenticated n/a while any signed-in user destroys any note"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/chores/:id",
+    "ownership": "checked",
+    "why": "twin: the engine controller's own owner check, untouched by the host"
+   }
+  ]
+ },
+ {
+  "case": "r7-block-auth",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "Rails.application.routes.draw do\n  resources :alphas, only: [:destroy]\n  resources :twins, only: [:destroy]\nend\n",
+   "app/controllers/alphas_controller.rb": "class AlphasController < ActionController::Base\n  before_action { authenticate_user! }\n\n  def destroy\n    Note.find(params[:id]).destroy\n  end\nend\n",
+   "app/controllers/twins_controller.rb": "class TwinsController < ActionController::Base\n  before_action :authenticate_user!\n\n  def destroy\n    current_user.notes.find(params[:id]).destroy\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/alphas/:id",
+    "ownership": "caller-blind",
+    "why": "_rails_guards drops every block callback, so `before_action { authenticate_user! }` is read as no authentication (n/a, the same row a public route gets) while any signed-in user destroys any note"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/twins/:id",
+    "ownership": "scoped",
+    "why": "twin: symbol authentication guard and a caller association"
+   }
+  ]
+ },
+ {
+  "case": "r7-spec-reopen",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "Rails.application.routes.draw do\n  resources :notes, only: [:destroy]\n  resources :twins, only: [:destroy]\nend\n",
+   "app/controllers/notes_controller.rb": "class NotesController < ApplicationController\n  before_action :set_note\n\n  def destroy\n    @note.destroy\n  end\n\n  private\n\n  def set_note\n    @note = Note.find(params[:id])\n  end\nend\n",
+   "app/controllers/twins_controller.rb": "class TwinsController < ApplicationController\n\n  before_action :set_note\n  before_action :require_owner\n\n  def destroy\n    @note.destroy\n  end\n\n  private\n\n  def set_note\n    @note = Note.find(params[:id])\n  end\n\n  def require_owner\n    head :forbidden unless @note.user == current_user\n  end\nend\n",
+   "spec/support/notes_controller.rb": "class NotesController\n  before_action :require_owner\n\n  def require_owner\n    head :forbidden unless @note.user == current_user\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/notes/:id",
+    "ownership": "caller-blind",
+    "why": "the spec/test filter covers only class_eval; a `class NotesController` reopened under spec/support/ (root '') merges into the app controller and its test-only owner check is credited"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/twins/:id",
+    "ownership": "checked",
+    "why": "twin: the owner check written in the app controller"
+   }
+  ]
+ },
+ {
+  "case": "r7-policy-spec-double",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "Rails.application.routes.draw do\n  resources :notes, only: [:destroy]\nend\n",
+   "app/controllers/notes_controller.rb": "class NotesController < ApplicationController\nclass NotesController < ApplicationController\n  def destroy\n    @note = Note.find(params[:id])\n    authorize @note\n    @note.destroy\n  end\nend\n",
+   "app/policies/note_policy.rb": "class NotePolicy < ApplicationPolicy\n  def destroy?\n    true\n  end\nend\n",
+   "spec/support/note_policy.rb": "class NotePolicy < ApplicationPolicy\n  def destroy?\n    record.user == user\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/notes/:id",
+    "ownership": "caller-blind",
+    "why": "RubyCode.policies keeps the last class read under a qualified name; a spec/support NotePolicy test double replaces the app's permissive one (twin: r7-policy-twin)"
+   }
+  ]
+ },
+ {
+  "case": "r7-policy-twin",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "Rails.application.routes.draw do\n  resources :notes, only: [:destroy]\nend\n",
+   "app/controllers/notes_controller.rb": "class NotesController < ApplicationController\nclass NotesController < ApplicationController\n  def destroy\n    @note = Note.find(params[:id])\n    authorize @note\n    @note.destroy\n  end\nend\n",
+   "app/policies/note_policy.rb": "class NotePolicy < ApplicationPolicy\n  def destroy?\n    record.user == user\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/notes/:id",
+    "ownership": "checked",
+    "why": "twin for r7-policy-spec-double / r7-policy-include: the app's own NotePolicy compares the owner"
+   }
+  ]
+ },
+ {
+  "case": "r7-policy-include",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\n  def destroy?\n    record.user == user\n  end\n  def owner?\n    record.user == user\n  end\nend\n",
+   "config/routes.rb": "Rails.application.routes.draw do\n  resources :notes, only: [:destroy]\nend\n",
+   "app/controllers/notes_controller.rb": "class NotesController < ApplicationController\nclass NotesController < ApplicationController\n  def destroy\n    @note = Note.find(params[:id])\n    authorize @note\n    @note.destroy\n  end\nend\n",
+   "app/policies/permissive.rb": "module Permissive\n  def destroy?\n    true\n  end\n  def owner?\n    true\n  end\nend\n",
+   "app/policies/note_policy.rb": "class NotePolicy < ApplicationPolicy\n  include Permissive\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/notes/:id",
+    "ownership": "caller-blind",
+    "why": "policy_method skips the policy's included modules and reads the parent: Ruby runs Permissive#destroy? (true) ahead of ApplicationPolicy#destroy?; same for `alias_method :destroy?, :owner?`, which copies Permissive#owner?"
+   }
+  ]
+ },
+ {
+  "case": "r7-policy-namespaced-model",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "Rails.application.routes.draw do\n  resources :notes, only: [:destroy]\nend\n",
+   "app/controllers/notes_controller.rb": "class NotesController < ApplicationController\n  def destroy\n    @note = Billing::Note.find(params[:id])\n    authorize @note\n    @note.destroy\n  end\nend\n",
+   "app/models/billing/note.rb": "module Billing\n  class Note < ApplicationRecord\n    self.table_name = 'notes'\n    belongs_to :user\n  end\nend\n",
+   "app/policies/note_policy.rb": "class NotePolicy < ApplicationPolicy\n  def destroy?\n    record.user == user\n  end\nend\n",
+   "app/policies/billing/note_policy.rb": "module Billing\n  class NotePolicy < ApplicationPolicy\n    def destroy?\n      true\n    end\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/notes/:id",
+    "ownership": "caller-blind",
+    "why": "Pundit looks up `Billing::NotePolicy` (true) for a `Billing::Note`; policy_method's exact `<Model>Policy` lookup uses the short model name and reads the top-level strict NotePolicy"
+   }
+  ]
+ },
+ {
+  "case": "r7-policy-class-lexical",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "Rails.application.routes.draw do\n  namespace :admin do\n    resources :notes, only: [:destroy]\n  end\n  resources :notes, only: [:destroy]\nend\n",
+   "app/controllers/admin/notes_controller.rb": "module Admin\n  class NotesController < ApplicationController\n    def destroy\n      @note = Note.find(params[:id])\n      authorize @note, policy_class: NotePolicy\n      @note.destroy\n    end\n  end\nend\n",
+   "app/controllers/notes_controller.rb": "class NotesController < ApplicationController\n  def destroy\n    @note = Note.find(params[:id])\n    authorize @note, policy_class: NotePolicy\n    @note.destroy\n  end\nend\n",
+   "app/policies/note_policy.rb": "class NotePolicy < ApplicationPolicy\n  def destroy?\n    record.user == user\n  end\nend\n",
+   "app/policies/admin/note_policy.rb": "module Admin\n  class NotePolicy < ApplicationPolicy\n    def destroy?\n      true\n    end\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/admin/notes/:id",
+    "ownership": "caller-blind",
+    "why": "`policy_class: NotePolicy` written inside `module Admin` resolves to Admin::NotePolicy (true); policy() is called with exact=True and no lexical scope, so the top-level strict NotePolicy is read"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/notes/:id",
+    "ownership": "checked",
+    "why": "twin: the same constant written at top level is the strict ::NotePolicy"
+   }
+  ]
+ },
+ {
+  "case": "r7-alias-binds-inherited",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "Rails.application.routes.draw do\n  resources :alphas, only: [:destroy]\n  resources :betas, only: [:destroy]\n  resources :twins, only: [:destroy]\nend\n",
+   "app/controllers/concerns/lenient.rb": "module Lenient\n  def check\n  end\nend\n",
+   "app/controllers/base_notes_controller.rb": "class BaseNotesController < ApplicationController\n  def check\n  end\nend\n",
+   "app/controllers/alphas_controller.rb": "class AlphasController < ApplicationController\n  include Lenient\n\n  before_action :set_note\n  before_action :require_owner\n\n  def destroy\n    @note.destroy\n  end\n\n  private\n\n  def set_note\n    @note = Note.find(params[:id])\n  end\n\n  alias_method :require_owner, :check\n\n  def check\n    head :forbidden unless @note.user == current_user\n  end\nend\n",
+   "app/controllers/betas_controller.rb": "class BetasController < BaseNotesController\n\n  before_action :set_note\n  before_action :require_owner\n\n  def destroy\n    @note.destroy\n  end\n\n  private\n\n  def set_note\n    @note = Note.find(params[:id])\n  end\n\n  alias_method :require_owner, :check\n\n  def check\n    head :forbidden unless @note.user == current_user\n  end\nend\n",
+   "app/controllers/twins_controller.rb": "class TwinsController < ApplicationController\n\n  before_action :set_note\n  before_action :require_owner\n\n  def destroy\n    @note.destroy\n  end\n\n  private\n\n  def set_note\n    @note = Note.find(params[:id])\n  end\n\n  def check\n    head :forbidden unless @note.user == current_user\n  end\n  alias_method :require_owner, :check\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/alphas/:id",
+    "ownership": "caller-blind",
+    "why": "_alias records an alias to a not-yet-defined name and lookup resolves it from the class itself, so the later strict `def check` is used; Ruby copies the included Lenient#check (no-op) at alias time"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/betas/:id",
+    "ownership": "caller-blind",
+    "why": "same with the parent's no-op `check`: the alias copies BaseNotesController#check, not the later redefinition"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/twins/:id",
+    "ownership": "checked",
+    "why": "twin: the strict check is defined before the alias"
+   }
+  ]
+ },
+ {
+  "case": "r7-ability-namespaced",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "Rails.application.routes.draw do\n  resources :notes, only: [:destroy]\nend\n",
+   "app/controllers/notes_controller.rb": "class NotesController < ApplicationController\nclass NotesController < ApplicationController\n  load_and_authorize_resource\n\n  def destroy\n    @note.destroy\n  end\nend\n",
+   "app/models/ability.rb": "class Ability\n  include CanCan::Ability\n  def initialize(user)\n    can :manage, Note\n  end\nend\n",
+   "app/models/admin/ability.rb": "module Admin\n  class Ability\n    include CanCan::Ability\n    def initialize(user)\n      can :destroy, Note, user_id: user.id\n    end\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/notes/:id",
+    "ownership": "caller-blind",
+    "why": "RubyCode.ability is keyed by the short name, last read wins: Admin::Ability (strict) is read though CanCanCan's current_ability is ::Ability (can :manage, Note); twin: r7-ability-twin"
+   }
+  ]
+ },
+ {
+  "case": "r7-ability-self-can",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "Rails.application.routes.draw do\n  resources :notes, only: [:destroy]\nend\n",
+   "app/controllers/notes_controller.rb": "class NotesController < ApplicationController\nclass NotesController < ApplicationController\n  load_and_authorize_resource\n\n  def destroy\n    @note.destroy\n  end\nend\n",
+   "app/models/ability.rb": "class Ability\n  include CanCan::Ability\n  def initialize(user)\n    self.can :manage, Note\n    can :destroy, Note, user_id: user.id\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/notes/:id",
+    "ownership": "caller-blind",
+    "why": "_ability reads only receiver-less `can`; `self.can :manage, Note` grants every user every note and is skipped"
+   }
+  ]
+ },
+ {
+  "case": "r7-ability-class-eval",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "Rails.application.routes.draw do\n  resources :notes, only: [:destroy]\nend\n",
+   "app/controllers/notes_controller.rb": "class NotesController < ApplicationController\nclass NotesController < ApplicationController\n  load_and_authorize_resource\n\n  def destroy\n    @note.destroy\n  end\nend\n",
+   "app/models/ability.rb": "class Ability\n  include CanCan::Ability\n  def initialize(user)\n    can :destroy, Note, user_id: user.id\n  end\nend\n",
+   "config/initializers/ability_rules.rb": "Ability.class_eval do\n  alias_method :strict_initialize, :initialize\n\n  def initialize(user)\n    strict_initialize(user)\n    can :manage, Note\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/notes/:id",
+    "ownership": "unknown",
+    "why": "the superclass/super rule misses rules added by reopening Ability elsewhere (`Ability.class_eval` redefining initialize to add `can :manage, Note`)"
+   }
+  ]
+ },
+ {
+  "case": "r7-ability-twin",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "Rails.application.routes.draw do\n  resources :notes, only: [:destroy]\nend\n",
+   "app/controllers/notes_controller.rb": "class NotesController < ApplicationController\nclass NotesController < ApplicationController\n  load_and_authorize_resource\n\n  def destroy\n    @note.destroy\n  end\nend\n",
+   "app/models/ability.rb": "class Ability\n  include CanCan::Ability\n  def initialize(user)\n    can :destroy, Note, user_id: user.id\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/notes/:id",
+    "ownership": "checked",
+    "why": "twin: one Ability, owner-conditioned rule only"
+   }
+  ]
+ },
+ {
+  "case": "r7-admin-gate-trailing",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "Rails.application.routes.draw do\n  resources :alphas, only: [:destroy]\n  resources :twins, only: [:destroy]\nend\n",
+   "app/controllers/alphas_controller.rb": "class AlphasController < ApplicationController\n  before_action :set_note\n  before_action :require_admin\n\n  def destroy\n    @note.destroy\n  end\n\n  private\n\n  def set_note\n    @note = Note.find(params[:id])\n  end\n\n  def require_admin\n    return if current_user.admin?\n    head :forbidden\n    @note.destroy\n  end\nend\n",
+   "app/controllers/twins_controller.rb": "class TwinsController < ApplicationController\n  before_action :set_note\n  before_action :require_admin\n\n  def destroy\n    @note.destroy\n  end\n\n  private\n\n  def set_note\n    @note = Note.find(params[:id])\n  end\n\n  def require_admin\n    return if current_user.admin?\n    head :forbidden\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/alphas/:id",
+    "ownership": "unchecked",
+    "why": "admin_gate checks only the first refusing statement (and now _sends on it); the callback keeps running after `head :forbidden` and destroys the note for every non-admin, yet the route is n/a"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/twins/:id",
+    "ownership": "n/a",
+    "why": "twin: a pure admin gate"
+   }
+  ]
+ },
+ {
+  "case": "r7-regress-callers",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "Rails.application.routes.draw do\n  resources :alphas, only: [:destroy]\n  resources :betas, only: [:destroy]\nend\n",
+   "app/controllers/alphas_controller.rb": "class AlphasController < ApplicationController\n  def destroy\n    current_user.notes.find(params[:id]).destroy\n  end\n\n  private\n\n  def current_user\n    request.env[\"warden\"].user\n  end\nend\n",
+   "app/controllers/betas_controller.rb": "class BetasController < ApplicationController\n  before_action :set_tenant\n\n  def destroy\n    current_user.notes.find(params[:id]).destroy\n  end\n\n  private\n\n  def set_tenant\n    @tenant = Tenant.find_by!(subdomain: request.subdomain)\n  end\n\n  def current_user\n    @current_user ||= @tenant.users.find_by(id: session[:user_id])\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/alphas/:id",
+    "ownership": "scoped",
+    "why": "REGRESSION (base: scoped): Devise's warden from request.env is the session credential, but the new _forged header/env check sees `request.env` and the `\"warden\"` string is dropped by _words"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/betas/:id",
+    "ownership": "scoped",
+    "why": "REGRESSION (base: scoped): _returns_unset flags the tenant ivar (`@tenant` from the subdomain) though the user itself comes from the session"
+   }
+  ]
+ },
+ {
+  "case": "r7-regress-admin-json",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "Rails.application.routes.draw do\n  resources :alphas, only: [:destroy]\nend\n",
+   "app/controllers/alphas_controller.rb": "class AlphasController < ApplicationController\n  before_action :set_note\n  before_action :require_admin\n\n  def destroy\n    @note.destroy\n  end\n\n  private\n\n  def set_note\n    @note = Note.find(params[:id])\n  end\n\n  def require_admin\n    render json: { error: 'Forbidden' }.to_json, status: :forbidden unless current_user.admin?\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/alphas/:id",
+    "ownership": "n/a",
+    "why": "REGRESSION (base: n/a): _sends treats any call in the render body as a value, so a literal error hash's `.to_json` makes a pure admin gate unchecked"
+   }
+  ]
+ },
+ {
+  "case": "r7-regress-dummy-models",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "Rails.application.routes.draw do\n  resources :notes, only: [:destroy]\nend\n",
+   "app/controllers/notes_controller.rb": "class NotesController < ApplicationController\n  def destroy\n    current_user.notes.find(params[:id]).destroy\n  end\nend\n",
+   "spec/dummy/config/routes.rb": "Rails.application.routes.draw do\nend\n",
+   "spec/dummy/app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\nend\n",
+   "spec/dummy/app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/notes/:id",
+    "ownership": "unknown",
+    "why": "REGRESSION (base: scoped): model_roots makes User/Note unread whenever a test app defines the same models, even identically"
+   }
+  ]
+ },
+ {
+  "case": "r7-regress-policy-lexical",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "Rails.application.routes.draw do\n  namespace :admin do\n    resources :notes, only: [:destroy]\n  end\nend\n",
+   "app/controllers/admin/notes_controller.rb": "module Admin\n  class NotesController < ApplicationController\n    def destroy\n      @note = Note.find(params[:id])\n      authorize @note, policy_class: NotePolicy\n      @note.destroy\n    end\n  end\nend\n",
+   "app/policies/admin/note_policy.rb": "module Admin\n  class NotePolicy < ApplicationPolicy\n    def destroy?\n      record.user == user\n    end\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/admin/notes/:id",
+    "ownership": "checked",
+    "why": "REGRESSION (base: checked): `policy_class: NotePolicy` inside `module Admin` is Admin::NotePolicy; the exact lookup now finds only a top-level NotePolicy, so the strict policy is unknown"
+   }
+  ]
+ },
+ {
+  "case": "r7-crash-draw-fanout",
+  "files": {
+   "db/schema.rb": "\nActiveRecord::Schema[7.1].define(version: 1) do\n  create_table \"users\" do |t|\n    t.string \"email\"\n    t.boolean \"admin\"\n    t.references \"manager\"\n  end\n  create_table \"notes\" do |t|\n    t.references \"user\"\n    t.references \"original\"\n    t.text \"body\"\n    t.boolean \"public\"\n  end\nend\n",
+   "app/models/application_record.rb": "class ApplicationRecord < ActiveRecord::Base\nend\n",
+   "app/models/user.rb": "class User < ApplicationRecord\n  has_many :notes\n  belongs_to :manager, class_name: \"User\"\nend\n",
+   "app/models/note.rb": "class Note < ApplicationRecord\n  belongs_to :user\n  belongs_to :original, class_name: \"Note\"\nend\n",
+   "app/controllers/application_controller.rb": "class ApplicationController < ActionController::Base\n  include Pundit::Authorization\n  before_action :authenticate_user!\nend\n",
+   "app/policies/application_policy.rb": "class ApplicationPolicy\n  attr_reader :user, :record\nend\n",
+   "config/routes.rb": "Rails.application.routes.draw do\n  draw :r0\nend\n",
+   "config/routes/r0.rb": "draw :r1\ndraw :r1\n",
+   "config/routes/r1.rb": "draw :r2\ndraw :r2\n",
+   "config/routes/r2.rb": "draw :r3\ndraw :r3\n",
+   "config/routes/r3.rb": "draw :r4\ndraw :r4\n",
+   "config/routes/r4.rb": "draw :r5\ndraw :r5\n",
+   "config/routes/r5.rb": "draw :r6\ndraw :r6\n",
+   "config/routes/r6.rb": "draw :r7\ndraw :r7\n",
+   "config/routes/r7.rb": "draw :r8\ndraw :r8\n",
+   "config/routes/r8.rb": "draw :r9\ndraw :r9\n",
+   "config/routes/r9.rb": "draw :r10\ndraw :r10\n",
+   "config/routes/r10.rb": "draw :r11\ndraw :r11\n",
+   "config/routes/r11.rb": "draw :r12\ndraw :r12\n",
+   "config/routes/r12.rb": "draw :r13\ndraw :r13\n",
+   "config/routes/r13.rb": "draw :r14\ndraw :r14\n",
+   "config/routes/r14.rb": "draw :r15\ndraw :r15\n",
+   "config/routes/r15.rb": "draw :r16\ndraw :r16\n",
+   "config/routes/r16.rb": "draw :r17\ndraw :r17\n",
+   "config/routes/r17.rb": "draw :r18\ndraw :r18\n",
+   "config/routes/r18.rb": "draw :r19\ndraw :r19\n",
+   "config/routes/r19.rb": "resources :notes, only: [:destroy]\n",
+   "app/controllers/notes_controller.rb": "class NotesController < ApplicationController\n  def destroy\n    current_user.notes.find(params[:id]).destroy\n  end\nend\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/notes/:id",
+    "ownership": "scoped",
+    "why": "CRASH (introduced): `drawn` is discarded after each expansion, so 20 route files each drawing the next twice expand 2^20 times; base reads one route instantly, HEAD did not finish in 100s"
+   }
+  ]
  }
 ]

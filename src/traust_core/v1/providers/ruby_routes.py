@@ -21,7 +21,7 @@ from traust_core.v1.providers.route_guards import (
     _unique,
 )
 from traust_core.v1.providers.route_ownership import path_params
-from traust_core.v1.providers.ruby_ownership import app_roots, root_of
+from traust_core.v1.providers.ruby_ownership import app_roots, root_of, test_file
 from traust_core.v1.providers.syntax import Node, Parsed, walk
 from traust_core.v1.providers.syntax import ruby_parser as parser
 from traust_core.v1.providers.tree import TreeFile
@@ -105,6 +105,7 @@ _KNOWN_MACROS = {
 }
 _SKIP_AFTER = ("skip_after_action", "skip_after_filter")
 _MAX_ROUTE_NESTING = 100
+_MAX_EXPANSIONS = 16  # times one routes file or concern expands (Rails apps draw a few)
 _LITERAL_NAMES = ("array", "symbol_array", "string_array", "simple_symbol", "string")
 # `unless: -> { current_user.admin? }`: skipped only for an admin (D10)
 _ADMIN_ONLY = re.compile(
@@ -257,6 +258,7 @@ class _RailsRoutes:
         self.sources = sources
         self.routes: list[_Route] = []
         self.drawn: set[str] = set()  # `draw :api` files being expanded
+        self.expansions: dict[object, int] = {}  # how often each file or concern expanded
         # `concern :commentable`, by the routes directory that declares it
         self.concerns: dict[tuple[str, str], tuple[_Source, list[Node]]] = {}
         self.expanding: set[tuple[str, str]] = set()
@@ -273,6 +275,11 @@ class _RailsRoutes:
                         self._block(
                             src, _body(n), _Scope(module=module), rel.removesuffix("routes.rb")
                         )
+        # the same route drawn again (a file or concern expanded twice) matches only once
+        unique: dict[tuple[str, str, str, str], _Route] = {}
+        for route in self.routes:
+            unique.setdefault((route.method, route.pattern, route.controller, route.action), route)
+        self.routes = list(unique.values())
 
     def _isolated(self, drawn_on: str) -> str:
         """`Billing::Engine.routes.draw` of an engine whose class calls `isolate_namespace
@@ -358,8 +365,10 @@ class _RailsRoutes:
         elif name == "draw" and first:
             rel = f"{config}routes/{first}.rb"
             included = self.sources.get(rel)
-            if included is not None and rel not in self.drawn:
+            seen = self.expansions.get(rel, 0)
+            if included is not None and rel not in self.drawn and seen < _MAX_EXPANSIONS:
                 self.drawn.add(rel)  # drawing itself again (a cycle) stops; another scope doesn't
+                self.expansions[rel] = seen + 1
                 self._block(included, list(included.root.named_children), scope, config)
                 self.drawn.discard(rel)
 
@@ -399,7 +408,9 @@ class _RailsRoutes:
     def _concerns(self, names: list[str], scope: _Scope, config: str) -> None:
         for name in names:
             key = (config, name)
-            if key in self.concerns and key not in self.expanding:
+            seen = self.expansions.get(key, 0)  # type: ignore[call-overload]
+            if key in self.concerns and key not in self.expanding and seen < _MAX_EXPANSIONS:
+                self.expansions[key] = seen + 1  # type: ignore[index]
                 csrc, body = self.concerns[key]
                 self.expanding.add(key)  # a concern naming itself expands once
                 self._block(csrc, body, scope, config)
@@ -508,6 +519,8 @@ def _controllers(sources: dict[str, _Source]) -> dict[str, _Controller]:
     found: dict[str, _Controller] = {}
     roots = app_roots(list(sources))
     for rel, src in sources.items():
+        if test_file(rel, roots):
+            continue  # `spec/support/notes_controller.rb` reopens no app's controller
         root = _app_root(rel, roots)
         for n in walk(src.root):
             if n.type != "class" or not n.is_named:
@@ -554,7 +567,10 @@ def _controllers(sources: dict[str, _Source]) -> dict[str, _Controller]:
             here = _app_root(src.file.rel, roots)
             if re.search(r"(^|/)(spec|test)/", src.file.rel[len(here) :]):
                 continue  # a test's `NotesController.class_eval { … }` changes no app
-            owners = {id(c): c for k, c in found.items() if k == f"{here}|{target}"}.values()
+            owners = list({id(c): c for k, c in found.items() if k == f"{here}|{target}"}.values())
+            if not owners:  # a host decorator on an engine's `Billing::NotesController`
+                elsewhere = {id(c): c for k, c in found.items() if k.split("|", 1)[1] == target}
+                owners = list(elsewhere.values()) if len(elsewhere) == 1 else []
             if _method(src, n) in ("class_eval", "class_exec"):
                 for c in owners:
                     _read_class(src, _body(n), c)  # `NotesController.class_eval { … }`
@@ -898,6 +914,17 @@ def _rails_guards(
         and (_is_guard(cb.name) or cb.name in _GUARD_CALLBACKS)
     ]
     guard = [cb.name for cb in guarding if not cb.skipped]
+    # `before_action { authenticate_user! }`: the guards a block calls
+    guard += [
+        name
+        for cb in callbacks
+        if cb.body is not None and not cb.after and not cb.around and not cb.skipped
+        for s in _callback_body(cb.body)
+        if s.type in ("call", "identifier")
+        and (s.type == "identifier" or s.child_by_field_name("receiver") is None)
+        and (name := _method(cb.src or c.src, s) if s.type == "call" else (cb.src or c.src).text(s))
+        and _is_guard(name)
+    ]
     # a skip that may take a guard out (`skip_before_action :x, if: :public?`) is an unguard
     removed += [cb.name for cb in guarding if cb.skipped]
     skipped = [
@@ -1125,16 +1152,18 @@ class _Ownership:
                     return hit
             return None
 
-        memo: dict[tuple[str, int, int | None], tuple[Parsed, Node] | None] = {}
+        memo: dict[tuple[str, int, int | None, int | None], tuple[Parsed, Node] | None] = {}
 
-        def find(name: str, depth: int = 0, upto: int | None = None) -> tuple[Parsed, Node] | None:
-            key = (name, depth, upto)
+        def find(
+            name: str, depth: int = 0, upto: int | None = None, skip: int | None = None
+        ) -> tuple[Parsed, Node] | None:
+            key = (name, depth, upto, skip)
             if key not in memo:
-                memo[key] = lookup(name, depth, upto)
+                memo[key] = lookup(name, depth, upto, skip)
             return memo[key]
 
         def lookup(
-            name: str, depth: int = 0, upto: int | None = None
+            name: str, depth: int = 0, upto: int | None = None, skip: int | None = None
         ) -> tuple[Parsed, Node] | None:
             # Ruby's lookup: prepended modules, the class, its modules (the last included
             # first), then its parent; an alias copies the method where it's declared
@@ -1142,8 +1171,10 @@ class _Ownership:
                 ctrl = chain[i]
                 for m in [*reversed(ctrl.prepends), None, *reversed(ctrl.includes)]:
                     if m is None:
+                        if i == skip:
+                            continue  # an alias of an inherited method skips the class's own
                         if name in ctrl.aliases and depth < 4:
-                            return find(ctrl.aliases[name], depth + 1, i + 1)
+                            return find(ctrl.aliases[name], depth + 1, i + 1, i)
                         if name in ctrl.actions:
                             return ctrl.sources.get(name, ctrl.src), ctrl.actions[name]
                         if name in ctrl.delegated or name in ctrl.unread or ctrl.dynamic:
