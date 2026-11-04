@@ -1122,3 +1122,397 @@ def test_an_admin_gate_that_sends_the_record_is_none(tmp_path: Path, refusal: st
     )
     row = _row(_tree(tmp_path, _notes_app(controller)), "DELETE", "/notes/:id")
     assert row["ownership"] not in ("n/a", "checked", "scoped", "none")
+
+
+IMPERSONATED = (
+    "class NotesController < ApplicationController\n"
+    "  prepend_before_action :impersonate\n\n"
+    "  def destroy\n    {lookup}.notes.find(params[:id]).destroy\n  end\n\n"
+    "  private\n\n  def impersonate\n    {write}\n  end\n\n"
+    "  def current_user\n    @current_user ||= User.find_by(id: session[:user_id])\n  end\nend\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("lookup", "write"),
+    [
+        ("Current.user", "Current.user = User.find(params[:user_id])"),
+        ("Current.user", "Current.user ||= User.find(params[:user_id])"),
+        ("Current.user", "Current.set(user: User.find(params[:user_id]))"),
+        ("current_user", "self.current_user = User.find(params[:user_id])"),
+        ("current_user", "session[:user_id] = params[:user_id]"),
+        ("current_user", "session[:user_id] ||= params[:user_id]"),
+        ("current_user", "session.update(user_id: params[:user_id])"),
+        ("current_user", "session.merge!(params.permit(:user_id).to_h)"),
+        ("current_user", "session.store(:user_id, params[:user_id])"),
+        ("current_user", "request.session[:user_id] = params[:user_id]"),
+        ("current_user", "session[key] = params[:user_id]"),
+        ("current_user", "cookies.signed.permanent[:user_id] = params[:user_id]"),
+    ],
+)
+def test_a_caller_the_request_sets_is_never_scoped(tmp_path: Path, lookup: str, write: str) -> None:
+    controller = IMPERSONATED.format(lookup=lookup, write=write)
+    row = _row(_tree(tmp_path, _notes_app(controller)), "DELETE", "/notes/:id")
+    assert row["ownership"] != "scoped"
+
+
+@pytest.mark.parametrize(
+    "write",
+    [
+        "session[:return_to] = request.fullpath",
+        "session[:user_id] = current_user.id",
+    ],
+)
+def test_a_session_write_that_leaves_the_caller_keeps_it_scoped(tmp_path: Path, write: str) -> None:
+    controller = IMPERSONATED.format(lookup="current_user", write=write)
+    row = _row(_tree(tmp_path, _notes_app(controller)), "DELETE", "/notes/:id")
+    assert row["ownership"] == "scoped"
+
+
+def test_a_session_write_devise_may_read_leaves_no_caller_scoped(tmp_path: Path) -> None:
+    controller = (
+        "class NotesController < ApplicationController\n"
+        "  prepend_before_action :impersonate\n\n"
+        "  def destroy\n    current_user.notes.find(params[:id]).destroy\n  end\n\n"
+        "  private\n\n  def impersonate\n"
+        '    session["warden.user.user.key"] = [[params[:user_id]], nil]\n  end\nend\n'
+    )
+    row = _row(_tree(tmp_path, _notes_app(controller)), "DELETE", "/notes/:id")
+    assert row["ownership"] != "scoped"
+
+
+FORGED_SESSION = (
+    "class NotesController < ApplicationController\n"
+    "  prepend_before_action :impersonate\n\n"
+    "  def destroy\n    current_user.notes.find(params[:id]).destroy\n  end\n\n"
+    "  private\n\n  def impersonate\n    {write}\n  end\n\n{helpers}end\n"
+)
+SESSION_USER = "  def current_user\n    @current_user ||= User.find_by(id: {read})\n  end\n"
+
+
+@pytest.mark.parametrize(
+    ("write", "helpers"),
+    [
+        # read through a method on the store
+        (
+            "session[:user_id] = params[:user_id]",
+            SESSION_USER.format(read="session.fetch(:user_id, nil)"),
+        ),
+        (
+            "session[:user_id] = params[:user_id]",
+            SESSION_USER.format(read="session.to_h['user_id']"),
+        ),
+        ("session[:user_id] = params[:user_id]", SESSION_USER.format(read="session.dig(:user_id)")),
+        # a caller helper that returns the lookup, assigning nothing
+        (
+            "session[:user_id] = params[:user_id]",
+            "  def current_user\n    User.find_by(id: session[:user_id])\n  end\n",
+        ),
+        (
+            "session[:user_id] = params[:user_id]",
+            "  def current_user = User.find_by(id: session[:user_id])\n",
+        ),
+        # written by a helper that takes the value
+        (
+            "login_as(params[:user_id])",
+            "  def login_as(id)\n    session[:user_id] = id\n  end\n\n"
+            + SESSION_USER.format(read="session[:user_id]"),
+        ),
+        # written through an alias, a block, `self` or `send`
+        (
+            "s = session\n    s[:user_id] = params[:user_id]",
+            SESSION_USER.format(read="session[:user_id]"),
+        ),
+        (
+            "session.tap { |s| s[:user_id] = params[:user_id] }",
+            SESSION_USER.format(read="session[:user_id]"),
+        ),
+        (
+            "self.session[:user_id] = params[:user_id]",
+            SESSION_USER.format(read="session[:user_id]"),
+        ),
+        (
+            "session.send(:[]=, :user_id, params[:user_id])",
+            SESSION_USER.format(read="session[:user_id]"),
+        ),
+        # a local named `session` in another method shadows nothing here
+        (
+            "session[:user_id] = params[:user_id]\n    current_session",
+            "  def current_session\n"
+            "    session = Session.find_by(id: cookies.signed[:sid])\n  end\n\n"
+            + SESSION_USER.format(read="session[:user_id]"),
+        ),
+    ],
+)
+def test_every_way_the_request_reaches_the_sessions_caller_is_closed(
+    tmp_path: Path, write: str, helpers: str
+) -> None:
+    controller = FORGED_SESSION.format(write=write, helpers=helpers)
+    row = _row(_tree(tmp_path, _notes_app(controller)), "DELETE", "/notes/:id")
+    assert row["ownership"] != "scoped"
+
+
+@pytest.mark.parametrize(
+    ("write", "read"),
+    [
+        (
+            "session[:user_id] = nil if session[:expires_at].to_i < Time.now.to_i",
+            "session[:user_id]",
+        ),
+        (
+            "cookies.permanent.signed[:user_id] = { value: current_user.id, httponly: true }",
+            "cookies.signed[:user_id]",
+        ),
+        ("session[:a], session[:b] = 1, 2", "session[:user_id]"),
+        ("key = :return_to\n    session[key] = request.fullpath", "session[:user_id]"),
+        ("session.delete(:user_id)", "session[:user_id]"),
+    ],
+)
+def test_a_session_write_the_request_doesnt_choose_keeps_the_caller(
+    tmp_path: Path, write: str, read: str
+) -> None:
+    controller = FORGED_SESSION.format(write=write, helpers=SESSION_USER.format(read=read))
+    row = _row(_tree(tmp_path, _notes_app(controller)), "DELETE", "/notes/:id")
+    assert row["ownership"] == "scoped"
+
+
+def test_a_namespace_whose_module_the_version_decides_is_unknown(tmp_path: Path) -> None:
+    files = {
+        **_notes_app(
+            "class NotesController < ApplicationController\n  def destroy\n"
+            "    current_user.notes.find(params[:id]).destroy\n  end\nend\n"
+        ),
+        "config/routes.rb": (
+            "Rails.application.routes.draw do\n  namespace :admin, module: nil do\n"
+            "    resources :notes, only: [:destroy]\n  end\nend\n"
+        ),
+        "app/controllers/admin/notes_controller.rb": (
+            "class Admin::NotesController < ApplicationController\n  def destroy\n"
+            "    Note.find(params[:id]).destroy\n  end\nend\n"
+        ),
+    }
+    assert _row(_tree(tmp_path, files), "DELETE", "/admin/notes/:id")["ownership"] == "unknown"
+
+
+# Invented session and caller-setter shapes from two independent reviews: each file set is
+# what differs from `_notes_app("")`. A request-chosen caller stays judged or unknown.
+_SESSION = Path(__file__).parents[2] / "fixtures/code_facts/rails_session_review.json"
+_SESSION_CASES = json.loads(_SESSION.read_text())
+
+
+@pytest.mark.parametrize("case", _SESSION_CASES, ids=[c["case"] for c in _SESSION_CASES])
+def test_what_the_session_reviews_found_stays_closed(tmp_path: Path, case: dict) -> None:
+    files = {**_notes_app(""), **case["files"]}
+    row = _row(_tree(tmp_path, files), case["method"], case["pattern"])
+    assert row["ownership"] == case["ownership"], case["why"]
+
+
+@pytest.mark.parametrize(
+    "write",
+    [
+        "session.values.first.replace(params[:user_id])",
+        "session.to_h[:user_id].replace(params[:user_id])",
+        "session[:user_id].to_s.replace(params[:user_id])",
+        "session.each_value { |v| v.replace(params[:user_id]) }",
+    ],
+)
+def test_a_stored_value_mutated_through_a_read_is_a_write(tmp_path: Path, write: str) -> None:
+    controller = FORGED_SESSION.format(
+        write=write, helpers=SESSION_USER.format(read="session[:user_id]")
+    )
+    row = _row(_tree(tmp_path, _notes_app(controller)), "DELETE", "/notes/:id")
+    assert row["ownership"] != "scoped"
+
+
+def test_another_objects_session_is_not_the_requests(tmp_path: Path) -> None:
+    write = "@account = Account.first\n    @account.session.update(token: params[:t])"
+    controller = FORGED_SESSION.format(
+        write=write, helpers=SESSION_USER.format(read="session[:user_id]")
+    )
+    row = _row(_tree(tmp_path, _notes_app(controller)), "DELETE", "/notes/:id")
+    assert row["ownership"] == "scoped"
+
+
+def test_a_local_named_like_a_helper_calls_no_helper(tmp_path: Path) -> None:
+    controller = FORGED_SESSION.format(
+        write='helper = "safe"\n    logger.info(helper)',
+        helpers="  def helper\n    session[:user_id] = params[:user_id]\n  end\n\n"
+        + SESSION_USER.format(read="session[:user_id]"),
+    )
+    row = _row(_tree(tmp_path, _notes_app(controller)), "DELETE", "/notes/:id")
+    assert row["ownership"] == "scoped"
+
+
+def test_a_cycle_of_key_locals_in_a_loop_ends(tmp_path: Path) -> None:
+    write = (
+        "a = :x\n    b = :y\n    2.times do\n      a = b\n      b = a\n"
+        "      session[a] = params[:user_id]\n    end"
+    )
+    controller = FORGED_SESSION.format(
+        write=write, helpers=SESSION_USER.format(read="session[:user_id]")
+    )
+    row = _row(_tree(tmp_path, _notes_app(controller)), "DELETE", "/notes/:id")
+    assert row["ownership"] != "scoped"
+
+
+@pytest.mark.parametrize(
+    ("write", "helpers"),
+    [
+        # the request through a local (`r = request`), or the store handed to a helper
+        ("r = request\n    r.session[:user_id] = params[:user_id]", ""),
+        (
+            "remember(session)",
+            "  def remember(session)\n    session[:user_id] = params[:id]\n  end\n\n",
+        ),
+        # a block assigning the outer key local
+        ("key = :locale\n    [1].each { key = :user_id }\n    session[key] = params[:user_id]", ""),
+        # `delete` returns the value it removes
+        ("session[:pending_uid] = params[:uid]", ""),
+        # signing in through `self` or `send`
+        ("self.sign_in(User.find(params[:user_id]))", ""),
+        ("send(:sign_in, User.find(params[:user_id]))", ""),
+    ],
+    ids=[
+        "request-alias",
+        "session-param",
+        "block-key",
+        "delete-read",
+        "self-sign-in",
+        "send-sign-in",
+    ],
+)
+def test_what_qodos_review_of_362_found_stays_closed(
+    tmp_path: Path, write: str, helpers: str
+) -> None:
+    read = "session.delete(:pending_uid)" if "pending_uid" in write else "session[:user_id]"
+    controller = FORGED_SESSION.format(
+        write=write, helpers=helpers + SESSION_USER.format(read=read)
+    )
+    if "sign_in" in write:
+        controller = FORGED_SESSION.format(write=write, helpers="")
+    row = _row(_tree(tmp_path, _notes_app(controller)), "DELETE", "/notes/:id")
+    assert row["ownership"] != "scoped"
+
+
+def test_a_method_an_action_defines_but_never_calls_runs_nothing(tmp_path: Path) -> None:
+    controller = FORGED_SESSION.format(
+        write="def later\n      session[:user_id] = params[:user_id]\n    end",
+        helpers=SESSION_USER.format(read="session[:user_id]"),
+    )
+    row = _row(_tree(tmp_path, _notes_app(controller)), "DELETE", "/notes/:id")
+    assert row["ownership"] == "scoped"
+
+
+def test_a_name_read_before_its_assignment_in_a_loop_is_the_method(tmp_path: Path) -> None:
+    write = "2.times do\n      forge\n      forge = 1\n    end"
+    controller = FORGED_SESSION.format(
+        write=write,
+        helpers="  def forge\n    session[:user_id] = params[:user_id]\n  end\n\n"
+        + SESSION_USER.format(read="session[:user_id]"),
+    )
+    row = _row(_tree(tmp_path, _notes_app(controller)), "DELETE", "/notes/:id")
+    assert row["ownership"] != "scoped"
+
+
+def test_a_method_an_action_defines_and_calls_runs(tmp_path: Path) -> None:
+    write = "def later\n      session[:user_id] = params[:user_id]\n    end\n    later"
+    controller = FORGED_SESSION.format(
+        write=write, helpers=SESSION_USER.format(read="session[:user_id]")
+    )
+    row = _row(_tree(tmp_path, _notes_app(controller)), "DELETE", "/notes/:id")
+    assert row["ownership"] != "scoped"
+
+
+@pytest.mark.parametrize(
+    "write",
+    [
+        # another object's session, through a helper's parameter
+        "touch(Account.first)\n  end\n\n"
+        "  def touch(account)\n    account.session.update(token: params[:t])",
+        # a block's own parameter isn't the outer key
+        "key = :return_to\n    [1].each { |key| key = params[:user_id] }\n"
+        "    session[key] = request.fullpath",
+    ],
+    ids=["helper-param-session", "shadowed-key"],
+)
+def test_what_qodos_third_review_of_362_keeps_scoped(tmp_path: Path, write: str) -> None:
+    controller = FORGED_SESSION.format(
+        write=write, helpers=SESSION_USER.format(read="session[:user_id]")
+    )
+    row = _row(_tree(tmp_path, _notes_app(controller)), "DELETE", "/notes/:id")
+    assert row["ownership"] == "scoped"
+
+
+@pytest.mark.parametrize(
+    ("write", "helpers"),
+    [
+        # the action redefines a clean helper, then calls it
+        (
+            "def remember\n      session[:user_id] = params[:user_id]\n    end\n    remember",
+            "  def remember\n    nil\n  end\n\n",
+        ),
+        # the request handed to a parameter of any name, or a block's
+        (
+            "forge(request)",
+            "  def forge(store)\n    store.session[:user_id] = params[:user_id]\n  end\n\n",
+        ),
+        (
+            "forge(env: request)",
+            "  def forge(env:)\n    env.session[:user_id] = params[:user_id]\n  end\n\n",
+        ),
+        ("[request].each { |r| r.session[:user_id] = params[:user_id] }", ""),
+    ],
+    ids=["redefined-helper", "param-store", "keyword-param", "block-param"],
+)
+def test_what_qodos_review_of_6c6fd55_found_stays_closed(
+    tmp_path: Path, write: str, helpers: str
+) -> None:
+    controller = FORGED_SESSION.format(
+        write=write, helpers=helpers + SESSION_USER.format(read="session[:user_id]")
+    )
+    row = _row(_tree(tmp_path, _notes_app(controller)), "DELETE", "/notes/:id")
+    assert row["ownership"] != "scoped"
+
+
+@pytest.mark.parametrize(
+    ("write", "helpers"),
+    [
+        # an alias of the request handed to a helper
+        (
+            "r = request\n    forge(r)",
+            "  def forge(store)\n    store.session[:user_id] = params[:user_id]\n  end\n\n",
+        ),
+        # a default argument that names the request
+        (
+            "remember",
+            "  def remember(target = request)\n"
+            "    target.session[:user_id] = params[:user_id]\n  end\n\n",
+        ),
+        # an earlier definition the callback runs, before the action redefines it clean
+        (
+            "def note_user\n      session[:user_id] = params[:user_id]\n    end\n    note_user\n"
+            "    def note_user\n      nil\n    end",
+            "",
+        ),
+    ],
+    ids=["request-alias-arg", "default-arg", "earlier-definition"],
+)
+def test_what_qodos_review_of_c1e0e8e_found_stays_closed(
+    tmp_path: Path, write: str, helpers: str
+) -> None:
+    controller = FORGED_SESSION.format(
+        write=write, helpers=helpers + SESSION_USER.format(read="session[:user_id]")
+    )
+    row = _row(_tree(tmp_path, _notes_app(controller)), "DELETE", "/notes/:id")
+    assert row["ownership"] != "scoped"
+
+
+def test_a_lambda_callbacks_parameter_is_the_controller(tmp_path: Path) -> None:
+    controller = (
+        "class NotesController < ApplicationController\n"
+        "  before_action ->(c) { c.session[:user_id] = c.params[:user_id] }\n\n"
+        "  def destroy\n    current_user.notes.find(params[:id]).destroy\n  end\n\n"
+        "  private\n\n" + SESSION_USER.format(read="session[:user_id]") + "end\n"
+    )
+    row = _row(_tree(tmp_path, _notes_app(controller)), "DELETE", "/notes/:id")
+    assert row["ownership"] != "scoped"
