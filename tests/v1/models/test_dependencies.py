@@ -91,6 +91,7 @@ def test_unorderable_versions_have_no_key(version: str, ecosystem: Ecosystem) ->
         (Ecosystem.CARGO, ["1.0.0-alpha", "1.0.0"]),
         (Ecosystem.NUGET, ["1.0.0-beta.1", "1.0.0"]),
         (PYPI, ["2.0.dev1", "2.0a1.dev1", "2.0a1", "2.0b1", "2.0rc1", "2.0"]),
+        (PYPI, ["2.0rc1", "2.0rc1.post1.dev1", "2.0rc1.post1", "2.0"]),
         (PYPI, ["2.0", "2.0.post1.dev1", "2.0.post1", "2.0.1"]),
     ],
 )
@@ -118,6 +119,15 @@ def test_a_pre_release_of_the_fix_is_still_affected() -> None:
     fixed_in_2 = package(span("0", "2.0.0"), ecosystem=NPM)
     assert fixed_in_2.affects(Version("2.0.0-rc.1")) is True
     assert fixed_in_2.affects(Version("2.0.0")) is False
+
+
+def test_a_pre_release_fixed_with_its_own_post_release_still_affects_the_pre_release() -> None:
+    """A PyPI fix at 2.0rc1.post1 must not treat an installed 2.0rc1 as fixed (its key
+    ordered equal before the post segment joined the pre-release's stage)."""
+    fixed_at = package(span("0", "2.0rc1.post1"), ecosystem=PYPI)
+    assert fixed_at.affects(Version("2.0rc1")) is True
+    assert fixed_at.affects(Version("2.0rc1.post1")) is False
+    assert fixed_at.affects(Version("2.0rc1.post1.dev1")) is True
 
 
 def test_semver_pre_release_case_still_orders_outside_nuget() -> None:

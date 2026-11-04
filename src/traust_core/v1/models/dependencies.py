@@ -102,13 +102,20 @@ def _semver_stage(rest: str, fold: bool) -> tuple[int | tuple[int, int | str], .
 
 
 def _pep440_stage(rest: str) -> tuple[int, ...]:
-    """PEP 440 order within one release: dev < pre (a < b < rc) < final < post."""
+    """PEP 440 order within one release: dev < pre (a < b < rc) < final < post, and a
+    pre-release's own post and dev segments order within it (2.0rc1 < 2.0rc1.post1.dev1
+    < 2.0rc1.post1)."""
     m = _PEP440_SUFFIX.fullmatch(rest.lower())
     if not m:
         return (0,)
     dev = (0,) if m["dev"] is None else (-1, int(m["dev_n"] or 0))
+    post = (
+        (0,)
+        if not (m["post_implicit"] or m["post"])
+        else (1, int(m["post_implicit"] or m["post_n"] or 0))
+    )
     if m["pre"]:
-        return (-1, _PEP440_PRE_RANK.get(m["pre"], 2), int(m["pre_n"] or 0), *dev)
+        return (-1, _PEP440_PRE_RANK.get(m["pre"], 2), int(m["pre_n"] or 0), *post, *dev)
     if m["post_implicit"] or m["post"]:
         return (1, int(m["post_implicit"] or m["post_n"] or 0), *dev)
     return (-2, int(m["dev_n"] or 0)) if m["dev"] else (0,)
