@@ -16,7 +16,14 @@ from sqlalchemy.engine import Engine
 from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import Seed
 from traust_core.v1.context import Config, Context
-from traust_core.v1.errors import ConfigError, IntegrityError, NotFoundError, ValidationError
+from traust_core.v1.errors import (
+    ConfigError,
+    ConflictError,
+    ForbiddenError,
+    IntegrityError,
+    NotFoundError,
+    ValidationError,
+)
 from traust_core.v1.models.artifacts import (
     ArtifactDocument,
     CloudConfigAuditArtifact,
@@ -38,8 +45,10 @@ from traust_core.v1.models.assessment import (
 )
 from traust_core.v1.models.common import ArtifactRef, Provenance
 from traust_core.v1.models.findings import FindingCandidate
+from traust_core.v1.models.identity import IdentitySource, Principal
 from traust_core.v1.models.integrity import sha256_hex
-from traust_core.v1.models.vocabulary import SourceType
+from traust_core.v1.models.operations import OrderRequest, WorkerId
+from traust_core.v1.models.vocabulary import ActorKind, SourceType
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.repositories.objects import ObjectKey
 from traust_core.v1.services.artifact_publishing import AssessmentLog, PublishSpec, PublishSpecs
@@ -809,3 +818,80 @@ def test_report_effort_cutover_does_not_tighten_unrelated_severity_override_note
     assert restored.payload == doc.payload
     override = restored.disposition_summary.severity_overrides[0]
     assert getattr(override, "from") == "retained source-specific severity"
+
+
+OPERATOR = Principal(
+    identity="operator@example.com",
+    kind=ActorKind.HUMAN,
+    display="operator@example.com",
+    verified_by=IdentitySource.LOCAL_USER,
+)
+
+
+def order(context: Context, ref: UUID | None, *, lease: bool = True, expired: bool = False) -> UUID:
+    """An order on `ref`'s repository (None: fleet-wide), leased unless `lease` is false; an
+    `expired` lease is still marked leased, as it is until the engine requeues it."""
+    services = context.services()
+    repository_id = None if ref is None else services.portfolio.inventory.get_ref(ref).repository_id
+    submitted = services.ops.submit(
+        OrderRequest(asset="full_audit", priority=1, repository_id=repository_id), OPERATOR
+    )
+    assert submitted.id is not None
+    if lease:
+        services.ops.claim(WorkerId("machine:runner"), timedelta(minutes=5), order_id=submitted.id)
+    if expired:
+        with SqlTraustUnitOfWork(context.database) as uow:
+            leased = uow.run_orders.get(submitted.id)
+            uow.run_orders.update(
+                leased.model_copy(update={"lease_expires_at": datetime(2000, 1, 1, tzinfo=UTC)})
+            )
+            uow.commit()
+    return submitted.id
+
+
+def test_an_assessment_recorded_for_a_leased_order_is_that_orders_result(
+    context: Context, ref: UUID
+) -> None:
+    run = order(context, ref)
+    saved = context.services().assessment.record(
+        REPORT,
+        ref,
+        AssessmentKind.CONTAINER,
+        "skill:test",
+        "0.1.0",
+        provenance(),
+        run_order_id=run,
+    )
+    assert saved.run_order_id == run
+    assert [a.id for a in context.services().assessment.list_for_order(run)] == [saved.id]
+
+
+def test_an_order_that_is_not_running_or_ran_elsewhere_takes_no_assessment(
+    context: Context, ref: UUID, engine: Engine
+) -> None:
+    services = context.services()
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        other = seed.repository_ref(seed.repository(url="https://github.com/org/elsewhere"))
+        uow.commit()
+    assert other.id is not None
+    cases = [
+        (order(context, ref, lease=False), ConflictError, "not leased"),
+        (order(context, other.id), ForbiddenError, "outside its scope"),
+        (order(context, None), ForbiddenError, "outside its scope"),
+        (order(context, ref, expired=True), ConflictError, "lease expired"),
+        (uuid4(), NotFoundError, ""),
+    ]
+    for run, error, match in cases:
+        with pytest.raises(error, match=match):
+            services.assessment.record(
+                REPORT,
+                ref,
+                AssessmentKind.CONTAINER,
+                "skill:test",
+                "0.1.0",
+                provenance(),
+                run_order_id=run,
+            )
+    with SqlTraustUnitOfWork(engine) as uow:
+        assert uow.assessments.list_for_ref(ref) == []

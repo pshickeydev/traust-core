@@ -4,7 +4,8 @@ import copy
 import json
 import logging
 from collections import Counter, defaultdict
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Collection, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from datetime import UTC, datetime, time
 from pathlib import Path
 from time import monotonic
@@ -550,12 +551,14 @@ class AssessmentService:
         provenance: Provenance,
         *,
         status: str = ASSESSMENT_COMPLETED,
+        run_order_id: UUID | None = None,
     ) -> Assessment:
         """An assessment of `kind` on the commit holding `doc`, published here unless provenance
         names it (whose bytes must be `doc`'s); the same document at the same time is one run.
         A container, RPM or vuln-scan document's findings (a fuzz report's crashers, each also
         confirmed by its reproducer) are findings of the assessment; a document failing its gate
-        (`check_audit`) is refused."""
+        (`check_audit`) is refused. With `run_order_id`, the assessment is that leased order's
+        result, so the order can be checked for what it recorded."""
         contracts.validate_enum("assessment_kind", kind)
         if provenance.artifact is None and self._publisher is None:
             raise ValidationError("record requires a published artifact reference")
@@ -563,25 +566,27 @@ class AssessmentService:
         ref = self._inventory.get_ref(repository_ref_id)
         assessment = Assessment(
             repository_ref_id=repository_ref_id,
+            run_order_id=run_order_id,
             kind=kind,
             status=status,
             assessor=assessor,
             assessor_version=assessor_version,
             occurred_at=provenance.occurred_at,
         )
-        stated = REPORTED_FINDINGS.get(kind)
-        if stated is None or doc.schema != RECORDED_SCHEMAS[kind]:
-            return self._record(doc, assessment, provenance.artifact)[0]
-        candidates = stated(doc, ref.repository_id)
-        if kind != AssessmentKind.FUZZ:
-            return self._record_findings(
-                doc,
-                assessment,
-                provenance.artifact,
-                candidates,
-                hold_moves=kind in REBASELINED_KINDS,
-            )[0]
-        return self._record_fuzz(doc, assessment, provenance.artifact, candidates)
+        with self._bound(run_order_id, ref.repository_id):
+            stated = REPORTED_FINDINGS.get(kind)
+            if stated is None or doc.schema != RECORDED_SCHEMAS[kind]:
+                return self._record(doc, assessment, provenance.artifact)[0]
+            candidates = stated(doc, ref.repository_id)
+            if kind != AssessmentKind.FUZZ:
+                return self._record_findings(
+                    doc,
+                    assessment,
+                    provenance.artifact,
+                    candidates,
+                    hold_moves=kind in REBASELINED_KINDS,
+                )[0]
+            return self._record_fuzz(doc, assessment, provenance.artifact, candidates)
 
     def _record_fuzz(
         self,
@@ -759,8 +764,27 @@ class AssessmentService:
             listed = "; ".join(f"{v.item}: {v.message}" for v in violations)
             raise ValidationError(f"{doc.name} report fails its gate: {listed}")
 
+    @contextmanager
+    def _bound(self, run_order_id: UUID | None, repository_id: UUID) -> Iterator[None]:
+        """With `run_order_id`, the writes inside run under that order's live lease on this
+        repository (`OperationsService.bound`) and commit with it; without, they are unbound."""
+        if run_order_id is None:
+            yield
+            return
+        if self._recording is None:
+            raise ConfigError("binding an assessment to its order needs operations")
+        if self._recording._uow is not self._uow:
+            raise ConfigError("binding an assessment and operations must share a unit of work")
+        with self._recording.bound(run_order_id, repository_id):
+            yield
+
     def record_audit(
-        self, doc: CloudConfigAuditArtifact, repository_ref_id: UUID, provenance: Provenance
+        self,
+        doc: CloudConfigAuditArtifact,
+        repository_ref_id: UUID,
+        provenance: Provenance,
+        *,
+        run_order_id: UUID | None = None,
     ) -> tuple[Assessment, list[Decision]]:
         """An audit of the commit (degraded when its report lists gaps) with its published report,
         every finding it states, and its judgment on each as a decision. A provenance without an
@@ -773,16 +797,18 @@ class AssessmentService:
             raise ConfigError(
                 "record_audit needs assessment, intake and decisions to share a unit of work"
             )
-        with self._uow.write() as uow:
+        ref = self._inventory.get_ref(repository_ref_id)
+        # The lease is the outer transaction when bound, so the audit commits with it.
+        with self._bound(run_order_id, ref.repository_id), self._uow.write() as uow:
             doc = CloudConfigAuditArtifact.parse(doc.payload)
             self._gate(doc)
             self._decisions.require_signable()
-            ref = self._inventory.get_ref(repository_ref_id)
             candidates, judgments = audit_candidates(doc, ref.repository_id), audit_judgments(doc)
             assessment, report, taken = self._record_findings(
                 doc,
                 Assessment(
                     repository_ref_id=repository_ref_id,
+                    run_order_id=run_order_id,
                     kind=AssessmentKind.CLOUD_CONFIG_CANONICAL,
                     status=ASSESSMENT_DEGRADED if doc.gaps else ASSESSMENT_COMPLETED,
                     assessor=f"skill:{doc.name}",
