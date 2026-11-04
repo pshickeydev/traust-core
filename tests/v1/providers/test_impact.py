@@ -22,7 +22,7 @@ from traust_core.v1.providers.impact import (
     govulncheck_reach,
     source_files,
 )
-from traust_core.v1.providers.process import ProcessResult
+from traust_core.v1.providers.process import ProcessResult, ProcessRunner
 from traust_core.v1.providers.tools import ToolRequest
 
 FIXTURES = Path(__file__).parents[2] / "fixtures" / "dependencies"
@@ -121,10 +121,19 @@ def test_a_failed_run_raises_and_bad_output_is_rejected(tmp_path: Path) -> None:
 
 
 def test_govulncheck_is_ready_only_when_installed(monkeypatch: pytest.MonkeyPatch) -> None:
+    allowed = GovulncheckAnalyzer(ProcessRunner(["govulncheck"]), FixedClock(AT))
     monkeypatch.setattr("shutil.which", lambda _: None)
-    assert govulncheck(Runner(b"")).check().ready is False
+    assert allowed.check().ready is False
     monkeypatch.setattr("shutil.which", lambda _: "/bin/govulncheck")
-    assert govulncheck(Runner(b"")).check().ready is True
+    assert allowed.check().ready is True
+
+
+def test_govulncheck_the_allowlist_doesnt_grant_is_not_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("shutil.which", lambda _: "/bin/govulncheck")
+    ready = GovulncheckAnalyzer(ProcessRunner(["syft"]), FixedClock(AT)).check()
+    assert ready.ready is False and "process.allowed_binaries" in ready.detail
 
 
 @pytest.mark.parametrize(

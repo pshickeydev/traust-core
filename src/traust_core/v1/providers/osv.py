@@ -184,8 +184,10 @@ class ExportedAdvisoryLookup:
 
     def record(self, identifier: AdvisoryIdentifier) -> Result[AdvisoryRecord | None]:
         want = identifier.upper()
-        names = ({r.identifier.upper(), *map(str.upper, r.aliases)} for r in self._records)
-        found = next((r for r, n in zip(self._records, names, strict=True) if want in n), None)
+        # the record exported under this id first: a CVE file lists its GHSA alias too
+        found = next((r for r in self._records if r.identifier.upper() == want), None) or next(
+            (r for r in self._records if want in map(str.upper, r.aliases)), None
+        )
         source = found.source if found else "exported records"
         acquisition = Acquisition(provider=self.name, acquired_at=self._clock.now(), source=source)
         return Result(found, acquisition)

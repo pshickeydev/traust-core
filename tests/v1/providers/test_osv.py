@@ -425,6 +425,20 @@ def test_an_exported_record_answers_by_id_and_alias_with_its_file_as_source(
     assert lookup.record(AdvisoryIdentifier("GHSA-zzzz-zzzz-zzzz")).data is None
 
 
+def test_an_exported_record_under_the_id_asked_wins_over_one_listing_it_as_an_alias(
+    tmp_path: Path,
+) -> None:
+    fixtures = Path(__file__).parents[2] / "fixtures/dependencies"
+    cve, ghsa = (
+        (fixtures / f"osv-{i}.json").read_bytes() for i in ("CVE-2023-39325", "GHSA-4374-p667-p6c8")
+    )
+    lookup = exported(tmp_path, cve, ghsa)
+    found = lookup.record(AdvisoryIdentifier("GHSA-4374-p667-p6c8")).data
+    assert found is not None and found.identifier == "GHSA-4374-p667-p6c8"
+    by_alias = lookup.record(AdvisoryIdentifier("GO-2023-2102")).data
+    assert by_alias is not None and by_alias.identifier == "CVE-2023-39325"
+
+
 def test_exported_records_answer_package_queries_from_their_own_spans(tmp_path: Path) -> None:
     lookup = exported(tmp_path, GRPC)
     hits = lookup.affecting(

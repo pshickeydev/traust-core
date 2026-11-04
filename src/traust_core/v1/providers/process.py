@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from traust_core.v1.errors import ServiceError, ValidationError
+from traust_core.v1.providers.base import Readiness, on_path
 from traust_core.v1.providers.correlation import REQUEST_ID_ENV, current_correlation
 
 _SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "fish", "csh", "tcsh", "env"})
@@ -79,6 +80,12 @@ class ProcessRunner:
     def allows(self, binary: str) -> bool:
         """Whether `binary` may run here (the deployment's allowlist, never a shell)."""
         return Path(binary).name in self._allowed
+
+    def readiness(self, binary: str) -> Readiness:
+        """Ready when the allowlist grants `binary` and it is on PATH."""
+        if not self.allows(binary):
+            return Readiness(ready=False, detail=f"{binary} is not in process.allowed_binaries")
+        return on_path(binary, missing=" not on PATH")
 
     def _validate(self, argv: Sequence[str]) -> tuple[str, ...]:
         if not argv or not all(isinstance(a, str) for a in argv):

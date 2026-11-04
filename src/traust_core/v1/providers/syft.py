@@ -6,7 +6,7 @@ from __future__ import annotations
 import json
 
 from traust_core.v1.errors import ServiceError
-from traust_core.v1.providers.base import Acquisition, Readiness, Result, argv_digest, on_path
+from traust_core.v1.providers.base import Acquisition, Readiness, Result, argv_digest
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.process import ProcessRunner
 from traust_core.v1.providers.tools import DatabaseStatus, NoDatabase, ToolRequest
@@ -105,7 +105,7 @@ class SyftSbom:
         self._clock = clock
 
     def check(self) -> Readiness:
-        return on_path(self.name, missing=" not on PATH")
+        return self._process.readiness(self.name)
 
     def acquire(self, request: ToolRequest) -> Result[bytes]:
         workspace = request.checkout()

@@ -380,6 +380,29 @@ def test_an_advisory_naming_no_package_cant_be_prepared(engine: Engine) -> None:
         exposure.prepare(record.advisory_id, app.id)
 
 
+def test_a_cve_asked_first_is_analyzed_through_its_aliases_packages(engine: Engine) -> None:
+    cve, go, ghsa = (
+        parse_osv((FIXTURES / f"osv-{i}.json").read_bytes(), f"osv/{i}")
+        for i in ("CVE-2023-39325", "GO-2023-2102", "GHSA-4374-p667-p6c8")
+    )
+    [app, fixed] = refs(engine, 2)
+    assert app.id is not None and fixed.id is not None
+    exposure = service(engine, cve, go, ghsa)
+    exposure.ingest_sbom(sbom(("golang.org/x/net", "v0.8.0")), app.id)
+    exposure.ingest_sbom(sbom(("golang.org/x/net", "v0.17.0")), fixed.id)
+    found = exposure.find_advisory(cve.identifier)
+    assert found is not None and found.advisory_id is not None
+    assert {r.repository_ref_id for r in exposure.affected(found.advisory_id)} == {app.id, fixed.id}
+    doc = exposure.prepare(found.advisory_id, app.id).document("1")
+    assert doc.repos[0].classification == "inconclusive"
+    assert doc.metadata.module == "golang.org/x/net"
+    assert doc.metadata.advisory_sources[:3] == ("osv/CVE-2023-39325", ghsa.source, go.source)
+    later = exposure.find_advisory(go.identifier)
+    assert later is not None and later.advisory_id == found.advisory_id
+    out = exposure.prepare(found.advisory_id, fixed.id).document("1")
+    assert out.repos[0].classification == "version_not_in_range"
+
+
 def affected_doc(prepared: ImpactInput) -> ImpactAnalysisArtifact:
     evidence = prepared.evidence.model_copy(
         update={"govulncheck": ImpactGovulncheck.SYMBOL_REACHABLE}

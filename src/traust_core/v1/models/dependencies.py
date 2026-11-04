@@ -76,8 +76,12 @@ def package_name(ecosystem: Ecosystem, name: str) -> str:
     return name.lower() if ecosystem == Ecosystem.NPM else name
 
 
+def is_advisory_identifier(raw: str) -> bool:
+    return _ADVISORY_ID.fullmatch(raw) is not None
+
+
 def parse_advisory_identifier(raw: str) -> AdvisoryIdentifier:
-    if not _ADVISORY_ID.fullmatch(raw):
+    if not is_advisory_identifier(raw):
         raise ValidationError(f"not an advisory id: {raw!r}")
     return AdvisoryIdentifier(raw)
 
@@ -382,6 +386,7 @@ class AdvisoryRecord(Model):
     fix_references: tuple[str, ...] = ()
     fixed_commits: tuple[str, ...] = ()  # commit URLs of GIT ranges' `fixed` events
     source: str
+    package_sources: tuple[str, ...] = ()  # alias records that filled an empty `affected`
 
     @property
     def severity(self) -> ScannerSeverity:
@@ -832,7 +837,11 @@ class ImpactInput(SkillInput):
                     "vulnerable_symbols": [s.symbol for s in found.symbols],
                     "vulnerable_packages": list(self.package.imports),
                     "feature_description": feature_description,
-                    "advisory_sources": [self.advisory.source, *found.fix_commits],
+                    "advisory_sources": [
+                        self.advisory.source,
+                        *self.advisory.package_sources,
+                        *found.fix_commits,
+                    ],
                     "portfolio_graph_db": None,
                     "portfolio_graph_version": None,
                     "harness_version": harness_version,

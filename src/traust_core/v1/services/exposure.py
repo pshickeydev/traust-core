@@ -81,6 +81,7 @@ from traust_core.v1.models.dependencies import (
     Version,
     VexStatus,
     VulnerableSymbol,
+    is_advisory_identifier,
     package_name,
     parse_advisory_identifier,
     repo_label,
@@ -900,10 +901,40 @@ class ExposureService:
         record = self._require_lookup().record(parse_advisory_identifier(identifier)).data
         if record is None:
             return None
+        if not record.affected and not record.withdrawn:
+            record = self._with_alias_packages(record)
         with self._uow as uow:
             advisory = self._keep_advisory(uow, record)
             uow.commit()
         return record.model_copy(update={"advisory_id": advisory.id})
+
+    def _with_alias_packages(self, record: AdvisoryRecord) -> AdvisoryRecord:
+        # OSV's CVE records name no package; their GHSA / GO- / PYSEC- aliases state the same
+        # vulnerability per ecosystem. Without this, which id is asked first decides the analysis.
+        # Only ids the impact schema admits are asked: the rest (BIT-, distro ids) name packages
+        # in ecosystems core doesn't model.
+        lookup = self._require_lookup()
+        named = [
+            alias
+            for name in record.aliases
+            if is_advisory_identifier(name)
+            and (alias := lookup.record(name).data)
+            and alias.identifier.upper() == name.upper()
+            and alias.affected
+            and not alias.withdrawn
+        ]
+        # Two aliases may state one package with different spans: keep every span, so a version
+        # only one of them covers is still in range.
+        packages: dict[tuple[Ecosystem, str], AffectedPackage] = {}
+        for p in (p for alias in named for p in alias.affected):
+            kept = packages.get((p.ecosystem, p.name))
+            packages[(p.ecosystem, p.name)] = p if kept is None else _joined(kept, p)
+        return record.model_copy(
+            update={
+                "affected": tuple(packages.values()),
+                "package_sources": tuple(alias.source for alias in named),
+            }
+        )
 
     def _keep_advisory(self, uow: TraustUnitOfWork, record: AdvisoryRecord) -> Advisory:
         # Aliases join the first one already known, so one vulnerability keeps one canonical row.
@@ -1434,6 +1465,16 @@ def _sbom_packages(uow: TraustUnitOfWork, sbom_id: UUID) -> list[RefDependency]:
     packages = {p.id: p for p in uow.packages.list_by_ids({d.package_id for d in rows})}
     listed = [RefDependency(dependency=d, package=packages[d.package_id]) for d in rows]
     return sorted(listed, key=lambda r: (r.package.ecosystem, r.package.name, r.dependency.version))
+
+
+def _joined(a: AffectedPackage, b: AffectedPackage) -> AffectedPackage:
+    """One package as two aliases state it: every span, listed version, import and symbol."""
+    return a.model_copy(
+        update={
+            field: tuple(dict.fromkeys((*getattr(a, field), *getattr(b, field))))
+            for field in ("spans", "versions", "imports", "symbols")
+        }
+    )
 
 
 def _in_range(

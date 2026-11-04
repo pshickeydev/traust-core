@@ -12,7 +12,7 @@ import pytest
 from traust_core.v1.errors import ServiceError
 from traust_core.v1.providers.base import argv_digest
 from traust_core.v1.providers.clock import FixedClock
-from traust_core.v1.providers.process import ProcessResult
+from traust_core.v1.providers.process import ProcessResult, ProcessRunner
 from traust_core.v1.providers.syft import SyftSbom
 from traust_core.v1.providers.tools import NoDatabase, ToolProvider, ToolRequest
 
@@ -68,3 +68,11 @@ def test_syft_reports_its_version_and_keeps_no_database() -> None:
 def test_an_unreadable_version_is_a_service_error() -> None:
     with pytest.raises(ServiceError, match="syft version wrote no version"):
         syft("{}").version()
+
+
+@pytest.mark.parametrize(("allowed", "ready"), [(["syft"], True), (["git"], False)])
+def test_syft_is_ready_only_when_the_allowlist_grants_it(
+    monkeypatch: pytest.MonkeyPatch, allowed: list[str], ready: bool
+) -> None:
+    monkeypatch.setattr("shutil.which", lambda _: "/bin/syft")
+    assert SyftSbom(ProcessRunner(allowed), FixedClock(AT)).check().ready is ready
