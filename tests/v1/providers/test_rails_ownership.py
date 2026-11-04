@@ -1472,3 +1472,47 @@ def test_what_qodos_review_of_6c6fd55_found_stays_closed(
     )
     row = _row(_tree(tmp_path, _notes_app(controller)), "DELETE", "/notes/:id")
     assert row["ownership"] != "scoped"
+
+
+@pytest.mark.parametrize(
+    ("write", "helpers"),
+    [
+        # an alias of the request handed to a helper
+        (
+            "r = request\n    forge(r)",
+            "  def forge(store)\n    store.session[:user_id] = params[:user_id]\n  end\n\n",
+        ),
+        # a default argument that names the request
+        (
+            "remember",
+            "  def remember(target = request)\n"
+            "    target.session[:user_id] = params[:user_id]\n  end\n\n",
+        ),
+        # an earlier definition the callback runs, before the action redefines it clean
+        (
+            "def note_user\n      session[:user_id] = params[:user_id]\n    end\n    note_user\n"
+            "    def note_user\n      nil\n    end",
+            "",
+        ),
+    ],
+    ids=["request-alias-arg", "default-arg", "earlier-definition"],
+)
+def test_what_qodos_review_of_c1e0e8e_found_stays_closed(
+    tmp_path: Path, write: str, helpers: str
+) -> None:
+    controller = FORGED_SESSION.format(
+        write=write, helpers=helpers + SESSION_USER.format(read="session[:user_id]")
+    )
+    row = _row(_tree(tmp_path, _notes_app(controller)), "DELETE", "/notes/:id")
+    assert row["ownership"] != "scoped"
+
+
+def test_a_lambda_callbacks_parameter_is_the_controller(tmp_path: Path) -> None:
+    controller = (
+        "class NotesController < ApplicationController\n"
+        "  before_action ->(c) { c.session[:user_id] = c.params[:user_id] }\n\n"
+        "  def destroy\n    current_user.notes.find(params[:id]).destroy\n  end\n\n"
+        "  private\n\n" + SESSION_USER.format(read="session[:user_id]") + "end\n"
+    )
+    row = _row(_tree(tmp_path, _notes_app(controller)), "DELETE", "/notes/:id")
+    assert row["ownership"] != "scoped"

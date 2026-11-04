@@ -1416,13 +1416,12 @@ class _Action:
         # a `def` among the statements defines a method, and runs nothing until it's called
         queue = [(s.src, s.node, s.kind) for s in steps if s.node.type not in _DEFS]
         called: set[str] = set()
-        redefined: set[str] = set()
+        redefined: set[tuple[str, int]] = set()
         # methods defined inside a statement (`def later` in an action): found when called
-        nested: dict[str, tuple[Parsed, Node, Kind]] = {
-            s.src.text(name): (s.src, s.node, s.kind)
-            for s in steps
-            if s.node.type in _DEFS and (name := s.node.child_by_field_name("name")) is not None
-        }
+        nested: dict[str, list[tuple[Parsed, Node, Kind]]] = {}
+        for s in steps:
+            if s.node.type in _DEFS and (name := s.node.child_by_field_name("name")) is not None:
+                nested.setdefault(s.src.text(name), []).append((s.src, s.node, s.kind))
         while queue:
             if len(out) >= _MAX_CLOSURE:
                 self.capped = True
@@ -1431,7 +1430,7 @@ class _Action:
             out.append((src, node, kind))
             scan = _scan(self.code, src, node)
             for name, defined in scan[3]:
-                nested.setdefault(name, (src, defined, kind))
+                nested.setdefault(name, []).append((src, defined, kind))
             called |= set(scan[1])
             for name in [*scan[1], *nested]:
                 if name not in called:
@@ -1440,10 +1439,11 @@ class _Action:
                 if name not in seen and (found := self.methods(name)) is not None:
                     seen.add(name)
                     queue.append((found[0], found[1], inner))  # the whole method, scanned once
-                if name in nested and name not in redefined:
-                    # the action's own `def` replaces the class's once it runs: either may
-                    redefined.add(name)
-                    queue.append((nested[name][0], nested[name][1], inner))
+                for s, defined, _ in nested.get(name, []):
+                    # a `def` the action runs replaces the class's: any of them may run
+                    if (s.file.rel, defined.start_byte) not in redefined:
+                        redefined.add((s.file.rel, defined.start_byte))
+                        queue.append((s, defined, inner))
         return out
 
     def _session_writes(self) -> set[str]:
@@ -3381,6 +3381,13 @@ def _passed_a_store(code: RubyCode, src: Parsed, name: Node) -> bool:
     forge(store)`)."""
     text = src.text(name)
     for scope in _ancestors(name):
+        if scope.type == "lambda":
+            params = next((c for c in scope.named_children if c.type == "lambda_parameters"), None)
+            if params is None or text not in {
+                src.text(p) for p in walk(params) if p.type == "identifier"
+            }:
+                continue
+            return True  # a lambda's parameter: whatever calls it (`before_action ->(c) { … }`)
         if scope.type in ("block", "do_block"):
             params = next((c for c in scope.named_children if c.type == "block_parameters"), None)
             if params is None or text not in {
@@ -3410,6 +3417,9 @@ def _passed_a_store(code: RubyCode, src: Parsed, name: Node) -> bool:
             )
             if position is None:
                 return False
+            default = names[position].child_by_field_name("value")
+            if default is not None and _STORE_TEXT.search(src.text(default)):
+                return True  # `def remember(target = request)`
             keyword = names[position].type == "keyword_parameter"
             method = src.text(scope.child_by_field_name("name"))
             for s, call in code.calls_to(method):
@@ -3428,8 +3438,16 @@ def _passed_a_store(code: RubyCode, src: Parsed, name: Node) -> bool:
                 else:
                     positional = [g for g in given if g.type != "pair"]
                     picked = [positional[position]] if position < len(positional) else []
-                if any(p is not None and _STORE_TEXT.search(s.text(p)) for p in picked):
-                    return True
+                for p in picked:
+                    if p is None:
+                        continue
+                    if _STORE_TEXT.search(s.text(p)):
+                        return True
+                    held = _local_at(code, s, p) if p.type == "identifier" else None
+                    if held is not None and (
+                        held[1] or any(_STORE_TEXT.search(s.text(v)) for v in held[0] if v)
+                    ):
+                        return True  # `r = request; forge(r)`, or a parameter passed along
             return False
         if scope.type in _BOUNDARIES:
             return False
