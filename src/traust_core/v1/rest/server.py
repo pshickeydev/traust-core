@@ -4,12 +4,17 @@ until it serves."""
 from __future__ import annotations
 
 import argparse
+import logging
 from pathlib import Path
 
 from traust_core.v1.context import Config, Context
 
 _REST_EXTRA = {"fastapi", "starlette", "uvicorn"}
 _UNTRUSTED = "this config does not trust its local issuer: set identity.trust_local: true"
+# The rate card spend is priced from, beside traust.yaml (contracts `model-registry`).
+_RATE_CARD = "model-registry.yaml"
+
+log = logging.getLogger(__name__)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -32,7 +37,25 @@ def main(argv: list[str] | None = None) -> None:
     context = Context(config)
     context.configure_logging()
     context.register_feeds()
+    if (rate_card := _rate_card(args.config)) is not None:
+        context.register_model_catalog(rate_card)
+        log.info("model registry (rate card) loaded from %s", rate_card)
+    else:
+        log.warning(
+            "no %s beside %s: usage settles as spend-unpriced, never as a priced spend_event",
+            _RATE_CARD,
+            args.config,
+        )
     uvicorn.run(create_app(context), host=args.host, port=args.port, log_config=None)
+
+
+def _rate_card(config_path: Path | None) -> Path | None:
+    """The model registry beside the served traust.yaml, when the deployment ships one; the
+    registry is a config-home file, not a traust.yaml key."""
+    if config_path is None:
+        return None
+    path = config_path.parent / _RATE_CARD
+    return path if path.is_file() else None
 
 
 def _token(config: Config, identity: str, *, machine: bool) -> str:

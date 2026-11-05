@@ -14,8 +14,9 @@ _MTOK = Decimal(1_000_000)
 _CACHE_READ = Decimal("0.1")  # cache hits, relative to input, unless the model sets its own
 _CACHE_WRITE = Decimal("1.25")  # 5-minute cache writes, the same for every current model
 # The registry flags a rate nobody has confirmed with a trailing comment on the model's line;
-# its schema has no field for it, so the raw text is the source.
-_UNVERIFIED = re.compile(r"^\s*([A-Za-z0-9._-]+):\s*\{.*\}\s*#.*price unverified", re.M | re.I)
+# its schema has no field for it, so the raw text is the source. Model ids may carry a provider
+# prefix with slashes (gateway ids like `rits/zai-org/glm-5-3`).
+_UNVERIFIED = re.compile(r"^\s*([A-Za-z0-9._/-]+):\s*\{.*\}\s*#.*price unverified", re.M | re.I)
 # Tier classes, weakest first: a role never runs below its floor.
 TIER_ORDER = ("haiku-class", "sonnet-class", "opus-class", "mythos-class")
 
