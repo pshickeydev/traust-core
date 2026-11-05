@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Iterator
+from enum import StrEnum
 from typing import Any
 
 from traust_core.v1.errors import ValidationError
@@ -19,6 +20,17 @@ _LEVEL_TO_SEVERITY = {
     "note": "informational",
     "none": "informational",
 }
+
+
+# Strongest first; only accepted (or no status) suppresses: underReview is undecided (§3.35.3).
+class SuppressionStatus(StrEnum):
+    """A scanner suppression's state, as SARIF names it."""
+
+    ACCEPTED = "accepted"
+    UNDER_REVIEW = "underReview"
+    REJECTED = "rejected"
+
+
 _PRECISION_TO_CONFIDENCE = {"very-high": 0.95, "high": 0.85, "medium": 0.6, "low": 0.4}
 _DEPENDABOT_SEVERITY = {
     "critical": "critical",
@@ -55,7 +67,13 @@ def _json(raw: bytes, format: str) -> Any:
         raise ValidationError(f"{format}: not JSON: {e}") from e
 
 
-def sarif(raw: bytes, *, repository_url: str | None = None, sha: str | None = None) -> list[Fields]:
+def sarif(
+    raw: bytes,
+    *,
+    repository_url: str | None = None,
+    sha: str | None = None,
+    include_suppressed: bool = False,
+) -> list[Fields]:
     doc = _json(raw, "sarif")
     if not (
         isinstance(doc, dict)
@@ -66,12 +84,18 @@ def sarif(raw: bytes, *, repository_url: str | None = None, sha: str | None = No
     return [
         fields
         for run in doc["runs"]
-        for fields in _sarif_run(run, repository_url=repository_url, sha=sha)
+        for fields in _sarif_run(
+            run, repository_url=repository_url, sha=sha, include_suppressed=include_suppressed
+        )
     ]
 
 
 def _sarif_run(
-    run: dict[str, Any], *, repository_url: str | None = None, sha: str | None = None
+    run: dict[str, Any],
+    *,
+    repository_url: str | None = None,
+    sha: str | None = None,
+    include_suppressed: bool = False,
 ) -> Iterator[Fields]:
     tool = run.get("tool") or {}
     rules = (tool.get("driver") or {}).get("rules") or []
@@ -84,7 +108,12 @@ def _sarif_run(
     by_location = _sarif_artifacts(artifacts)
     bound = _sarif_binding(run, repository_url, sha)
     for result in run.get("results") or []:
-        if result.get("suppressions"):
+        suppression = _sarif_suppression(result.get("suppressions"))
+        if (
+            suppression
+            and suppression["status"] == SuppressionStatus.ACCEPTED
+            and not include_suppressed
+        ):
             continue
         index = result.get("ruleIndex")
         rule = (
@@ -119,7 +148,34 @@ def _sarif_run(
             "symbol": symbol,
             "hashes": _sarif_hashes(artifact, bound),
             "confidence": _PRECISION_TO_CONFIDENCE.get(rule_props.get("precision")),
+            "suppression": suppression,
         }
+
+
+def _sarif_suppression(suppressions: object) -> Fields | None:
+    """The result's suppression: accepted if any suppression stands (accepted or no status),
+    else under review if any is, else rejected; with every stated justification."""
+    if suppressions is None or suppressions == []:
+        return None
+    if not isinstance(suppressions, list) or not all(isinstance(s, dict) for s in suppressions):
+        raise ValidationError("sarif: a result's suppressions must be an array of objects")
+    statuses: set[str] = set()
+    reasons: dict[str, None] = {}
+    for suppression in suppressions:
+        status = suppression.get("status", SuppressionStatus.ACCEPTED.value)
+        if not isinstance(status, str) or status not in set(SuppressionStatus):
+            raise ValidationError(
+                f"sarif: suppression status {status!r} is not one of "
+                f"{tuple(s.value for s in SuppressionStatus)}"
+            )
+        justification = suppression.get("justification")
+        if justification is not None and not isinstance(justification, str):
+            raise ValidationError("sarif: a suppression justification must be a string")
+        statuses.add(status)
+        if justification and justification.strip():
+            reasons[justification.strip()] = None
+    status = next(s for s in SuppressionStatus if s in statuses)
+    return {"status": status, "justification": "; ".join(reasons) or None}
 
 
 def _sarif_severity(

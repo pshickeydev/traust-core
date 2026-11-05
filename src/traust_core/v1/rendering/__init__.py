@@ -8,6 +8,7 @@ from traust_core.v1.rendering.markdown import (
     Table,
     inline,
     markdown_table,
+    markdown_text,
     publish,
 )
 
@@ -21,5 +22,6 @@ __all__ = [
     "csv_table",
     "inline",
     "markdown_table",
+    "markdown_text",
     "publish",
 ]

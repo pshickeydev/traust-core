@@ -65,9 +65,15 @@ from traust_core.v1.models.insight import (
     CensusLayer,
     CensusProduct,
     ComplianceDashboard,
+    ContainerFinding,
+    ContainerFindings,
+    ContainerReport,
     CoverageDashboard,
+    DeclaredIac,
+    DeclaredIacTarget,
     DependencyReach,
     EcosystemReach,
+    ExecutivePanel,
     ExecutiveSummary,
     ExposureDashboard,
     FindingsRollup,
@@ -80,6 +86,8 @@ from traust_core.v1.models.insight import (
     InsecurePattern,
     InsecurePatternCut,
     InsecurePatterns,
+    IsolationReviewRow,
+    IsolationSummary,
     LanguageSeverity,
     LanguageTotal,
     LeastPrivilege,
@@ -153,6 +161,7 @@ from traust_core.v1.models.vocabulary import (
     DispositionAssurance,
     DispositionResolution,
     Ecosystem,
+    IsolationDimension,
     MitigationEffort,
     OwnershipClass,
     PqcReadinessBucket,
@@ -289,6 +298,189 @@ class InsightService:
             raise ValidationError(
                 f"view {name.value!r} is not built; built views: {known}"
             ) from None
+
+
+class ContainerFindingsView:
+    """A container report family's cumulative findings; absence never closes a finding."""
+
+    name = ViewName.CONTAINER_FINDINGS
+    per_item = True
+
+    def __init__(
+        self,
+        findings: FindingService,
+        portfolio: PortfolioService,
+        assessment: AssessmentService,
+        rating: RatingPolicy,
+    ) -> None:
+        self._findings = findings
+        self._portfolio = portfolio
+        self._assessment = assessment
+        self._rating = rating
+
+    def build(self, filter: ViewFilter) -> ContainerFindings:
+        stem = filter.report_stem
+        if not stem or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*-container-audit", stem):
+            raise ValidationError(
+                "container-findings requires report_stem '<image>-container-audit'"
+            )
+        if filter.assessment_id is None:
+            raise ValidationError("container-findings requires a container assessment_id")
+        anchor = self._assessment.get(filter.assessment_id)
+        if anchor.kind != AssessmentKind.CONTAINER:
+            raise ValidationError(f"assessment {anchor.id} is not a container assessment")
+        if filter.as_of is not None and anchor.occurred_at > filter.as_of:
+            raise ValidationError("container assessment is later than as_of")
+        doc = self._assessment.report(filter.assessment_id)
+        if doc is None:
+            raise NotFoundError(f"container assessment {anchor.id} has no report")
+        image_repository = _image_repository(doc.metadata.repository)
+        ref = self._portfolio.inventory.get_ref(anchor.repository_ref_id)
+        repository = self._portfolio.get_repository(ref.repository_id)
+        _, _, allowed = _scope(self._portfolio, filter)
+        if repository.id not in {r.id for r in allowed}:
+            raise ValidationError("container assessment is outside the requested scope")
+        reports = []
+        occurrences: dict[UUID, list[Occurrence]] = defaultdict(list)
+        for run in self._assessment.list_for_repository(
+            ref.repository_id, AssessmentKind.CONTAINER
+        ):
+            if filter.as_of is not None and run.occurred_at > filter.as_of:
+                continue
+            assert run.id is not None
+            report = self._assessment.report(run.id)
+            if report is None:
+                continue
+            if _image_repository(report.metadata.repository) != image_repository:
+                continue
+            reports.append(
+                ContainerReport(
+                    assessment_id=run.id,
+                    repository_ref_id=run.repository_ref_id,
+                    occurred_at=run.occurred_at,
+                    image=report.metadata.repository,
+                    title=report.title,
+                )
+            )
+            for occurrence in self._findings.occurrences(assessment_id=run.id):
+                occurrences[occurrence.finding_id].append(occurrence)
+        views = self._findings.all(
+            FindingFilter(repository_id=ref.repository_id, as_of=filter.as_of)
+        )
+        categories = set(filter.categories)
+        rows = []
+        for view in views:
+            finding_id = view.finding.id
+            if finding_id not in occurrences or (
+                categories and view.label(CATEGORY) not in categories
+            ):
+                continue
+            assert finding_id is not None
+            held = occurrences[finding_id]
+            latest = held[-1]
+            assert latest.id is not None
+            selected = view.model_copy(
+                update={
+                    "occurrence": latest,
+                    "locations": tuple(self._findings.locations([latest.id])),
+                    "effective_severity": self._rating.effective_severity(latest, view.disposition),
+                    "sla_due": None,
+                }
+            )
+            history = self._findings.history(finding_id)
+            rows.append(
+                ContainerFinding(
+                    view=selected,
+                    occurrences=tuple(held),
+                    history=tuple(
+                        d for d in history if filter.as_of is None or d.occurred_at <= filter.as_of
+                    ),
+                )
+            )
+        return ContainerFindings(
+            as_of=filter.as_of,
+            repository_id=ref.repository_id,
+            repository_url=repository.url,
+            report_stem=stem,
+            image_repository=image_repository,
+            reports=tuple(reports),
+            findings=tuple(rows),
+            total=_tally(row.view for row in rows),
+        )
+
+    def report(self, model: ContainerFindings, generated_at: datetime) -> Report:
+        return Report(
+            title=f"{model.report_stem}-findings-current",
+            generated_at=generated_at,
+            sections=(
+                Section(
+                    heading="Population",
+                    body=f"Image repository: {inline(model.image_repository)}. "
+                    f"{len(model.reports)} stored container reports; {len(model.findings)} "
+                    "distinct canonical findings. Decisions supply current disposition; "
+                    "absence from a later report does not establish resolution.",
+                ),
+                Section(
+                    heading="Findings",
+                    table=Table(
+                        columns=("finding id", "finding", "severity", "state", "occurrences"),
+                        rows=tuple(
+                            (
+                                str(row.view.finding.id),
+                                row.view.finding.title,
+                                str(row.view.effective_severity or "unrated"),
+                                str(row.view.state()),
+                                str(len(row.occurrences)),
+                            )
+                            for row in model.findings
+                        ),
+                    ),
+                ),
+                Section(
+                    heading="Stored reports",
+                    table=Table(
+                        columns=("assessment", "time", "image", "title"),
+                        rows=tuple(
+                            (str(r.assessment_id), r.occurred_at.isoformat(), r.image, r.title)
+                            for r in model.reports
+                        ),
+                    ),
+                ),
+                *(
+                    Section(
+                        heading=f"Finding {row.view.finding.id}: {inline(row.view.finding.title)}",
+                        table=Table(
+                            columns=("decision", "time", "validity", "resolution", "rationale"),
+                            rows=tuple(
+                                (
+                                    str(d.id),
+                                    d.occurred_at.isoformat(),
+                                    str(d.validity or "-"),
+                                    str(d.resolution or "-"),
+                                    d.rationale or "",
+                                )
+                                for d in row.history
+                            ),
+                        )
+                        if row.history
+                        else None,
+                    )
+                    for row in model.findings
+                ),
+            ),
+        )
+
+
+def _image_repository(image: str | None) -> str:
+    if not image:
+        raise ValidationError("container report requires metadata.repository image provenance")
+    name = image.split("@", 1)[0]
+    if "://" in name:
+        raise ValidationError(
+            "container metadata.repository must identify an image, not a source URL"
+        )
+    prefix, slash, leaf = name.rpartition("/")
+    return prefix + slash + leaf.split(":", 1)[0]
 
 
 class FindingsRollupView:
@@ -1218,6 +1410,12 @@ class LocView:
     def build(self, filter: ViewFilter) -> LocDashboard:
         if filter.as_of is not None:
             raise ValidationError("the loc view reads the latest measurement; it takes no as_of")
+        # NEED(core: historical LoC reads): comparing needs default heads and language stats as
+        # of a past time (default_refs, collect and their assessment queries take no cutoff yet).
+        if filter.compare_as_of is not None:
+            raise ValidationError(
+                "the loc view reads the latest measurement; it takes no compare_as_of"
+            )
         _, _, repositories = _scope(self._portfolio, filter)
         measured = [_measured(self._code_facts, self._portfolio, r) for r in repositories]
         totals: defaultdict[str, list[int]] = defaultdict(list)
@@ -1230,6 +1428,13 @@ class LocView:
         ]
         return LocDashboard(
             code=sum(r.code for r in measured),
+            first_party_divisor=filter.first_party_divisor,
+            first_party_estimate=(
+                Decimal(sum(r.code for r in measured)) / filter.first_party_divisor
+                if filter.first_party_divisor is not None
+                and any(not r.unmeasured for r in measured)
+                else None
+            ),
             total=sum(r.total for r in measured),
             reported=sum(map(_reported, tallies)),
             dispositioned=sum(bool(t.decided) for t in tallies),
@@ -1257,6 +1462,12 @@ class LocView:
             f"repositories measured: {model.code:,} lines of code ({model.total:,} with "
             "documentation languages)."
         )
+        if model.first_party_estimate is not None:
+            summary += (
+                f" First-party estimate: {model.first_party_estimate:,.1f} code lines "
+                f"(measured code / explicitly supplied divisor {model.first_party_divisor}; "
+                "not a measurement)."
+            )
         return Report(
             title="Lines of code",
             generated_at=generated_at,
@@ -2934,12 +3145,21 @@ class ExecutiveSummaryView:
         assessment: AssessmentService,
         code_facts: CodeFactsService,
         exposure: ExposureService,
+        *,
+        attack: AttackCoverageView | None = None,
+        pqc: PqcPortfolioView | None = None,
+        threats: ThreatRegisterView | None = None,
+        census: CensusView | None = None,
     ) -> None:
         self._findings = findings
         self._portfolio = portfolio
         self._assessment = assessment
         self._code_facts = code_facts
         self._exposure = exposure
+        self._attack = attack
+        self._pqc = pqc
+        self._threats = threats
+        self._census = census
 
     def build(self, filter: ViewFilter) -> ExecutiveSummary:
         products, shipped, repositories, views = _scoped_findings(
@@ -2954,6 +3174,92 @@ class ExecutiveSummaryView:
             by_language[primary or "unknown"].append(r.id)  # type: ignore[arg-type]
         profiles = self._assessment.privileges(AssessmentFilter(), list(urls), filter.as_of)
         fleet = not (filter.product_ids or filter.team_ids)
+        panels = set(filter.executive_panels)
+        attack = pqc = isolation = iac = None
+        pqc_unavailable = None
+        if ExecutivePanel.ATTACK in panels:
+            if self._attack is None:
+                raise ConfigError("executive ATT&CK panel has no catalog view wired")
+            attack = self._attack.build(filter)
+        if ExecutivePanel.PQC in panels:
+            if self._pqc is None:
+                raise ConfigError("executive PQC panel has no portfolio view wired")
+            if filter.as_of is None:
+                pqc = self._pqc.build(filter)
+            else:
+                pqc_unavailable = (
+                    "Historical PQC readiness is unavailable; the PQC portfolio reads current "
+                    "readiness only. Current data is not substituted for this snapshot."
+                )
+        if ExecutivePanel.ISOLATION in panels:
+            if self._threats is None:
+                raise ConfigError("executive isolation panel has no threat-register view wired")
+            register = self._threats.build(filter)
+            isolation = IsolationSummary(
+                threat_register=register,
+                reviews=tuple(
+                    sorted(
+                        (
+                            IsolationReviewRow(
+                                repository=urls[rid],
+                                assessment_id=assessment.id,
+                                service=doc.metadata.service,
+                                posture=doc.posture.overall,
+                                interfaces=len(doc.interfaces),
+                                gaps=len(doc.gaps),
+                                dimensions=dict(
+                                    Counter(
+                                        getattr(interface.dimensions, dimension).result
+                                        for interface in doc.interfaces
+                                        for dimension in IsolationDimension
+                                    )
+                                ),
+                            )
+                            for rid, assessment, doc in self._assessment.isolation_reviews(
+                                tuple(urls), filter.as_of
+                            )
+                        ),
+                        key=lambda row: (
+                            ("critical-gap", "weak", "adequate", "strong").index(row.posture),
+                            -row.gaps,
+                            row.service,
+                            row.repository,
+                        ),
+                    )
+                ),
+            )
+        if ExecutivePanel.IAC in panels:
+            if self._census is None:
+                raise ConfigError("executive IaC panel has no census view wired")
+            census = self._census.build(filter)
+            targets = []
+            for rid, assessment, doc in self._assessment.cloud_config_audits(
+                tuple(urls), filter.as_of
+            ):
+                reported = {
+                    o.finding_id for o in self._findings.occurrences(assessment_id=assessment.id)
+                }
+                found = [v for v in views[rid] if v.finding.id in reported]
+                unsuppressed = [f for f in doc.findings if f.status != "suppressed"]
+                severities = Counter(f.severity or "unrated" for f in unsuppressed)
+                targets.append(
+                    DeclaredIacTarget(
+                        repository=urls[rid],
+                        assessment_id=assessment.id,
+                        target=doc.metadata.target,
+                        unsuppressed=len(unsuppressed),
+                        suppressed=sum(f.status == "suppressed" for f in doc.findings),
+                        needs_review=sum(f.status == "needs_review" for f in doc.findings),
+                        ledgered=sum(v.disposition is not None for v in found),
+                        severities=SeverityCounts(**severities),
+                    )
+                )
+            iac = DeclaredIac(
+                repositories=len(targets),
+                assessments=len(targets),
+                findings=census.cloud_config,
+                targets=tuple(sorted(targets, key=lambda r: (-r.unsuppressed, r.repository))),
+            )
         return ExecutiveSummary(
             rollup=_rollup(filter.as_of, products, shipped, repositories, views),
             credential_leaks=tuple(
@@ -2992,6 +3298,11 @@ class ExecutiveSummaryView:
             )
             if fleet
             else None,
+            attack=attack,
+            pqc=pqc,
+            pqc_unavailable=pqc_unavailable,
+            isolation=isolation,
+            iac=iac,
         )
 
     def report(self, model: ExecutiveSummary, generated_at: datetime) -> Report:
@@ -3129,6 +3440,115 @@ class ExecutiveSummaryView:
                 else None,
             ),
         ]
+        if model.attack is not None:
+            if self._attack is None:
+                raise ConfigError("executive ATT&CK renderer has no catalog view wired")
+            sections.extend(
+                s.model_copy(update={"heading": f"ATT&CK — {s.heading}"})
+                for s in self._attack.report(model.attack, generated_at).sections
+            )
+        if model.pqc is not None:
+            if self._pqc is None:
+                raise ConfigError("executive PQC renderer has no portfolio view wired")
+            sections.extend(
+                s.model_copy(update={"heading": f"PQC — {s.heading}"})
+                for s in self._pqc.report(model.pqc, generated_at).sections
+            )
+        elif model.pqc_unavailable is not None:
+            sections.append(
+                Section(heading="PQC — snapshot availability", body=model.pqc_unavailable)
+            )
+        if model.isolation is not None:
+            sections.append(
+                Section(
+                    heading="Tenant-isolation posture (PEACH)",
+                    body=f"{len(model.isolation.reviews)} latest recorded isolation reviews; "
+                    f"{sum(r.interfaces for r in model.isolation.reviews)} reviewed interfaces; "
+                    f"{sum(r.gaps for r in model.isolation.reviews)} gaps. "
+                    "No review is not evidence of isolation. Weakest first by the stated "
+                    "posture categories, not an invented numeric score.",
+                    table=Table(
+                        columns=(
+                            "repository",
+                            "service",
+                            "posture",
+                            "interfaces",
+                            "gaps",
+                            "dimensions",
+                        ),
+                        rows=tuple(
+                            (
+                                r.repository,
+                                r.service,
+                                r.posture,
+                                str(r.interfaces),
+                                str(r.gaps),
+                                ", ".join(f"{k}: {n}" for k, n in sorted(r.dimensions.items())),
+                            )
+                            for r in model.isolation.reviews[:5]
+                        ),
+                    )
+                    if model.isolation.reviews
+                    else None,
+                )
+            )
+            sections.extend(_weakest_boundaries(model.isolation.threat_register))
+        if model.iac is not None:
+            layer = model.iac
+            declared = SeverityCounts(
+                **sum((Counter(t.severities.model_dump()) for t in layer.targets), Counter())
+            )
+            sections.append(
+                Section(
+                    heading="Cloud configuration — declared layer (IaC at rest)",
+                    body=f"{layer.assessments} recorded audits across "
+                    f"{layer.repositories} repositories. "
+                    f"{sum(t.unsuppressed for t in layer.targets)} unsuppressed, "
+                    f"{sum(t.suppressed for t in layer.targets)} suppressed, "
+                    f"{sum(t.ledgered for t in layer.targets)} with a recorded decision. "
+                    "Severities below are the artifacts' unsuppressed proposals, not live-cluster "
+                    "posture or the census distinct-vulnerability headline.",
+                    table=Table(
+                        columns=("critical", "high", "medium", "low", "info", "unrated", "total"),
+                        rows=(_counts(declared, unrated=True),),
+                    )
+                    if layer.assessments
+                    else None,
+                )
+            )
+            sections.append(
+                _table_section(
+                    "Declared IaC targets",
+                    (
+                        "repository",
+                        "target",
+                        "unsuppressed",
+                        "suppressed",
+                        "needs review",
+                        "ledgered",
+                        "critical",
+                        "high",
+                        "medium",
+                        "low",
+                        "info",
+                        "unrated",
+                        "total",
+                    ),
+                    [
+                        (
+                            r.repository,
+                            r.target,
+                            str(r.unsuppressed),
+                            str(r.suppressed),
+                            str(r.needs_review),
+                            str(r.ledgered),
+                            *_counts(r.severities, unrated=True),
+                        )
+                        for r in layer.targets[:_TOP_N]
+                    ],
+                    "_No declared IaC audits recorded._",
+                )
+            )
         return Report(
             title="Executive summary: findings", generated_at=generated_at, sections=tuple(sections)
         )

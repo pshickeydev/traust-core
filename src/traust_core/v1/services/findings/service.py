@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from collections import Counter, defaultdict
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
@@ -48,10 +48,12 @@ from traust_core.v1.models.findings import (
     Occurrence,
     ReviewItem,
     SurfaceCoverage,
+    VerifiedFixMtta,
+    folded_resolutions,
     normalize_decision,
 )
 from traust_core.v1.models.integrity import FingerprintInput
-from traust_core.v1.models.inventory import default_line
+from traust_core.v1.models.inventory import default_line, ref_line
 from traust_core.v1.models.vocabulary import (
     DecisionReason,
     DispositionResolution,
@@ -283,6 +285,19 @@ class FindingService:
             )
         return sorted((v for v in views if filter.keeps(v)), key=_newest_first)
 
+    def on_ref(self, repository_ref_id: UUID) -> list[FindingView]:
+        """Findings reported on this named line, with resolution folded on that line."""
+        with self._uow as uow:
+            ref = self._inventory.get_ref(repository_ref_id)
+            refs = self._inventory.list_refs(ref.repository_id)
+            line = ref_line(ref, refs)
+            findings = uow.findings.list_for_repository(ref.repository_id)
+            if not findings:
+                return []
+            facts = FindingFacts.load(uow, findings, None, repository_ref_id)
+            kept = [f for f in findings if not facts.off_line(f.id, line)]
+            return self._views.views(uow, kept, facts=facts)
+
     def review_surfaces(
         self, repository_id: UUID, as_of: datetime | None = None
     ) -> dict[str, SurfaceCoverage]:
@@ -342,12 +357,33 @@ class FindingService:
         """Resolved findings of this folded validity whose standing resolving decision names the
         commit it was fixed on, and that a report saw on an earlier commit."""
         with self._uow as uow:
-            ids = uow.decisions.list_finding_ids_with_validity(validity)
-            found = uow.findings.list_by_ids(ids) if ids else []
-            facts = FindingFacts.load(uow, found, until=None)
-            views = self._views.views(uow, found, None, facts=facts)
-        fixes = []
-        for view in views:
+            return self._fixes(uow, self._with_validity(uow, validity), validity)
+
+    def fixes_by_fingerprint(self, validity: Validity, batch: int) -> Iterator[FindingFix]:
+        """`fixes` in (fingerprint, finding id) order, folded `batch` findings at a time so a
+        bounded reader stops early."""
+        if batch < 1:
+            raise ValidationError("fix batch size must be positive")
+        with self._uow as uow:
+            found = sorted(
+                self._with_validity(uow, validity), key=lambda f: (f.fingerprint, str(f.id))
+            )
+        for start in range(0, len(found), batch):
+            with self._uow as uow:
+                fixes = self._fixes(uow, found[start : start + batch], validity)
+            yield from fixes
+
+    @staticmethod
+    def _with_validity(uow: TraustUnitOfWork, validity: Validity) -> list[Finding]:
+        ids = uow.decisions.list_finding_ids_with_validity(validity)
+        return uow.findings.list_by_ids(ids) if ids else []
+
+    def _fixes(
+        self, uow: TraustUnitOfWork, found: Sequence[Finding], validity: Validity
+    ) -> list[FindingFix]:
+        facts = FindingFacts.load(uow, found, until=None)
+        fixed: list[tuple[FindingView, Occurrence, Decision]] = []
+        for view in self._views.views(uow, found, None, facts=facts):
             finding_id = view.finding.id
             assert finding_id is not None
             if view.state() != FindingState.RESOLVED or view.disposition.validity != validity:  # type: ignore[union-attr]
@@ -361,22 +397,28 @@ class FindingService:
                 continue
             fix = max(fixing, key=lambda d: d.occurred_at)
             earlier = [
-                ref
+                o
                 for o in facts.reported_by(finding_id, None)
                 if facts.at[o.assessment_id] <= fix.occurred_at
-                and (ref := facts.assessments[o.assessment_id].repository_ref_id)
+                and facts.assessments[o.assessment_id].repository_ref_id
                 not in (None, fix.fixed_repository_ref_id)
             ]
             if earlier:
-                fixes.append(
-                    FindingFix(
-                        view=view,
-                        reported_ref_id=earlier[-1],
-                        fixed_ref_id=fix.fixed_repository_ref_id,  # type: ignore[arg-type]
-                        rationale=fix.rationale,
-                    )
-                )
-        return fixes
+                fixed.append((view, earlier[-1], fix))
+        places: defaultdict[UUID, list[Location]] = defaultdict(list)
+        reported_ids = [o.id for _, o, _ in fixed if o.id is not None]
+        for location in uow.locations.list_for_occurrences(reported_ids) if reported_ids else ():
+            places[location.occurrence_id].append(location)
+        return [
+            FindingFix(
+                view=view,
+                reported_ref_id=facts.assessments[reported.assessment_id].repository_ref_id,  # type: ignore[arg-type]
+                reported_locations=tuple(places[reported.id]) if reported.id else (),
+                fixed_ref_id=fix.fixed_repository_ref_id,  # type: ignore[arg-type]
+                rationale=fix.rationale,
+            )
+            for view, reported, fix in fixed
+        ]
 
     def history(self, finding_id: UUID) -> list[Decision]:
         return self.decisions.list_for_finding(finding_id)
@@ -426,6 +468,46 @@ class FindingService:
         return sorted(
             (finding_rollup(key, views) for key, views in groups.items()),
             key=lambda r: (-r.findings, r.key is None, r.key or ""),
+        )
+
+    def verified_fix_mtta(self, filter: FindingFilter) -> list[VerifiedFixMtta]:
+        """First report to the first standing, evidence-backed resolved decision on the line the
+        disposition folds; human-only closures never qualify, even if a later report repeats it."""
+        with self._uow as uow:
+            findings = uow.findings.list_for_repository(filter.repository_id)
+            facts = FindingFacts.load(uow, findings, until=filter.as_of)
+        groups: defaultdict[ScannerSeverity, list[float]] = defaultdict(list)
+        for finding in findings:
+            assert finding.id is not None
+            reported = facts.reported_by(finding.id, filter.as_of)
+            view = self._views.view(facts, finding, filter.as_of, {})
+            if not reported or view is None or not filter.keeps(view):
+                continue
+            fixed = [
+                decision.occurred_at
+                for decision in folded_resolutions(
+                    facts.decided_by(finding.id, filter.as_of), facts.lines
+                )
+                if decision.resolution == _RESOLVED
+                and decision.assessment_id is not None
+                and facts.assessments[decision.assessment_id].kind in {"validation", "verification"}
+            ]
+            if not fixed:
+                continue
+            first = facts.at[reported[0].assessment_id]
+            days = max((min(fixed) - first).total_seconds() / 86400, 0.0)
+            severity = ScannerSeverity(view.effective_severity or ScannerSeverity.UNRATED)
+            groups[severity].append(days)
+        return sorted(
+            (
+                VerifiedFixMtta(
+                    severity=severity,
+                    findings=len(days),
+                    mtta_days=round(sum(days) / len(days), 1),
+                )
+                for severity, days in groups.items()
+            ),
+            key=lambda row: (-row.mtta_days, row.severity),
         )
 
     def timeline(self, filter: FindingFilter, bucket: TimeBucket) -> list[FindingSeriesPoint]:

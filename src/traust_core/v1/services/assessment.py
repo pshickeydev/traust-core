@@ -460,6 +460,8 @@ class AssessmentService:
         raw: bytes,
         format: CandidateFormat,
         provenance: Provenance,
+        *,
+        include_suppressed: bool = False,
     ) -> tuple[Assessment, IntakeResult]:
         """Third-party scanner output (SARIF, Dependabot, govulncheck) as an assessment of the
         commit and its findings; the same output again is the same assessment and adds nothing."""
@@ -473,7 +475,12 @@ class AssessmentService:
             name, version = candidate_formats.scanner(format.value, raw)
             ref, repository = self._inventory.resolve(repository_ref_id)
             candidates = FindingCandidate.parse_many(
-                raw, format, ref.repository_id, repository_url=repository.url, sha=ref.sha
+                raw,
+                format,
+                ref.repository_id,
+                repository_url=repository.url,
+                sha=ref.sha,
+                include_suppressed=include_suppressed,
             )
             assessment = uow.assessments.find_scan(repository_ref_id, name, provenance.occurred_at)
             if assessment is None:
@@ -1234,6 +1241,32 @@ class AssessmentService:
             PrivilegeProfile.of(a, repository_id, json.loads(doc.payload))
             for repository_id, a, doc in documents
         ]
+
+    def isolation_reviews(
+        self, repository_ids: Collection[UUID], as_of: datetime | None = None
+    ) -> list[tuple[UUID, Assessment, IsolationReviewArtifact]]:
+        """Each repository's latest completed default-line isolation review by the cutoff."""
+        _, documents = self._latest_documents(
+            AssessmentFilter(
+                kind=AssessmentKind.ISOLATION_REVIEW_CANONICAL, status=ASSESSMENT_COMPLETED
+            ),
+            repository_ids,
+            IsolationReviewArtifact,
+            as_of,
+        )
+        return documents
+
+    def cloud_config_audits(
+        self, repository_ids: Collection[UUID], as_of: datetime | None = None
+    ) -> list[tuple[UUID, Assessment, CloudConfigAuditArtifact]]:
+        """Each repository's latest default-line declared audit, including explicit gaps."""
+        _, documents = self._latest_documents(
+            AssessmentFilter(kind=AssessmentKind.CLOUD_CONFIG_CANONICAL),
+            repository_ids,
+            CloudConfigAuditArtifact,
+            as_of,
+        )
+        return documents
 
     def fuzz_reports(
         self, repository_ids: Collection[UUID], as_of: datetime | None = None
