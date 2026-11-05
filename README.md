@@ -421,6 +421,53 @@ flowchart LR
 | Add a named artifact | one line in `models/artifacts.py`: `class XArtifact(ArtifactDocument, name=…, schema=…, kind=…)` |
 | See an artifact's fields | `TriageArtifact.describe()` (field tree with types, required/optional); `TriageArtifact.schema_path()` |
 
+### PQC source scanner
+
+`providers.pqc.PqcScanTool` runs the configured `pqc-scan` binary over a supplied checkout.
+Register it with `Context.register_pqc_scanner(binary, rules, adapter_version=..., scan_commit=...)`;
+the binary and merged rules pack remain caller-owned inputs, not files vendored into core.
+The deployment's `ProcessRunner` must allow `pqc-scan`; its timeout and environment policy apply.
+
+**Placement exception:** consumer-adoption plan 15, decision 4 / row 52 explicitly approves
+this provider in core, with engine orchestration. This overrides the consuming-package-only
+security-tool rule in the [legacy provider recipe, item 8](.agents/skills/traust-core-patterns/provider.md)
+(Qodo checklist 6208), as recorded in PR #373. Rule-pack content and readiness policy retain
+their existing owners; this is not a second engine scanner.
+
+The provider checks the binary's adjacent `.sha256` record, stamps the binary/rules, parses
+required coverage and raw findings, and retains CBOM bytes. Missing/malformed output and nonzero
+exits fail rather than becoming clean scans. Changed binary/rules during a run invalidate its result.
+These are raw facts, not readiness verdicts.
+
+Scanner hits require a nonempty checkout-relative source file and a positive integer line when
+one is supplied. Readiness also requires an executable, checksum-valid binary.
+
+| Scanner output | Default budget |
+|---|---|
+| Report JSON | 16 MiB |
+| Optional CBOM | 16 MiB |
+| Findings | 50,000 |
+| Combined process stdout/stderr | 1 MiB |
+
+Outputs exceeding a budget fail explicitly, not as clean scans. Capped process capture is
+file-backed and monitored while running, with bounded reads into memory; temporary disk usage
+can overshoot between checks. `PqcScanError.result` retains bounded internal diagnostics, but
+its public message and ordinary process logs do not include raw scanner output.
+
+Rule discovery recursively includes regular `.yml` and `.yaml` files, excluding file symlinks.
+Counts accept the scanner's YAML mapping or sequence forms through Context's shared decoder.
+The fingerprint binds sorted relative paths and file-content hashes. This replaces the old
+root-only stamp format: previously cached stamps refresh once; historical records are not rewritten.
+
+`PqcService.prescan` remains the owner of post-processing, recorded facts and same-pack reuse;
+its crypto census requires an ingested manifest SBOM. Engine schedules work but does not own a
+second scanner implementation.
+`PqcService.scan_states` compares source facts against adapter version, rules digest, scanner
+commit and binary digest. Scanner replacement or rule changes invalidate source currency.
+SBOM-only currency depends on the adapter/mapping pack, not scanner-only metadata.
+Zero-file or unmeasured source coverage cannot assert a verified zero-hit or automatically
+produce not-applicable readiness, regardless of rule count; recorded facts remain available.
+
 ### PQC effort writes
 
 `PqcService.check` and new `record` admissions select the installed

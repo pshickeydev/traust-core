@@ -326,7 +326,7 @@ def facts_document(
         "skipped_files": None if scan is None else scan.skipped_files,
         "rules_in_pack": None if scan is None else scan.rules_in_pack,
     }
-    if scan is not None and not facts:
+    if scan is not None and scan.scanned_files is not None and scan.scanned_files > 0 and not facts:
         coverage["no_crypto_detected_assertion"] = no_crypto_assertion(scan)
     summary = {
         name: dict(Counter(key(f) for f in facts))

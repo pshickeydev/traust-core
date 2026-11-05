@@ -20,15 +20,59 @@ def test_an_unscanned_commit_has_a_state_without_a_scan(world: World) -> None:
     ]
 
 
-def test_a_scan_is_current_until_the_pack_changes(world: World) -> None:
+@pytest.mark.parametrize(
+    ("field", "before", "after"),
+    [
+        ("rules_sha256", STAMPS.rules_sha256, "cd" * 32),
+        ("pqc_scan_commit", STAMPS.pqc_scan_commit, "new-commit"),
+        ("binary_sha256", "11" * 32, "22" * 32),
+        ("binary_sha256", None, "22" * 32),
+    ],
+)
+def test_a_source_scan_is_current_until_its_scanner_identity_changes(
+    world: World, field: str, before: str | None, after: str
+) -> None:
+    assert world.scanner is not None
+    world.scanner.pack = world.scanner.scanned_with = STAMPS.model_copy(update={field: before})
     ref = world.ref()
     done = world.pqc.prescan(ref, CHECKOUT)
     (state,) = world.pqc.scan_states(PqcFilter(repository_ref_ids=(ref,)))
     assert (state.assessment_id, state.basis, state.current) == (done.assessment_id, "source", True)
-    assert world.scanner is not None
-    world.scanner.pack = STAMPS.model_copy(update={"rules_sha256": "cd" * 32})
+    world.scanner.pack = world.scanner.pack.model_copy(update={field: after})
     (stale,) = world.pqc.scan_states(PqcFilter(repository_ref_ids=(ref,)))
     assert (stale.assessment_id, stale.current) == (done.assessment_id, False)
+    world.scanner.scanned_with = world.scanner.pack
+    refreshed = world.pqc.prescan(ref, CHECKOUT)
+    (current,) = world.pqc.scan_states(PqcFilter(repository_ref_ids=(ref,)))
+    assert refreshed.assessment_id != done.assessment_id
+    assert (current.assessment_id, current.basis, current.current) == (
+        refreshed.assessment_id,
+        "source",
+        True,
+    )
+
+
+@pytest.mark.parametrize("field", ["pqc_scan_commit", "binary_sha256"])
+def test_sbom_currency_ignores_scanner_metadata_but_not_its_mapping_pack(
+    world: World, field: str
+) -> None:
+    ref = world.ref()
+    done = world.pqc.prescan(ref, None)
+    assert world.scanner is not None
+    world.scanner.pack = STAMPS.model_copy(update={field: "cd" * 32})
+    (current,) = world.pqc.scan_states(PqcFilter(repository_ref_ids=(ref,)))
+    assert (current.assessment_id, current.basis, current.current) == (
+        done.assessment_id,
+        "sbom-only",
+        True,
+    )
+    world.scanner.pack = world.scanner.pack.model_copy(update={"rules_sha256": "ef" * 32})
+    (stale,) = world.pqc.scan_states(PqcFilter(repository_ref_ids=(ref,)))
+    assert (stale.assessment_id, stale.basis, stale.current) == (
+        done.assessment_id,
+        "sbom-only",
+        False,
+    )
 
 
 def test_without_a_scanner_currency_is_unmeasured_not_false(

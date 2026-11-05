@@ -82,9 +82,17 @@ class FakeScanner:
 
     name = "pqc-scan"
 
-    def __init__(self, hits: tuple[PqcScanFinding, ...] = HITS, ready: bool = True) -> None:
+    def __init__(
+        self,
+        hits: tuple[PqcScanFinding, ...] = HITS,
+        ready: bool = True,
+        *,
+        scanned_files: int | None = 40,
+        skipped_files: int | None = 2,
+    ) -> None:
         self.hits, self.ready, self.pack, self.scans = hits, ready, STAMPS, 0
         self.scanned_with = STAMPS
+        self.scanned_files, self.skipped_files = scanned_files, skipped_files
 
     def check(self) -> Readiness:
         return Readiness(ready=self.ready, detail="" if self.ready else "binary missing")
@@ -96,8 +104,8 @@ class FakeScanner:
         self.scans += 1
         scan = PqcScan(
             findings=self.hits,
-            scanned_files=40,
-            skipped_files=2,
+            scanned_files=self.scanned_files,
+            skipped_files=self.skipped_files,
             rules_in_pack=150,
             stamps=self.scanned_with,
             cbom=CBOM,
@@ -199,7 +207,20 @@ def test_prescan_records_the_facts_of_the_scan_and_the_census(world: World) -> N
     )
 
 
-def test_prescan_is_idempotent_for_the_current_pack_and_rescans_a_stale_one(world: World) -> None:
+@pytest.mark.parametrize(
+    ("field", "before", "after"),
+    [
+        ("rules_sha256", STAMPS.rules_sha256, "cd" * 32),
+        ("pqc_scan_commit", STAMPS.pqc_scan_commit, "new-commit"),
+        ("binary_sha256", "11" * 32, "22" * 32),
+        ("binary_sha256", None, "22" * 32),
+    ],
+)
+def test_prescan_reuses_only_the_current_source_identity(
+    world: World, field: str, before: str | None, after: str
+) -> None:
+    assert world.scanner is not None
+    world.scanner.pack = world.scanner.scanned_with = STAMPS.model_copy(update={field: before})
     ref = world.ref()
     first = world.pqc.prescan(ref, CHECKOUT)
     again = world.pqc.prescan(ref, CHECKOUT)
@@ -212,11 +233,16 @@ def test_prescan_is_idempotent_for_the_current_pack_and_rescans_a_stale_one(worl
     )
     assert again.facts == first.facts
     assert world.scanner is not None
-    world.scanner.pack = world.scanner.scanned_with = STAMPS.model_copy(
-        update={"rules_sha256": "cd" * 32}
+    world.scanner.pack = world.scanner.scanned_with = world.scanner.pack.model_copy(
+        update={field: after}
     )
+    prepared = world.pqc.prepare(ref)
+    assert prepared.route == PqcRoute.UNREFRESHED
+    assert prepared.facts == first.facts
     rescanned = world.pqc.prescan(ref, CHECKOUT)
     assert rescanned.scanned and rescanned.assessment_id != first.assessment_id
+    assert world.scanner.scans == 2
+    assert world.pqc.prepare(ref).route == PqcRoute.UNSCORED
 
 
 def test_a_verified_zero_hit_reads_as_not_applicable_without_a_stored_report(
@@ -234,6 +260,25 @@ def test_a_verified_zero_hit_reads_as_not_applicable_without_a_stored_report(
     assert again.readiness == done.readiness and not again.scanned
 
 
+@pytest.mark.parametrize(("scanned", "skipped"), [(0, 0), (0, 7), (None, None)])
+@pytest.mark.parametrize("has_report", [False, True])
+def test_no_scanned_files_cannot_create_clean_readiness_or_replace_a_report(
+    engine: Engine, scanned: int | None, skipped: int | None, has_report: bool
+) -> None:
+    world = World(engine, FakeScanner(hits=(), scanned_files=scanned, skipped_files=skipped))
+    ref = world.ref(sbom=b'{"bomFormat": "CycloneDX", "components": []}')
+    prior = world.pqc.record(ref, report(), PROVENANCE) if has_report else None
+    done = world.pqc.prescan(ref, ToolRequest(workspace=CRYPTO / "image"))
+    assert done.facts == () and done.readiness is None
+    prepared = world.pqc.prepare(ref)
+    assert prepared.no_crypto_detected_assertion is None
+    assert prepared.prior == prior
+    assert world.pqc.find(ref) == prior
+    assert world.pqc.list_readiness(PqcFilter(repository_ref_ids=(ref,))) == (
+        [prior] if prior is not None else []
+    )
+
+
 def test_an_sbom_only_prescan_reads_the_manifest_packages(world: World) -> None:
     ref = world.ref()
     done = world.pqc.prescan(ref, None)
@@ -243,6 +288,25 @@ def test_an_sbom_only_prescan_reads_the_manifest_packages(world: World) -> None:
     assert done.readiness is None  # sbom-only never templates a zero-hit
     source = world.pqc.prescan(ref, CHECKOUT)
     assert source.scanned and source.assessment_id != done.assessment_id
+
+
+@pytest.mark.parametrize("field", ["pqc_scan_commit", "binary_sha256"])
+def test_sbom_prescan_reuses_its_facts_after_scanner_identity_changes(
+    world: World, field: str
+) -> None:
+    ref = world.ref()
+    first = world.pqc.prescan(ref, None)
+    assert world.scanner is not None
+    world.scanner.pack = STAMPS.model_copy(update={field: "cd" * 32})
+    prepared = world.pqc.prepare(ref)
+    assert prepared.facts == first.facts and prepared.route == PqcRoute.UNSCORED
+    again = world.pqc.prescan(ref, None)
+    assert (again.assessment_id, again.scanned, again.facts) == (
+        first.assessment_id,
+        False,
+        first.facts,
+    )
+    assert world.scanner.scans == 0
 
 
 def test_prescan_refusals(engine: Engine) -> None:
@@ -261,6 +325,18 @@ def test_prescan_refusals(engine: Engine) -> None:
         world.pqc.prescan(world.ref(url=f"{URL}-4"), CHECKOUT)
     with pytest.raises(NotFoundError):
         world.pqc.prescan(uuid4(), CHECKOUT)
+
+
+@pytest.mark.parametrize("field", ["pqc_scan_commit", "binary_sha256"])
+def test_prescan_refuses_a_result_from_another_scanner_identity(world: World, field: str) -> None:
+    ref = world.ref()
+    assert world.scanner is not None
+    world.scanner.scanned_with = STAMPS.model_copy(update={field: "cd" * 32})
+    with pytest.raises(IntegrityError, match="does not stamp"):
+        world.pqc.prescan(ref, CHECKOUT)
+    assert world.pqc.find(ref) is None
+    (state,) = world.pqc.scan_states(PqcFilter(repository_ref_ids=(ref,)))
+    assert state.assessment_id is None
 
 
 def test_prepare_hands_layer_2_the_facts_and_the_route(world: World) -> None:
@@ -567,8 +643,7 @@ def test_readiness_lists_carry_the_reports_clock_items(world: World) -> None:
     assert world.pqc.list_readiness(PqcFilter(buckets=(PqcReadinessBucket.READY,))) == []
 
 
-def test_context_wires_the_service_without_a_scanner(tmp_path: Path) -> None:
+def test_prescan_refuses_when_scanner_is_not_registered(tmp_path: Path) -> None:
     services = Context(Config(home=tmp_path)).services()
-    assert isinstance(services.pqc, PqcService)
-    with pytest.raises(ConfigError, match="traust-engine registers it"):
+    with pytest.raises(ConfigError):
         services.pqc.prescan(uuid4(), CHECKOUT)
