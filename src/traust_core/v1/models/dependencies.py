@@ -15,7 +15,7 @@ from enum import StrEnum
 from typing import Any, NamedTuple, NewType, Self
 from uuid import UUID
 
-from pydantic import Field, computed_field
+from pydantic import Field, JsonValue, computed_field
 
 from traust_core.v1.errors import NotFoundError, ValidationError
 from traust_core.v1.models.artifacts import ImpactAnalysisArtifact
@@ -814,6 +814,32 @@ class ImpactAnalysis(Model):
     advisory_id: UUID
     classification: ImpactClassification
     finding_id: UUID | None = None
+
+
+class ImpactExportRepo(ImpactAnalysis):
+    """One retained commit/package verdict, with its complete native document."""
+
+    repo: str
+    repository_url: str
+    sha: str
+    ecosystem: Ecosystem | None
+    module: str
+    version: Version | None
+    evidence: ImpactEvidence
+    document: dict[str, JsonValue]
+
+
+class ImpactExport(Model):
+    """An advisory's latest analysis per commit and affected package version, with its native
+    evidence."""
+
+    advisory_id: UUID
+    advisory: AdvisoryIdentifier
+    generated_at: datetime
+    commits: int
+    analyses: int
+    classifications: dict[ImpactClassification, int]
+    repos: tuple[ImpactExportRepo, ...]
 
 
 class ImpactInput(SkillInput):

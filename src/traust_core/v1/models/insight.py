@@ -27,6 +27,7 @@ from traust_core.v1.models.findings import (
     FindingSeriesPoint,
     FindingView,
     Label,
+    Occurrence,
     ReviewCase,
 )
 from traust_core.v1.models.operations import SpendAttribution, SpendRollup, ThroughputPoint
@@ -45,6 +46,7 @@ from traust_core.v1.models.vocabulary import (
 
 class ViewName(StrEnum):
     FINDINGS_ROLLUP = "findings-rollup"
+    CONTAINER_FINDINGS = "container-findings"
     INSECURE_PATTERNS = "insecure-patterns"
     FINDINGS_TREND = "findings-trend"
     COVERAGE = "coverage"
@@ -77,6 +79,13 @@ class ViewName(StrEnum):
 class ViewModel(Model): ...
 
 
+class ExecutivePanel(StrEnum):
+    ATTACK = "attack"
+    PQC = "pqc"
+    ISOLATION = "isolation"
+    IAC = "iac"
+
+
 class ViewFilter(Model):
     """Scope (products, teams, category labels), the point in time, and for series a window and
     bucket; `artifact_id` names the document a single-item view renders."""
@@ -90,6 +99,11 @@ class ViewFilter(Model):
     window: TimeWindow | None = None
     bucket: TimeBucket = TimeBucket.MONTH
     artifact_id: UUID | None = None
+    executive_panels: tuple[ExecutivePanel, ...] = ()
+    assessment_id: UUID | None = None
+    report_stem: str | None = None
+    compare_as_of: datetime | None = None
+    first_party_divisor: Decimal | None = Field(default=None, gt=0, allow_inf_nan=False)
 
 
 class SeverityCounts(Model):
@@ -150,6 +164,31 @@ class TopFinding(Model):
     cvss_score: Decimal | None = None
     execution_proven: bool = False
     sla_due: datetime | None = None
+
+
+class ContainerReport(Model):
+    assessment_id: UUID
+    repository_ref_id: UUID
+    occurred_at: datetime
+    image: str
+    title: str
+
+
+class ContainerFinding(Model):
+    view: FindingView
+    occurrences: tuple[Occurrence, ...]
+    history: tuple[Decision, ...] = ()
+
+
+class ContainerFindings(ViewModel):
+    as_of: datetime | None = None
+    repository_id: UUID
+    repository_url: str
+    report_stem: str
+    image_repository: str
+    reports: tuple[ContainerReport, ...]
+    findings: tuple[ContainerFinding, ...]
+    total: FindingTally
 
 
 class FindingsRollup(ViewModel):
@@ -663,6 +702,8 @@ class LocDashboard(ViewModel):
     """Lines of code the scope's repositories hold, by language and repository, largest first."""
 
     code: int
+    first_party_divisor: Decimal | None = None
+    first_party_estimate: Decimal | None = None
     total: int
     reported: int = 0  # repositories with findings reported, for the population block
     dispositioned: int = 0  # of those, with a decision recorded
@@ -710,6 +751,39 @@ class LeastPrivilege(Model):
     flags: Mapping[str, int] = Field(default_factory=dict)
 
 
+class IsolationReviewRow(Model):
+    repository: str
+    assessment_id: UUID
+    service: str
+    posture: str
+    interfaces: int
+    gaps: int
+    dimensions: Mapping[str, int] = Field(default_factory=dict)
+
+
+class IsolationSummary(Model):
+    reviews: tuple[IsolationReviewRow, ...] = ()
+    threat_register: ThreatRegister
+
+
+class DeclaredIacTarget(Model):
+    repository: str
+    assessment_id: UUID
+    target: str
+    unsuppressed: int
+    suppressed: int
+    needs_review: int
+    ledgered: int
+    severities: SeverityCounts
+
+
+class DeclaredIac(Model):
+    repositories: int
+    assessments: int
+    findings: CensusLayer
+    targets: tuple[DeclaredIacTarget, ...] = ()
+
+
 class ExecutiveSummary(ViewModel):
     """The leadership roll-up; `exposure` is fleet-wide, None for a product or team scope."""
 
@@ -720,6 +794,11 @@ class ExecutiveSummary(ViewModel):
     languages: tuple[LanguageSeverity, ...] = ()
     privileges: LeastPrivilege
     exposure: tuple[ExposureRollup, ...] | None = None
+    attack: AttackCoverage | None = None
+    pqc: PqcPortfolio | None = None
+    pqc_unavailable: str | None = None
+    isolation: IsolationSummary | None = None
+    iac: DeclaredIac | None = None
 
 
 class ReviewCard(Model):

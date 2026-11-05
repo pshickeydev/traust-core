@@ -42,6 +42,7 @@ from traust_core.v1.models.artifacts import (
 from traust_core.v1.models.assessment import AssessmentKind
 from traust_core.v1.models.common import PageRequest, TimeWindow
 from traust_core.v1.models.detection_quality import (
+    COMPLIANCE_PRECISION_GATE,
     BenchmarkFilter,
     CanaryInjection,
     CanaryKind,
@@ -511,6 +512,30 @@ def test_compliance_precision_counts_overrides_of_check_failures_as_dismissals(
 def test_compliance_precision_without_assessments_is_empty(world: World) -> None:
     cal = world.service().calibrate_compliance(NIST)  # type: ignore[arg-type]
     assert (cal.assessments, cal.checks) == (0, ())
+
+
+def test_compliance_precision_gate_is_configurable_and_inclusive(world: World) -> None:
+    world.attach(
+        compliance(check("tls", "not_satisfied"), overridden("tls")), AssessmentKind.COMPLIANCE
+    )
+    service = world.service()
+    low = service.calibrate_compliance(NIST, gate=0.49)  # type: ignore[arg-type]
+    boundary = service.calibrate_compliance(NIST, gate=0.5)  # type: ignore[arg-type]
+    assert (low.checks[0].precision, low.checks[0].flagged) == (0.5, False)
+    assert boundary.checks[0].flagged is True
+    assert boundary.model_dump(mode="json")["checks"][0]["precision"] == 0.5
+    assert boundary.model_dump(mode="json")["checks"][0]["flagged"] is True
+    assert (low.gate, boundary.gate) == (0.49, 0.5)
+    for invalid in (-0.1, 1.1, float("nan")):
+        with pytest.raises(ValidationError):
+            service.calibrate_compliance(NIST, gate=invalid)  # type: ignore[arg-type]
+
+
+def test_compliance_precision_default_gate_is_the_shared_constant(world: World) -> None:
+    world.attach(compliance(check("tls", "not_satisfied")), AssessmentKind.COMPLIANCE)
+    cal = world.service().calibrate_compliance(NIST)  # type: ignore[arg-type]
+    assert cal.gate == COMPLIANCE_PRECISION_GATE
+    assert cal.checks[0].gate == COMPLIANCE_PRECISION_GATE
 
 
 # --- scorecards -------------------------------------------------------------------------------

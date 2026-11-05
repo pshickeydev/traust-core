@@ -14,7 +14,7 @@ from traust_core.v1.models.findings import (
     FindingLabel,
     Occurrence,
 )
-from traust_core.v1.models.inventory import RepositoryRef, default_line
+from traust_core.v1.models.inventory import RepositoryRef, default_line, ref_line
 from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.services.artifact_publishing import AssessmentLog
 from traust_core.v1.services.portfolio import Inventory
@@ -35,7 +35,11 @@ class FindingFacts:
 
     @classmethod
     def load(
-        cls, uow: TraustUnitOfWork, findings: Sequence[Finding], until: datetime | None
+        cls,
+        uow: TraustUnitOfWork,
+        findings: Sequence[Finding],
+        until: datetime | None,
+        repository_ref_id: UUID | None = None,
     ) -> FindingFacts:
         """Decisions made after `until` are left out; every occurrence is kept."""
         ids = [f.id for f in findings if f.id is not None]
@@ -70,6 +74,7 @@ class FindingFacts:
                     )
                 },
                 Inventory(uow).list_refs_of({f.repository_id for f in findings}),
+                repository_ref_id,
             ),
             decisions=decisions,
             reported=reported,
@@ -110,14 +115,20 @@ def _lines(
     assessments: Mapping[UUID, Assessment],
     baselines: Mapping[UUID, Assessment],
     refs: Sequence[RepositoryRef],
+    repository_ref_id: UUID | None = None,
 ) -> dict[UUID, bool]:
     """Decision id -> judged on the default line or another named one (data model §3b): a
     comparison's on its baseline's, an assessment's on its own, a person's on the commit they
     named. A bare commit off the default line ties a decision to no line; until a repository's
     default branch is observed its lines can't be told apart, so none of its refs splits them."""
-    observed = {r.repository_id for r in refs if r.is_default}
-    refs = [r for r in refs if r.repository_id in observed]
-    on, named = default_line(refs), {r.id for r in refs if r.name is not None}
+    if repository_ref_id is None:
+        observed = {r.repository_id for r in refs if r.is_default}
+        refs = [r for r in refs if r.repository_id in observed]
+        on = default_line(refs)
+    else:
+        target = next(r for r in refs if r.id == repository_ref_id)
+        on = ref_line(target, refs)
+    named = {r.id for r in refs if r.name is not None}
     lines: dict[UUID, bool] = {}
     for d in decisions:
         judged = assessments[d.assessment_id] if d.assessment_id else None

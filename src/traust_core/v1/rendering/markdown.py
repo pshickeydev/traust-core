@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from collections.abc import Sequence
 from datetime import datetime
+from html import escape
 from typing import Protocol
 
 from traust_core.v1.models.base import Model
@@ -67,6 +68,11 @@ _HOSTILE = re.compile("[\\x00-\\x08\\x0b\\x0c\\x0e-\\x1f\\x7f\\u202a-\\u202e\\u2
 def inline(value: object) -> str:
     """Text safe for one line of markdown: hostile characters stripped, whitespace collapsed."""
     return " ".join(_HOSTILE.sub("", "" if value is None else str(value)).split())
+
+
+def markdown_text(value: object) -> str:
+    """Plain structured text, not authored Markdown: no HTML, links or inline formatting."""
+    return re.sub(r"([\\`*_\[\]{}()!~])", r"\\\1", escape(inline(value), quote=False))
 
 
 def markdown_table(columns: Sequence[str], rows: Sequence[Sequence[str]]) -> list[str]:

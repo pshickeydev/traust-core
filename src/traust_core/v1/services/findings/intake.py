@@ -32,6 +32,7 @@ from traust_core.v1.models.vocabulary import ActorKind, FindingKind, ReviewItemS
 from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.services.artifact_publishing import AssessmentLog
 from traust_core.v1.services.findings.identity import IdentityPolicy
+from traust_core.v1.services.findings.review import request
 from traust_core.v1.services.findings.taxonomy import TaxonomyPolicy
 from traust_core.v1.services.portfolio import Inventory
 
@@ -93,12 +94,27 @@ class FindingIntake:
             pending: dict[UUID, dict[tuple[str, int | None], CodeSpan]] = {}
             baselines: dict[UUID, set[tuple[str, int | None]]] = {}
             keys, kinds = self._fingerprints(repo, candidates, f"assessment {assessment_id}")
-            taken = {
-                c.label: self._take(
-                    uow, assessment_id, c, fp, catalog, pending, baselines, kind=kinds.get(fp)
+            took = [
+                (
+                    c,
+                    self._take(
+                        uow, assessment_id, c, fp, catalog, pending, baselines, kind=kinds.get(fp)
+                    ),
                 )
                 for c, fp in zip(candidates, keys, strict=True)
-            }
+            ]
+            taken = {c.label: result for c, result in took}
+            # each candidate's own finding: two candidates may share a label
+            for c, (finding_id, _) in took:
+                if (
+                    c.suppression is not None
+                    and c.suppression.stands
+                    and not any(
+                        item.reason == ReviewReason.MANUAL_QUEUE
+                        for item in uow.review_items.list_for_finding(finding_id)
+                    )
+                ):
+                    request(uow, finding_id, ReviewReason.MANUAL_QUEUE)
             for occurrence_id, locations in pending.items():
                 for (path, line), span in locations.items():
                     saved = uow.locations.add(

@@ -89,6 +89,16 @@ class DocsTarget:
     version: str
     guides: tuple[str, ...] = ()
 
+    def validate(self) -> None:
+        _segment(self.product_slug)
+        _segment(self.version)
+        if not isinstance(self.guides, tuple):
+            raise ValidationError("docs.redhat.com guides must be a tuple of plain slugs")
+        for guide in self.guides:
+            _segment(guide)
+        if len(set(self.guides)) != len(self.guides):
+            raise ValidationError("docs.redhat.com guides must be unique")
+
 
 class RedHatDocSource:
     """docs.redhat.com guides as single-page html, fetched with stock curl (the CDN refuses
@@ -141,6 +151,6 @@ class RedHatDocSource:
 
 
 def _segment(value: str) -> str:
-    if not _SLUG.fullmatch(value):
+    if not isinstance(value, str) or value in {".", ".."} or not _SLUG.fullmatch(value):
         raise ValidationError(f"docs.redhat.com path segment {value!r} is not a plain slug")
     return value

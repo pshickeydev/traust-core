@@ -101,6 +101,7 @@ from traust_core.v1.models.vocabulary import (
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.collaboration import AdrSource, DocSource
 from traust_core.v1.providers.runtime import CloudInventoryProvider
+from traust_core.v1.rendering.compliance import assessment_markdown
 from traust_core.v1.repositories.objects import ObjectKey, ObjectStore
 from traust_core.v1.repositories.traust.assessments import AssessmentsUnitOfWork
 from traust_core.v1.services.artifact_publishing import (
@@ -688,6 +689,11 @@ class ComplianceService:
         return oscal_assessment_results(
             self._publisher.read(artifact_id, ComplianceAssessmentArtifact)
         )
+
+    @staticmethod
+    def render_assessment(document: ComplianceAssessmentArtifact) -> bytes:
+        """Human-readable coverage, control verdicts, reasons and citations for one run."""
+        return assessment_markdown(document)
 
     def _record_variances(
         self, doc: DocVarianceArtifact, provenance: Provenance, *, update: bool

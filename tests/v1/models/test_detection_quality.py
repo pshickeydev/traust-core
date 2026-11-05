@@ -10,10 +10,18 @@ from typing import Any
 
 import pytest
 import yaml
+from pydantic import ValidationError as PydanticValidationError
 
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.code_facts import ConfigTriple, RouteGuardRow
-from traust_core.v1.models.detection_quality import CardDeck, Predicate, fact_fields
+from traust_core.v1.models.detection_quality import (
+    CardDeck,
+    CheckPrecision,
+    ComplianceCalibration,
+    Predicate,
+    fact_fields,
+)
+from traust_core.v1.models.vocabulary import ComplianceFramework
 
 PILOT = Path(__file__).parents[2] / "fixtures/detection_quality/precedent-cards.yaml"
 
@@ -234,3 +242,32 @@ def test_a_predicate_leaf_with_an_unhashable_op_is_rejected_not_crashed() -> Non
     deck = CardDeck.parse({"cards": [card]})
     assert not deck.cards
     assert "unknown op" in " ".join(deck.rejected[0].reasons)
+
+
+def test_compliance_calibration_parses_back_its_own_serialization() -> None:
+    calibration = ComplianceCalibration(
+        framework=ComplianceFramework("pci-dss-v4"),
+        assessments=2,
+        gate=0.6,
+        checks=(
+            CheckPrecision(check_id="tls", fired=3, dismissed=2, gate=0.6),
+            CheckPrecision(check_id="mfa", fired=0, dismissed=0, gate=0.6),
+        ),
+    )
+    for check in calibration.checks:
+        assert CheckPrecision.model_validate(check.model_dump()) == check
+        assert CheckPrecision.model_validate_json(check.model_dump_json()) == check
+    assert ComplianceCalibration.model_validate(calibration.model_dump()) == calibration
+    assert ComplianceCalibration.model_validate_json(calibration.model_dump_json()) == calibration
+    dumped = calibration.model_dump(mode="json")
+    assert ComplianceCalibration.model_validate(dumped) == calibration
+    assert dumped["checks"][0] | {"precision": 0.333, "flagged": True} == dumped["checks"][0]
+
+
+@pytest.mark.parametrize("stated", [{"precision": 1.0}, {"flagged": False}])
+def test_a_check_precision_whose_derived_keys_disagree_with_its_counts_is_refused(
+    stated: dict[str, Any],
+) -> None:
+    dumped = CheckPrecision(check_id="tls", fired=3, dismissed=2).model_dump() | stated
+    with pytest.raises(PydanticValidationError, match="disagree"):
+        CheckPrecision.model_validate(dumped)
