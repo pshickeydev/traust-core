@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 from traust_core.v1.models.detection_quality import BenchmarkRun, MatchTier, Recall, Scorecard
-from traust_core.v1.rendering.markdown import markdown_table
+from traust_core.v1.rendering.markdown import markdown_table, markdown_text
 
 
 def _rate(value: float | None) -> str:
@@ -11,7 +11,9 @@ def _rate(value: float | None) -> str:
 
 
 def _table(columns: tuple[str, ...], rows: Sequence[tuple[str, ...]]) -> list[str]:
-    return [*markdown_table(columns, rows), ""] if rows else ["None.", ""]
+    if not rows:
+        return ["None.", ""]
+    return [*markdown_table(columns, [tuple(map(markdown_text, row)) for row in rows]), ""]
 
 
 def _scorecard(card: Scorecard) -> list[str]:

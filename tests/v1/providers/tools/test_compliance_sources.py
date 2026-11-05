@@ -12,6 +12,7 @@ from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
 import pytest
+import yaml
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -20,15 +21,13 @@ from cryptography.x509.oid import NameOID
 from traust_core.v1.context import Config, Context
 from traust_core.v1.errors import ConfigError, NotFoundError, ServiceError, ValidationError
 from traust_core.v1.models.common import ArtifactRef
-from traust_core.v1.models.compliance import doc_text, parse_adr
-from traust_core.v1.models.inventory import DEFAULT_FORGE_HOSTS
-from traust_core.v1.models.values import ProductSlug
+from traust_core.v1.models.compliance import DocsTarget, doc_text, parse_adr
+from traust_core.v1.models.inventory import DEFAULT_FORGE_HOSTS, ProductSlug
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.forge_api import ForgeApi
 from traust_core.v1.providers.http import HttpFetcher
 from traust_core.v1.providers.process import ProcessResult, ProcessRunner
 from traust_core.v1.providers.tools.compliance_sources import (
-    DocsTarget,
     GithubAdrSource,
     RedHatDocSource,
     github_slug,
@@ -258,8 +257,8 @@ def test_named_guides_skip_the_landing_page() -> None:
 def test_a_failed_or_unsafe_fetch_is_loud_never_partial(
     answer: Callable[[str], bytes | BaseException], target: DocsTarget, match: str
 ) -> None:
+    source, _, product = docs_source(answer, target)
     with pytest.raises((ServiceError, NotFoundError, ValidationError), match=match):
-        source, _, product = docs_source(answer, target)
         source.fetch(product)
 
 
@@ -367,7 +366,11 @@ OFFICIAL_GUIDE = (
     "https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/9"
     "/html-single/security_hardening/index"
 )
-OFFICIAL_TARGET = DocsTarget("red_hat_enterprise_linux", "9", ("security_hardening",))
+OFFICIAL_TARGET = {
+    "product_slug": "red_hat_enterprise_linux",
+    "version": "9",
+    "guides": ["security_hardening"],
+}
 
 
 def registered_product(tmp_path: Path) -> tuple[Context, UUID]:
@@ -377,14 +380,23 @@ def registered_product(tmp_path: Path) -> tuple[Context, UUID]:
     return ctx, product.id
 
 
-def test_registered_product_target_reaches_curl_and_html_to_text(
+def configured_context(tmp_path: Path, targets: dict[str, object]) -> Context:
+    path = tmp_path / "traust.yaml"
+    path.write_text(
+        yaml.safe_dump({"home": str(tmp_path / "data"), "compliance": {"docs_targets": targets}})
+    )
+    return Context.from_file(path)
+
+
+def test_file_configured_registered_product_reaches_curl_and_html_to_text(
     tmp_path: Path, docs_transport: tuple[dict[str, tuple[int, bytes]], list[str]]
 ) -> None:
-    ctx, product_id = registered_product(tmp_path)
+    _, product_id = registered_product(tmp_path)
+    ctx = configured_context(tmp_path, {str(product_id): OFFICIAL_TARGET})
     responses, requests = docs_transport
     body = Path(__file__).parents[3] / "fixtures/compliance/security-hardening-excerpt.html"
     responses[urlsplit(OFFICIAL_GUIDE).path] = (200, body.read_bytes())
-    ctx.register_compliance_sources({product_id: OFFICIAL_TARGET})
+    ctx.register_compliance_sources()
 
     (guide,) = ctx.services().compliance.collect_product_docs(product_id)
 
@@ -402,15 +414,19 @@ def test_registered_product_target_reaches_curl_and_html_to_text(
     assert "<code" not in guide.text and "Copy link" not in guide.text
 
 
-def test_replacing_product_targets_changes_subsequent_reads(
+def test_explicit_product_target_reaches_the_same_transport(
     tmp_path: Path, docs_transport: tuple[dict[str, tuple[int, bytes]], list[str]]
 ) -> None:
     ctx, product_id = registered_product(tmp_path)
-    ctx.register_compliance_sources({product_id: OFFICIAL_TARGET})
-    ctx.register_compliance_sources({})
-    with pytest.raises(NotFoundError):
-        ctx.services().compliance.collect_product_docs(product_id)
-    assert docs_transport[1] == []
+    responses, requests = docs_transport
+    body = Path(__file__).parents[3] / "fixtures/compliance/security-hardening-excerpt.html"
+    responses[urlsplit(OFFICIAL_GUIDE).path] = (200, body.read_bytes())
+    ctx.register_compliance_sources(
+        {product_id: DocsTarget("red_hat_enterprise_linux", "9", ("security_hardening",))}
+    )
+    (guide,) = ctx.services().compliance.collect_product_docs(product_id)
+    assert "applications reject weak algorithms by default." in guide.text
+    assert requests == [urlsplit(OFFICIAL_GUIDE).path]
 
 
 def test_registered_product_with_no_target_refuses_without_transport(
@@ -420,26 +436,29 @@ def test_registered_product_with_no_target_refuses_without_transport(
     ctx.register_compliance_sources()
     with pytest.raises(NotFoundError) as refused:
         ctx.services().compliance.collect_product_docs(product_id)
-    assert "Context.register_compliance_sources" in str(refused.value)
+    assert f"compliance.docs_targets[{product_id}]" in str(refused.value)
+    assert {"product_slug", "version", "traust.yaml"} <= set(str(refused.value).split())
     assert docs_transport[1] == []
 
 
-def test_unknown_product_target_refuses_before_transport(
+def test_unknown_configured_product_refuses_before_transport(
     tmp_path: Path, docs_transport: tuple[dict[str, tuple[int, bytes]], list[str]]
 ) -> None:
-    ctx = Context(Config(home=tmp_path / "data"))
+    ctx = configured_context(tmp_path, {str(uuid4()): OFFICIAL_TARGET})
     with pytest.raises(ConfigError):
-        ctx.register_compliance_sources({uuid4(): OFFICIAL_TARGET})
+        ctx.register_compliance_sources()
+    assert ctx.doc_source is None
     assert docs_transport[1] == []
 
 
-def test_target_transport_failure_is_not_replaced_with_content(
+def test_configured_transport_failure_is_not_replaced_with_content(
     tmp_path: Path, docs_transport: tuple[dict[str, tuple[int, bytes]], list[str]]
 ) -> None:
-    ctx, product_id = registered_product(tmp_path)
+    _, product_id = registered_product(tmp_path)
+    ctx = configured_context(tmp_path, {str(product_id): OFFICIAL_TARGET})
     responses, requests = docs_transport
     responses[urlsplit(OFFICIAL_GUIDE).path] = (503, b"temporarily unavailable")
-    ctx.register_compliance_sources({product_id: OFFICIAL_TARGET})
+    ctx.register_compliance_sources()
     with pytest.raises(ServiceError):
         ctx.services().compliance.collect_product_docs(product_id)
     assert requests == [urlsplit(OFFICIAL_GUIDE).path]
@@ -448,22 +467,82 @@ def test_target_transport_failure_is_not_replaced_with_content(
 @pytest.mark.parametrize(
     "target",
     [
-        {"product_slug": "", "version": "9"},
-        {"product_slug": "rhel/other", "version": "9"},
-        {"product_slug": ".", "version": "9"},
-        {"product_slug": "rhel", "version": ""},
-        {"product_slug": "rhel", "version": ".."},
-        {"product_slug": "rhel", "version": 9},
-        {"product_slug": "rhel", "version": "9", "guides": ("security_hardening", "../other")},
-        {"product_slug": "rhel", "version": "9", "guides": ("g", "g")},
-        {"product_slug": "rhel", "version": "9", "guides": "security_hardening"},
-        {"product_slug": "rhel", "version": "9", "guides": ["security_hardening"]},
-        {"product_slug": "rhel", "version": "9", "guides": None},
+        {},
+        {"product_slug": "red_hat_enterprise_linux"},
+        {**OFFICIAL_TARGET, "product_slug": ""},
+        {**OFFICIAL_TARGET, "product_slug": "rhel/other"},
+        {**OFFICIAL_TARGET, "version": ""},
+        {**OFFICIAL_TARGET, "version": ".."},
+        {**OFFICIAL_TARGET, "version": 9},
+        {**OFFICIAL_TARGET, "guides": ["security_hardening", "../other"]},
+        {**OFFICIAL_TARGET, "guides": ["security_hardening", "security_hardening"]},
+        {**OFFICIAL_TARGET, "guides": "security_hardening"},
+        {**OFFICIAL_TARGET, "guides": None},
+        {**OFFICIAL_TARGET, "guide": ["security_hardening"]},
     ],
 )
-def test_invalid_product_docs_target_is_refused_before_transport(
-    tmp_path: Path, target: dict[str, Any]
+def test_invalid_product_docs_target_is_refused_by_real_file_loader(
+    tmp_path: Path, target: dict[str, object]
+) -> None:
+    with pytest.raises(ConfigError):
+        configured_context(tmp_path, {str(uuid4()): target})
+
+
+def test_product_docs_target_requires_product_uuid(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError):
+        configured_context(tmp_path, {"example-platform": OFFICIAL_TARGET})
+
+
+def test_docs_target_validate_refuses_unsafe_or_duplicate_segments() -> None:
+    DocsTarget("p", "1", ("g",)).validate()
+    for target in (
+        DocsTarget("p/../x", "1"),
+        DocsTarget("p", ".."),
+        DocsTarget("p", "1", ("g", "g")),
+        DocsTarget("p", "1", ["g"]),  # type: ignore[arg-type]
+    ):
+        with pytest.raises(ValidationError):
+            target.validate()
+
+
+def test_parse_builds_only_a_valid_target() -> None:
+    assert DocsTarget.parse("p", "1", ["g"]) == DocsTarget("p", "1", ("g",))
+    for raw in (("p", ".."), ("p/q", "1"), ("p", "1", ["g", "g"]), ("p", "1", "abc")):
+        with pytest.raises(ValidationError):
+            DocsTarget.parse(*raw)  # type: ignore[arg-type]
+
+
+def test_an_explicit_invalid_target_is_a_config_error(tmp_path: Path) -> None:
+    ctx, product_id = registered_product(tmp_path)
+    with pytest.raises(ConfigError, match=f"docs target for product {product_id}"):
+        ctx.register_compliance_sources({product_id: DocsTarget("p", "..")})
+    assert ctx.doc_source is None
+
+
+def test_docs_target_is_a_model_consumers_import_without_the_provider() -> None:
+    import traust_core.v1.context as context
+
+    assert DocsTarget.__module__ == "traust_core.v1.models.compliance"
+    assert not hasattr(context, "DocsTarget")
+
+
+def test_a_registered_product_without_an_explicit_target_is_refused_before_transport(
+    tmp_path: Path, docs_transport: tuple[dict[str, tuple[int, bytes]], list[str]]
 ) -> None:
     ctx, product_id = registered_product(tmp_path)
-    with pytest.raises(ConfigError):
-        ctx.register_compliance_sources({product_id: DocsTarget(**target)})
+    ctx.register_compliance_sources()
+    with pytest.raises(NotFoundError, match=r"no docs\.redhat\.com slug/version declared"):
+        ctx.services().compliance.collect_product_docs(product_id)
+    assert docs_transport[1] == []
+
+
+def test_an_explicit_target_for_an_unregistered_product_is_a_config_error(
+    tmp_path: Path, docs_transport: tuple[dict[str, tuple[int, bytes]], list[str]]
+) -> None:
+    ctx, _ = registered_product(tmp_path)
+    with pytest.raises(ConfigError, match="docs target for product"):
+        ctx.register_compliance_sources(
+            {uuid4(): DocsTarget("red_hat_enterprise_linux", "9", ("security_hardening",))}
+        )
+    assert ctx.doc_source is None
+    assert docs_transport[1] == []

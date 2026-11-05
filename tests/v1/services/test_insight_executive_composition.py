@@ -16,9 +16,15 @@ from traust_core.v1.models.artifacts import (
     ArtifactDocument,
     CloudConfigAuditArtifact,
     IsolationReviewArtifact,
+    PrivProfileArtifact,
 )
 from traust_core.v1.models.assessment import Assessment, AssessmentKind
-from traust_core.v1.models.insight import ExecutivePanel, ExecutiveSummary, ViewFilter, ViewName
+from traust_core.v1.models.insight import (
+    ExecutivePanel,
+    ExecutiveSummary,
+    ViewFilter,
+    ViewName,
+)
 from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.models.inventory import RepositoryRef
 from traust_core.v1.providers.clock import FixedClock
@@ -29,6 +35,7 @@ from traust_core.v1.services.artifact_publishing import (
     PublishSpec,
     PublishSpecs,
 )
+from traust_core.v1.services.insight import ExecutiveSummaryView
 
 DAY = timedelta(days=1)
 FIXTURES = Path(__file__).parents[2] / "fixtures"
@@ -82,6 +89,8 @@ def test_optional_panels_read_latest_domain_documents_and_render_the_same_compos
     cloud = CloudConfigAuditArtifact.parse(
         (FIXTURES / "cloud_config/myrepo-cloud-config-audit.json").read_bytes()
     )
+    profile = json.loads((FIXTURES / "assessments/widget-operator-priv-profile.json").read_text())
+    profile["tier2_required_vs_granted"]["shipped_not_declared_count"] = 7
     with SqlTraustUnitOfWork(engine) as uow:
         seed = Seed(uow)
         repo = seed.repository(url="https://github.com/example-org/myrepo")
@@ -107,6 +116,13 @@ def test_optional_panels_read_latest_domain_documents_and_render_the_same_compos
         seed.occurrence(found, audit, severity="critical")
         seed.decision(
             found, validity="confirmed", actor="human:analyst@example.com", occurred_at=T0
+        )
+        attach(
+            context,
+            uow,
+            ref,
+            AssessmentKind.PRIV_PROFILE_CANONICAL,
+            PrivProfileArtifact.from_document(profile),
         )
         uow.commit()
     scope = ViewFilter(
@@ -153,7 +169,7 @@ def test_attack_and_pqc_are_embedded_models_and_rendered_panels(context: Context
     model = executive(context, scope)
     service = context.services().insight
     assert model.attack is not None
-    assert model.attack.as_of == model.rollup.as_of == T0 + 20 * DAY
+    assert model.attack.as_of == T0 + 20 * DAY
     assert model.attack == service.build(ViewName.ATTACK_COVERAGE, ViewFilter())
     assert model.pqc == service.build(ViewName.PQC_PORTFOLIO, ViewFilter())
     rendered = service.publish(ViewName.EXECUTIVE_SUMMARY, scope)
@@ -163,12 +179,23 @@ def test_attack_and_pqc_are_embedded_models_and_rendered_panels(context: Context
     assert any(section.heading.startswith("PQC") for section in sections)
 
 
-@pytest.mark.parametrize("panel", tuple(ExecutivePanel))
-def test_optional_panels_are_not_fabricated_without_their_view(
-    context: Context, panel: ExecutivePanel
+def test_historical_pqc_panel_states_its_gap_instead_of_substituting_current_data(
+    context: Context,
 ) -> None:
-    from traust_core.v1.services.insight import ExecutiveSummaryView
+    model = executive(context, ViewFilter(as_of=T0, executive_panels=(ExecutivePanel.PQC,)))
+    assert model.pqc is None
+    assert model.pqc_unavailable is not None and "Historical PQC" in model.pqc_unavailable
+    sections = (
+        context.services()
+        .insight.report(
+            ViewName.EXECUTIVE_SUMMARY, ViewFilter(as_of=T0, executive_panels=(ExecutivePanel.PQC,))
+        )
+        .sections
+    )
+    assert "PQC — snapshot availability" in {s.heading for s in sections}
 
+
+def test_a_panel_without_its_view_wired_is_a_config_error(context: Context) -> None:
     services = context.services()
     view = ExecutiveSummaryView(
         services.findings,
@@ -176,23 +203,21 @@ def test_optional_panels_are_not_fabricated_without_their_view(
         services.assessment,
         services.code_facts,
         services.exposure,
-        clock=FixedClock(T0 + DAY),
     )
-    with pytest.raises(ConfigError):
-        view.build(ViewFilter(executive_panels=(panel,)))
+    for panel in ExecutivePanel:
+        with pytest.raises(ConfigError):
+            view.build(ViewFilter(executive_panels=(panel,)))
+    assert view.build(ViewFilter()).isolation is None
 
 
-def test_historical_pqc_panel_reports_unavailability_without_current_substitution(
-    context: Context,
-) -> None:
-    model = executive(context, ViewFilter(as_of=T0, executive_panels=(ExecutivePanel.PQC,)))
-    assert model.pqc is None and model.pqc_unavailable is not None
-    sections = (
-        context.services()
-        .insight.report(
-            ViewName.EXECUTIVE_SUMMARY,
-            ViewFilter(as_of=T0, executive_panels=(ExecutivePanel.PQC,)),
-        )
-        .sections
-    )
-    assert any(section.heading == "PQC — snapshot availability" for section in sections)
+def test_panels_render_their_empty_population_explicitly(context: Context) -> None:
+    scope = ViewFilter(executive_panels=(ExecutivePanel.ISOLATION, ExecutivePanel.IAC))
+    model = executive(context, scope)
+    assert model.isolation is not None and model.isolation.reviews == ()
+    assert model.iac is not None and (model.iac.assessments, model.iac.targets) == (0, ())
+    sections = {
+        s.heading: s
+        for s in context.services().insight.report(ViewName.EXECUTIVE_SUMMARY, scope).sections
+    }
+    assert sections["Tenant-isolation posture (PEACH)"].table is None
+    assert sections["Declared IaC targets"].body == "_No declared IaC audits recorded._"

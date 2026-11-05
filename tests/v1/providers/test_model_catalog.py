@@ -206,6 +206,17 @@ def test_resolve_role_with_nothing_approved_high_enough_says_so(tmp_path: Path) 
         catalog.resolve_role("quick-look", "opus-class")
 
 
+def test_the_unverified_flag_binds_to_gateway_ids_that_carry_slashes(tmp_path: Path) -> None:
+    # Gateway model ids carry a provider prefix (`rits/zai-org/glm-5-3`); the flag must still bind.
+    text = ROLES_REGISTRY.replace(
+        "m-haiku: {tier: haiku-class, batch_eligible: false}",
+        "rits/zai-org/glm-5-3: {tier: haiku-class, batch_eligible: false}  # price unverified",
+    ).replace("approved: [m-mythos, m-haiku]", "approved: [m-mythos, rits/zai-org/glm-5-3]")
+    catalog = _catalog(tmp_path, text)
+    assert catalog.resolve(ModelName("rits/zai-org/glm-5-3")).price_verified is False
+    assert catalog.resolve(ModelName("m-sonnet")).price_verified is True
+
+
 def test_list_roles_is_sorted_by_name(roles: RegistryModelCatalog) -> None:
     assert [(r.name, r.floor, r.approved) for r in roles.list_roles()] == [
         ("deep-audit", "mythos-class", ("m-mythos",)),

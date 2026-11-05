@@ -88,7 +88,7 @@ class ExecutivePanel(StrEnum):
 
 class ViewFilter(Model):
     """Scope (products, teams, category labels), the point in time, and for series a window and
-    bucket; `artifact_id` names the document a single-item view renders."""
+    bucket; `artifact_id` or `repository_id` names what a single-item view renders."""
 
     product_ids: tuple[UUID, ...] = ()
     team_ids: tuple[UUID, ...] = ()
@@ -99,7 +99,10 @@ class ViewFilter(Model):
     window: TimeWindow | None = None
     bucket: TimeBucket = TimeBucket.MONTH
     artifact_id: UUID | None = None
+    repository_id: UUID | None = None
     executive_panels: tuple[ExecutivePanel, ...] = ()
+    assessment_id: UUID | None = None
+    report_stem: str | None = None
     compare_as_of: datetime | None = None
     first_party_divisor: Decimal | None = Field(default=None, gt=0, allow_inf_nan=False)
 
@@ -139,33 +142,6 @@ class FindingTally(Model):
         return self.open.total + self.hardening + self.resolved + self.risk_accepted
 
 
-class ContainerReport(Model):
-    assessment_id: UUID
-    repository_ref_id: UUID
-    occurred_at: datetime
-    image: str
-    title: str
-
-
-class ContainerFinding(Model):
-    view: FindingView
-    occurrences: tuple[Occurrence, ...]
-    history: tuple[Decision, ...] = ()
-    description: str = ""
-
-
-class ContainerFindings(ViewModel):
-    as_of: datetime | None = None
-    artifact_id: UUID
-    repository_id: UUID
-    repository_url: str
-    report_stem: str
-    image_repository: str
-    reports: tuple[ContainerReport, ...]
-    findings: tuple[ContainerFinding, ...]
-    total: FindingTally
-
-
 class RepositoryRollup(Model):
     repository_id: UUID
     repository_url: str
@@ -189,6 +165,31 @@ class TopFinding(Model):
     cvss_score: Decimal | None = None
     execution_proven: bool = False
     sla_due: datetime | None = None
+
+
+class ContainerReport(Model):
+    assessment_id: UUID
+    repository_ref_id: UUID
+    occurred_at: datetime
+    image: str
+    title: str
+
+
+class ContainerFinding(Model):
+    view: FindingView
+    occurrences: tuple[Occurrence, ...]
+    history: tuple[Decision, ...] = ()
+
+
+class ContainerFindings(ViewModel):
+    as_of: datetime | None = None
+    repository_id: UUID
+    repository_url: str
+    report_stem: str
+    image_repository: str
+    reports: tuple[ContainerReport, ...]
+    findings: tuple[ContainerFinding, ...]
+    total: FindingTally
 
 
 class FindingsRollup(ViewModel):
@@ -321,6 +322,18 @@ class OscalAssessmentResults(ViewModel):
     )
 
     assessment_results: dict[str, Any] = Field(alias="assessment-results")
+
+
+class SarifLog(ViewModel):
+    """A repository's findings as SARIF 2.1.0; the JSON model is the SARIF log itself."""
+
+    model_config = ConfigDict(
+        frozen=True, extra="forbid", populate_by_name=True, serialize_by_alias=True
+    )
+
+    schema_: str = Field(alias="$schema")
+    version: str
+    runs: tuple[dict[str, Any], ...]
 
 
 class PqcScope(Model):
@@ -716,9 +729,9 @@ class LocDashboard(ViewModel):
 
     code: int
     as_of: datetime | None = None
+    comparison: LocComparison | None = None
     first_party_divisor: Decimal | None = None
     first_party_estimate: Decimal | None = None
-    comparison: LocComparison | None = None
     total: int
     reported: int = 0  # repositories with findings reported, for the population block
     dispositioned: int = 0  # of those, with a decision recorded

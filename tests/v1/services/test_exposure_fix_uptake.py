@@ -75,7 +75,8 @@ def uptake(exposure: ExposureService, commit: RepositoryRef):  # type: ignore[no
             [True, False],
         ),
         ((("golang.org/x/net", "master"),), "pending", [None]),
-        ((("example.com/other", "v1.0.0"),), "module_absent", []),
+        # an SBOM given as a document has unknown coverage: a package it lacks is unknown
+        ((("example.com/other", "v1.0.0"),), "not_observed", []),
     ],
 )
 def test_the_manifest_decides(
@@ -121,8 +122,10 @@ def test_a_commit_with_no_sbom_is_not_observed_never_absent(
     assert uptake(exposure, commit).state == "not_observed"
 
 
-def test_an_unknown_package_is_absent(exposure: ExposureService, commit: RepositoryRef) -> None:
+def test_a_package_a_document_sbom_lacks_is_not_observed(
+    exposure: ExposureService, commit: RepositoryRef
+) -> None:
     assert commit.id is not None
     exposure.ingest_sbom(sbom(("example.com/other", "v1.0.0")), commit.id)
     found = exposure.consumes_fix(commit.id, Ecosystem.NPM, "never-seen", Version("1.0.0"))
-    assert (found.state, found.checked) == ("module_absent", ())
+    assert (found.state, found.checked) == ("not_observed", ())

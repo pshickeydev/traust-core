@@ -26,7 +26,7 @@ def compliance_precision_markdown(report: ComplianceCalibration) -> str:
             ("Check", "Fired", "Dismissed", "Precision", "Demotion review"),
             [
                 (
-                    check.check_id,
+                    markdown_text(check.check_id),
                     str(check.fired),
                     str(check.dismissed),
                     "unmeasured" if check.precision is None else f"{check.precision:.3f}",

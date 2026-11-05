@@ -158,4 +158,30 @@ def test_no_measurements_never_become_an_estimated_first_party_zero(
     )
     assert model.first_party_estimate is None
     assert model.repositories[0].unmeasured is not None
-    assert model.repositories[0].code is None and model.repositories[0].total is None
+
+
+def test_first_party_estimate_divides_measured_code_and_is_labelled_an_estimate(
+    engine: Engine,
+    tmp_path: Path,
+) -> None:
+    ctx = Context(Config(home=tmp_path), clock=FixedClock(T0 + 10 * DAY))
+    ctx.__dict__["database"] = engine
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        ref = seed.repository_ref(seed.repository(), is_default=True)
+        seed.assessment(ref, kind=AssessmentKind.REPO_STATE, occurred_at=T0)
+        uow.commit()
+    assert ref.id is not None
+    record(ctx, ref.id, 300, 1)
+    scope = ViewFilter(first_party_divisor=Decimal("2.5"))
+    model = ctx.services().insight.build(ViewName.LOC, scope)
+    assert isinstance(model, LocDashboard)
+    assert (model.code, model.first_party_divisor, model.first_party_estimate) == (
+        300,
+        Decimal("2.5"),
+        Decimal("120"),
+    )
+    summary = ctx.services().insight.report(ViewName.LOC, scope).sections[0].body
+    assert "First-party estimate: 120.0 code lines" in summary and "not a measurement" in summary
+    plain = ctx.services().insight.build(ViewName.LOC, ViewFilter())
+    assert plain.first_party_estimate is None

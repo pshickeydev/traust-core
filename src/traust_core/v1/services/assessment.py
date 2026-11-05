@@ -1209,30 +1209,6 @@ class AssessmentService:
             documents.append((latest[a.id], a, self._publisher.read(row.id, artifact)))
         return len(latest), documents
 
-    def isolation_reviews(
-        self, repository_ids: Collection[UUID], as_of: datetime | None = None
-    ) -> list[tuple[UUID, Assessment, IsolationReviewArtifact]]:
-        """Each repository's latest completed default-line isolation review by the cutoff."""
-        return self._latest_documents(
-            AssessmentFilter(
-                kind=AssessmentKind.ISOLATION_REVIEW_CANONICAL, status=ASSESSMENT_COMPLETED
-            ),
-            repository_ids,
-            IsolationReviewArtifact,
-            as_of,
-        )[1]
-
-    def cloud_config_audits(
-        self, repository_ids: Collection[UUID], as_of: datetime | None = None
-    ) -> list[tuple[UUID, Assessment, CloudConfigAuditArtifact]]:
-        """Each repository's latest default-line declared audit, including explicit gaps."""
-        return self._latest_documents(
-            AssessmentFilter(kind=AssessmentKind.CLOUD_CONFIG_CANONICAL),
-            repository_ids,
-            CloudConfigAuditArtifact,
-            as_of,
-        )[1]
-
     def coverage(self, filter: AssessmentFilter, repository_ids: Collection[UUID]) -> Coverage:
         """What the repositories' latest default-line audits (`filter.kind`, secure-code when
         None; degraded runs included) say they could not examine, as gap families."""
@@ -1285,6 +1261,32 @@ class AssessmentService:
             PrivilegeProfile.of(a, repository_id, json.loads(doc.payload))
             for repository_id, a, doc in documents
         ]
+
+    def isolation_reviews(
+        self, repository_ids: Collection[UUID], as_of: datetime | None = None
+    ) -> list[tuple[UUID, Assessment, IsolationReviewArtifact]]:
+        """Each repository's latest completed default-line isolation review by the cutoff."""
+        _, documents = self._latest_documents(
+            AssessmentFilter(
+                kind=AssessmentKind.ISOLATION_REVIEW_CANONICAL, status=ASSESSMENT_COMPLETED
+            ),
+            repository_ids,
+            IsolationReviewArtifact,
+            as_of,
+        )
+        return documents
+
+    def cloud_config_audits(
+        self, repository_ids: Collection[UUID], as_of: datetime | None = None
+    ) -> list[tuple[UUID, Assessment, CloudConfigAuditArtifact]]:
+        """Each repository's latest default-line declared audit, including explicit gaps."""
+        _, documents = self._latest_documents(
+            AssessmentFilter(kind=AssessmentKind.CLOUD_CONFIG_CANONICAL),
+            repository_ids,
+            CloudConfigAuditArtifact,
+            as_of,
+        )
+        return documents
 
     def fuzz_reports(
         self, repository_ids: Collection[UUID], as_of: datetime | None = None

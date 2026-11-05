@@ -606,7 +606,6 @@ def consumer(engine: Engine) -> tuple[UUID, UUID]:
         ((("google.golang.org/grpc", "v1.57.1"),), "consumed", [True]),
         ((("google.golang.org/grpc", "v1.57.0"),), "pending", [False]),
         ((("google.golang.org/grpc", "v1.40.0"),), "pending", [False]),
-        ((("example.com/other", "v1.0.0"),), "module_absent", []),
     ],
 )
 def test_propagation_judges_the_versions_the_component_ships(
@@ -631,6 +630,19 @@ def test_propagation_judges_the_versions_the_component_ships(
     (package,) = got.evidence
     assert (package.name, package.fixed) == ("google.golang.org/grpc", "1.56.3")
     assert [c.consumed for c in package.checked] == consumed
+
+
+def test_propagation_over_a_document_sbom_lacking_the_package_is_unknown(
+    service: VerificationService,
+    remediation: RemediationService,
+    context: Context,
+    engine: Engine,
+) -> None:
+    item = opened(remediation, advisory_world(engine))
+    component, ref = consumer(engine)
+    context.services().exposure.ingest_sbom(sbom(("example.com/other", "v1.0.0")), ref)
+    with pytest.raises(NotFoundError, match="coverage leaves the package unknown"):
+        service.propagation(item.work_item_id, component)
 
 
 def test_propagation_needs_an_sbom_and_an_advisory(
@@ -941,57 +953,142 @@ def test_shared_sha_baseline_requires_the_verified_branch_and_does_not_break_rep
     assert not context.services().findings.on_ref(patched.id)[0].is_open()
 
 
-def test_registered_branch_fallback_excludes_tags_and_the_default_line(
+def test_sweep_markdown_renders_every_classified_entry_without_changing_state(
     service: VerificationService, engine: Engine
 ) -> None:
     world = World(engine)
     audited(engine, world, world.base)
-    with SqlTraustUnitOfWork(engine) as uow:
-        seed = Seed(uow)
-        branch = seed.repository_ref(world.repo, name="release-1", sha="b" * 40)
-        tag = seed.repository_ref(world.repo, name="release-1", kind="tag", sha="d" * 40)
-        tag_only = seed.repository_ref(world.repo, name="v1.0", kind="tag", sha="e" * 40)
-        audit = seed.assessment(branch, kind="secure-code", occurred_at=WHEN - timedelta(days=1))
-        seed.occurrence(world.findings[0], audit)
-        seed.assessment(tag, kind="repo-state", occurred_at=WHEN)
-        seed.assessment(tag_only, kind="repo-state", occurred_at=WHEN)
-        uow.commit()
-    default_only = service.sweep([world.repo.id])
-    assert len((*default_only.queued, *default_only.skipped)) == 1
-
-    sweep = service.sweep([world.repo.id], include_branches=True)
-    entries = (*sweep.queued, *sweep.skipped)
-    branch_entries = [entry for entry in entries if entry.ref_name == "release-1"]
-    assert len(branch_entries) == 1
-    assert branch_entries[0].repository_ref_id == branch.id
-    assert branch_entries[0].head_source == "registered_branch"
-    assert not any(entry.ref_name == "v1.0" for entry in entries)
-    assert len([entry for entry in entries if entry.ref_name == "main"]) == 1
+    head = moved_head(engine, world)
+    sweep = service.sweep([world.repo.id])
+    markdown = service.sweep_markdown(sweep)
+    assert markdown.startswith("# Remediation verification worklist\n")
+    assert f"{len(sweep.queued)} queued; {len(sweep.skipped)} skipped." in markdown
+    for tier in ("T1", "T2", "T3", "T4"):
+        assert f"| {tier} |" in markdown
+    (entry,) = sweep.queued
+    ref = entry.ref_name or "(default)"
+    assert f"| {entry.tier} | {world.repo.url} | {ref} | observed_default |" in markdown
+    assert head.sha in markdown
+    assert service.sweep([world.repo.id]) == sweep
 
 
-def test_empty_sweep_is_empty_and_unknown_repositories_are_not_silently_skipped(
-    service: VerificationService,
-) -> None:
-    assert service.sweep([], include_branches=True).queued == ()
-    assert service.sweep([], include_branches=True).skipped == ()
-    with pytest.raises(NotFoundError):
-        service.sweep([uuid4()], include_branches=True)
+def test_sweep_markdown_of_an_empty_sweep_lists_no_targets(service: VerificationService) -> None:
+    markdown = service.sweep_markdown(service.sweep([]))
+    assert "0 queued; 0 skipped." in markdown
+    assert "| T1 | 0 |" in markdown
 
 
-def test_sweep_markdown_renders_the_same_targets_without_changing_work_items(
-    service: VerificationService, remediation: RemediationService, engine: Engine
+def test_default_sweep_entries_name_their_head_ref(
+    service: VerificationService, engine: Engine
 ) -> None:
     world = World(engine)
     audited(engine, world, world.base)
-    item = opened(remediation, world)
-    remediation.record_progress(item.work_item_id, RemediationStatus.PATCHED)
-    sweep = service.sweep([world.repo.id])
-    before = remediation.get(item.work_item_id)
+    head = moved_head(engine, world)
+    (entry,) = service.sweep([world.repo.id]).queued
+    assert (entry.repository_ref_id, entry.ref_name, entry.head_source) == (
+        head.id,
+        head.name,
+        "observed_default",
+    )
 
-    markdown = service.sweep_markdown(sweep)
 
-    assert world.repo.url in markdown
-    assert BASE_SHA in markdown
-    assert "| T1 |" in markdown
-    assert remediation.get(item.work_item_id) == before
-    assert service.sweep([world.repo.id]) == sweep
+def test_default_sweep_weighs_off_line_verifications_and_claims_as_development_did(
+    service: VerificationService, remediation: RemediationService, engine: Engine
+) -> None:
+    world = World(engine, findings=2)
+    audited(engine, world, world.base)
+    claimed = remediation.open([world.ids[1]], world.patched.id)  # type: ignore[list-item]
+    remediation.record_progress(claimed.work_item_id, RemediationStatus("forked"))
+    service.record(report(world, {world.ids[0]: "unresolved"}), provenance())
+    (entry,) = service.sweep([world.repo.id]).queued
+    assert (
+        entry.head_sha,
+        entry.pinned_sha,
+        entry.verified_at_head,
+        entry.claims,
+        entry.open_findings,
+        entry.tier,
+    ) == (BASE_SHA, PATCHED_SHA, False, 1, 2, "T1")
+
+
+def test_a_tag_of_a_branchs_name_never_replaces_the_branch_sweep_target(
+    service: VerificationService, engine: Engine
+) -> None:
+    world = World(engine)
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        branch = seed.repository_ref(world.repo, name="release-1", sha="b" * 40)
+        tag = seed.repository_ref(world.repo, name="release-1", kind="tag", sha="c" * 40)
+        seed.assessment(tag, kind="repo-state", occurred_at=WHEN)
+        uow.commit()
+    sweep = service.sweep([world.repo.id], include_branches=True)
+    [entry] = [e for e in (*sweep.queued, *sweep.skipped) if e.ref_name == "release-1"]
+    assert (entry.repository_ref_id, entry.head_sha, entry.head_source) == (
+        branch.id,
+        "b" * 40,
+        "registered_branch",
+    )
+
+
+def test_a_branch_sweep_reads_each_repositorys_verifications_once(
+    service: VerificationService, engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    worlds = [World(engine), World(engine)]
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        for world in worlds:
+            for name in ("release-1", "release-2"):
+                seed.repository_ref(world.repo, name=name, sha=uuid4().hex + "0" * 8)
+        uow.commit()
+    read: list[UUID] = []
+    verifications = VerificationService._verifications
+
+    def counted(self: VerificationService, repository_id: UUID) -> Any:
+        read.append(repository_id)
+        return verifications(self, repository_id)
+
+    monkeypatch.setattr(VerificationService, "_verifications", counted)
+    sweep = service.sweep([w.repo.id for w in worlds], include_branches=True)
+    assert len((*sweep.queued, *sweep.skipped)) == 2 * (1 + 3)
+    assert sorted(read, key=str) == sorted((w.repo.id for w in worlds), key=str)
+
+
+def test_a_default_sweep_reads_no_verification_reports(
+    service: VerificationService, engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    world = World(engine)
+    audited(engine, world, world.base)
+    service.record(report(world, {world.ids[0]: "unresolved"}), provenance())
+
+    def unread(self: VerificationService, repository_id: UUID) -> Any:
+        pytest.fail(f"a default sweep read {repository_id}'s verification reports")
+
+    monkeypatch.setattr(VerificationService, "_verifications", unread)
+    (entry,) = (*(sweep := service.sweep([world.repo.id])).queued, *sweep.skipped)
+    assert entry.pinned_sha == PATCHED_SHA
+
+
+def test_a_default_sweep_counts_a_verdicted_run_without_a_report_as_development_did(
+    service: VerificationService, engine: Engine
+) -> None:
+    world = World(engine)
+    audited(engine, world, world.base)
+    head = moved_head(engine, world)
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        run = seed.assessment(head, kind="verification", occurred_at=WHEN)
+        seed.decision(
+            world.findings[0],
+            validity=None,
+            resolution="resolved",
+            assessment_id=run.id,
+            actor=None,
+            occurred_at=WHEN,
+        )
+        uow.commit()
+    (entry,) = (*(sweep := service.sweep([world.repo.id])).queued, *sweep.skipped)
+    assert (entry.verified_at_head, entry.pinned_sha, entry.skip) == (
+        True,
+        head.sha,
+        "already_verified",
+    )

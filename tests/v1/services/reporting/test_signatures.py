@@ -102,18 +102,16 @@ def test_historical_signature_formats_verify_without_a_database(
     assert json.loads(document.payload) == signed_layer
 
 
-@pytest.mark.parametrize("strict", [False, True])
 def test_reporting_verifies_the_signed_layer_and_preserves_its_bytes(
     reporting: ReportingService,
     tmp_path: Path,
     signed_layer: dict[str, Any],
     signing_keys: tuple[Path, Path, Path],
-    strict: bool,
 ) -> None:
     path = write(tmp_path, "widget-findings-layer.json", signed_layer)
     original = path.read_bytes()
 
-    (result,) = reporting.validate_reports(path, signing_pubkey=signing_keys[1], strict=strict)
+    (result,) = reporting.validate_reports(path, signing_pubkey=signing_keys[1])
 
     assert result.passed
     assert result.integrity is not None
@@ -200,13 +198,8 @@ def test_explicit_verification_fails_closed_when_cosign_is_unavailable(
 
 
 @pytest.mark.parametrize("signed", [False, True])
-@pytest.mark.parametrize("strict", [False, True])
 def test_ordinary_validation_does_not_require_or_verify_signatures(
-    reporting: ReportingService,
-    tmp_path: Path,
-    signed_layer: dict[str, Any],
-    signed: bool,
-    strict: bool,
+    reporting: ReportingService, tmp_path: Path, signed_layer: dict[str, Any], signed: bool
 ) -> None:
     if signed:
         signed_layer["metadata"]["merkle_root_signature"] = "invalid-but-not-requested"
@@ -214,7 +207,7 @@ def test_ordinary_validation_does_not_require_or_verify_signatures(
         del signed_layer["metadata"]["merkle_root_signature"]
     path = write(tmp_path, "widget-findings-layer.json", signed_layer)
 
-    (result,) = reporting.validate_reports(path, strict=strict)
+    (result,) = reporting.validate_reports(path)
 
     assert result.passed
     assert result.integrity is None
@@ -312,3 +305,23 @@ def test_signature_verification_binds_historical_metadata_not_just_the_root(
     assert not result.passed
     assert result.integrity is not None
     assert [issue.check for issue in result.integrity.errors] == [IntegrityCheck.SIGNATURE]
+
+
+@pytest.mark.parametrize("mutation", ["unsigned", "tampered"])
+def test_a_fragment_qualified_layer_schema_still_requires_the_signature(
+    reporting: ReportingService,
+    tmp_path: Path,
+    signed_layer: dict[str, Any],
+    signing_keys: tuple[Path, Path, Path],
+    mutation: str,
+) -> None:
+    if mutation == "unsigned":
+        del signed_layer["metadata"]["merkle_root_signature"]
+    else:
+        signed_layer["events"][0]["rationale"] = "An attacker substituted a different rationale."
+    path = write(tmp_path, "historical.json", signed_layer)
+
+    (result,) = reporting.validate_reports(path, schema="layer#", signing_pubkey=signing_keys[1])
+
+    assert not result.passed
+    assert result.integrity is not None and not result.integrity.passed

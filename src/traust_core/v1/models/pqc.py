@@ -31,10 +31,14 @@ class PqcStamps(Model):
     rules_sha256: str
     binary_sha256: str | None = None
 
-    def same_pack(self, other: PqcStamps) -> bool:
+    def same_pack(self, other: PqcStamps, *, source: bool = True) -> bool:
         return (self.adapter_version, self.rules_sha256) == (
             other.adapter_version,
             other.rules_sha256,
+        ) and (
+            not source
+            or (self.pqc_scan_commit, self.binary_sha256)
+            == (other.pqc_scan_commit, other.binary_sha256)
         )
 
 
@@ -60,7 +64,7 @@ class PqcScan(Model):
     skipped_files: int | None = None
     rules_in_pack: int
     stamps: PqcStamps
-    cbom: bytes | None = None  # CycloneDX, as the scanner wrote it
+    cbom: bytes | None = None  # Native scanner CBOM bytes, preserved unchanged
 
 
 class PqcClock(Model):
@@ -214,6 +218,16 @@ class PqcSite(Model):
     fact: PqcFact
 
 
+class PqcScanState(Model):
+    """A commit's newest pqc-facts scan, and whether the current pack produced it (None: no
+    scanner to compare against, or no scan)."""
+
+    repository_ref_id: UUID
+    assessment_id: UUID | None = None
+    basis: str | None = None
+    current: bool | None = None
+
+
 class PqcPrescan(Model):
     """Layer 1 for one commit: its facts, the templated report when the scan found nothing, and
     the scan's CBOM (derived output for the caller to write; never stored)."""
@@ -232,13 +246,6 @@ class PqcReadinessInput(SkillInput):
     no_crypto_detected_assertion: str | None = None
     route: PqcRoute
     prior: PqcReadiness | None = None
-
-
-class PqcScanState(Model):
-    repository_ref_id: UUID
-    assessment_id: UUID | None = None
-    basis: str | None = None
-    current: bool | None = None
 
 
 class PqcVendorPackage(Model):

@@ -117,7 +117,10 @@ def _lines(
     refs: Sequence[RepositoryRef],
     repository_ref_id: UUID | None = None,
 ) -> dict[UUID, bool]:
-    """Decision id -> judged on the requested line, or the default line when unspecified."""
+    """Decision id -> judged on the default line or another named one (data model §3b): a
+    comparison's on its baseline's, an assessment's on its own, a person's on the commit they
+    named. A bare commit off the default line ties a decision to no line; until a repository's
+    default branch is observed its lines can't be told apart, so none of its refs splits them."""
     if repository_ref_id is None:
         observed = {r.repository_id for r in refs if r.is_default}
         refs = [r for r in refs if r.repository_id in observed]

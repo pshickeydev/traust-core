@@ -57,6 +57,8 @@ class RepositoryRef(Entity):
     is_default: bool = False
     sha: str
     manifest_sbom_id: UUID | None = None
+    # The manifest scan whose coverage is current; None (an SBOM given as a document) is unknown.
+    manifest_sbom_assessment_id: UUID | None = None
 
 
 def default_line(refs: Iterable[RepositoryRef]) -> set[UUID]:
@@ -79,7 +81,7 @@ def default_line(refs: Iterable[RepositoryRef]) -> set[UUID]:
 
 
 def ref_line(ref: RepositoryRef, refs: Iterable[RepositoryRef]) -> set[UUID]:
-    """A ref's named line, with bare commits matched only by SHA, never inferred ancestry."""
+    """The named line a ref belongs to; a bare commit alone establishes no branch ancestry."""
     refs = [r for r in refs if r.repository_id == ref.repository_id]
     default = default_line(refs)
     if ref.id in default:

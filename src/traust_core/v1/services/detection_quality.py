@@ -237,13 +237,10 @@ class DetectionQualityService:
         if limit < 1:
             raise ValidationError("benchmark bootstrap limit must be positive")
         targets: dict[str, dict[str, Any]] = {}
-        for fix in sorted(
-            self._findings.fixes(Validity.CONFIRMED),
-            key=lambda f: (f.view.finding.fingerprint, str(f.view.finding.id)),
-        ):
+        for fix in self._findings.fixes_by_fingerprint(Validity.CONFIRMED, batch=limit):
             view = fix.view
             fingerprint = view.finding.fingerprint
-            paths = sorted({canon_path(loc.path) for loc in view.locations if loc.path})
+            paths = sorted({canon_path(loc.path) for loc in fix.reported_locations if loc.path})
             if (
                 not paths
                 or not view.cwes

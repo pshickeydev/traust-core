@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import re
-from string import punctuation
 from uuid import UUID
 
 from traust_core.v1.models.detection_quality import (
@@ -17,10 +15,6 @@ from traust_core.v1.models.detection_quality import (
 from traust_core.v1.rendering.benchmark import benchmark_markdown, scorecards_markdown
 
 KEY = UUID("00000000-0000-0000-0000-000000000001")
-
-
-def visible(text: str) -> str:
-    return re.sub(r"\\([" + re.escape(punctuation) + "])", r"\1", text)
 
 
 def run() -> BenchmarkRun:
@@ -79,14 +73,14 @@ def run() -> BenchmarkRun:
 
 
 def test_typed_run_preserves_strict_recall_and_review_population() -> None:
-    out = visible(benchmark_markdown(run()))
+    out = benchmark_markdown(run())
     assert f"| {KEY} | 7 |" in out
     assert "| Targets scored | 3 |" in out
     assert "| Targets skipped | 1 |" in out
     assert "| Expected findings | 5 |" in out
     assert "| Strict detections | 3 |" in out
     assert "| Strict recall | 60.0% |" in out
-    assert "| Near misses requiring adjudication (excluded from detections) | 1 |" in out
+    assert "| Near misses requiring adjudication \\(excluded from detections\\) | 1 |" in out
     assert "| bt-dev | CWE-89 | high | review | F4 |" in out
     adjudication = out.split("## Near misses / adjudication\n", 1)[1].split("## Injection", 1)[0]
     assert "| bt-dev | CWE-89 | high | F4 |" in adjudication
@@ -96,23 +90,23 @@ def test_typed_run_preserves_strict_recall_and_review_population() -> None:
 
 
 def test_every_cut_uses_the_typed_scorecard_denominator() -> None:
-    out = visible(benchmark_markdown(run()))
+    out = benchmark_markdown(run())
     for heading in ("CWE", "Severity", "Provenance", "Language", "Development / held-out split"):
         assert f"### Recall by {heading}\n" in out
     for row in (
         "| CWE-89 | 1 | 2 | 50.0% |",
         "| high | 1 | 2 | 50.0% |",
-        "| self_replay | 3 | 4 | 75.0% |",
+        r"| self\_replay | 3 | 4 | 75.0% |",
         "| python | 3 | 4 | 75.0% |",
         "| development | 3 | 4 | 75.0% |",
-        "| held_out | 0 | 1 | 0.0% |",
+        r"| held\_out | 0 | 1 | 0.0% |",
         "| unspecified | 0 | 1 | 0.0% |",
     ):
         assert row in out
 
 
 def test_injection_obedience_and_stability_are_not_lost_in_summary() -> None:
-    out = visible(benchmark_markdown(run()))
+    out = benchmark_markdown(run())
     assert "| Injection canaries passed | 0 |" in out
     assert "| Injection attempts reported | 1 |" in out
     assert "| Injection pass rate | 0.0% |" in out
@@ -121,7 +115,7 @@ def test_injection_obedience_and_stability_are_not_lost_in_summary() -> None:
     )
     assert "| Mean rerun Jaccard | 0.750 |" in out
     assert "| bt-dev | 0.750 |" in out
-    assert "| bt-dev | self_replay | python | development | 4 | 3 | 4 |" in out
+    assert "| bt-dev | self\\_replay | python | development | 4 | 3 | 4 |" in out
 
 
 def test_empty_run_reports_unknown_metrics_not_zero() -> None:
@@ -175,5 +169,5 @@ def test_all_untrusted_fields_are_literal_markdown_without_forged_rows() -> None
     out = benchmark_markdown(source)
     assert "[act](" not in out and "<img" not in out
     assert "\u202e" not in out and "\n|forged" not in out
-    assert r"\[act\]" in out and r"\|forged" in out
+    assert r"\[act\]\(https://evil.invalid\)&lt;img src=x&gt; \|forged" in out
     assert "<img" not in scorecards_markdown([source.scorecard()])

@@ -183,6 +183,7 @@ MAX_FIX_COMMITS = 4  # backports repeat the same change; more commits only add A
 REACHED_THROUGH = "reached through a base image or an internal library; not listed itself"
 SURFACE = "{} surface: manifest-level, no reachability"
 UNRESOLVED = "not in the SBOM, but these manifests could not be resolved: {}"
+UNKNOWN_COVERAGE = "not in the SBOM, whose coverage is unknown: no manifest scan recorded it"
 _TICK = timedelta(microseconds=1)
 _SURFACES = frozenset({Ecosystem.ACTIONS, Ecosystem.DOCKER, Ecosystem.HELM})
 # Ecosystems whose evidence stops at the pin (no reachability tool): the SBOM is the manifest tier.
@@ -313,20 +314,12 @@ class ExposureService:
             uow.commit()
         return self.feed_status(feed)
 
-    def ingest_sbom(
-        self,
-        raw: bytes,
-        repository_ref_id: UUID,
-        *,
-        declared_direct: frozenset[tuple[Ecosystem, str, str | None]] | None = None,
-    ) -> Sbom:
-        """A commit's manifest SBOM (CycloneDX / SPDX JSON from standard tools). The same package
-        list again, in either format, is the same SBOM; only its first document is kept.
-        `declared_direct`: (ecosystem, name, version-or-None) the checkout's manifests
-        declare, the direct set syft's graph omits for Go, Rust and requirements-file
-        Python."""
+    def ingest_sbom(self, raw: bytes, repository_ref_id: UUID) -> Sbom:
+        """A commit's manifest SBOM given as a document (CycloneDX / SPDX JSON from standard
+        tools). The same package list again, in either format, is the same SBOM; only its first
+        document is kept. No scan stands behind it, so the commit's coverage becomes unknown."""
         portfolio = self._require_portfolio()
-        contents = parse_sbom(raw, declared_direct)
+        contents = parse_sbom(raw)
         with self._uow as uow:
             sbom = uow.sboms.find_by_digest(contents.digest) or self._add_sbom(uow, raw, contents)
             uow.commit()
@@ -396,7 +389,8 @@ class ExposureService:
 
     def record_manifest_sbom(self, repository_ref_id: UUID) -> Sbom:
         """The commit's manifest SBOM: the one recorded, else the SBOM tool's over the commit's
-        manifests, fetched from its forge (the fleet sweep's door; a re-run never fetches)."""
+        manifests, fetched from its forge (the fleet sweep's door; a re-run never fetches). A
+        recorded SBOM given as a document stays, with its coverage unknown."""
         ref, repository = self._inventory.resolve(repository_ref_id)
         if ref.manifest_sbom_id is not None:
             with self._uow as uow:
@@ -420,38 +414,17 @@ class ExposureService:
         return self._sbom_tool
 
     def ingest_dependencies(self, repository_ref_id: UUID, checkout: Path) -> DependencyIngest:
-        """The commit's manifest SBOM, read from its checkout by the SBOM tool (syft) and
-        ingested, with a `manifest-coverage` record of what it could not resolve written first,
-        so a failure before the SBOM lands is retried whole; the same package list again is the
-        same SBOM."""
+        """The commit's manifest SBOM, read from its checkout by the SBOM tool (syft), recorded in
+        one transaction with this scan's `manifest_sbom` assessment, its `manifest-coverage`
+        record bound to both, and the commit's pointer to the scan: coverage is never read off
+        another scan."""
         sbom_tool = self._require_sbom_tool()
+        portfolio = self._require_portfolio()
         unresolved = unresolved_manifests(checkout)
         scanned = sbom_tool.acquire(ToolRequest(workspace=checkout))
         tool, version = scanned.acquisition.provider, scanned.acquisition.version
         if version is None:
             raise ServiceError(f"{tool} reported no version; its coverage can't be attributed")
-        coverage = ManifestCoverageArtifact.from_document(
-            {
-                "artifact": "manifest-coverage",
-                "tool": {"name": tool, "version": version},
-                "unresolved": [m.model_dump(mode="json") for m in unresolved],
-            }
-        )
-        latest = self._latest_coverage(repository_ref_id)
-        if latest is None or latest.digest != sha256_hex(coverage.payload):
-            with self._uow as uow:
-                ref = self._inventory.get_ref(repository_ref_id)
-                self._record_document(
-                    uow,
-                    ref,
-                    coverage,
-                    AssessmentKind.MANIFEST_SBOM,
-                    tool,
-                    version,
-                    self._clock.now(),
-                    reuse=False,
-                )
-                uow.commit()
         # syft's manifest scan emits no dependency edges for Go (go.mod), Rust
         # (Cargo.lock) or a requirements file's Python (verified: each tree's
         # dependencies graph is empty), so every such package would key indirect. The
@@ -468,10 +441,36 @@ class ExposureService:
             (Ecosystem.PYPI, package_name(Ecosystem.PYPI, name), None)
             for name in requirements_names(checkout)
         }
-        sbom = self.ingest_sbom(
-            scanned.data, repository_ref_id, declared_direct=frozenset(declared)
-        )
-
+        contents = parse_sbom(scanned.data, frozenset(declared))
+        with self._uow as uow:
+            sbom = uow.sboms.find_by_digest(contents.digest) or self._add_sbom(
+                uow, scanned.data, contents
+            )
+            ref = self._inventory.get_ref(repository_ref_id)
+            assert ref.id is not None and sbom.id is not None
+            scan = self._log.open(
+                Assessment(
+                    repository_ref_id=ref.id,
+                    kind=AssessmentKind.MANIFEST_SBOM,
+                    status=ASSESSMENT_COMPLETED,
+                    assessor=tool,
+                    assessor_version=version,
+                    occurred_at=self._clock.now(),
+                )
+            )
+            assert scan.id is not None
+            coverage = ManifestCoverageArtifact.from_document(
+                {
+                    "artifact": "manifest-coverage",
+                    "tool": {"name": tool, "version": version},
+                    "sbom_id": str(sbom.id),
+                    "assessment_id": str(scan.id),
+                    "unresolved": _coverage(unresolved),
+                }
+            )
+            self._attach_document(uow, scan, coverage)
+            portfolio.record_manifest_sbom(repository_ref_id, sbom.id, scan.id)
+            uow.commit()
         return DependencyIngest(
             repository_ref_id=repository_ref_id,
             sbom=sbom,
@@ -480,23 +479,37 @@ class ExposureService:
             unresolved=unresolved,
         )
 
-    def unresolved_manifests(self, repository_ref_id: UUID) -> tuple[UnresolvedManifest, ...]:
-        """The manifests the SBOM tool could not resolve on the commit, from its latest
-        `manifest-coverage` record; none recorded (an SBOM ingested as a document) is none known."""
-        latest = self._latest_coverage(repository_ref_id)
-        if latest is None:
-            return ()
-        doc = ManifestCoverageArtifact.parse(stored_bytes(self._objects, latest))
+    def unresolved_manifests(
+        self, repository_ref_id: UUID
+    ) -> tuple[UnresolvedManifest, ...] | None:
+        """The manifests the SBOM tool could not resolve on the commit, from the coverage of the
+        scan that recorded its current SBOM. None is unknown: no such scan (an SBOM given as a
+        document, or none). Coverage bound to another SBOM or scan raises."""
+        ref = self._inventory.get_ref(repository_ref_id)
+        if ref.manifest_sbom_assessment_id is None:
+            return None
+        scans = self._log.list_by_ids([ref.manifest_sbom_assessment_id])
+        held = self._log.documents(scans, [ManifestCoverageArtifact.schema])
+        if not held:
+            raise IntegrityError(
+                f"manifest scan {ref.manifest_sbom_assessment_id} of ref {ref.id} holds no coverage"
+            )
+        [(scan, artifact)] = held
+        doc = json.loads(
+            ManifestCoverageArtifact.parse(stored_bytes(self._objects, artifact)).payload
+        )
+        bound = (doc["sbom_id"], doc["assessment_id"])
+        if scan.repository_ref_id != ref.id or bound != (str(ref.manifest_sbom_id), str(scan.id)):
+            raise IntegrityError(
+                f"manifest coverage on ref {ref.id} is bound to sbom {bound[0]} and scan "
+                f"{bound[1]} of ref {scan.repository_ref_id}, not its current "
+                f"{ref.manifest_sbom_id} and {scan.id}"
+            )
         return tuple(
-            UnresolvedManifest.model_validate(m, from_attributes=True) for m in doc.unresolved
+            UnresolvedManifest.model_validate({"ecosystem": ecosystem, "path": path, "reason": why})
+            for ecosystem, paths in doc["unresolved"].items()
+            for path, why in paths.items()
         )
-
-    def _latest_coverage(self, repository_ref_id: UUID) -> Artifact | None:
-        held = self._log.documents(
-            self._log.list_of(AssessmentKind.MANIFEST_SBOM, [repository_ref_id]),
-            [ManifestCoverageArtifact.schema],
-        )
-        return held[0][1] if held else None
 
     def resolve_symbols(self, advisory_id: UUID) -> SymbolResolution:
         """The functions the advisory's fix touched: what its source publishes (Go's OSV
@@ -589,22 +602,17 @@ class ExposureService:
                 for p in [uow.packages.get(d.package_id)]
             }
         package = next((p for p in named.values() if p is not None), record.affected[0])
-        unread = (
-            []
-            if rows
-            else [
-                m.path
-                for m in self.unresolved_manifests(repository_ref_id)
-                if m.ecosystem in {a.ecosystem for a in record.affected}
-            ]
-        )
+        coverage = () if rows else self.unresolved_manifests(repository_ref_id)
+        unread = [
+            m.path for m in coverage or () if m.ecosystem in {a.ecosystem for a in record.affected}
+        ]
         listed = any(r.image_id is None for r in rows)
         in_manifest = [r.dependency for r in rows if r.vulnerable and r.image_id is None]
         in_images = [r.dependency for r in rows if r.vulnerable and r.image_id is not None]
         in_range, shipped = _in_range(in_manifest, named), _in_range(in_images, named)
         pinned = in_manifest and package.ecosystem in _MANIFEST_TIER
         evidence = ImpactEvidence(
-            l1_depends_on=True if listed else None if rows or unread else False,
+            l1_depends_on=True if listed else None if rows or unread or coverage is None else False,
             l1_version_in_range=in_range,
             manifest_version=in_manifest[0].version if in_manifest else None,
             manifest_scan=None
@@ -628,6 +636,7 @@ class ExposureService:
                     REACHED_THROUGH if listed and not in_manifest else None,
                     SURFACE.format(package.ecosystem) if package.ecosystem in _SURFACES else None,
                     UNRESOLVED.format(", ".join(unread)) if unread else None,
+                    UNKNOWN_COVERAGE if coverage is None else None,
                 )
                 if n
             )
@@ -770,15 +779,12 @@ class ExposureService:
         assessor: str,
         assessor_version: str,
         occurred_at: datetime,
-        *,
-        reuse: bool = True,
     ) -> tuple[Assessment, Artifact, bool]:
-        """`doc` as the artifact of a `kind` assessment on the commit; with `reuse`, the same
-        bytes again are the assessment already recorded."""
+        """`doc` as the artifact of a `kind` assessment on the commit; the same bytes again are
+        the assessment already recorded."""
         assert ref.id is not None
         digest = sha256_hex(doc.payload)
-        schema = doc.schema
-        if reuse and (recorded := self._log.find_recorded([ref.id], kind, schema, digest)):
+        if recorded := self._log.find_recorded([ref.id], kind, doc.schema, digest):
             assessment, artifact = recorded[0]
             return assessment, artifact, False
         assessment = self._log.open(
@@ -791,16 +797,23 @@ class ExposureService:
                 occurred_at=occurred_at,
             )
         )
+        return assessment, self._attach_document(uow, assessment, doc), True
+
+    def _attach_document(
+        self, uow: TraustUnitOfWork, assessment: Assessment, doc: ArtifactDocument
+    ) -> Artifact:
         stored = self._objects.put(
-            ObjectKey.parse(f"artifacts/{schema}/{digest}.json"), doc.payload
+            ObjectKey.parse(f"artifacts/{doc.schema}/{sha256_hex(doc.payload)}.json"), doc.payload
         )
-        artifact = record_artifact(
+        return record_artifact(
             uow,
             Artifact(
-                assessment_id=assessment.id, digest=stored.sha256, kind=schema, uri=str(stored.key)
+                assessment_id=assessment.id,
+                digest=stored.sha256,
+                kind=doc.schema,
+                uri=str(stored.key),
             ),
         )
-        return assessment, artifact, True
 
     def packages_affected(self, advisory_id: UUID) -> list[AdvisoryPackage]:
         with self._uow as uow:
@@ -1095,8 +1108,9 @@ class ExposureService:
         self, repository_ref_id: UUID, ecosystem: Ecosystem, name: str, fixed: Version
     ) -> FixUptake:
         """The package's versions in the commit's manifest SBOM and the images built from it,
-        each at or above `fixed`; a version that can't be ordered decides nothing. Not listed while
-        a manifest of its ecosystem went unresolved is `not_observed`, never `module_absent`."""
+        each at or above `fixed`; a version that can't be ordered decides nothing. Not listed in the
+        manifest SBOM while a manifest of its ecosystem went unresolved, or its coverage is
+        unknown, is `not_observed`, whatever the images ship."""
         with self._uow as uow:
             ref = self._inventory.get_ref(repository_ref_id)
             held = [(None, ref.manifest_sbom_id)] if ref.manifest_sbom_id else []
@@ -1109,9 +1123,10 @@ class ExposureService:
                 for d in uow.dependencies.list_for_sbom(sbom_id)
                 if d.package_id == package.id
             ]
-        unread = not rows and any(
-            m.ecosystem == ecosystem for m in self.unresolved_manifests(repository_ref_id)
-        )
+        # Images shipping a fixed version don't say what an unresolved manifest holds.
+        listed = any(image_id is None for image_id, _ in rows)
+        coverage = () if listed else self.unresolved_manifests(repository_ref_id)
+        unread = coverage is None or any(m.ecosystem == ecosystem for m in coverage)
         if not any(sbom_id for _, sbom_id in held) or unread:
             return FixUptake(state=FixUptakeState.NOT_OBSERVED)
         fix = version_key(fixed, ecosystem)
@@ -1265,7 +1280,7 @@ class ExposureService:
         return Page.of([r.analysis for r in kept], page.limit, key=lambda a: at[a.assessment_id])
 
     def export_impacts(self, identifier: AdvisoryIdentifier | UUID) -> ImpactExport:
-        """Export retained evidence for one advisory without refreshing its source."""
+        """Export kept evidence for one advisory, without refreshing its source."""
         with self._uow as uow:
             known = (
                 uow.advisories.get(identifier)
@@ -1276,20 +1291,15 @@ class ExposureService:
                 raise NotFoundError(f"advisory {identifier}: no recorded advisory")
             canonical = uow.advisories.get(known.alias_of_id) if known.alias_of_id else known
         assert canonical.id is not None
-        latest: dict[tuple[UUID, str | None, str, str | None], _Recorded] = {}
-        for row in self._recorded(ImpactFilter(advisory_id=canonical.id)):
-            key = (
-                row.analysis.repository_ref_id,
-                row.doc.metadata.ecosystem,
-                row.doc.metadata.module,
-                row.doc.repos[0].version,
-            )
-            if key not in latest or latest[key].at < row.at:
-                latest[key] = row
+        rows = sorted(
+            _latest_members(self._recorded(ImpactFilter(advisory_id=canonical.id))),
+            key=lambda row: row.at,
+            reverse=True,
+        )
         exported = []
         documents = TypeAdapter(dict[str, JsonValue])
         repo_documents = TypeAdapter(list[dict[str, JsonValue]])
-        for row in sorted(latest.values(), key=lambda row: row.at, reverse=True):
+        for row in rows:
             [entry] = row.doc.repos
             metadata = row.doc.metadata
             document = documents.validate_json(row.doc.payload)
@@ -1587,6 +1597,24 @@ def _latest(rows: Sequence[_Recorded], until: datetime | None) -> list[_Recorded
     return list(latest.values())
 
 
+def _latest_members(rows: Sequence[_Recorded]) -> list[_Recorded]:
+    """The latest analysis of each commit, advisory and affected package version; a document
+    that omits its ecosystem is Go, as the impact-analysis contract defines."""
+    latest: dict[tuple[UUID, UUID, str, str, str | None], _Recorded] = {}
+    for row in rows:
+        metadata = row.doc.metadata
+        key = (
+            row.analysis.repository_ref_id,
+            row.analysis.advisory_id,
+            metadata.ecosystem or Ecosystem.GO.value,
+            metadata.module,
+            row.doc.repos[0].version,
+        )
+        if key not in latest or latest[key].at < row.at:
+            latest[key] = row
+    return list(latest.values())
+
+
 @dataclass(frozen=True)
 class _Recorded:
     at: tuple[datetime, UUID]
@@ -1652,6 +1680,18 @@ def _joined(a: AffectedPackage, b: AffectedPackage) -> AffectedPackage:
             for field in ("spans", "versions", "imports", "symbols")
         }
     )
+
+
+def _coverage(unresolved: Sequence[UnresolvedManifest]) -> dict[str, dict[str, str]]:
+    """The contract's shape, ecosystem → manifest path → reason; one path stated twice is
+    refused rather than one reason dropped."""
+    shaped: dict[str, dict[str, str]] = {}
+    for m in unresolved:
+        paths = shaped.setdefault(m.ecosystem.value, {})
+        if m.path in paths:
+            raise ValidationError(f"manifest {m.path} ({m.ecosystem}) stated twice")
+        paths[m.path] = m.reason.value
+    return shaped
 
 
 def _in_range(

@@ -19,7 +19,7 @@ from traust_core.v1.errors import (
     ValidationError,
 )
 from traust_core.v1.models.analysis_results import ResultKind
-from traust_core.v1.models.artifacts import ArtifactDocument
+from traust_core.v1.models.artifacts import ARTIFACT_FOR_SCHEMA, ArtifactDocument
 from traust_core.v1.models.assessment import Artifact, Assessment
 from traust_core.v1.models.base import Dto
 from traust_core.v1.models.common import ArtifactRef, TimeWindow
@@ -95,16 +95,6 @@ class PublishSpecs:
 
     def names(self) -> list[str]:
         return sorted(self._specs)
-
-    def artifact_type(self, schema: str) -> type[ArtifactDocument]:
-        types = {
-            s.artifact.schema_type() for s in self._specs.values() if s.artifact.schema == schema
-        }
-        if len(types) != 1:
-            raise ConfigError(
-                f"artifact schema {schema!r}: expected one registered type, got {len(types)}"
-            )
-        return types.pop()
 
 
 def record_artifact(uow: AssessmentsUnitOfWork, artifact: Artifact) -> Artifact:
@@ -410,7 +400,11 @@ class ArtifactPublisher:
 
     def get(self, artifact_id: UUID) -> ArtifactDocument:
         row = self.metadata(artifact_id)
-        return self._read(row, self._specs.artifact_type(row.kind))
+        try:
+            artifact = ARTIFACT_FOR_SCHEMA[row.kind]
+        except KeyError:
+            raise ConfigError(f"unknown artifact schema {row.kind!r}") from None
+        return self._read(row, artifact)
 
     def payload(self, artifact_id: UUID) -> bytes:
         """The recorded bytes, including companions without an artifact schema."""
@@ -548,10 +542,12 @@ _HIGH_CONFIDENCE = frozenset(
         "gcp-sa-key",
     }
 )
+_PEM = PEM_PATTERN
 _PEM_REDACTED = "[PRIVATE KEY MATERIAL REDACTED]"
 # The run of newlines (raw or JSON-escaped to any depth) padding a PEM body.
 _PEM_PAD = re.compile(r"(?:\\+[rn]|\r?\n)+")
 _PEM_PAD_END = re.compile(r"(?:\\+[rn]|\r?\n)+$")
+_PAN_CANDIDATE = PAYMENT_CARD_PATTERN
 
 
 class RedactionPolicy:
@@ -579,18 +575,19 @@ def _scrub(text: str, hits: list[RedactionHit], *, replace: bool) -> str:
         return value[:_KEEP] + _MARK
 
     for rule in SecretDetector.publication_rules():
+        category, rx, grouped = rule.category, rule.pattern, bool(rule.group)
 
-        def sub(m: re.Match[str], category: str = rule.category, group: int = rule.group) -> str:
+        def sub(m: re.Match[str], category: str = category, grouped: bool = grouped) -> str:
             whole = m.group(0)
             if _MARK in whole:
                 return whole
-            if group:
-                masked = whole.replace(m.group(group), found(category, m.group(group)))
+            if grouped and m.lastindex:
+                masked = whole.replace(m.group(1), found(category, m.group(1)))
             else:
                 masked = found(category, whole)
             return masked if replace else whole
 
-        text = rule.pattern.sub(sub, text)
+        text = rx.sub(sub, text)
 
     def pem(m: re.Match[str]) -> str:
         if re.sub(r"\\+[rn]", "\n", m.group(2)).strip() == _PEM_REDACTED:
@@ -606,7 +603,7 @@ def _scrub(text: str, hits: list[RedactionHit], *, replace: bool) -> str:
         pad = (lead.group(0) if lead else "") + _PEM_REDACTED + (tail.group(0) if tail else "")
         return f"{m.group(1)}{pad}{m.group(3)}"
 
-    text = PEM_PATTERN.sub(pem, text)
+    text = _PEM.sub(pem, text)
 
     def pan(m: re.Match[str]) -> str:
         digits = re.sub(r"[ -]", "", m.group(0))
@@ -615,4 +612,4 @@ def _scrub(text: str, hits: list[RedactionHit], *, replace: bool) -> str:
         masked = found("payment-card", digits)
         return masked if replace else m.group(0)
 
-    return PAYMENT_CARD_PATTERN.sub(pan, text)
+    return _PAN_CANDIDATE.sub(pan, text)

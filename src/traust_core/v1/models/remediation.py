@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from fnmatch import fnmatchcase
-from typing import Any, Self
+from typing import Any, Literal, Self
 from uuid import UUID
 
 import pydantic
@@ -669,7 +669,10 @@ def propagated(evidence: Sequence[PropagationEvidence]) -> CrossRepoPropagation:
     under another name)."""
     states = {e.state for e in evidence}
     if FixUptakeState.NOT_OBSERVED in states or not states:
-        raise NotFoundError("the component's commit has no SBOM yet: record one first")
+        raise NotFoundError(
+            "the component's commit has no SBOM yet, or one whose coverage leaves the package "
+            "unknown: record one from its manifests first"
+        )
     if FixUptakeState.PENDING in states:
         return CrossRepoPropagation("pending")
     held = states - {FixUptakeState.MODULE_ABSENT}
@@ -891,19 +894,15 @@ class SweepSkip(StrEnum):
     HEAD_UNCHANGED = "head_unchanged"  # nothing landed since the findings were last judged
 
 
-class SweepHeadSource(StrEnum):
-    OBSERVED_DEFAULT = "observed_default"
-    OBSERVED_BRANCH = "observed_branch"
-    REGISTERED_BRANCH = "registered_branch"
-
-
 class SweepEntry(Model):
     """Whether a repository is worth re-verifying, and how urgently; the sweep routes only."""
 
     repository_id: UUID
     repository_ref_id: UUID | None = None
     ref_name: str | None = None
-    head_source: SweepHeadSource = SweepHeadSource.OBSERVED_DEFAULT
+    head_source: Literal["observed_default", "observed_branch", "registered_branch"] = (
+        "observed_default"
+    )
     head_sha: str | None = None
     pinned_sha: str | None = None
     verified_at_head: bool = False

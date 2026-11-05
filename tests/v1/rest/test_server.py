@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -12,7 +13,10 @@ from pydantic import SecretStr
 
 from traust_core.v1.context import Config, Context
 from traust_core.v1.models.identity import Credential
+from traust_core.v1.providers.model_catalog import RegistryModelCatalog
 from traust_core.v1.rest import server
+
+REGISTRY = Path(__file__).parents[2] / "fixtures" / "operations" / "model-registry.yaml"
 
 
 def test_traust_server_serves_the_configured_context(
@@ -29,7 +33,27 @@ def test_traust_server_serves_the_configured_context(
     assert ran["app"].state.context.advisories is not None
     logging.getLogger("traust_core.rest.access").info("server access event")
     records = (tmp_path / "logs" / "traust.log").read_text().splitlines()
-    assert [json.loads(line)["message"] for line in records] == ["server access event"]
+    messages = [json.loads(line)["message"] for line in records]
+    assert messages[0].startswith("no model-registry.yaml beside")  # spend stays unpriced
+    assert messages[1:] == ["server access event"]
+
+
+def test_traust_server_prices_spend_from_the_rate_card_beside_the_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = tmp_path / "traust.yaml"
+    config.write_text(f"home: {tmp_path}\n")
+    shutil.copy(REGISTRY, tmp_path / "model-registry.yaml")
+    ran: dict[str, Any] = {}
+    monkeypatch.setattr(uvicorn, "run", lambda app, **kw: ran.update(app=app, **kw))
+    server.main(["--config", str(config), "--port", "9001"])
+    context = ran["app"].state.context
+    assert isinstance(context.model_catalog, RegistryModelCatalog)
+    assert context.model_catalog.check().ready
+    records = (tmp_path / "logs" / "traust.log").read_text().splitlines()
+    assert json.loads(records[0])["message"] == (
+        f"model registry (rate card) loaded from {tmp_path / 'model-registry.yaml'}"
+    )
 
 
 def local(tmp_path: Path, trusted: bool = True) -> Path:

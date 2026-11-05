@@ -143,7 +143,7 @@ class LedgerService:
     def verify_document(
         document: FindingsLayerArtifact, *, public_key_path: Path
     ) -> DocumentVerification:
-        """Check a historical layer's events and require its public-key signature."""
+        """Verify a historical layer's stored events and require its public-key signature."""
         layer = json.loads(document.payload)
         signer = CosignBackend()
         merkle = verify_merkle_integrity(layer)

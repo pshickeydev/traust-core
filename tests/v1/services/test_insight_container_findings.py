@@ -22,15 +22,8 @@ from traust_core.v1.models.insight import ContainerFindings, ViewFilter, ViewNam
 from traust_core.v1.models.vocabulary import SourceType
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
-from traust_core.v1.services.artifact_publishing import PublishSpec, PublishSpecs
 
 DAY = timedelta(days=1)
-
-
-def attached_report(context: Context, assessment_id: UUID) -> UUID:
-    [artifact] = context.services().artifacts.list_for_assessment(assessment_id, kind="report")
-    assert artifact.id is not None
-    return artifact.id
 
 
 @pytest.fixture(params=SQL_BACKENDS)
@@ -47,13 +40,7 @@ def context(engine: Engine, tmp_path: Path) -> Context:
 
 
 def record_container(
-    context: Context,
-    ref_id: UUID,
-    image: str,
-    day: int,
-    indices: tuple[int, ...] = (0, 1),
-    *,
-    description: str | None = None,
+    context: Context, ref_id: UUID, image: str, day: int, indices: tuple[int, ...] = (0, 1)
 ) -> UUID:
     body = json.loads(authored_report().payload)
     body["title"] = f"Container assessment {day}: {image}"
@@ -69,8 +56,6 @@ def record_container(
         finding.pop("validation_status", None)
         finding.pop("disposition", None)
         finding.pop("effective_severity", None)
-        if description is not None:
-            finding["description"] = description
     saved = context.services().assessment.record(
         SecurityAuditArtifact.from_document(body),
         ref_id,
@@ -116,7 +101,7 @@ def test_container_population_is_cumulative_image_scoped_and_decision_driven(
             occurred_at=T0 + 5 * DAY,
         )
         uow.commit()
-    scope = ViewFilter(artifact_id=attached_report(context, empty))
+    scope = ViewFilter(assessment_id=empty, report_stem="widget-container-audit")
     rendered = context.services().insight.publish(ViewName.CONTAINER_FINDINGS, scope)
     model = rendered.model
     assert isinstance(model, ContainerFindings)
@@ -128,7 +113,6 @@ def test_container_population_is_cumulative_image_scoped_and_decision_driven(
     assert len(by_id[repeated].occurrences) == 2
     assert by_id[repeated].view.occurrence.assessment_id == second
     assert by_id[repeated].view.effective_severity == "high"
-    assert by_id[repeated].description == authored_report().findings[0].description
     assert by_id[repeated].view.state() == FindingState.RESOLVED
     assert by_id[absent].view.state() == FindingState.OPEN
     assert model.total.resolved == 1 and model.total.open.total == 1
@@ -149,100 +133,79 @@ def test_container_population_is_cumulative_image_scoped_and_decision_driven(
     }
 
 
-def test_container_view_requires_an_attached_container_report_and_honors_its_cutoff(
-    context: Context,
-    engine: Engine,
+def test_container_scope_rejects_code_anchor_missing_stem_and_future_anchor(
+    context: Context, engine: Engine
 ) -> None:
     with SqlTraustUnitOfWork(engine) as uow:
-        ref = Seed(uow).repository_ref()
+        seed = Seed(uow)
+        ref = seed.repository_ref()
+        code = seed.assessment(ref, kind="secure-code", occurred_at=T0)
         uow.commit()
     assert ref.id is not None
-    assessment_id = record_container(
-        context,
-        ref.id,
-        "registry.example/apps/widget:release",
-        1,
-        (),
-    )
-    artifact_id = attached_report(context, assessment_id)
-    detached = (
-        context.artifact_publisher(PublishSpecs(PublishSpec(SecurityAuditArtifact)))
-        .publish_artifact(authored_report())
-        .artifact_id
-    )
+    container = record_container(context, ref.id, "registry.example/apps/widget@sha256:aaa", 1, ())
+    insight = context.services().insight
     for scope in (
-        ViewFilter(),
-        ViewFilter(artifact_id=detached),
-        ViewFilter(artifact_id=artifact_id, as_of=T0),
+        ViewFilter(assessment_id=container),
+        ViewFilter(assessment_id=container, report_stem="widget"),
+        ViewFilter(assessment_id=code.id, report_stem="widget-container-audit"),
+        ViewFilter(assessment_id=container, report_stem="widget-container-audit", as_of=T0),
     ):
         with pytest.raises(ValidationError):
-            context.services().insight.build(ViewName.CONTAINER_FINDINGS, scope)
+            insight.build(ViewName.CONTAINER_FINDINGS, scope)
 
 
-def test_container_view_rejects_a_source_code_report_anchor(
-    context: Context,
-    engine: Engine,
+def test_container_scope_rejects_a_source_url_as_image_and_an_out_of_scope_anchor(
+    context: Context, engine: Engine
 ) -> None:
     with SqlTraustUnitOfWork(engine) as uow:
-        ref = Seed(uow).repository_ref()
+        seed = Seed(uow)
+        ref = seed.repository_ref()
+        team = seed.team()
         uow.commit()
-    assert ref.id is not None
-    saved = context.services().assessment.record(
-        authored_report(),
-        ref.id,
-        AssessmentKind.SECURE_CODE_CANONICAL,
-        "fixture",
-        "1",
-        Provenance(run_id=uuid4(), source=SourceType.INTERACTIVE, occurred_at=T0),
-    )
-    assert saved.id is not None
-    with pytest.raises(ValidationError, match="not a container"):
-        context.services().insight.build(
-            ViewName.CONTAINER_FINDINGS, ViewFilter(artifact_id=attached_report(context, saved.id))
+    assert ref.id is not None and team.id is not None
+    source = record_container(context, ref.id, "https://github.com/example-org/widget", 1, ())
+    insight = context.services().insight
+    with pytest.raises(ValidationError, match="not a source URL"):
+        insight.build(
+            ViewName.CONTAINER_FINDINGS,
+            ViewFilter(assessment_id=source, report_stem="widget-container-audit"),
+        )
+    image = record_container(context, ref.id, "registry.example/apps/widget@sha256:aaa", 2, ())
+    with pytest.raises(ValidationError, match="outside the requested scope"):
+        insight.build(
+            ViewName.CONTAINER_FINDINGS,
+            ViewFilter(
+                assessment_id=image, report_stem="widget-container-audit", team_ids=(team.id,)
+            ),
         )
 
 
-def test_container_single_item_view_is_excluded_from_dashboard_refresh(context: Context) -> None:
-    from traust_core.v1.services.findings.rating import RatingConfig, RatingPolicy
-    from traust_core.v1.services.insight import ContainerFindingsView, InsightService
-
-    services = context.services()
-    view = ContainerFindingsView(
-        services.findings,
-        services.portfolio,
-        services.assessment,
-        RatingPolicy(RatingConfig()),
-        services.artifacts,
-    )
-    refreshed = InsightService([view], FixedClock(T0)).refresh(None, ViewFilter())
-    assert refreshed.rendered == {} and refreshed.failed == {}
+def test_container_view_is_single_item_and_left_out_of_a_full_refresh(context: Context) -> None:
+    refreshed = context.services().insight.refresh(None, ViewFilter())
+    assert ViewName.CONTAINER_FINDINGS not in refreshed.rendered
+    assert ViewName.CONTAINER_FINDINGS not in refreshed.failed
 
 
-def test_container_body_values_are_literal_after_storage_and_publication(
+def test_container_image_provenance_is_literal_in_published_report_bodies(
     context: Context, engine: Engine
 ) -> None:
     with SqlTraustUnitOfWork(engine) as uow:
         ref = Seed(uow).repository_ref()
         uow.commit()
     assert ref.id is not None
-    image_repository = "registry.example/apps/widget<img src=x onerror=alert(2)>"
-    description = "<iframe src=x></iframe> [open](javascript:alert(1))\n## Injected heading"
-    assessment_id = record_container(
-        context,
-        ref.id,
-        f"{image_repository}:latest",
-        1,
-        (0,),
-        description=description,
-    )
-    rendered = context.services().insight.publish(
-        ViewName.CONTAINER_FINDINGS,
-        ViewFilter(artifact_id=attached_report(context, assessment_id)),
-    )
-    assert rendered.model.image_repository == image_repository
-    assert rendered.model.findings[0].description == description
-    assert "<img" not in rendered.markdown
-    assert "<iframe" not in rendered.markdown
-    assert "&lt;img" in rendered.markdown and "&lt;iframe" in rendered.markdown
-    assert "[open](javascript:" not in rendered.markdown
-    assert "\n## Injected heading" not in rendered.markdown
+    image = "registry.example/apps/<img src=x onerror=alert(1)> [docs](evil)\n## forged"
+    assessment_id = record_container(context, ref.id, image + "@sha256:aaa", 0)
+    scope = ViewFilter(assessment_id=assessment_id, report_stem="widget-container-audit")
+    insight = context.services().insight
+    model = insight.build(ViewName.CONTAINER_FINDINGS, scope)
+    assert isinstance(model, ContainerFindings)
+    assert model.image_repository == image
+    report = insight.report(ViewName.CONTAINER_FINDINGS, scope)
+    assert "<img" not in report.sections[0].body
+    assert "[docs](evil)" not in report.sections[0].body
+    assert "\n## forged" not in report.sections[0].body
+    published = insight.publish(ViewName.CONTAINER_FINDINGS, scope)
+    assert "<img" not in published.markdown and "<img" not in published.html
+    assert "\n## forged" not in published.markdown
+    stored = context.services().assessment.report(assessment_id)
+    assert stored is not None and stored.metadata.repository == image + "@sha256:aaa"

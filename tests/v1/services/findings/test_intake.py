@@ -16,10 +16,17 @@ from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import Seed
 from traust_core.v1.errors import NotFoundError, ValidationError
 from traust_core.v1.models.common import CodeSpan, RepoPath
-from traust_core.v1.models.findings import CweId, ExposureKey, FindingCandidate, Label
+from traust_core.v1.models.findings import (
+    CweId,
+    ExposureKey,
+    FindingCandidate,
+    Label,
+    Suppression,
+    SuppressionStatus,
+)
 from traust_core.v1.models.integrity import FingerprintInput
 from traust_core.v1.models.inventory import Repository, RepositoryRef
-from traust_core.v1.models.vocabulary import Severity
+from traust_core.v1.models.vocabulary import ReviewReason, Severity
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services.findings import FindingIntake, IdentityPolicy, TaxonomyPolicy
 
@@ -498,3 +505,33 @@ def test_reaccepting_an_assessment_records_its_new_locations(
     assert again.created == ()
     got = rows(engine, first.findings[Label("OPERATOR-abcdef0-001")])
     assert len(got["locations"]) == 3
+
+
+def test_a_suppressed_candidate_is_queued_for_review_even_when_another_shares_its_label(
+    engine: Engine, target: Target
+) -> None:
+    run = audit(engine, target)
+    suppressed = candidate(
+        target,
+        label="SCAN-1",
+        suppression=Suppression(status=SuppressionStatus.ACCEPTED, justification="by design"),
+    )
+    plain = candidate(
+        target,
+        label="SCAN-1",
+        rule="go.xss.reflected",
+        cwes=(CweId("CWE-79"),),
+        locations=(CodeSpan(path=RepoPath("pkg/files/open.go"), line=7),),
+    )
+    intake(engine).accept(run, (suppressed, plain))
+    with SqlTraustUnitOfWork(engine) as uow:
+        findings = {o.finding_id for o in uow.occurrences.list_for_assessment(run)}
+        queued = {
+            f
+            for f in findings
+            for item in uow.review_items.list_for_finding(f)
+            if item.reason == ReviewReason.MANUAL_QUEUE
+        }
+        rules = {f: uow.occurrences.list_for_finding(f)[0].rule for f in queued}
+    assert len(findings) == 2
+    assert list(rules.values()) == ["go.sql.injection"]

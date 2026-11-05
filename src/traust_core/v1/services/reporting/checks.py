@@ -93,13 +93,7 @@ _NON_AUDIT = (
     "adapter-result",
     "impact-analysis",
 )
-_SCHEMA_ONLY = (
-    "layer",
-    "refuted-register",
-    "operator-priv-profile",
-    "pqc-readiness",
-    "adapter-result",
-)
+_SCHEMA_ONLY = ("refuted-register", "operator-priv-profile", "pqc-readiness", "adapter-result")
 
 
 @dataclass
@@ -1343,6 +1337,8 @@ def validate_report(
             cross_validate_cloud_config_current(report, result)
         elif "cloud-config-audit" in sid:
             pass  # run_checkov.py --validate-report is that family's content gate
+        elif "layer" in sid:
+            pass  # Historical layer cryptography is opt-in through LedgerService.
         elif "validation" in sid:
             cross_validate_validation(report, result, context.files)
         elif "threat-model" in sid:

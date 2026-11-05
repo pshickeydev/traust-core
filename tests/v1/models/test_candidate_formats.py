@@ -11,7 +11,12 @@ import pytest
 
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.common import CodeSpan
-from traust_core.v1.models.findings import CandidateFormat, FindingCandidate
+from traust_core.v1.models.findings import (
+    CandidateFormat,
+    FindingCandidate,
+    Suppression,
+    SuppressionStatus,
+)
 
 SCANNERS = Path(__file__).parents[2] / "fixtures" / "findings" / "scanners"
 REPO = uuid4()
@@ -43,6 +48,94 @@ def test_sarif_maps_a_codeql_result_and_skips_suppressed() -> None:
         "Sanitize before logging.",
     ]
     assert (c.repository_id, c.category) == (REPO, None)
+
+
+def test_suppressed_sarif_review_is_opt_in_and_keeps_claim_locations() -> None:
+    candidates = FindingCandidate.parse_many(
+        sarif(), CandidateFormat.SARIF, REPO, include_suppressed=True
+    )
+    assert [(candidate.label, candidate.locations[0].path) for candidate in candidates] == [
+        ("go/log-injection", "pkg/api/handler.go"),
+        ("go/log-injection#2", "pkg/api/other.go"),
+    ]
+    assert candidates[1].description.startswith("Suppressed instance.")
+    assert len(parse(sarif(), CandidateFormat.SARIF)) == 1
+
+
+@pytest.mark.parametrize(
+    ("suppressions", "status", "justification"),
+    [
+        ([{"kind": "external"}], SuppressionStatus.ACCEPTED, None),
+        (
+            [
+                {"kind": "inSource", "status": "rejected", "justification": "Not dead code"},
+                {"kind": "external", "status": "underReview", "justification": "Owner asked"},
+            ],
+            SuppressionStatus.UNDER_REVIEW,
+            "Not dead code; Owner asked",
+        ),
+        ([{"kind": "inSource", "status": "rejected"}], SuppressionStatus.REJECTED, None),
+    ],
+)
+def test_an_included_suppressed_result_carries_its_suppression(
+    suppressions: list[dict[str, str]], status: SuppressionStatus, justification: str | None
+) -> None:
+    def suppress(doc: dict[str, Any]) -> None:
+        doc["runs"][0]["results"][1]["suppressions"] = suppressions
+
+    plain, suppressed = FindingCandidate.parse_many(
+        sarif(suppress), CandidateFormat.SARIF, REPO, include_suppressed=True
+    )
+    assert plain.suppression is None
+    assert suppressed.suppression == Suppression(status=status, justification=justification)
+
+
+@pytest.mark.parametrize(
+    ("suppressions", "imported"),
+    [
+        ([{"kind": "inSource", "status": "rejected"}], True),
+        ([{"kind": "external", "status": "underReview"}], True),
+        ([{"kind": "external", "status": "rejected"}, {"kind": "inSource"}], False),
+        ([{"kind": "external", "status": "accepted"}], False),
+        ([], True),
+    ],
+)
+def test_by_default_only_a_standing_suppression_hides_a_result(
+    suppressions: list[dict[str, str]], imported: bool
+) -> None:
+    def suppress(doc: dict[str, Any]) -> None:
+        doc["runs"][0]["results"][1]["suppressions"] = suppressions
+
+    labels = [c.label for c in parse(sarif(suppress), CandidateFormat.SARIF)]
+    assert ("go/log-injection#2" in labels) is imported
+
+
+@pytest.mark.parametrize(
+    "suppressions",
+    [
+        [{"kind": "external", "status": []}],
+        [{"kind": "external", "status": None}],
+        [{"kind": "external", "status": "underreview"}],
+        [{"kind": "external", "status": "accepted", "justification": 7}],
+        ["accepted"],
+        {"status": "accepted"},
+    ],
+)
+@pytest.mark.parametrize("include_suppressed", [False, True])
+def test_a_malformed_suppression_is_refused(suppressions: Any, include_suppressed: bool) -> None:
+    def suppress(doc: dict[str, Any]) -> None:
+        doc["runs"][0]["results"][1]["suppressions"] = suppressions
+
+    with pytest.raises(ValidationError, match="suppression"):
+        FindingCandidate.parse_many(
+            sarif(suppress), CandidateFormat.SARIF, REPO, include_suppressed=include_suppressed
+        )
+
+
+@pytest.mark.parametrize("format", [CandidateFormat.DEPENDABOT, CandidateFormat.GOVULNCHECK])
+def test_suppression_override_rejects_other_formats(format: CandidateFormat) -> None:
+    with pytest.raises(ValidationError):
+        FindingCandidate.parse_many(b"[]", format, REPO, include_suppressed=True)
 
 
 def test_sarif_level_decides_without_security_severity() -> None:

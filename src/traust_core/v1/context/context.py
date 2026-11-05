@@ -47,7 +47,13 @@ from traust_core.v1.context.tools import (
     load_toolchain,
     scanner_tools,
 )
-from traust_core.v1.errors import ConfigError, DocumentError, NotFoundError, ValidationError
+from traust_core.v1.errors import (
+    ConfigError,
+    DocumentError,
+    NotFoundError,
+    RepositoryError,
+    ValidationError,
+)
 from traust_core.v1.models.artifacts import (
     ARTIFACT_FOR_KIND,
     AdrRegistryArtifact,
@@ -86,6 +92,7 @@ from traust_core.v1.models.artifacts import (
 from traust_core.v1.models.assessment import AtlasCatalog, AttackCatalog
 from traust_core.v1.models.below_range import GapReason
 from traust_core.v1.models.cloud_config import CHECKOV
+from traust_core.v1.models.compliance import DocsTarget
 from traust_core.v1.models.insight import SlaPolicy, ViewName
 from traust_core.v1.models.operations import Invoice, Requirement
 from traust_core.v1.providers.base import ProviderRegistry
@@ -123,7 +130,7 @@ from traust_core.v1.providers.mirror import FETCH_TIMEOUT_SECONDS, MirrorCheckou
 from traust_core.v1.providers.model_catalog import ModelCatalog, RegistryModelCatalog
 from traust_core.v1.providers.osv import ExportedAdvisoryLookup
 from traust_core.v1.providers.package_source import PackageSources
-from traust_core.v1.providers.pqc import PqcScanner
+from traust_core.v1.providers.pqc import PqcScanner, PqcScanTool
 from traust_core.v1.providers.priv_profile import PrivProfiler
 from traust_core.v1.providers.process import ProcessRunner
 from traust_core.v1.providers.product_definitions import ProductDefinitionsCache
@@ -136,7 +143,6 @@ from traust_core.v1.providers.syft import SyftSbom
 from traust_core.v1.providers.symbols import SymbolIndex
 from traust_core.v1.providers.tools import ToolInspector, ToolProvider
 from traust_core.v1.providers.tools.adapter import AdapterTool
-from traust_core.v1.providers.tools.compliance_sources import DocsTarget
 from traust_core.v1.providers.tools.detection_quality import OpengrepRuleSweep
 from traust_core.v1.providers.tools.opengrep import SupplementalPack
 from traust_core.v1.providers.tools.safe_exec import SafeExec
@@ -205,6 +211,7 @@ from traust_core.v1.services.insight import (
     ProgramView,
     RemediationIndexView,
     ReviewCardView,
+    SarifView,
     ScoreboardView,
     SlaView,
     ThreatRegisterView,
@@ -311,7 +318,7 @@ class Context:
         self.feed_sources: ProviderRegistry[FeedSource] = ProviderRegistry("feed-source")
         self.advisories: AdvisoryLookup | None = None
         self.package_sources: PackageSources | None = None
-        self.pqc_scanner: PqcScanner | None = None  # traust-engine registers pqc-scan
+        self.pqc_scanner: PqcScanner | None = None
         # The register_* doors set these; the doors that read them raise without.
         self.fleet_fix_applier: FleetFixApplier | None = None
         self.fleet_fix_goldens: GoldenRunner | None = None
@@ -605,6 +612,20 @@ class Context:
         self.tool_floors.update(self.toolchain.floors({t.name: t.binary for t in scanners}))
         return tool
 
+    def register_pqc_scanner(
+        self, binary: Path, rules: Path, *, adapter_version: str, scan_commit: str
+    ) -> None:
+        """Register the pinned scanner and rules pack used by PQC prescans."""
+        self.pqc_scanner = PqcScanTool(
+            self.process,
+            self.clock,
+            binary,
+            rules,
+            adapter_version=adapter_version,
+            scan_commit=scan_commit,
+            load_yaml=yaml_documents,
+        )
+
     def register_fleet_fix(self) -> None:
         """Apply fleet fixes and run their ast-grep golden tests over a writable checkout from
         the checkout service."""
@@ -613,8 +634,9 @@ class Context:
         )
 
     def register_compliance_sources(self, targets: Mapping[UUID, DocsTarget] | None = None) -> None:
-        """Register ADR and official-document sources for explicitly mapped products."""
-        targets = {} if targets is None else targets
+        """Read ADR registers and official docs, for traust.yaml's `compliance.docs_targets` or
+        explicit product targets, each checked against the registered products."""
+        targets = self.config.compliance.docs_targets if targets is None else targets
         if targets:
             portfolio = PortfolioService(
                 SqlTraustUnitOfWork(self.database), PortfolioPolicy(), clock=self.clock
@@ -624,7 +646,7 @@ class Context:
                     target.validate()
                     portfolio.get_product(product_id)
                 except (NotFoundError, ValidationError) as e:
-                    raise ConfigError(f"compliance target for product {product_id}: {e}") from e
+                    raise ConfigError(f"docs target for product {product_id}: {e}") from e
         self.adr_source, self.doc_source = compliance_sources(
             self.config.process.keep_env, self.forge_api, self.http, self.clock, targets
         )
@@ -705,6 +727,8 @@ class Context:
         engine = create_database_engine(self.config.record_store_url())
         if local and not sa.inspect(engine).get_table_names():
             apply_schema(engine, contracts.database_ddl(Dialect.of(engine)))
+        else:
+            _manifest_scan_pointer(engine, upgrade=local)
         return engine
 
     @cached_property
@@ -779,21 +803,6 @@ class Context:
             rating,
             self.object_store,
         )
-        assessment_publisher = ArtifactPublisher(
-            PublishSpecs(
-                PublishSpec(CloudConfigAuditArtifact),
-                PublishSpec(ReportArtifact),
-                PublishSpec(SecurityAuditArtifact),
-                PublishSpec(VulnFindingsArtifact),
-                PublishSpec(ThreatModelArtifact),
-                PublishSpec(IsolationReviewArtifact),
-                PublishSpec(PrivProfileArtifact),
-                PublishSpec(CodeFactsArtifact),
-                PublishSpec(FuzzReportArtifact),
-            ),
-            self.object_store,
-            uow,
-        )
         assessment = AssessmentService(
             uow,
             intake,
@@ -801,7 +810,21 @@ class Context:
             hosts=hosts,
             tools=self.tools,
             decisions=decisions,
-            publisher=assessment_publisher,
+            publisher=ArtifactPublisher(
+                PublishSpecs(
+                    PublishSpec(CloudConfigAuditArtifact),
+                    PublishSpec(ReportArtifact),
+                    PublishSpec(SecurityAuditArtifact),
+                    PublishSpec(VulnFindingsArtifact),
+                    PublishSpec(ThreatModelArtifact),
+                    PublishSpec(IsolationReviewArtifact),
+                    PublishSpec(PrivProfileArtifact),
+                    PublishSpec(CodeFactsArtifact),
+                    PublishSpec(FuzzReportArtifact),
+                ),
+                self.object_store,
+                uow,
+            ),
             findings=findings,
             git=self.git,
             symbols=self.symbols,
@@ -951,8 +974,8 @@ class Context:
         attack = AttackCoverageView(
             assessment, findings, portfolio, self.attack_catalog, self.clock
         )
-        census = CensusView(findings, assessment, portfolio, self.clock)
         pqc_portfolio = PqcPortfolioView(pqc, code_facts, portfolio)
+        census = CensusView(findings, assessment, portfolio, self.clock)
         executive = ExecutiveSummaryView(
             findings,
             portfolio,
@@ -963,7 +986,6 @@ class Context:
             pqc=pqc_portfolio,
             threats=threats,
             census=census,
-            clock=self.clock,
         )
         sla_policies = ArtifactPublisher(
             PublishSpecs(PublishSpec(SlaPolicyArtifact)), self.object_store, uow
@@ -1056,14 +1078,8 @@ class Context:
             insight=InsightService(
                 (
                     FindingsRollupView(findings, portfolio, assessment),
+                    ContainerFindingsView(findings, portfolio, assessment, rating),
                     InsecurePatternsView(findings, portfolio),
-                    ContainerFindingsView(
-                        findings,
-                        portfolio,
-                        assessment,
-                        rating,
-                        assessment_publisher,
-                    ),
                     trend,
                     ProgramView(spend, ops, self.assets.names),
                     CoverageView(assessment, portfolio, self.clock),
@@ -1074,6 +1090,7 @@ class Context:
                     PqcVendorsView(pqc, exposure, portfolio),
                     ComplianceDashboardView(compliance),
                     OscalExport(compliance),
+                    SarifView(findings, portfolio, self.clock),
                     threats,
                     LocView(code_facts, portfolio, findings, clock=self.clock),
                     RemediationIndexView(remediation, portfolio),
@@ -1152,3 +1169,31 @@ def _sla_policy(path: Path) -> SlaPolicy:
         return SlaPolicy.model_validate(document)
     except ValueError as e:
         raise ConfigError(f"SLA policy {path}: {e}") from e
+
+
+def _manifest_scan_pointer(engine: Engine, *, upgrade: bool) -> None:
+    """contracts added `repository_ref.manifest_sbom_assessment_id`: a local store is upgraded; a
+    configured database's schema is its deployment's, so its absence is refused here rather
+    than failing every read of a commit."""
+    dialect = Dialect.of(engine)
+    schema = "traust" if dialect == Dialect.POSTGRES else None
+
+    def present() -> bool | None:
+        inspector = sa.inspect(engine)
+        if not inspector.has_table("repository_ref", schema=schema):
+            return None
+        columns = inspector.get_columns("repository_ref", schema=schema)
+        return any(c["name"] == "manifest_sbom_assessment_id" for c in columns)
+
+    if present() is not False:
+        return
+    if not upgrade:
+        raise ConfigError(
+            "the database's repository_ref predates manifest_sbom_assessment_id: apply "
+            "traust_core.v1.contracts.manifest_sbom_binding_upgrade(dialect) to it"
+        )
+    try:
+        apply_schema(engine, contracts.manifest_sbom_binding_upgrade(dialect))
+    except RepositoryError:
+        if not present():  # else another process opening the same store upgraded it first
+            raise

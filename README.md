@@ -30,7 +30,11 @@ All modules live under `traust_core.v1` (see [Versioning](#versioning)).
 | **Verification records** | `rest.remediation` | `POST /v1/verification-records`: exact UTF-8 report text, native `Provenance`, and `run_order_id` → `VerificationService.record_order` → native `Verification`; a verified machine must own a live lease for the report repository and a server-allowed verification asset | event envelopes, caller-supplied actor/signer, human countersigns |
 | **Validation report REST** | `rest.validation` | `POST /v1/validation-records` → `services.validation.record_order`; live leased `run_order_id`, exact report text, `Provenance`, native `ValidationRecordInput` bindings → `ValidationRecordResult` | source-label lookups, route-owned authorization or verdict rules, human decision commands |
 | **Reporting** | `services.reporting`, `providers.report_files` | `ctx.reporting` (the same instance as `ctx.services().reporting`; it never opens the record store, so file-only callers use it) over a report document the caller holds, nothing stored: `validate(payload, XArtifact)` → contract `Issue`s; `validate_reports(path, strict=, schema=)` → a `ReportValidation` (errors, warnings) per report file at `path` (a directory sweeps its .json files; the schema comes from each file name unless a contract schema is named): the contract schema, then the family's content checks (`services.reporting.checks`: counts against findings, canonical ids, `metadata.repository`, dispositions, review surfaces, OWASP threat ratings) and, with `strict`, the audit-report warnings; `lint(doc, files=None)` runs every core `Lint` registered for the type; `render(doc, RenderFormat.MARKDOWN \| HTML)` (triage in both; security reports and threat models as Markdown: `services.reporting.report_markdown`, `services.reporting.threat_model`); `lint_threat_models(paths, strict=)` lints THREAT_MODEL.md prose (`threat_model.lint_threat_model`, OWASP cells via `services.reporting.threat_rating`; ATT&CK and ATLAS ids against the registered catalogs, which the pack always pins; without them the door raises naming the register doors); `lost_sections(existing, rendered)` (the render guard); `sarif_reports(root)` is the SARIF sweep's report selection; `sarif(doc)` for report and cloud-config audits (`SarifExport.report`, `locations.sarif_tool_uri` as `informationUri`). `ctx.services().redaction.redact(payload)` scrubs secrets (`RedactionPolicy`; `scan(text)` finds them without redacting) | `traust_engine.reporting` (`validate`, `lint`, `render`, `sarif`), `_util/redact.py` |
-| **Rendering** | `rendering` | `Report` → `MarkdownRenderer` → `publish()`; `markdown_table()` | 18 copies of `render_md` |
+| **Rendering** | `rendering` | `Report` → `MarkdownRenderer` → `publish()`; `markdown_table()`; `markdown_text()` escapes a structured cell as plain text (no HTML, links or inline formatting) | 18 copies of `render_md` |
+| **Detection-quality and compliance renderers** | `rendering.benchmark`, `rendering.compliance_precision`, `rendering.compliance` | `benchmark_markdown(run)` / `scorecards_markdown(cards)` and `compliance_precision_markdown(calibration)` render typed results with untrusted cells escaped; `rendering.compliance.assessment_report(document)` → `ComplianceService.render_assessment(document)` Markdown bytes | consumer-owned report renderers |
+| **Secret detection** | `models.redaction` | `SecretDetector.publication_rules()` / `evidence_rules()` yield ordered `SecretRule`s whose `spans(text)` return exact `SecretSpan(tag, start, end)` offsets; `RedactionPolicy` publishes through the same catalog, so it is the one owner of secret patterns | a consumer-owned credential regex table |
+| **Verification worklists** | `services.remediation`, `models.remediation`, `services.findings` | `verification.sweep(repository_ids, include_branches=False)` keeps repository/ref identity, branch head source and line-specific counts; `sweep_markdown(sweep)` renders the same queue; `findings.on_ref(repository_ref_id)` folds resolution on that ref's line | a second worklist store |
+| **Historical report signatures** | `services.reporting`, `services.ledger`, `models.ledger` | `validate_reports(..., signing_pubkey=Path(...))` requires a historical layer document's Merkle tree and public-key signature through `LedgerService.verify_document`; `ReportValidation.integrity` holds the typed `DocumentVerification` | trusting an unsigned layer |
 | **Jobs** | `models.operations`, `services.operations` | `Materializer.materialize(AssetRequest) -> JobResult` (succeeded · degraded · refused · failed): the seam traust-engine calls; `Router` for continuous-ops `route()` | each CLI inventing its own exit codes |
 | **Providers** | `providers` | the outside world: `base` (`Provider`, `Readiness`, `Provenance`, registry), `tools`, `sources`, `feeds` (`FeedProvider`, `HttpFileFeed` for single-file feeds, `validate_payload`), `http` (`HttpFetcher` + `RetryPolicy`, the outbound HTTP path), `correlation` (`correlation_scope`: scoped request/order/run IDs passed to HTTP and subprocesses), `depsdev` (`DepsDevResolver`: deps.dev graphs and default versions through the feeds registry's `deps_dev` source, answers cached a day in the object store; `ctx.deps_dev`), `process` (`ProcessRunner`, the only subprocess path), `report_files` (`ReportFiles`: the report files a caller names on disk), `clock`, `model_catalog` (`ctx.model_catalog`: list prices and cost, plus roles: `list_roles()`, `resolve_role(role, tier)` (never below the floor), `validate()`, `stamp(role, model)` for a report's `model_routing`), `transcripts` (`ctx.session_transcripts.source(workspace, skills)`: Claude Code transcripts as a `SpendSource` for `SpendService.collect` and `usage_summary`, each request's skill inferred from the session's signals) | ad hoc `subprocess`/`git`/fetch code, 22 private `run` wrappers |
 | **Tools** | `providers.tools`, `providers.tools.toolchain`, `providers.tools.safe_exec`, `providers.tools.elf`, `providers.tools.adapter`, `providers.tools.fleet_fix`, `providers.tools.compliance_sources`, `providers.tools.detection_quality`, `providers.tools.opengrep`, `providers.tools.osv_manifests`, `context.tools` | `ctx.register_toolchain(external_tools, safe_exec_profiles)` reads both files on first use; `ctx.toolchain` (`Toolchain`: `external-tools.yaml`'s `ToolPin`s, `version`, `database`, `populate`, `check` / `preflight` and `preflight_failures`, `freeze_env` / `freeze_flags`) probes only the pinned binaries; `ctx.safe_exec` (`SafeExec`: the deployment's profiles, `validate_argv`, `vet_command_string`, `run`, `run_segments` through `ProcessRunner`, pipelines with no shell); `ElfAnalyzer` (header, linked libraries through `models.elf_formats`, byte patterns); `AdapterTool` wraps a scanner adapter's `scan()` as a `ToolProvider`, and core's scanners are registered by name from `context.tools.scanner_tools`, each one's floor the pin of its binary. `ctx.register_fleet_fix()` (`GitFleetFixApplier`: https-only clone, `git ls-remote`, ast-grep, diffs; also the golden runner), `ctx.register_compliance_sources()` (`GithubAdrSource`, `RedHatDocSource`) and `ctx.register_detection_quality(pack_version, canary_sources, canary_repos)` (`OpengrepRulePacks` over the pack `ctx.register_rule_pack(pack, allowlist)` registered and the `rule-pack-allowlist` supplements cloned under `providers.tools.opengrep`'s cache, read on first use; `GitCanaryMaterializer`; `OpengrepRuleSweep`, one rule over many checkouts, shallow https clones through `GitCheckout.clone`) set the non-scanner providers; rule packs and allowlists stay pack config passed by path; `osv_manifests` holds the osv scan's lockfile and manifest readers (only `providers/tools/osv*` reads them: the portfolio SBOM is syft's) | `traust_engine.toolchain`, `_util/safe_exec.py`, `_util/elf.py`, `adapters/tools.py`, `adapters/{fleet_fix,compliance_sources,detection_quality}.py`, `portfolio/parsers.py` (for osv), `depsdev/` |
@@ -40,30 +44,31 @@ All modules live under `traust_core.v1` (see [Versioning](#versioning)).
 | **Deps and SBOM scanners** | `providers.tools.osv`, `providers.tools.osv_sbom`, `providers.tools.grype` | registered by `scanner_tools`: `grype` over a checkout or SBOM path, database frozen by default; `osv`, a checkout's declared packages looked up through `ctx.advisories` with coverage reported, `osv.scan_api(..., resolver=ctx.deps_dev)` for the full candidates document; `osv_sbom`, an image's syft JSON language packages not installed by an OS package, with `mark_grype_duplicates` / `grype_os_installed_matches` and the air-gapped osv-scanner path; CVSS through `models.dependencies.cvss_base_score` | `adapters/{osv,osv_sbom,grype}.py`, `osv/` (client: reuses `providers.osv`) |
 | **Config + Context** | `context`, `context.documents` (the YAML codec: `yaml_documents`, `yaml_documents_with_lines`, `yaml_text`, passed to providers, which don't import yaml), `context.preflight` | one `traust.yaml`; `Context` builds everything ([ledger and identity sections](docs/configuration.md)). The deployment config home: `resolve_config_home(explicit)` (`$TRAUST_CONFIG_HOME`, else `~/.traust/config` when it exists), `config_path(name)` (`DeploymentConfigMissing` naming the file and its template), `optional_config_path(name)`, `config_completeness_audit()` (`(errors, warnings)` for `install_traust --doctor`). `Context.preflight(requirements)` (`context.preflight`): one readiness door the engine's start gate, the platform doors and `traust doctor` call — a `Requirement` (`models.operations`, the pack schema's `requires:` vocabulary: tools, config keys, recorded facts, feed sources, secrets) is checked against `Toolchain.preflight`, the traust.yaml keys `Config.provided` records, the recorded facts, the enabled feed sources, the environment and the config home audit, raising `PreflightError` with every gap and its fix; `schema_dir()` / `schema_path(name)` / `validate_config(name, document)` and the ops types consumers annotate with (`OpsService`, `SpendService`, `FeedQuery`, `Router`, `Clock`) re-exported for consumers | `os.environ`, scattered config files, `traust_contracts.config` |
 
-## Native consumer reads and reports
+## Historical reads and reporting correctness
 
-These doors operate on the current core models; they do not restore path-keyed inventory,
-stored dashboard snapshots, or a second owner for findings and evidence.
+The native consumer doors above remain owned by their existing services and models.
+The remaining correctness changes are:
 
-| Door | Behavior |
-|---|---|
-| `DetectionQualityService.bootstrap_benchmark(limit=)` | Confirmed fixes become unadmitted answer-key candidates; generation records nothing. `rendering.benchmark_markdown` and `scorecards_markdown` render the results. |
-| `DetectionQualityService.calibrate_compliance(framework, gate=)` | Inclusive precision gate; computed `precision` and `flagged` survive serialization. Unmeasured precision remains null. `rendering.compliance_precision_markdown` renders the review worklist. |
-| `FindingService.on_ref(ref_id)` / `verified_fix_mtta(filter)` | Finding population and resolution follow the requested code line; fix timing requires standing validation/verification evidence. Bare commits imply no ancestry. |
-| `Context.register_compliance_sources(targets)` | An explicit mapping of registered product UUIDs to `providers.tools.compliance_sources.DocsTarget`; invalid targets/products fail before transport. Omitting the map retains ADR reads but declares no official-document targets. The pinned configuration contract has no `compliance:` YAML section. |
-| `ComplianceService.render_assessment(document)` | Markdown for a draft or recorded compliance assessment, preserving coverage, verdicts, evidence and skipped-framework reasons. Its pure report builder is `rendering.compliance.assessment_report`. |
-| `ExposureService.export_impacts(identifier)` | Typed retained advisory/alias evidence, independent by commit, ecosystem, package and version; no feed refresh. |
-| `VerificationService.sweep(repository_ids, include_branches=)` | A read-only worklist from observed default heads, optionally including branches, never tags. `sweep_markdown` delegates to `rendering.verification.verification_sweep`. |
-| `ReportingService.validate_reports(path, signing_pubkey=)` | Historical layer schemas are checked as layers, not audit reports. An explicit key adds Merkle/signature verification through `LedgerService.verify_document`, with typed failures and no payload rewriting. |
-| `ViewFilter.executive_panels`, `compare_as_of`, `first_party_divisor` | Executive panels compose domain reads. LoC selects historical heads and measurements; comparisons exclude coverage changes, and estimates require an explicit positive divisor. Historical PQC remains explicitly unavailable rather than using current data. |
-| `ViewName.CONTAINER_FINDINGS` with `ViewFilter.artifact_id` | A registered single-item view anchored to an attached container report. Image-family findings accumulate; absence from a later report never resolves them. Untrusted image names and finding descriptions render as literal Markdown text, including inside report bodies. |
-| `PqcService.scan_states(filter)` | Read scan basis/freshness for registered commits, including unscanned ones, without executing a scanner. |
-| `AssessmentService.record_scan(..., include_suppressed=True)` | Explicit SARIF suppression opt-in; retained claims still receive no suppression verdict. Replay preserves assessment/finding identity. |
-| `models.redaction.SecretDetector` | The single secret-pattern owner, shared with publication's `RedactionPolicy` and evidence-rule consumers. |
-
-Structured Markdown values escape active HTML and formatting; view-authored body prose remains
-Markdown. Historical layer verification proves the supplied document's signed bytes, not a new
-binding between legacy signatures and operational database rows.
+- `AssessmentService.latest(..., as_of=)` selects the latest measurement at or before an
+  inclusive cutoff using the existing assessment index. `PortfolioService.default_ref(s)`
+  and `CodeFactsService.collect` / `language_stats` accept the same historical cutoff.
+- `ViewName.LOC` selects both the observed default head and its measurement at `ViewFilter.as_of`.
+  `compare_as_of` must precede that time; changes count only repositories measured at both
+  points, not newly measured coverage. Unknown measurements remain null. An explicit positive
+  `first_party_divisor` produces a labelled estimate, not a measurement.
+- Executive language grouping respects the requested historical cutoff. Historical PQC
+  remains explicitly unavailable; no current readiness is substituted.
+- Verification recording selects the original audit on the verified named branch when
+  several lines share its SHA. An ambiguous branch must be identified; exact replay keeps
+  the original baseline.
+- Container image provenance is escaped as literal text inside authored report bodies.
+  Stored provenance is unchanged, and container selection retains the existing
+  `assessment_id` / `report_stem` contract.
+- Triage rendering loads its report-only view on demand to avoid the findings/insight
+  initialization cycle.
+- `services.artifacts` resolves every named document through the shared artifact catalog,
+  including PQC facts published by the native prescan. Role aliases retain their common
+  schema type; integrity checks and domain-scoped publication permissions remain unchanged.
 
 
 ## Repository checkouts
@@ -443,6 +448,53 @@ flowchart LR
 | Add a named artifact | one line in `models/artifacts.py`: `class XArtifact(ArtifactDocument, name=…, schema=…, kind=…)` |
 | See an artifact's fields | `TriageArtifact.describe()` (field tree with types, required/optional); `TriageArtifact.schema_path()` |
 
+### PQC source scanner
+
+`providers.pqc.PqcScanTool` runs the configured `pqc-scan` binary over a supplied checkout.
+Register it with `Context.register_pqc_scanner(binary, rules, adapter_version=..., scan_commit=...)`;
+the binary and merged rules pack remain caller-owned inputs, not files vendored into core.
+The deployment's `ProcessRunner` must allow `pqc-scan`; its timeout and environment policy apply.
+
+**Placement exception:** consumer-adoption plan 15, decision 4 / row 52 explicitly approves
+this provider in core, with engine orchestration. This overrides the consuming-package-only
+security-tool rule in the [legacy provider recipe, item 8](.agents/skills/traust-core-patterns/provider.md)
+(Qodo checklist 6208), as recorded in PR #373. Rule-pack content and readiness policy retain
+their existing owners; this is not a second engine scanner.
+
+The provider checks the binary's adjacent `.sha256` record, stamps the binary/rules, parses
+required coverage and raw findings, and retains CBOM bytes. Missing/malformed output and nonzero
+exits fail rather than becoming clean scans. Changed binary/rules during a run invalidate its result.
+These are raw facts, not readiness verdicts.
+
+Scanner hits require a nonempty checkout-relative source file and a positive integer line when
+one is supplied. Readiness also requires an executable, checksum-valid binary.
+
+| Scanner output | Default budget |
+|---|---|
+| Report JSON | 16 MiB |
+| Optional CBOM | 16 MiB |
+| Findings | 50,000 |
+| Combined process stdout/stderr | 1 MiB |
+
+Outputs exceeding a budget fail explicitly, not as clean scans. Capped process capture is
+file-backed and monitored while running, with bounded reads into memory; temporary disk usage
+can overshoot between checks. `PqcScanError.result` retains bounded internal diagnostics, but
+its public message and ordinary process logs do not include raw scanner output.
+
+Rule discovery recursively includes regular `.yml` and `.yaml` files, excluding file symlinks.
+Counts accept the scanner's YAML mapping or sequence forms through Context's shared decoder.
+The fingerprint binds sorted relative paths and file-content hashes. This replaces the old
+root-only stamp format: previously cached stamps refresh once; historical records are not rewritten.
+
+`PqcService.prescan` remains the owner of post-processing, recorded facts and same-pack reuse;
+its crypto census requires an ingested manifest SBOM. Engine schedules work but does not own a
+second scanner implementation.
+`PqcService.scan_states` compares source facts against adapter version, rules digest, scanner
+commit and binary digest. Scanner replacement or rule changes invalidate source currency.
+SBOM-only currency depends on the adapter/mapping pack, not scanner-only metadata.
+Zero-file or unmeasured source coverage cannot assert a verified zero-hit or automatically
+produce not-applicable readiness, regardless of rule count; recorded facts remain available.
+
 ### PQC effort writes
 
 `PqcService.check` and new `record` admissions select the installed
@@ -667,7 +719,10 @@ Provenance lead dates and elapsed SLA durations use UTC instants, including acro
 non-UTC database sessions and daylight-saving transitions. Stored timestamps and
 the existing `RatingPolicy.sla_due` deadline policy are unchanged.
 
-`services.insight.SarifExport.document(views, repository_url)` projects these views to SARIF.
+`services.insight.SarifExport.document(views, repository_url)` projects these views to SARIF;
+the registered `sarif` Insight view (`insight.build(ViewName.SARIF, ViewFilter(repository_id=…,
+as_of=…, categories=…))`, `GET /v1/insights/sarif?repository_id=…`) applies it to one
+repository's baseline and refuses a product or team scope.
 Unknown severity uses level `none`, a null `traust/severity` and no `security-severity`;
 it is never turned into an informational rating. False positives and accepted risks are
 suppressions, and resolved findings are `absent`.

@@ -86,7 +86,6 @@ from traust_core.v1.models.remediation import (
     RepositoryCandidates,
     ScanFact,
     SweepEntry,
-    SweepHeadSource,
     Verification,
     VerificationFilter,
     VerificationInput,
@@ -124,8 +123,7 @@ from traust_core.v1.providers.checkout import NumstatRow
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.comments import JIRA
 from traust_core.v1.providers.fleet_fix import FleetFixApplier, GoldenRunner
-from traust_core.v1.rendering.markdown import MarkdownRenderer
-from traust_core.v1.rendering.verification import verification_sweep
+from traust_core.v1.rendering.markdown import MarkdownRenderer, Report, Section, Table
 from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.services.artifact_publishing import ArtifactPublisher, AssessmentLog
 from traust_core.v1.services.assessment import AssessmentService
@@ -1277,23 +1275,82 @@ class VerificationService:
                     ):
                         branches[ref.name] = ref
                         observed.add(ref.name)
+                completed = (
+                    {v.verification_id for v in self._verifications(repository_id)}
+                    if branches
+                    else set()
+                )
                 entries.extend(
                     self._sweep_entry(
-                        repository_id, ref, refs, branch=True, observed=ref.name in observed
+                        repository_id,
+                        ref,
+                        refs,
+                        completed,
+                        branch=True,
+                        observed=ref.name in observed,
                     )
                     for _, ref in sorted(branches.items())
                 )
         return VerifySweep.of(entries)
 
     def sweep_markdown(self, sweep: VerifySweep) -> str:
-        """Render the classified worklist without changing verification or remediation state."""
+        """Human-readable companion of the same classified sweep, not a second state store."""
         entries = (*sweep.queued, *sweep.skipped)
         repositories = {
             r.id: r.url
             for r in self._inventory.list_repositories({e.repository_id for e in entries})
-            if r.id is not None
         }
-        report = verification_sweep(sweep, repositories, self._clock.now())
+        tiers = Counter(str(e.tier) for e in sweep.queued)
+        report = Report(
+            title="Remediation verification worklist",
+            generated_at=self._clock.now(),
+            sections=(
+                Section(
+                    heading="Summary",
+                    body=f"{len(sweep.queued)} queued; {len(sweep.skipped)} skipped. "
+                    "Routing is not verification evidence; no work-item status is changed.",
+                    table=Table(
+                        columns=("Tier", "Targets"),
+                        rows=tuple((tier, str(tiers[tier])) for tier in ("T1", "T2", "T3", "T4")),
+                    ),
+                ),
+                Section(
+                    heading="Targets",
+                    table=Table(
+                        columns=(
+                            "Tier / skip",
+                            "Repository",
+                            "Ref",
+                            "Head source",
+                            "Pinned SHA",
+                            "Head SHA",
+                            "Open",
+                            "Critical",
+                            "High",
+                            "Claims",
+                            "Archived",
+                        ),
+                        rows=tuple(
+                            (
+                                str(e.tier or e.skip),
+                                repositories[e.repository_id],
+                                e.ref_name or "(default)",
+                                e.head_source,
+                                e.pinned_sha or "unknown",
+                                e.head_sha or "unobserved",
+                                str(e.open_findings),
+                                str(e.criticals),
+                                str(e.highs),
+                                str(e.claims),
+                                "unknown" if e.archived is None else str(e.archived).lower(),
+                            )
+                            for e in entries
+                        ),
+                    ),
+                ),
+            ),
+            sources=("Registered inventory, completed assessments and finding decisions",),
+        )
         return MarkdownRenderer().render(report).decode()
 
     def _sweep_entry(
@@ -1301,18 +1358,20 @@ class VerificationService:
         repository_id: UUID,
         head: RepositoryRef | None,
         refs: Sequence[RepositoryRef],
+        verified_ids: Collection[UUID] | None = None,
         *,
         branch: bool = False,
         observed: bool = False,
     ) -> SweepEntry:
-        assert head is None or head.id is not None
+        """A default entry weighs every line's evidence and every verification run that stated
+        a verdict; a branch entry only its own line's, and only `verified_ids`."""
         with self._uow:
             repository = self._inventory.get_repository(repository_id)
             shas = {r.id: r.sha for r in refs}
-            line = ref_line(head, refs) if branch and head else default_line(refs)
+            line = ref_line(head, refs) if branch and head else None
             views = self._findings.on_ref(head.id) if branch and head else None
             findings = (
-                {v.finding.id for v in views if v.finding.id is not None}
+                {v.finding.id for v in views}
                 if views is not None
                 else self._findings.records.ids_for_repository(repository_id)
             )
@@ -1335,11 +1394,13 @@ class VerificationService:
             return not line or baseline.repository_ref_id in line
 
         kinds = {a.id: a.kind for a in judged}
-        verified_ids = {v.verification_id for v in self._verifications(repository_id)}
+        if verified_ids is None:
+            stated = {d.assessment_id for d in decided}
+            verified_ids = {a.id for a in judged if a.kind == VERIFICATION and a.id in stated}
         verified = [a for a in judged if a.id in verified_ids and on_line(a)]
         pinned = max(
             (a for a in judged if (a.id in reported or a.id in verified_ids) and on_line(a)),
-            key=lambda a: (a.occurred_at, str(a.id)),
+            key=lambda a: a.occurred_at,
             default=None,
         )
         latest: dict[UUID, Decision] = {}
@@ -1353,11 +1414,9 @@ class VerificationService:
             repository_id=repository_id,
             repository_ref_id=None if head is None else head.id,
             ref_name=None if head is None else head.name,
-            head_source=(
-                SweepHeadSource.OBSERVED_BRANCH if observed else SweepHeadSource.REGISTERED_BRANCH
-            )
+            head_source=("observed_branch" if observed else "registered_branch")
             if branch
-            else SweepHeadSource.OBSERVED_DEFAULT,
+            else "observed_default",
             head_sha=None if head is None else head.sha,
             pinned_sha=None if pinned is None else shas[pinned.repository_ref_id],
             verified_at_head=head is not None

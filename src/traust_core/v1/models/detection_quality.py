@@ -6,10 +6,18 @@ from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime
 from enum import StrEnum
 from pathlib import PurePosixPath
-from typing import NewType, get_args
+from typing import Any, NewType, Self, get_args
 from uuid import UUID
 
-from pydantic import AliasChoices, BaseModel, Field, JsonValue, computed_field
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    Field,
+    JsonValue,
+    ModelWrapValidatorHandler,
+    computed_field,
+    model_validator,
+)
 from pydantic import ValidationError as PydanticValidationError
 
 from traust_core.v1.errors import ValidationError
@@ -684,6 +692,18 @@ class CheckPrecision(Model):
     def flagged(self) -> bool:
         """At or under the gate: a candidate for demotion to evidence_review (a reviewed change)."""
         return self.precision is not None and self.precision <= self.gate
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def _derived_match(cls, data: Any, handler: ModelWrapValidatorHandler[Self]) -> Self:
+        """A serialized precision round-trips: its derived keys are re-derived and must agree."""
+        if not isinstance(data, Mapping):
+            return handler(data)
+        derived = ("precision", "flagged")
+        made = handler({k: v for k, v in data.items() if k not in derived})
+        if stated := {k: data[k] for k in derived if k in data and data[k] != getattr(made, k)}:
+            raise ValueError(f"check {made.check_id}: {sorted(stated)} disagree with its counts")
+        return made
 
 
 class ComplianceCalibration(Model):

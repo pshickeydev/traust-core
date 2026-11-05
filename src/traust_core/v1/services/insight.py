@@ -45,7 +45,6 @@ from traust_core.v1.models.dependencies import (
     package_name,
 )
 from traust_core.v1.models.findings import (
-    FindingCandidate,
     FindingClock,
     FindingDimension,
     FindingFilter,
@@ -122,6 +121,7 @@ from traust_core.v1.models.insight import (
     RepositoryRollup,
     ReviewCard,
     ReviewCards,
+    SarifLog,
     Scoreboard,
     SeverityCounts,
     SlaCounts,
@@ -229,16 +229,16 @@ class InsightService:
         self._sla_policies = sla_policies
 
     def build(self, view: ViewName, filter: ViewFilter) -> ViewModel:
-        return self._view(view, filter).build(filter)
+        return self._view(view).build(filter)
 
     def report(self, view: ViewName, filter: ViewFilter) -> Report:
         """The view as a report for a person (markdown, html)."""
-        found = self._view(view, filter)
+        found = self._view(view)
         return found.report(found.build(filter), filter.as_of or self._clock.now())
 
     def publish(self, view: ViewName, filter: ViewFilter) -> RenderedView:
         """The view's model and its markdown and html renders; core writes no files."""
-        found = self._view(view, filter)
+        found = self._view(view)
         model = found.build(filter)
         report = found.report(model, filter.as_of or self._clock.now())
         export = getattr(found, "export", None)
@@ -293,13 +293,7 @@ class InsightService:
                 failed[name] = f"{type(e).__name__}: {e}"
         return RefreshResult(rendered=rendered, failed=failed)
 
-    def _view(self, name: ViewName, filter: ViewFilter | None = None) -> View:
-        if (
-            name != ViewName.LOC
-            and filter is not None
-            and (filter.compare_as_of is not None or filter.first_party_divisor is not None)
-        ):
-            raise ValidationError("compare_as_of and first_party_divisor require the loc view")
+    def _view(self, name: ViewName) -> View:
         try:
             return self._views[name]
         except KeyError:
@@ -321,30 +315,29 @@ class ContainerFindingsView:
         portfolio: PortfolioService,
         assessment: AssessmentService,
         rating: RatingPolicy,
-        publisher: ArtifactPublisher,
     ) -> None:
         self._findings = findings
         self._portfolio = portfolio
         self._assessment = assessment
         self._rating = rating
-        self._publisher = publisher
 
     def build(self, filter: ViewFilter) -> ContainerFindings:
-        if filter.artifact_id is None:
-            raise ValidationError("container-findings requires a container report artifact_id")
-        artifact = self._publisher.metadata(filter.artifact_id)
-        if artifact.kind != ReportArtifact.schema:
-            raise ValidationError("container-findings requires a report artifact")
-        if artifact.assessment_id is None:
-            raise ValidationError("container-findings requires an assessment-attached report")
-        anchor = self._assessment.get(artifact.assessment_id)
+        stem = filter.report_stem
+        if not stem or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*-container-audit", stem):
+            raise ValidationError(
+                "container-findings requires report_stem '<image>-container-audit'"
+            )
+        if filter.assessment_id is None:
+            raise ValidationError("container-findings requires a container assessment_id")
+        anchor = self._assessment.get(filter.assessment_id)
         if anchor.kind != AssessmentKind.CONTAINER:
             raise ValidationError(f"assessment {anchor.id} is not a container assessment")
         if filter.as_of is not None and anchor.occurred_at > filter.as_of:
             raise ValidationError("container assessment is later than as_of")
-        doc = self._publisher.read(filter.artifact_id, ReportArtifact)
+        doc = self._assessment.report(filter.assessment_id)
+        if doc is None:
+            raise NotFoundError(f"container assessment {anchor.id} has no report")
         image_repository = _image_repository(doc.metadata.repository)
-        stem = _stem(image_repository.rsplit("/", 1)[-1]) + "-container-audit"
         ref = self._portfolio.inventory.get_ref(anchor.repository_ref_id)
         repository = self._portfolio.get_repository(ref.repository_id)
         _, _, allowed = _scope(self._portfolio, filter)
@@ -352,7 +345,6 @@ class ContainerFindingsView:
             raise ValidationError("container assessment is outside the requested scope")
         reports = []
         occurrences: dict[UUID, list[Occurrence]] = defaultdict(list)
-        descriptions: dict[UUID, dict[UUID, str]] = {}
         for run in self._assessment.list_for_repository(
             ref.repository_id, AssessmentKind.CONTAINER
         ):
@@ -373,12 +365,6 @@ class ContainerFindingsView:
                     title=report.title,
                 )
             )
-            descriptions[run.id] = {
-                finding_id: candidate.description
-                for candidate in FindingCandidate.of_report(report.findings, ref.repository_id)
-                if (finding_id := self._findings.intake.match(ref.repository_id, candidate))
-                is not None
-            }
             for occurrence in self._findings.occurrences(assessment_id=run.id):
                 occurrences[occurrence.finding_id].append(occurrence)
         views = self._findings.all(
@@ -408,7 +394,6 @@ class ContainerFindingsView:
             rows.append(
                 ContainerFinding(
                     view=selected,
-                    description=descriptions[latest.assessment_id].get(finding_id, ""),
                     occurrences=tuple(held),
                     history=tuple(
                         d for d in history if filter.as_of is None or d.occurred_at <= filter.as_of
@@ -417,7 +402,6 @@ class ContainerFindingsView:
             )
         return ContainerFindings(
             as_of=filter.as_of,
-            artifact_id=filter.artifact_id,
             repository_id=ref.repository_id,
             repository_url=repository.url,
             report_stem=stem,
@@ -468,7 +452,6 @@ class ContainerFindingsView:
                 *(
                     Section(
                         heading=f"Finding {row.view.finding.id}: {inline(row.view.finding.title)}",
-                        body=markdown_text(row.description),
                         table=Table(
                             columns=("decision", "time", "validity", "resolution", "rationale"),
                             rows=tuple(
@@ -1486,6 +1469,8 @@ class LocView:
         code = sum(r.code for r in measured if r.code is not None)
         return LocDashboard(
             as_of=at,
+            comparison=comparison,
+            code=code,
             first_party_divisor=filter.first_party_divisor,
             first_party_estimate=(
                 Decimal(code) / filter.first_party_divisor
@@ -1493,8 +1478,6 @@ class LocView:
                 and any(not r.unmeasured for r in measured)
                 else None
             ),
-            comparison=comparison,
-            code=code,
             total=sum(r.total for r in measured if r.total is not None),
             reported=sum(map(_reported, tallies)),
             dispositioned=sum(bool(t.decided) for t in tallies),
@@ -3239,7 +3222,6 @@ class ExecutiveSummaryView:
         pqc: PqcPortfolioView | None = None,
         threats: ThreatRegisterView | None = None,
         census: CensusView | None = None,
-        clock: Clock | None = None,
     ) -> None:
         self._findings = findings
         self._portfolio = portfolio
@@ -3250,11 +3232,8 @@ class ExecutiveSummaryView:
         self._pqc = pqc
         self._threats = threats
         self._census = census
-        self._clock = clock or SystemClock()
 
     def build(self, filter: ViewFilter) -> ExecutiveSummary:
-        requested = filter
-        filter = filter.model_copy(update={"as_of": filter.as_of or self._clock.now()})
         products, shipped, repositories, views = _scoped_findings(
             self._findings, self._portfolio, filter
         )
@@ -3277,8 +3256,8 @@ class ExecutiveSummaryView:
         if ExecutivePanel.PQC in panels:
             if self._pqc is None:
                 raise ConfigError("executive PQC panel has no portfolio view wired")
-            if requested.as_of is None:
-                pqc = self._pqc.build(requested)
+            if filter.as_of is None:
+                pqc = self._pqc.build(filter)
             else:
                 pqc_unavailable = (
                     "Historical PQC readiness is unavailable; the PQC portfolio reads current "
@@ -5197,6 +5176,11 @@ def _category(view: FindingView) -> str:
     return view.label("category") or "uncategorized"
 
 
+def _categories(view: FindingView) -> set[str]:
+    """Every category label, or the `uncategorized` rule SARIF files an unlabelled finding under."""
+    return {fl.label for fl in view.labels if fl.taxonomy == CATEGORY} or {_category(view)}
+
+
 def _sarif_location(loc: Location) -> dict[str, Any]:
     if _PSEUDO_PATH.match(loc.path):
         return {"logicalLocations": [{"fullyQualifiedName": loc.path}]}
@@ -5249,6 +5233,48 @@ def _sarif_result(view: FindingView, rule_index: int) -> dict[str, Any]:
     if disposition is not None and disposition.resolution == "resolved":
         result["baselineState"] = "absent"
     return result
+
+
+class SarifView:
+    """One repository's findings as they stood at `as_of`, as SARIF (findings sarif)."""
+
+    name = ViewName.SARIF
+    per_item = True
+
+    def __init__(self, findings: FindingService, portfolio: PortfolioService, clock: Clock) -> None:
+        self._findings = findings
+        self._portfolio = portfolio
+        self._clock = clock
+
+    def build(self, filter: ViewFilter) -> SarifLog:
+        if filter.repository_id is None:
+            raise ValidationError("the sarif view exports one repository: name its repository_id")
+        if filter.product_ids or filter.team_ids:
+            raise ValidationError("the sarif view is one repository: it takes no product or team")
+        repository = self._portfolio.get_repository(filter.repository_id)
+        views = self._findings.baseline(filter.repository_id, filter.as_of or self._clock.now())
+        if filter.categories:
+            views = [v for v in views if _categories(v) & set(filter.categories)]
+        return SarifLog.model_validate(SarifExport().document(views, repository.url))
+
+    def report(self, model: SarifLog, generated_at: datetime) -> Report:
+        (run,) = model.runs
+        rows = [
+            (
+                r["ruleId"],
+                r["level"],
+                r["properties"]["traust/validity"],
+                "; ".join(s["justification"] for s in r.get("suppressions", ())),
+                r["message"]["text"],
+            )
+            for r in run["results"]
+        ]
+        columns = ("rule", "level", "validity", "suppressed", "title")
+        return Report(
+            title=f"SARIF: {run['properties']['traust/repository']}",
+            generated_at=generated_at,
+            sections=(_table_section("Results", columns, rows, "_No findings._"),),
+        )
 
 
 class OscalExport:

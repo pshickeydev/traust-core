@@ -108,6 +108,91 @@ def test_the_same_output_again_adds_nothing(context: Context, engine: Engine) ->
     assert again.id == first.id and intake.created == ()
 
 
+def test_suppressed_review_uses_same_scan_without_manufacturing_verdicts(
+    context: Context, engine: Engine
+) -> None:
+    service = context.services().assessment
+    ref, raw, prov = a_ref(engine), (SCANNERS / "codeql.sarif").read_bytes(), provenance()
+    assessment, first = service.record_scan(ref, raw, CandidateFormat.SARIF, prov)
+    reviewed, included = service.record_scan(
+        ref, raw, CandidateFormat.SARIF, prov, include_suppressed=True
+    )
+    assert reviewed.id == assessment.id
+    assert set(first.findings.values()) < set(included.findings.values())
+    assert len(included.created) == 1
+    prepared = context.services().findings.decisions.prepare(reviewed.id)
+    assert {item.locations[0].path for item in prepared.items} == {
+        "pkg/api/handler.go",
+        "pkg/api/other.go",
+    }
+    for finding_id in included.findings.values():
+        assert context.services().findings.history(finding_id) == []
+    replayed, replay = service.record_scan(
+        ref, raw, CandidateFormat.SARIF, prov, include_suppressed=True
+    )
+    assert replayed.id == assessment.id and replay.created == ()
+    assert replay.findings == included.findings
+
+
+def test_an_included_suppressed_result_is_queued_for_review_not_left_plain_open(
+    context: Context, engine: Engine
+) -> None:
+    services = context.services()
+    doc = json.loads((SCANNERS / "codeql.sarif").read_bytes())
+    doc["runs"][0]["results"][1]["suppressions"] = [
+        {"kind": "inSource", "status": "accepted", "justification": "Sanitised upstream"}
+    ]
+    ref, raw = a_ref(engine), json.dumps(doc).encode()
+    _, plain = services.assessment.record_scan(ref, raw, CandidateFormat.SARIF, provenance())
+    _, included = services.assessment.record_scan(
+        ref, raw, CandidateFormat.SARIF, provenance(), include_suppressed=True
+    )
+    [suppressed] = set(included.findings.values()) - set(plain.findings.values())
+    [queued] = services.findings.review.for_finding(suppressed)
+    assert (queued.reason, queued.status) == ("manual_queue", "pending")
+    for finding_id in plain.findings.values():
+        assert services.findings.review.for_finding(finding_id) == []
+    assert services.findings.history(suppressed) == []
+
+
+def test_a_closed_suppression_review_is_never_reopened_by_a_rescan(
+    context: Context, engine: Engine
+) -> None:
+    services = context.services()
+    ref, raw = a_ref(engine), (SCANNERS / "codeql.sarif").read_bytes()
+    first = provenance()
+    _, plain = services.assessment.record_scan(ref, raw, CandidateFormat.SARIF, first)
+    _, included = services.assessment.record_scan(
+        ref, raw, CandidateFormat.SARIF, first, include_suppressed=True
+    )
+    [suppressed] = set(included.findings.values()) - set(plain.findings.values())
+    [queued] = services.findings.review.for_finding(suppressed)
+    assert queued.id is not None
+    services.findings.review.close_unreviewed(queued.id)
+    later = Provenance(
+        run_id=uuid4(), source=SourceType.VULN_SCAN_REPORT, occurred_at=WHEN + timedelta(days=1)
+    )
+    for again in (first, later, later):
+        services.assessment.record_scan(
+            ref, raw, CandidateFormat.SARIF, again, include_suppressed=True
+        )
+    [item] = services.findings.review.for_finding(suppressed)
+    assert (item.id, item.status) == (queued.id, "closed_unreviewed")
+
+
+def test_an_under_review_suppression_is_an_ordinary_result_and_queues_nothing(
+    context: Context, engine: Engine
+) -> None:
+    services = context.services()
+    doc = json.loads((SCANNERS / "codeql.sarif").read_bytes())
+    doc["runs"][0]["results"][1]["suppressions"] = [{"kind": "external", "status": "underReview"}]
+    ref, raw = a_ref(engine), json.dumps(doc).encode()
+    _, plain = services.assessment.record_scan(ref, raw, CandidateFormat.SARIF, provenance())
+    assert len(set(plain.findings.values())) == 2
+    for finding_id in plain.findings.values():
+        assert services.findings.review.for_finding(finding_id) == []
+
+
 def test_record_scan_needs_intake(engine: Engine) -> None:
     with pytest.raises(ConfigError, match="needs finding intake"):
         AssessmentService(SqlTraustUnitOfWork(engine)).record_scan(

@@ -135,6 +135,29 @@ def test_reader_returns_the_named_artifact(tmp_path: Path) -> None:
     assert triage.findings[0].title == "SQL injection in handler"
 
 
+def test_context_artifact_reads_preserve_kind_and_stored_digest_checks(tmp_path: Path) -> None:
+    ctx = Context(Config(home=tmp_path))
+    published = ctx.artifact_publisher(default_specs()).publish("triage", triage_with(FINDING))
+    reader = ctx.services().artifacts
+    assert reader.read(published.artifact_id, TriageArtifact).findings[0].title == FINDING["title"]
+    with pytest.raises(IntegrityError):
+        reader.read(published.artifact_id, ReportArtifact)
+    ctx.object_store.put(ObjectKey.parse(published.written[0]), triage_with())
+    with pytest.raises(IntegrityError):
+        reader.get(published.artifact_id)
+
+
+def test_context_artifact_reads_do_not_enable_domain_publication(tmp_path: Path) -> None:
+    reader = Context(Config(home=tmp_path)).services().artifacts
+    document = TriageArtifact.parse(triage_with(FINDING))
+    with pytest.raises(ConfigError):
+        reader.publish(document.name, document.payload)
+    with pytest.raises(ConfigError):
+        reader.publish_artifact(document)
+    with pytest.raises(ConfigError):
+        reader.publish_successor(document, None)
+
+
 def test_record_failure_raises_without_claiming_success(
     setup: Publishing, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -272,10 +295,8 @@ def test_unknown_schema_is_explicit(setup: Publishing) -> None:
     with setup.uow as unit:
         row = Seed(unit).artifact(kind="unknown", uri="unknown.json")
         unit.commit()
-    with pytest.raises(ConfigError, match="expected one registered type, got 0"):
+    with pytest.raises(ConfigError):
         setup.service.get(row.id)
-    specs = PublishSpecs(PublishSpec(SecurityAuditArtifact), PublishSpec(FindingsCurrentArtifact))
-    assert specs.artifact_type("report") is ReportArtifact
 
 
 def test_report_aliases_share_one_readable_contract_type(setup: Publishing) -> None:

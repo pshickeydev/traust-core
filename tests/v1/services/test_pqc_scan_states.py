@@ -1,80 +1,101 @@
+"""PqcService.scan_states on SQLite and Postgres: each in-scope commit's newest facts scan."""
+
 from __future__ import annotations
 
-from sqlalchemy.engine import Engine
+from uuid import uuid4
 
-from tests.v1.repositories.tables.conftest import Seed
-from tests.v1.services.test_pqc import CHECKOUT, URL, FakeScanner, World
-from tests.v1.services.test_pqc import engine as engine
-from traust_core.v1.models.pqc import PqcFilter
-from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
-from traust_core.v1.services.pqc import PqcService
+import pytest
 
+from tests.v1.services.test_pqc import CHECKOUT, STAMPS, World, engine, world
+from traust_core.v1.errors import NotFoundError
+from traust_core.v1.models.pqc import PqcFilter, PqcScanState
 
-def test_scan_states_include_unscanned_registered_commits_without_running_a_scanner(
-    engine: Engine,
-) -> None:
-    scanner = FakeScanner()
-    world = World(engine, scanner)
-    scanned = world.ref()
-    missing = world.ref(url=f"{URL}-missing", sbom=None)
-    saved = world.pqc.prescan(scanned, CHECKOUT)
-    states = {row.repository_ref_id: row for row in world.pqc.scan_states(PqcFilter())}
-    assert set(states) == {scanned, missing}
-    assert states[scanned].assessment_id == saved.assessment_id
-    assert (states[scanned].basis, states[scanned].current) == ("source", True)
-    assert (states[missing].assessment_id, states[missing].basis, states[missing].current) == (
-        None,
-        None,
-        None,
-    )
-    assert scanner.scans == 1
-    assert world.pqc.list_readiness(PqcFilter()) == []
-    assert world.pqc.scan_states(PqcFilter(repository_ref_ids=())) == []
+__all__ = ["engine", "world"]
 
 
-def test_scan_states_distinguish_stale_pack_from_unmeasured_freshness(engine: Engine) -> None:
-    scanner = FakeScanner()
-    world = World(engine, scanner)
+def test_an_unscanned_commit_has_a_state_without_a_scan(world: World) -> None:
     ref = world.ref()
-    saved = world.pqc.prescan(ref, None)
-    [current] = world.pqc.scan_states(PqcFilter(repository_ref_ids=(ref,)))
+    assert world.pqc.scan_states(PqcFilter(repository_ref_ids=(ref,))) == [
+        PqcScanState(repository_ref_id=ref)
+    ]
+
+
+@pytest.mark.parametrize(
+    ("field", "before", "after"),
+    [
+        ("rules_sha256", STAMPS.rules_sha256, "cd" * 32),
+        ("pqc_scan_commit", STAMPS.pqc_scan_commit, "new-commit"),
+        ("binary_sha256", "11" * 32, "22" * 32),
+        ("binary_sha256", None, "22" * 32),
+    ],
+)
+def test_a_source_scan_is_current_until_its_scanner_identity_changes(
+    world: World, field: str, before: str | None, after: str
+) -> None:
+    assert world.scanner is not None
+    world.scanner.pack = world.scanner.scanned_with = STAMPS.model_copy(update={field: before})
+    ref = world.ref()
+    done = world.pqc.prescan(ref, CHECKOUT)
+    (state,) = world.pqc.scan_states(PqcFilter(repository_ref_ids=(ref,)))
+    assert (state.assessment_id, state.basis, state.current) == (done.assessment_id, "source", True)
+    world.scanner.pack = world.scanner.pack.model_copy(update={field: after})
+    (stale,) = world.pqc.scan_states(PqcFilter(repository_ref_ids=(ref,)))
+    assert (stale.assessment_id, stale.current) == (done.assessment_id, False)
+    world.scanner.scanned_with = world.scanner.pack
+    refreshed = world.pqc.prescan(ref, CHECKOUT)
+    (current,) = world.pqc.scan_states(PqcFilter(repository_ref_ids=(ref,)))
+    assert refreshed.assessment_id != done.assessment_id
     assert (current.assessment_id, current.basis, current.current) == (
-        saved.assessment_id,
+        refreshed.assessment_id,
+        "source",
+        True,
+    )
+
+
+@pytest.mark.parametrize("field", ["pqc_scan_commit", "binary_sha256"])
+def test_sbom_currency_ignores_scanner_metadata_but_not_its_mapping_pack(
+    world: World, field: str
+) -> None:
+    ref = world.ref()
+    done = world.pqc.prescan(ref, None)
+    assert world.scanner is not None
+    world.scanner.pack = STAMPS.model_copy(update={field: "cd" * 32})
+    (current,) = world.pqc.scan_states(PqcFilter(repository_ref_ids=(ref,)))
+    assert (current.assessment_id, current.basis, current.current) == (
+        done.assessment_id,
         "sbom-only",
         True,
     )
-    scanner.pack = scanner.pack.model_copy(update={"rules_sha256": "cd" * 32})
-    [stale] = world.pqc.scan_states(PqcFilter(repository_ref_ids=(ref,)))
-    assert stale.current is False
-    without_scanner = PqcService(
-        SqlTraustUnitOfWork(engine),
-        world.code_facts,
-        world.portfolio,
-        world.publisher,
-    )
-    [unmeasured] = without_scanner.scan_states(PqcFilter(repository_ref_ids=(ref,)))
-    assert (unmeasured.assessment_id, unmeasured.basis, unmeasured.current) == (
-        saved.assessment_id,
+    world.scanner.pack = world.scanner.pack.model_copy(update={"rules_sha256": "ef" * 32})
+    (stale,) = world.pqc.scan_states(PqcFilter(repository_ref_ids=(ref,)))
+    assert (stale.assessment_id, stale.basis, stale.current) == (
+        done.assessment_id,
         "sbom-only",
-        None,
+        False,
     )
-    assert scanner.scans == 0
 
 
-def test_scan_states_intersect_product_membership_and_requested_commits(engine: Engine) -> None:
-    world = World(engine, None)
-    included = world.ref()
-    excluded = world.ref(url=f"{URL}-other")
-    with SqlTraustUnitOfWork(engine) as uow:
-        seed = Seed(uow)
-        product = seed.product()
-        seed.component(seed.release(product), uow.repository_refs.get(included))
-        uow.commit()
-    assert product.id is not None
-    assert [
-        state.repository_ref_id for state in world.pqc.scan_states(PqcFilter(product_id=product.id))
-    ] == [included]
-    assert (
-        world.pqc.scan_states(PqcFilter(product_id=product.id, repository_ref_ids=(excluded,)))
-        == []
-    )
+def test_without_a_scanner_currency_is_unmeasured_not_false(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ref = world.ref()
+    world.pqc.prescan(ref, CHECKOUT)
+    monkeypatch.setattr(world.pqc, "_scanner", None)
+    (state,) = world.pqc.scan_states(PqcFilter(repository_ref_ids=(ref,)))
+    assert state.assessment_id is not None and state.current is None
+
+
+def test_a_fleet_filter_lists_every_registered_commit(world: World) -> None:
+    first = world.ref()
+    second = world.ref(url="https://github.com/acme/other")
+    world.pqc.prescan(first, CHECKOUT)
+    states = {s.repository_ref_id: s for s in world.pqc.scan_states(PqcFilter())}
+    assert set(states) == {first, second}
+    assert states[first].assessment_id is not None and states[second].assessment_id is None
+
+
+def test_an_empty_scope_has_no_states_and_an_unknown_product_is_not_found(world: World) -> None:
+    assert world.pqc.scan_states(PqcFilter(repository_ref_ids=())) == []
+    assert world.pqc.scan_states(PqcFilter()) == []
+    with pytest.raises(NotFoundError):
+        world.pqc.scan_states(PqcFilter(product_id=uuid4()))

@@ -15,6 +15,7 @@ from traust_core.v1.context.config import Locations
 from traust_core.v1.errors import ConfigError, DocumentError, ValidationError
 from traust_core.v1.models.artifacts import AdapterResultArtifact
 from traust_core.v1.models.common import ToolTarget
+from traust_core.v1.models.compliance import DocsTarget
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.config_matrix import YamlLoader
 from traust_core.v1.providers.forge_api import ForgeApi
@@ -32,7 +33,6 @@ from traust_core.v1.providers.tools.cloud_config import (
 )
 from traust_core.v1.providers.tools.compliance_sources import (
     CURL_TIMEOUT,
-    DocsTarget,
     GithubAdrSource,
     RedHatDocSource,
 )
@@ -288,7 +288,8 @@ def compliance_sources(
     clock: Clock,
     targets: Mapping[UUID, DocsTarget],
 ) -> tuple[GithubAdrSource, RedHatDocSource]:
-    """Build ADR and official-document readers for the mapped product targets."""
+    """ADR registers read over the forge's REST API and raw GitHub files; product docs fetched
+    with curl."""
     curl = ProcessRunner(["curl"], keep_env=keep_env, timeout_seconds=CURL_TIMEOUT)
     return GithubAdrSource(api, http, clock), RedHatDocSource(curl, clock, targets)
 

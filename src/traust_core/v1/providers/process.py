@@ -3,8 +3,10 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
+import tempfile
 import time
 from collections.abc import Iterable, Mapping, Sequence
+from contextlib import ExitStack, suppress
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -15,6 +17,7 @@ from traust_core.v1.providers.correlation import REQUEST_ID_ENV, current_correla
 _SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "fish", "csh", "tcsh", "env"})
 _DEFAULT_ENV = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR")
 _UPSTREAM_WAIT_SECONDS = 5
+_OUTPUT_POLL_SECONDS = 0.01
 log = logging.getLogger(__name__)
 
 
@@ -48,6 +51,15 @@ class ProcessError(ServiceError):
             f"{result.argv[0]} exited {result.returncode}: {tail}", operation="process.run"
         )
         self.result = result
+
+
+class ProcessOutputLimit(ServiceError):
+    """A run exceeding its combined stdout and stderr capture budget."""
+
+    def __init__(self, result: ProcessResult, max_output_bytes: int) -> None:
+        super().__init__("process output exceeded its capture limit", operation="process.run")
+        self.result = result
+        self.max_output_bytes = max_output_bytes
 
 
 class ProcessTimeout(ServiceError):
@@ -106,32 +118,117 @@ class ProcessRunner:
         stdin: bytes | None = None,
         check: bool = True,
         timeout_seconds: float | None = None,
+        max_output_bytes: int | None = None,
     ) -> ProcessResult:
+        """Run a command, optionally limiting combined captured stdout and stderr bytes."""
         args = self._validate(argv)
+        if max_output_bytes is not None and (
+            not isinstance(max_output_bytes, int)
+            or isinstance(max_output_bytes, bool)
+            or max_output_bytes <= 0
+        ):
+            raise ValidationError("max_output_bytes must be a positive integer")
         start = time.monotonic()
         try:
-            done = subprocess.run(
-                args,
-                cwd=cwd,
-                env=self._child_env(env),
-                input=stdin,
-                capture_output=True,
-                timeout=self._seconds(timeout_seconds),
-                check=False,
+            if max_output_bytes is None:
+                done = subprocess.run(
+                    args,
+                    cwd=cwd,
+                    env=self._child_env(env),
+                    input=stdin,
+                    capture_output=True,
+                    timeout=self._seconds(timeout_seconds),
+                    check=False,
+                )
+                result = ProcessResult(
+                    args, done.returncode, done.stdout, done.stderr, time.monotonic() - start
+                )
+            else:
+                result = self._run_bounded(
+                    args,
+                    cwd=cwd,
+                    env=env,
+                    stdin=stdin,
+                    seconds=self._seconds(timeout_seconds),
+                    max_output_bytes=max_output_bytes,
+                    start=start,
+                )
+        except ProcessOutputLimit as e:
+            _log_process(
+                "process.run", "output_limit", e.result.seconds * 1000, e.result.returncode
             )
+            raise
         except subprocess.TimeoutExpired as e:
             _log_process("process.run", "timeout", (time.monotonic() - start) * 1000)
             raise ProcessTimeout(args, e) from e
         except OSError as e:
             _log_process("process.run", "failed", (time.monotonic() - start) * 1000)
             raise ServiceError(f"{args[0]} failed to run: {e}", operation="process.run") from e
-        result = ProcessResult(
-            args, done.returncode, done.stdout, done.stderr, time.monotonic() - start
-        )
         _log_process("process.run", "completed", result.seconds * 1000, result.returncode)
         if check and result.returncode != 0:
             raise ProcessError(result)
         return result
+
+    def _run_bounded(
+        self,
+        args: tuple[str, ...],
+        *,
+        cwd: Path | None,
+        env: Mapping[str, str] | None,
+        stdin: bytes | None,
+        seconds: float,
+        max_output_bytes: int,
+        start: float,
+    ) -> ProcessResult:
+        with ExitStack() as resources:
+            stdout = resources.enter_context(tempfile.TemporaryFile())
+            stderr = resources.enter_context(tempfile.TemporaryFile())
+            source = None
+            if stdin is not None:
+                source = resources.enter_context(tempfile.TemporaryFile())
+                source.write(stdin)
+                source.seek(0)
+            with subprocess.Popen(
+                args,
+                cwd=cwd,
+                env=self._child_env(env),
+                stdin=source,
+                stdout=stdout,
+                stderr=stderr,
+            ) as process:
+                deadline = time.monotonic() + seconds
+                timed_out = False
+                try:
+                    while process.poll() is None:
+                        if (
+                            os.fstat(stdout.fileno()).st_size + os.fstat(stderr.fileno()).st_size
+                            > max_output_bytes
+                        ):
+                            break
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            timed_out = True
+                            break
+                        with suppress(subprocess.TimeoutExpired):
+                            process.wait(timeout=min(_OUTPUT_POLL_SECONDS, remaining))
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                    process.wait()
+                overflow = (
+                    os.fstat(stdout.fileno()).st_size + os.fstat(stderr.fileno()).st_size
+                    > max_output_bytes
+                )
+                stdout.seek(0)
+                stderr.seek(0)
+                out = stdout.read(max_output_bytes)
+                err = stderr.read(max_output_bytes - len(out))
+                result = ProcessResult(args, process.returncode, out, err, time.monotonic() - start)
+                if overflow:
+                    raise ProcessOutputLimit(result, max_output_bytes)
+                if timed_out:
+                    raise subprocess.TimeoutExpired(args, seconds, output=out, stderr=err)
+                return result
 
     def pipeline(
         self,

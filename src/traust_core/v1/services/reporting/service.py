@@ -80,7 +80,9 @@ class ReportingService:
         canonical_write: bool = False,
         signing_pubkey: Path | None = None,
     ) -> list[ReportValidation]:
-        """Check reports and, with a public key, historical layer integrity."""
+        """Every report file at `path` against its contract and content checks, under the named
+        schema's canonical-write contract if asked; with a public key, historical layer integrity.
+        """
         if canonical_write and schema is None:
             raise ValidationError("canonical-write validation requires an explicit schema")
         if canonical_write and "canonical_write" not in contracts.schema(schema).get("$defs", {}):
@@ -102,7 +104,7 @@ class ReportingService:
             result = validate_report(str(file), text, contract, context, strict=strict)
             if (
                 signing_pubkey is not None
-                and name == FindingsLayerArtifact.schema
+                and name.partition("#")[0] == FindingsLayerArtifact.schema
                 and result.passed
             ):
                 try:

@@ -12,10 +12,12 @@ from sqlalchemy.engine import Engine
 from tests.v1.services.test_exposure_impact import (
     AT,
     GHSA,
+    GRPC,
     Lookup,
     engine,
     refs,
     sbom,
+    service,
 )
 from tests.v1.services.test_exposure_reads import reads
 from traust_core.v1.errors import NotFoundError, ValidationError
@@ -25,6 +27,7 @@ from traust_core.v1.models.dependencies import (
     AdvisoryIdentifier,
     ImpactEvidence,
     ImpactExport,
+    Version,
 )
 from traust_core.v1.models.vocabulary import (
     ImpactClassification,
@@ -32,6 +35,7 @@ from traust_core.v1.models.vocabulary import (
     ImpactManifestScan,
     SourceType,
 )
+from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 
 __all__ = ["engine"]
 
@@ -153,38 +157,55 @@ def test_export_preserves_native_evidence_array_presence(
 def test_export_keeps_distinct_modules_and_versions_and_latest_evidence_for_each(
     engine: Engine,
 ) -> None:
-    exposure = reads(engine)
+    second = GRPC.affected[0].model_copy(update={"name": "example.org/transport"})
+    advisory = GRPC.model_copy(update={"affected": (*GRPC.affected, second)})
+    exposure = service(engine, advisory)
     [ref] = refs(engine, 1)
     assert ref.id is not None
-    exposure.ingest_sbom(sbom(("google.golang.org/grpc", "v1.56.2")), ref.id)
+    exposure.ingest_sbom(
+        sbom(
+            ("google.golang.org/grpc", "v1.56.2"),
+            ("google.golang.org/grpc", "v1.56.1"),
+            (second.name, "v1.56.2"),
+        ),
+        ref.id,
+    )
     known = exposure.find_advisory(GHSA)
     assert known is not None and known.advisory_id is not None
     prepared = exposure.prepare(known.advisory_id, ref.id)
+    packages = {p.name: p for p in advisory.affected}
+    with SqlTraustUnitOfWork(engine) as uow:
+        named = {
+            found.dependency.package_id: uow.packages.get(found.dependency.package_id).name
+            for found in prepared.dependencies
+        }
+    members = [
+        prepared.model_copy(
+            update={
+                "package": packages[named[found.dependency.package_id]],
+                "dependencies": (found,),
+            }
+        )
+        for found in prepared.dependencies
+        if found.vulnerable
+    ]
+    assert len(members) == 3
     originals = {}
-    documents = []
-    for module, version in (
-        ("google.golang.org/grpc", "v1.56.2"),
-        ("google.golang.org/grpc", "v1.56.1"),
-        ("example.org/transport", "v1.56.2"),
-    ):
-        native = json.loads(prepared.document("1.0.0").payload)
-        native["metadata"]["module"] = module
-        native["repos"][0]["version"] = version
-        document = ImpactAnalysisArtifact.from_document(native)
-        recorded = exposure.record(ref.id, document, source())
-        originals[(module, version)] = recorded.artifact_id
-        documents.append(native)
-    latest_native = documents[0]
-    latest_native["repos"][0]["evidence"]["notes"] = "Reviewed again"
-    latest = exposure.record(ref.id, ImpactAnalysisArtifact.from_document(latest_native), source(1))
-    originals[("google.golang.org/grpc", "v1.56.2")] = latest.artifact_id
+    for item in members:
+        doc = item.document("1.0.0")
+        recorded = exposure.record(ref.id, doc, source())
+        originals[(doc.metadata.module, doc.repos[0].version)] = recorded.artifact_id
+    updated = members[0].model_copy(update={"evidence": ImpactEvidence(notes="Reviewed again")})
+    latest_doc = updated.document("1.0.0")
+    latest = exposure.record(ref.id, latest_doc, source(1))
+    originals[(latest_doc.metadata.module, latest_doc.repos[0].version)] = latest.artifact_id
 
-    exported = exposure.export_impacts(known.advisory_id)
+    exported = exposure.export_impacts(GHSA)
     assert (exported.commits, exported.analyses) == (1, 3)
     assert {(row.module, row.version): row.artifact_id for row in exported.repos} == originals
-    assert {row.version for row in exported.repos} == {"v1.56.1", "v1.56.2"}
-    assert exported.repos[0].artifact_id == latest.artifact_id
-    assert exported.repos[0].evidence.notes == "Reviewed again"
+    assert {row.version for row in exported.repos} == {Version("v1.56.1"), Version("v1.56.2")}
+    retained = next(row for row in exported.repos if row.artifact_id == latest.artifact_id)
+    assert retained.evidence.notes == "Reviewed again"
 
 
 def test_export_distinguishes_unknown_advisory_from_known_without_analyses(engine: Engine) -> None:
@@ -198,3 +219,45 @@ def test_export_distinguishes_unknown_advisory_from_known_without_analyses(engin
         exposure.export_impacts(AdvisoryIdentifier("CVE-2099-9999"))
     with pytest.raises(ValidationError):
         exposure.export_impacts(AdvisoryIdentifier("../invalid"))
+
+
+def test_export_keeps_only_the_latest_analysis_of_a_commit(engine: Engine) -> None:
+    exposure = reads(engine)
+    [ref] = refs(engine, 1)
+    assert ref.id is not None
+    exposure.ingest_sbom(sbom(("google.golang.org/grpc", "v1.56.2")), ref.id)
+    known = exposure.find_advisory(GHSA)
+    assert known is not None and known.advisory_id is not None
+    prepared = exposure.prepare(known.advisory_id, ref.id)
+    exposure.record(ref.id, prepared.document("1.0.0"), source())
+    again = prepared.model_copy(update={"evidence": ImpactEvidence(notes="Reviewed again")})
+    latest = exposure.record(ref.id, again.document("1.0.0"), source(1))
+    exported = exposure.export_impacts(known.advisory_id)
+    assert (exported.commits, exported.analyses) == (1, 1)
+    [row] = exported.repos
+    assert (row.artifact_id, row.evidence.notes) == (latest.artifact_id, "Reviewed again")
+
+
+def test_export_by_unknown_advisory_id_is_not_found(engine: Engine) -> None:
+    with pytest.raises(NotFoundError):
+        reads(engine).export_impacts(uuid4())
+
+
+def test_a_document_omitting_its_go_ecosystem_is_the_same_package_as_one_naming_it(
+    engine: Engine,
+) -> None:
+    exposure = reads(engine)
+    [ref] = refs(engine, 1)
+    assert ref.id is not None
+    exposure.ingest_sbom(sbom(("google.golang.org/grpc", "v1.56.2")), ref.id)
+    known = exposure.find_advisory(GHSA)
+    assert known is not None and known.advisory_id is not None
+    prepared = exposure.prepare(known.advisory_id, ref.id)
+    legacy = json.loads(prepared.document("1.0.0").payload)
+    assert legacy["metadata"].pop("ecosystem") == "go"
+    exposure.record(ref.id, ImpactAnalysisArtifact.from_document(legacy), source())
+    again = prepared.model_copy(update={"evidence": ImpactEvidence(notes="Reviewed again")})
+    latest = exposure.record(ref.id, again.document("1.0.0"), source(1))
+    exported = exposure.export_impacts(GHSA)
+    assert (exported.commits, exported.analyses) == (1, 1)
+    assert [row.artifact_id for row in exported.repos] == [latest.artifact_id]
