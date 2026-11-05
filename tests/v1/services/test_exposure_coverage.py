@@ -4,6 +4,7 @@ read so a package missing from that SBOM is unknown rather than absent (plan 28,
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID
 
@@ -25,8 +26,9 @@ from traust_core.v1.models.dependencies import (
     Version,
 )
 from traust_core.v1.models.vocabulary import Ecosystem, ManifestCoverageReason
-from traust_core.v1.providers.base import ProviderRegistry
+from traust_core.v1.providers.base import ProviderRegistry, Result
 from traust_core.v1.providers.feeds import FeedProvider
+from traust_core.v1.providers.tools import ToolRequest
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.repositories.objects import InMemoryObjectStore
 from traust_core.v1.services.artifact_publishing import stored_bytes
@@ -264,3 +266,42 @@ def test_a_pointer_to_a_scan_holding_no_coverage_is_refused(engine: Engine) -> N
     assert ref.id is not None
     with pytest.raises(IntegrityError, match="holds no coverage"):
         exposure(engine).unresolved_manifests(ref.id)
+
+
+class TimedSbomTool(FakeSbomTool):
+    """Reads the tree at a stated time, as two overlapping scans of one commit would."""
+
+    def __init__(self) -> None:
+        super().__init__(raw=NO_LODASH)
+        self.at = datetime(2026, 11, 5, tzinfo=UTC)
+
+    def acquire(self, request: ToolRequest) -> Result[bytes]:
+        found = super().acquire(request)
+        return Result(found.data, found.acquisition.model_copy(update={"acquired_at": self.at}))
+
+
+def test_an_older_scan_finishing_late_never_displaces_a_newer_one(
+    engine: Engine, tmp_path: Path
+) -> None:
+    tool = TimedSbomTool()
+    ref, service = ref_id(engine), exposure(engine, tool)
+    newer, older = tool.at + timedelta(hours=1), tool.at
+    tool.at = newer
+    service.ingest_dependencies(ref, checkout(tmp_path / "now", locked=True))
+    tool.at = older  # read the tree before the newer scan, recorded after it
+    service.ingest_dependencies(ref, checkout(tmp_path / "then", locked=False))
+    assert service.unresolved_manifests(ref) == ()
+    assert coverage_runs(engine, ref) == 2
+
+
+def test_an_image_shipping_the_vulnerable_version_is_pending_whatever_the_manifest(
+    engine: Engine,
+) -> None:
+    ref, service = ref_id(engine), exposure(engine)
+    vulnerable_image = json.dumps(
+        {"bomFormat": "CycloneDX", "components": [{"purl": "pkg:npm/lodash@4.17.20"}]}
+    ).encode()
+    service.ingest_sbom(NO_LODASH, ref)  # coverage unknown
+    service.ingest_image_sbom(vulnerable_image, "sha256:" + "b" * 64, None, ref)
+    fix = service.consumes_fix(ref, Ecosystem.NPM, "lodash", Version("4.17.21"))
+    assert fix.state == FixUptakeState.PENDING

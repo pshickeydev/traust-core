@@ -249,3 +249,12 @@ def test_without_a_lookup_finding_is_a_config_error(engine: Engine) -> None:
 def test_get_advisory_of_an_unknown_id_raises(engine: Engine) -> None:
     with pytest.raises(NotFoundError):
         service(engine, None).get_advisory(uuid4())
+
+
+def test_symbols_filled_from_an_alias_cite_that_alias(engine: Engine) -> None:
+    exposure = service(engine, FakeLookup(CVE, GO, GHSA))
+    record = exposure.find_advisory(CVE.identifier)
+    assert record is not None and record.advisory_id is not None
+    resolved = exposure.resolve_symbols(record.advisory_id)
+    assert resolved.symbols
+    assert {s.reference for s in resolved.symbols} == {GO.source}

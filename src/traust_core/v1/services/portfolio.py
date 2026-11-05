@@ -147,6 +147,11 @@ class Inventory:
         with self._uow as uow:
             return uow.repository_refs.get(repository_ref_id)
 
+    def lock_ref(self, repository_ref_id: UUID) -> RepositoryRef:
+        """The commit, locked for the caller's transaction."""
+        with self._uow as uow:
+            return uow.repository_refs.get_for_update(repository_ref_id)
+
     def resolve(self, repository_ref_id: UUID) -> tuple[RepositoryRef, Repository]:
         """The commit and the repository it belongs to; NotFoundError names whichever is missing."""
         with self._uow as uow:

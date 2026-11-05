@@ -6,6 +6,7 @@ from uuid import UUID
 
 import sqlalchemy as sa
 
+from traust_core.v1.errors import NotFoundError
 from traust_core.v1.models.inventory import RepositoryRef
 from traust_core.v1.repositories.tables import (
     TRAUST,
@@ -33,6 +34,10 @@ REPOSITORY_REF = TableSpec(
 
 class RepositoryRefRepository(MutableRecordRepository[RepositoryRef], Protocol):
     def get_or_add(self, record: RepositoryRef) -> RepositoryRef: ...
+    def get_for_update(self, repository_ref_id: UUID) -> RepositoryRef:
+        """The ref, locked until the transaction ends (Postgres; SQLite serialises writers)."""
+        ...
+
     def find(self, repository_id: UUID, name: str | None, sha: str) -> RepositoryRef | None:
         """A named ref by (repository, name, sha); name None = the bare commit."""
         ...
@@ -48,6 +53,13 @@ class RepositoryRefRepository(MutableRecordRepository[RepositoryRef], Protocol):
 class SqlRepositoryRefRepository(SqlMutableRepository[RepositoryRef]):
     spec = REPOSITORY_REF
     record = RepositoryRef
+
+    def get_for_update(self, repository_ref_id: UUID) -> RepositoryRef:
+        stmt = self._select().where(self.table.c.id == repository_ref_id).with_for_update()
+        row = self._execute(f"lock ref {repository_ref_id}", stmt).mappings().one_or_none()
+        if row is None:
+            raise NotFoundError(f"repository ref {repository_ref_id}")
+        return self._to_record(row)
 
     def get_or_add(self, record: RepositoryRef) -> RepositoryRef:
         named = record.name is not None

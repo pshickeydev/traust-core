@@ -136,14 +136,13 @@ def test_a_store_another_process_upgraded_first_opens(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import traust_core.v1.context.context as module
-    from traust_core.v1.errors import RepositoryError
 
     _without_scan_pointer(tmp_path)
     real = module.apply_schema
 
     def raced(engine: sa.Engine, statements: list[str]) -> None:
         real(engine, statements)  # the other process's upgrade lands first
-        raise RepositoryError("duplicate column name", operation="apply_schema")
+        real(engine, statements)  # ours then hits the driver's duplicate-column error
 
     monkeypatch.setattr(module, "apply_schema", raced)
     engine = Context(Config(home=tmp_path)).database

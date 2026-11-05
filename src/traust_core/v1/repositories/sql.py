@@ -170,7 +170,8 @@ def apply_schema(engine: Engine, statements: Iterable[str]) -> None:
                     cursor.execute(stmt)
             finally:
                 cursor.close()
-    except SQLAlchemyError as e:
+    # The raw cursor raises the driver's own errors, which SQLAlchemy never wraps.
+    except (SQLAlchemyError, engine.dialect.loaded_dbapi.Error) as e:
         raise RepositoryError("apply schema failed", operation="apply_schema") from e
 
 

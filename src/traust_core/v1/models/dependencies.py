@@ -283,6 +283,9 @@ class AffectedPackage(Model):
     versions: tuple[Version, ...] = ()
     imports: tuple[str, ...] = ()
     symbols: tuple[str, ...] = ()
+    # The alias record that published `symbols`, when they came from one; in-process only, so
+    # documents carrying an advisory's packages keep their contract shape.
+    symbol_source: str | None = Field(default=None, exclude=True)
 
     def affects(self, version: Version) -> bool | None:
         """None when the version (or a bound it meets) can't be ordered: undecided, not safe."""
