@@ -14,11 +14,13 @@ from sqlalchemy.engine import Engine
 from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import T0
 from traust_core.v1.errors import ConflictError, NotFoundError, RepositoryError, ValidationError
+from traust_core.v1.models.common import PageRequest
 from traust_core.v1.models.inventory import (
     OrgName,
     OwnerAssignment,
     OwnershipSource,
     RefName,
+    RepositoryFilter,
     SyncReport,
     TeamName,
 )
@@ -98,6 +100,11 @@ def engine(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[Engine]:
 @pytest.fixture
 def portfolio(engine: Engine) -> PortfolioService:
     return PortfolioService(SqlTraustUnitOfWork(engine), PortfolioPolicy())
+
+
+def repository_count(portfolio: PortfolioService) -> int:
+    page = portfolio.list_repositories(RepositoryFilter(), PageRequest(limit=100))
+    return len(page.items)
 
 
 def sync(portfolio: PortfolioService, forge: Forge, at: datetime = T0) -> PortfolioSync:
@@ -224,7 +231,7 @@ def test_import_repository_matches_the_forks_parent_by_normalized_url(
     forge = Forge(described=describing("example-org/fork", "Example-Org/API"))
     report = sync(portfolio, forge).import_repository(url("example-org/fork"))
     assert portfolio.get_repository(report.added[0]).upstream_id == parent.id
-    assert portfolio.find_repository(url("Example-Org/API")) is None
+    assert repository_count(portfolio) == 2  # the fork and its one parent row
 
 
 def test_import_branch_registers_the_commit_the_branch_points_at(
@@ -393,7 +400,7 @@ def test_a_fork_links_a_parent_registered_in_another_case(portfolio: PortfolioSe
     forge = Forge(described=describing("example-org/fork", "Example-Org/API"))
     report = sync(portfolio, forge).import_repository(url("example-org/fork"))
     assert portfolio.get_repository(report.added[0]).upstream_id == parent.id
-    assert portfolio.find_repository(url("example-org/api")) is None  # no second parent row
+    assert repository_count(portfolio) == 2  # the fork and its one parent row
 
 
 def test_a_forge_outage_still_returns_a_known_repository(portfolio: PortfolioService) -> None:
@@ -431,3 +438,23 @@ def test_a_host_the_forge_cannot_ask_still_returns_a_known_repository(
     assert report.skipped == (
         f"{url('example-org/api')}: forge facts not refreshed: unsupported forge kind: example",
     )
+
+
+def test_every_lookup_and_registration_finds_a_github_repository_in_any_case(
+    portfolio: PortfolioService,
+) -> None:
+    # GitHub's owner/repo is case-insensitive: planning, filtered reads and registration all
+    # resolve the row a fork's lowercase placeholder (or anyone) registered
+    first = portfolio.register_repository(url("example-org/api"), public=False)
+    again = portfolio.register_repository(url("Example-Org/API"), public=True)
+    assert again.id == first.id and repository_count(portfolio) == 1
+    found = portfolio.find_repository(url("EXAMPLE-ORG/api"))
+    assert found is not None and found.id == first.id
+    listed = portfolio.list_repositories(
+        RepositoryFilter(url=str(url("Example-Org/Api"))), PageRequest(limit=10)
+    )
+    assert [r.id for r in listed.items] == [first.id]
+    # GitLab keeps exact matching
+    lab = portfolio.register_repository(url("group/app", "gitlab.com"), public=False)
+    assert portfolio.find_repository(url("Group/App", "gitlab.com")) is None
+    assert lab.id is not None
