@@ -488,12 +488,15 @@ class ExposureService:
         ref = self._inventory.get_ref(repository_ref_id)
         if ref.manifest_sbom_assessment_id is None:
             return None
-        [scan] = self._log.list_by_ids([ref.manifest_sbom_assessment_id])
-        held = self._log.documents([scan], [ManifestCoverageArtifact.schema])
+        scans = self._log.list_by_ids([ref.manifest_sbom_assessment_id])
+        held = self._log.documents(scans, [ManifestCoverageArtifact.schema])
         if not held:
-            raise IntegrityError(f"manifest scan {scan.id} on ref {ref.id} holds no coverage")
+            raise IntegrityError(
+                f"manifest scan {ref.manifest_sbom_assessment_id} of ref {ref.id} holds no coverage"
+            )
+        [(scan, artifact)] = held
         doc = json.loads(
-            ManifestCoverageArtifact.parse(stored_bytes(self._objects, held[0][1])).payload
+            ManifestCoverageArtifact.parse(stored_bytes(self._objects, artifact)).payload
         )
         bound = (doc["sbom_id"], doc["assessment_id"])
         if scan.repository_ref_id != ref.id or bound != (str(ref.manifest_sbom_id), str(scan.id)):
@@ -1105,8 +1108,9 @@ class ExposureService:
         self, repository_ref_id: UUID, ecosystem: Ecosystem, name: str, fixed: Version
     ) -> FixUptake:
         """The package's versions in the commit's manifest SBOM and the images built from it,
-        each at or above `fixed`; a version that can't be ordered decides nothing. Not listed while
-        a manifest of its ecosystem went unresolved is `not_observed`, never `module_absent`."""
+        each at or above `fixed`; a version that can't be ordered decides nothing. Not listed in the
+        manifest SBOM while a manifest of its ecosystem went unresolved, or its coverage is
+        unknown, is `not_observed`, whatever the images ship."""
         with self._uow as uow:
             ref = self._inventory.get_ref(repository_ref_id)
             held = [(None, ref.manifest_sbom_id)] if ref.manifest_sbom_id else []
@@ -1119,8 +1123,10 @@ class ExposureService:
                 for d in uow.dependencies.list_for_sbom(sbom_id)
                 if d.package_id == package.id
             ]
-        coverage = None if rows else self.unresolved_manifests(repository_ref_id)
-        unread = not rows and (coverage is None or any(m.ecosystem == ecosystem for m in coverage))
+        # Images shipping a fixed version don't say what an unresolved manifest holds.
+        listed = any(image_id is None for image_id, _ in rows)
+        coverage = () if listed else self.unresolved_manifests(repository_ref_id)
+        unread = coverage is None or any(m.ecosystem == ecosystem for m in coverage)
         if not any(sbom_id for _, sbom_id in held) or unread:
             return FixUptake(state=FixUptakeState.NOT_OBSERVED)
         fix = version_key(fixed, ecosystem)

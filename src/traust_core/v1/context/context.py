@@ -619,11 +619,9 @@ class Context:
         )
 
     def register_compliance_sources(self, targets: Mapping[UUID, DocsTarget] | None = None) -> None:
-        """Read ADR registers and official docs; explicit product targets are checked against the
-        registered products."""
-        # NEED(contracts: traust.yaml `compliance.docs_targets`): the pinned config schema has no
-        # `compliance` section, so product docs targets come only from the caller until it does.
-        targets = {} if targets is None else targets
+        """Read ADR registers and official docs, for traust.yaml's `compliance.docs_targets` or
+        explicit product targets, each checked against the registered products."""
+        targets = self.config.compliance.docs_targets if targets is None else targets
         if targets:
             portfolio = PortfolioService(
                 SqlTraustUnitOfWork(self.database), PortfolioPolicy(), clock=self.clock

@@ -231,3 +231,36 @@ def test_the_fleet_sweep_keeps_an_sbom_given_as_a_document(engine: Engine) -> No
     kept = service.ingest_sbom(NO_LODASH, ref)
     assert service.record_manifest_sbom(ref) == kept  # no checkout wired: nothing fetched
     assert service.unresolved_manifests(ref) is None
+
+
+def test_an_image_shipping_the_fix_does_not_speak_for_an_unknown_manifest(
+    engine: Engine, tmp_path: Path
+) -> None:
+    ref, service = ref_id(engine), exposure(engine)
+    fixed_image = json.dumps(
+        {"bomFormat": "CycloneDX", "components": [{"purl": "pkg:npm/lodash@4.17.21"}]}
+    ).encode()
+    service.ingest_sbom(NO_LODASH, ref)
+    service.ingest_image_sbom(fixed_image, "sha256:" + "a" * 64, None, ref)
+    fix = service.consumes_fix(ref, Ecosystem.NPM, "lodash", Version("4.17.21"))
+    assert fix.state == FixUptakeState.NOT_OBSERVED
+    service.ingest_dependencies(ref, checkout(tmp_path, locked=True))  # a complete read
+    fix = service.consumes_fix(ref, Ecosystem.NPM, "lodash", Version("4.17.21"))
+    assert fix.state == FixUptakeState.CONSUMED
+
+
+def test_a_pointer_to_a_scan_holding_no_coverage_is_refused(engine: Engine) -> None:
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        ref = seed.repository_ref()
+        bare = seed.assessment(ref)
+        sbom = seed.sbom()
+        uow.repository_refs.update(
+            ref.model_copy(
+                update={"manifest_sbom_id": sbom.id, "manifest_sbom_assessment_id": bare.id}
+            )
+        )
+        uow.commit()
+    assert ref.id is not None
+    with pytest.raises(IntegrityError, match="holds no coverage"):
+        exposure(engine).unresolved_manifests(ref.id)

@@ -15,6 +15,7 @@ from traust_core.v1 import contracts
 from traust_core.v1.errors import ConfigError, DocumentError
 from traust_core.v1.models.inventory import DEFAULT_FORGE_HOSTS
 from traust_core.v1.models.operations import Budget, RecordingStartScope
+from traust_core.v1.providers.tools.compliance_sources import DocsTarget
 from traust_core.v1.services.findings.rating import RatingConfig
 from traust_core.v1.services.findings.review import ReviewConfig
 from traust_core.v1.services.identity import IdentityConfig
@@ -250,16 +251,9 @@ class FeedsConfig(_Model):
     osv_access: Literal["api", "air-gapped"] = "api"  # air-gapped: exported OSV records only
 
 
-class DocsTarget(_Model):
-    """Official documentation coordinates of a product; no guides: discovered from its page."""
-
-    product_slug: str  # the contract's schema checks the shapes when traust.yaml loads
-    version: str
-    guides: tuple[str, ...] | None = None
-
-
 class ComplianceConfig(_Model):
-    docs_targets: dict[UUID, DocsTarget] = pydantic.Field(default_factory=dict)  # by product id
+    # Official docs coordinates by product id; the contract's schema checks their shapes.
+    docs_targets: dict[UUID, DocsTarget] = pydantic.Field(default_factory=dict)
 
 
 class ExecutionConfig(_Model):
