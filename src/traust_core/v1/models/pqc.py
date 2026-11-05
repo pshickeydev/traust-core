@@ -31,10 +31,14 @@ class PqcStamps(Model):
     rules_sha256: str
     binary_sha256: str | None = None
 
-    def same_pack(self, other: PqcStamps) -> bool:
+    def same_pack(self, other: PqcStamps, *, source: bool = True) -> bool:
         return (self.adapter_version, self.rules_sha256) == (
             other.adapter_version,
             other.rules_sha256,
+        ) and (
+            not source
+            or (self.pqc_scan_commit, self.binary_sha256)
+            == (other.pqc_scan_commit, other.binary_sha256)
         )
 
 

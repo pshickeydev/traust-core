@@ -606,7 +606,6 @@ def consumer(engine: Engine) -> tuple[UUID, UUID]:
         ((("google.golang.org/grpc", "v1.57.1"),), "consumed", [True]),
         ((("google.golang.org/grpc", "v1.57.0"),), "pending", [False]),
         ((("google.golang.org/grpc", "v1.40.0"),), "pending", [False]),
-        ((("example.com/other", "v1.0.0"),), "module_absent", []),
     ],
 )
 def test_propagation_judges_the_versions_the_component_ships(
@@ -631,6 +630,19 @@ def test_propagation_judges_the_versions_the_component_ships(
     (package,) = got.evidence
     assert (package.name, package.fixed) == ("google.golang.org/grpc", "1.56.3")
     assert [c.consumed for c in package.checked] == consumed
+
+
+def test_propagation_over_a_document_sbom_lacking_the_package_is_unknown(
+    service: VerificationService,
+    remediation: RemediationService,
+    context: Context,
+    engine: Engine,
+) -> None:
+    item = opened(remediation, advisory_world(engine))
+    component, ref = consumer(engine)
+    context.services().exposure.ingest_sbom(sbom(("example.com/other", "v1.0.0")), ref)
+    with pytest.raises(NotFoundError, match="coverage leaves the package unknown"):
+        service.propagation(item.work_item_id, component)
 
 
 def test_propagation_needs_an_sbom_and_an_advisory(

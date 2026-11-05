@@ -669,7 +669,10 @@ def propagated(evidence: Sequence[PropagationEvidence]) -> CrossRepoPropagation:
     under another name)."""
     states = {e.state for e in evidence}
     if FixUptakeState.NOT_OBSERVED in states or not states:
-        raise NotFoundError("the component's commit has no SBOM yet: record one first")
+        raise NotFoundError(
+            "the component's commit has no SBOM yet, or one whose coverage leaves the package "
+            "unknown: record one from its manifests first"
+        )
     if FixUptakeState.PENDING in states:
         return CrossRepoPropagation("pending")
     held = states - {FixUptakeState.MODULE_ABSENT}

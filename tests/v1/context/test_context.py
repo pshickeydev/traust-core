@@ -99,3 +99,54 @@ def test_recording_start_capabilities_parse_machine_assets_and_native_repositori
 def test_recording_start_rejects_malformed_capabilities(scope: dict[str, object]) -> None:
     with pytest.raises(ValueError):
         Config.model_validate({"recording": {"start": [scope]}})
+
+
+def test_a_local_database_from_before_the_manifest_scan_pointer_is_upgraded(
+    tmp_path: Path,
+) -> None:
+    _without_scan_pointer(tmp_path)
+    engine = Context(Config(home=tmp_path)).database
+    columns = {c["name"] for c in sa.inspect(engine).get_columns("repository_ref")}
+    assert "manifest_sbom_assessment_id" in columns
+    again = Context(Config(home=tmp_path)).database  # present: nothing applied twice
+    assert "manifest_sbom_assessment_id" in {
+        c["name"] for c in sa.inspect(again).get_columns("repository_ref")
+    }
+
+
+def _without_scan_pointer(home: Path) -> None:
+    with Context(Config(home=home)).database.begin() as conn:
+        conn.exec_driver_sql("DROP INDEX idx_repository_ref_manifest_sbom_assessment")
+        conn.exec_driver_sql("ALTER TABLE repository_ref DROP COLUMN manifest_sbom_assessment_id")
+
+
+def test_a_configured_database_missing_the_scan_pointer_is_refused_with_its_upgrade(
+    tmp_path: Path,
+) -> None:
+    _without_scan_pointer(tmp_path)
+    configured = Config(
+        home=tmp_path / "elsewhere",
+        database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'traust.db'}"),
+    )
+    with pytest.raises(ConfigError, match="manifest_sbom_binding_upgrade"):
+        _ = Context(configured).database
+
+
+def test_a_store_another_process_upgraded_first_opens(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import traust_core.v1.context.context as module
+    from traust_core.v1.errors import RepositoryError
+
+    _without_scan_pointer(tmp_path)
+    real = module.apply_schema
+
+    def raced(engine: sa.Engine, statements: list[str]) -> None:
+        real(engine, statements)  # the other process's upgrade lands first
+        raise RepositoryError("duplicate column name", operation="apply_schema")
+
+    monkeypatch.setattr(module, "apply_schema", raced)
+    engine = Context(Config(home=tmp_path)).database
+    assert "manifest_sbom_assessment_id" in {
+        c["name"] for c in sa.inspect(engine).get_columns("repository_ref")
+    }

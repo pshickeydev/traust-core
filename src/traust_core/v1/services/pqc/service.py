@@ -95,7 +95,7 @@ class PqcService:
         latest = self._latest(repository_ref_id, PqcFactsArtifact)
         if latest is not None:
             assessment, doc = latest
-            current = pqc_facts.read_stamps(doc).same_pack(stamps)
+            current = pqc_facts.read_stamps(doc).same_pack(stamps, source=request is not None)
             basis = doc.coverage.assessment_basis == ("sbom-only" if request is None else "source")
             if current and basis:
                 return self._prescanned(assessment, doc, scanned=False)
@@ -137,7 +137,7 @@ class PqcService:
         facts = pqc_facts.read_facts(doc)
         prior = self.find(repository_ref_id)
         stale = self._scanner is not None and not pqc_facts.read_stamps(doc).same_pack(
-            self._scanner.stamps()
+            self._scanner.stamps(), source=doc.coverage.assessment_basis == "source"
         )
         subject = self._portfolio.inventory.subject(repository_ref_id)
         return PqcReadinessInput(
@@ -269,7 +269,9 @@ class PqcService:
                     basis=doc.coverage.assessment_basis,
                     current=None
                     if stamps is None
-                    else pqc_facts.read_stamps(doc).same_pack(stamps),
+                    else pqc_facts.read_stamps(doc).same_pack(
+                        stamps, source=doc.coverage.assessment_basis == "source"
+                    ),
                 )
             )
         return states
@@ -327,7 +329,7 @@ class PqcService:
 
     def _require_scanner(self) -> PqcScanner:
         if self._scanner is None:
-            raise ConfigError("prescan needs the pqc-scan provider (traust-engine registers it)")
+            raise ConfigError("prescan needs the pqc-scan provider (Context.register_pqc_scanner)")
         return self._scanner
 
     @staticmethod
