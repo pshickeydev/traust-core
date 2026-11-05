@@ -92,6 +92,7 @@ from traust_core.v1.models.artifacts import (
 from traust_core.v1.models.assessment import AtlasCatalog, AttackCatalog
 from traust_core.v1.models.below_range import GapReason
 from traust_core.v1.models.cloud_config import CHECKOV
+from traust_core.v1.models.compliance import DocsTarget
 from traust_core.v1.models.insight import SlaPolicy, ViewName
 from traust_core.v1.models.operations import Invoice, Requirement
 from traust_core.v1.providers.base import ProviderRegistry
@@ -142,7 +143,6 @@ from traust_core.v1.providers.syft import SyftSbom
 from traust_core.v1.providers.symbols import SymbolIndex
 from traust_core.v1.providers.tools import ToolInspector, ToolProvider
 from traust_core.v1.providers.tools.adapter import AdapterTool
-from traust_core.v1.providers.tools.compliance_sources import DocsTarget
 from traust_core.v1.providers.tools.detection_quality import OpengrepRuleSweep
 from traust_core.v1.providers.tools.opengrep import SupplementalPack
 from traust_core.v1.providers.tools.safe_exec import SafeExec
@@ -211,6 +211,7 @@ from traust_core.v1.services.insight import (
     ProgramView,
     RemediationIndexView,
     ReviewCardView,
+    SarifView,
     ScoreboardView,
     SlaView,
     ThreatRegisterView,
@@ -1089,6 +1090,7 @@ class Context:
                     PqcVendorsView(pqc, exposure, portfolio),
                     ComplianceDashboardView(compliance),
                     OscalExport(compliance),
+                    SarifView(findings, portfolio, self.clock),
                     threats,
                     LocView(code_facts, portfolio, findings),
                     RemediationIndexView(remediation, portfolio),

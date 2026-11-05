@@ -88,7 +88,7 @@ class ExecutivePanel(StrEnum):
 
 class ViewFilter(Model):
     """Scope (products, teams, category labels), the point in time, and for series a window and
-    bucket; `artifact_id` names the document a single-item view renders."""
+    bucket; `artifact_id` or `repository_id` names what a single-item view renders."""
 
     product_ids: tuple[UUID, ...] = ()
     team_ids: tuple[UUID, ...] = ()
@@ -99,6 +99,7 @@ class ViewFilter(Model):
     window: TimeWindow | None = None
     bucket: TimeBucket = TimeBucket.MONTH
     artifact_id: UUID | None = None
+    repository_id: UUID | None = None
     executive_panels: tuple[ExecutivePanel, ...] = ()
     assessment_id: UUID | None = None
     report_stem: str | None = None
@@ -321,6 +322,18 @@ class OscalAssessmentResults(ViewModel):
     )
 
     assessment_results: dict[str, Any] = Field(alias="assessment-results")
+
+
+class SarifLog(ViewModel):
+    """A repository's findings as SARIF 2.1.0; the JSON model is the SARIF log itself."""
+
+    model_config = ConfigDict(
+        frozen=True, extra="forbid", populate_by_name=True, serialize_by_alias=True
+    )
+
+    schema_: str = Field(alias="$schema")
+    version: str
+    runs: tuple[dict[str, Any], ...]
 
 
 class PqcScope(Model):

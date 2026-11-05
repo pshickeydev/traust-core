@@ -21,14 +21,13 @@ from cryptography.x509.oid import NameOID
 from traust_core.v1.context import Config, Context
 from traust_core.v1.errors import ConfigError, NotFoundError, ServiceError, ValidationError
 from traust_core.v1.models.common import ArtifactRef
-from traust_core.v1.models.compliance import doc_text, parse_adr
+from traust_core.v1.models.compliance import DocsTarget, doc_text, parse_adr
 from traust_core.v1.models.inventory import DEFAULT_FORGE_HOSTS, ProductSlug
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.forge_api import ForgeApi
 from traust_core.v1.providers.http import HttpFetcher
 from traust_core.v1.providers.process import ProcessResult, ProcessRunner
 from traust_core.v1.providers.tools.compliance_sources import (
-    DocsTarget,
     GithubAdrSource,
     RedHatDocSource,
     github_slug,
@@ -506,6 +505,13 @@ def test_docs_target_validate_refuses_unsafe_or_duplicate_segments() -> None:
             target.validate()
 
 
+def test_parse_builds_only_a_valid_target() -> None:
+    assert DocsTarget.parse("p", "1", ["g"]) == DocsTarget("p", "1", ("g",))
+    for raw in (("p", ".."), ("p/q", "1"), ("p", "1", ["g", "g"]), ("p", "1", "abc")):
+        with pytest.raises(ValidationError):
+            DocsTarget.parse(*raw)  # type: ignore[arg-type]
+
+
 def test_an_explicit_invalid_target_is_a_config_error(tmp_path: Path) -> None:
     ctx, product_id = registered_product(tmp_path)
     with pytest.raises(ConfigError, match=f"docs target for product {product_id}"):
@@ -513,10 +519,11 @@ def test_an_explicit_invalid_target_is_a_config_error(tmp_path: Path) -> None:
     assert ctx.doc_source is None
 
 
-def test_docs_target_is_reexported_from_context() -> None:
-    from traust_core.v1.context import DocsTarget as Reexported
+def test_docs_target_is_a_model_consumers_import_without_the_provider() -> None:
+    import traust_core.v1.context as context
 
-    assert Reexported is DocsTarget
+    assert DocsTarget.__module__ == "traust_core.v1.models.compliance"
+    assert not hasattr(context, "DocsTarget")
 
 
 def test_a_registered_product_without_an_explicit_target_is_refused_before_transport(

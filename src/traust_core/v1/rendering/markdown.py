@@ -38,30 +38,30 @@ class MarkdownRenderer:
     media_type = "text/markdown"
 
     def render(self, report: Report) -> bytes:
-        # title, headings and sources are data (product names, labels from external
-        # threat models): one sanitized line each, the module's own contract — a
-        # hostile value cannot fabricate headings, bullets or rows. Section body is
-        # view-authored prose and keeps its paragraphs.
+        # title, headings, sources and table cells are data (finding titles, product names,
+        # labels from external threat models): one sanitized line each, the module's own
+        # contract — a hostile value cannot fabricate headings, bullets, rows, raw HTML or
+        # links. Section body is view-authored prose and keeps its paragraphs.
         lines = [
-            f"# {inline(report.title)}",
+            f"# {_inert(inline(report.title))}",
             "",
             f"_Generated {report.generated_at.isoformat()}_",
             "",
         ]
         for s in report.sections:
-            lines += [f"## {inline(s.heading)}", ""]
+            lines += [f"## {_inert(inline(s.heading))}", ""]
             if s.body:
                 lines += [s.body, ""]
             if s.table:
                 lines += [*markdown_table(s.table.columns, s.table.rows), ""]
         if report.sources:
-            lines += ["## Sources", "", *(f"- {inline(src)}" for src in report.sources), ""]
+            lines += ["## Sources", "", *(f"- {_inert(inline(src))}" for src in report.sources), ""]
         return "\n".join(lines).encode()
 
 
 # Report text is often written under prompt-injection pressure (titles, rationales from an audited
-# repository): control and bidi-override characters go, and inline text stays on one line, so it
-# can't fabricate rows, headings or raw HTML.
+# repository): control and bidi-override characters go and inline text stays on one line, so it
+# can't fabricate rows or headings; `_inert` keeps it from making raw HTML or links.
 _HOSTILE = re.compile("[\\x00-\\x08\\x0b\\x0c\\x0e-\\x1f\\x7f\\u202a-\\u202e\\u2066-\\u2069]")
 
 
@@ -75,8 +75,20 @@ def markdown_text(value: object) -> str:
     return re.sub(r"([\\`*_\[\]{}()!~])", r"\\\1", escape(inline(value), quote=False))
 
 
+def _inert(text: str) -> str:
+    """No raw HTML, link or image syntax; a bracket or entity already escaped stays as it is."""
+    text = _BRACKET.sub(lambda m: f"{m[1]}\\{m[2]}", text)
+    return _MARKUP.sub(lambda m: _MARKUP_ESCAPES[m[0]], text)
+
+
+# a bracket after an even run of backslashes (none, or escaped backslashes) is still syntax
+_BRACKET = re.compile(r"(?<!\\)((?:\\\\)*)([\[\]])")
+_MARKUP = re.compile(r"<|>|&(?![a-z]+;|#\d+;)")
+_MARKUP_ESCAPES = {"<": "&lt;", ">": "&gt;", "&": "&amp;"}
+
+
 def markdown_table(columns: Sequence[str], rows: Sequence[Sequence[str]]) -> list[str]:
-    esc = lambda v: inline(v).replace("|", "\\|")  # noqa: E731
+    esc = lambda v: _inert(inline(v)).replace("|", "\\|")  # noqa: E731
     return [
         "| " + " | ".join(map(esc, columns)) + " |",
         "|" + "---|" * len(columns),

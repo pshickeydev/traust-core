@@ -13,9 +13,9 @@ import yaml
 
 from traust_core.v1 import contracts
 from traust_core.v1.errors import ConfigError, DocumentError
+from traust_core.v1.models.compliance import DocsTarget
 from traust_core.v1.models.inventory import DEFAULT_FORGE_HOSTS
 from traust_core.v1.models.operations import Budget, RecordingStartScope
-from traust_core.v1.providers.tools.compliance_sources import DocsTarget
 from traust_core.v1.services.findings.rating import RatingConfig
 from traust_core.v1.services.findings.review import ReviewConfig
 from traust_core.v1.services.identity import IdentityConfig

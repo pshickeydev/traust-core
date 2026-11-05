@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from traust_core.v1.context.benchmark import benchmark_markdown, scorecards_markdown
 from traust_core.v1.models.detection_quality import (
     BenchmarkRun,
     BenchmarkTargetId,
@@ -13,6 +12,7 @@ from traust_core.v1.models.detection_quality import (
     Stability,
     TargetScore,
 )
+from traust_core.v1.rendering.benchmark import benchmark_markdown, scorecards_markdown
 
 KEY = UUID("00000000-0000-0000-0000-000000000001")
 

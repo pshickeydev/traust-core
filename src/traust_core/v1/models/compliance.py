@@ -6,6 +6,7 @@ import json
 import re
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from typing import NewType
@@ -1116,3 +1117,40 @@ class DocGuide(Model):
     guide: str
     url: str
     text: str
+
+
+# a docs.redhat.com path segment: a plain slug, never `.`, `..` or a separator
+_DOCS_SEGMENT = re.compile(r"[A-Za-z0-9._-]+")
+
+
+def docs_segment(value: str) -> str:
+    if not isinstance(value, str) or value in {".", ".."} or not _DOCS_SEGMENT.fullmatch(value):
+        raise ValidationError(f"docs.redhat.com path segment {value!r} is not a plain slug")
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class DocsTarget:
+    """One product's docs.redhat.com slug and version; no guides means every guide listed."""
+
+    product_slug: str
+    version: str
+    guides: tuple[str, ...] = ()
+
+    @classmethod
+    def parse(cls, product_slug: str, version: str, guides: Iterable[str] = ()) -> DocsTarget:
+        if isinstance(guides, str):
+            raise ValidationError("docs.redhat.com guides must be a collection of slugs, not one")
+        target = cls(product_slug, version, tuple(guides))
+        target.validate()
+        return target
+
+    def validate(self) -> None:
+        docs_segment(self.product_slug)
+        docs_segment(self.version)
+        if not isinstance(self.guides, tuple):
+            raise ValidationError("docs.redhat.com guides must be a tuple of plain slugs")
+        for guide in self.guides:
+            docs_segment(guide)
+        if len(set(self.guides)) != len(self.guides):
+            raise ValidationError("docs.redhat.com guides must be unique")

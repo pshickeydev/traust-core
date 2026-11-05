@@ -120,6 +120,7 @@ from traust_core.v1.models.insight import (
     RepositoryRollup,
     ReviewCard,
     ReviewCards,
+    SarifLog,
     Scoreboard,
     SeverityCounts,
     SlaCounts,
@@ -5104,6 +5105,11 @@ def _category(view: FindingView) -> str:
     return view.label("category") or "uncategorized"
 
 
+def _categories(view: FindingView) -> set[str]:
+    """Every category label, or the `uncategorized` rule SARIF files an unlabelled finding under."""
+    return {fl.label for fl in view.labels if fl.taxonomy == CATEGORY} or {_category(view)}
+
+
 def _sarif_location(loc: Location) -> dict[str, Any]:
     if _PSEUDO_PATH.match(loc.path):
         return {"logicalLocations": [{"fullyQualifiedName": loc.path}]}
@@ -5156,6 +5162,48 @@ def _sarif_result(view: FindingView, rule_index: int) -> dict[str, Any]:
     if disposition is not None and disposition.resolution == "resolved":
         result["baselineState"] = "absent"
     return result
+
+
+class SarifView:
+    """One repository's findings as they stood at `as_of`, as SARIF (findings sarif)."""
+
+    name = ViewName.SARIF
+    per_item = True
+
+    def __init__(self, findings: FindingService, portfolio: PortfolioService, clock: Clock) -> None:
+        self._findings = findings
+        self._portfolio = portfolio
+        self._clock = clock
+
+    def build(self, filter: ViewFilter) -> SarifLog:
+        if filter.repository_id is None:
+            raise ValidationError("the sarif view exports one repository: name its repository_id")
+        if filter.product_ids or filter.team_ids:
+            raise ValidationError("the sarif view is one repository: it takes no product or team")
+        repository = self._portfolio.get_repository(filter.repository_id)
+        views = self._findings.baseline(filter.repository_id, filter.as_of or self._clock.now())
+        if filter.categories:
+            views = [v for v in views if _categories(v) & set(filter.categories)]
+        return SarifLog.model_validate(SarifExport().document(views, repository.url))
+
+    def report(self, model: SarifLog, generated_at: datetime) -> Report:
+        (run,) = model.runs
+        rows = [
+            (
+                r["ruleId"],
+                r["level"],
+                r["properties"]["traust/validity"],
+                "; ".join(s["justification"] for s in r.get("suppressions", ())),
+                r["message"]["text"],
+            )
+            for r in run["results"]
+        ]
+        columns = ("rule", "level", "validity", "suppressed", "title")
+        return Report(
+            title=f"SARIF: {run['properties']['traust/repository']}",
+            generated_at=generated_at,
+            sections=(_table_section("Results", columns, rows, "_No findings._"),),
+        )
 
 
 class OscalExport:

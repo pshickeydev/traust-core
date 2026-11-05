@@ -5,12 +5,16 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
 from urllib.parse import quote
 from uuid import UUID
 
 from traust_core.v1.errors import NotFoundError, ServiceError, ValidationError
-from traust_core.v1.models.compliance import OFFICIAL_DOCS, is_decision_record
+from traust_core.v1.models.compliance import (
+    OFFICIAL_DOCS,
+    DocsTarget,
+    docs_segment,
+    is_decision_record,
+)
 from traust_core.v1.providers.base import Acquisition, Readiness, Result, on_path
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.collaboration import ProductDocument, RegisterFile
@@ -22,7 +26,6 @@ CURL_TIMEOUT = 90.0  # curl's own --max-time is 60 s
 _ADR_READ_CAP = 262_144  # bytes per register file, as legacy read them
 _GITHUB_REPO = re.compile(r"github\.com[/:]([\w.-]+/[\w.-]+?)(?:\.git/?|/|$)")
 _PIN = re.compile(r"[0-9a-f]{40}")
-_SLUG = re.compile(r"[A-Za-z0-9._-]+")
 
 
 class GithubAdrSource:
@@ -81,25 +84,6 @@ def github_slug(repo: str) -> str:
     raise ValidationError(f"ADR register {repo}: not a GitHub repository (no reader for its forge)")
 
 
-@dataclass(frozen=True, slots=True)
-class DocsTarget:
-    """One product's docs.redhat.com slug and version; no guides means every guide listed."""
-
-    product_slug: str
-    version: str
-    guides: tuple[str, ...] = ()
-
-    def validate(self) -> None:
-        _segment(self.product_slug)
-        _segment(self.version)
-        if not isinstance(self.guides, tuple):
-            raise ValidationError("docs.redhat.com guides must be a tuple of plain slugs")
-        for guide in self.guides:
-            _segment(guide)
-        if len(set(self.guides)) != len(self.guides):
-            raise ValidationError("docs.redhat.com guides must be unique")
-
-
 class RedHatDocSource:
     """docs.redhat.com guides as single-page html, fetched with stock curl (the CDN refuses
     python-urllib and custom user agents); nothing is cached or stored."""
@@ -124,13 +108,13 @@ class RedHatDocSource:
                 f"compliance.docs_targets[{product_id}] with product_slug and version "
                 "in traust.yaml"
             )
-        slug, version = _segment(target.product_slug), _segment(target.version)
+        slug, version = docs_segment(target.product_slug), docs_segment(target.version)
         base = f"{OFFICIAL_DOCS}en/documentation/{slug}/{version}"
         pages = [
             ProductDocument(
                 product_slug=slug, version=version, guide=guide, url=url, html=self._get(url)
             )
-            for guide in map(_segment, target.guides or self._guides(base, slug, version))
+            for guide in map(docs_segment, target.guides or self._guides(base, slug, version))
             for url in (f"{base}/html-single/{guide}/index",)
         ]
         acquisition = Acquisition(
@@ -152,9 +136,3 @@ class RedHatDocSource:
             return self._curl.run(argv).stdout.decode("utf-8", "replace")
         except ServiceError as e:
             raise ServiceError(f"fetch failed for {url}: {e}") from e
-
-
-def _segment(value: str) -> str:
-    if not isinstance(value, str) or value in {".", ".."} or not _SLUG.fullmatch(value):
-        raise ValidationError(f"docs.redhat.com path segment {value!r} is not a plain slug")
-    return value

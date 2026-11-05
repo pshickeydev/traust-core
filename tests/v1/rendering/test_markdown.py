@@ -31,9 +31,8 @@ def test_a_hostile_title_cannot_forge_headings() -> None:
         title="prod\n## Executive summary: all clear\n<b>injected</b>",
         sections=(Section(heading="Overview", body="prose", table=None),),
     )
-    # the hostile text may share the title's line; it may not start one. Inline HTML
-    # tags survive inline() by design (same as table cells) — an owner question,
-    # recorded as a hypothesis, not part of this fix.
+    # the hostile text may share the title's line; it may not start one (and its tags
+    # are inert: test_no_data_line_makes_raw_html_or_links)
     assert "\n## Executive summary" not in out
     assert "\n<b>injected</b>" not in out
     assert out.startswith("# prod")
@@ -69,3 +68,30 @@ def test_benign_reports_render_unchanged() -> None:
     assert "## Findings" in out
     assert "two paragraphs\n\nof prose" in out
     assert "- https://example.com/src" in out
+
+
+HOSTILE = "a <img src=x onerror=alert(1)> [docs](javascript:alert(1)) ![i](http://e/p.png)"
+
+
+def test_no_data_line_makes_raw_html_or_links() -> None:
+    out = render(
+        title=HOSTILE,
+        sections=(
+            Section(
+                heading=HOSTILE,
+                body="view prose keeps its *markup*",
+                table=Table(columns=("t",), rows=((HOSTILE,), (r"\\[x](javascript:y)",))),
+            ),
+        ),
+        sources=(HOSTILE,),
+    )
+    assert "<img" not in out and "[docs](" not in out and "![i](" not in out
+    assert out.count("&lt;img src=x onerror=alert(1)&gt; \\[docs\\](javascript:alert(1))") == 4
+    assert "\\\\\\[x\\](javascript:y)" in out  # an escaped backslash doesn't re-open a link
+    assert "view prose keeps its *markup*" in out
+
+
+def test_text_already_escaped_is_not_escaped_twice() -> None:
+    cell = r"\[ok\] &lt;b&gt; Tom &amp; Jerry, AT&T"
+    out = render(sections=(Section(heading="h", table=Table(columns=("c",), rows=((cell,),))),))
+    assert r"| \[ok\] &lt;b&gt; Tom &amp; Jerry, AT&amp;T |" in out
