@@ -4,6 +4,7 @@ read so a package missing from that SBOM is unknown rather than absent (plan 28,
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID
@@ -13,7 +14,7 @@ from sqlalchemy.engine import Engine
 
 from tests.v1.repositories.tables.conftest import Seed
 from tests.v1.services.test_exposure_impact import LODASH, Lookup, engine
-from tests.v1.services.test_exposure_sweep import FakeSbomTool
+from tests.v1.services.test_exposure_sweep import FakeCheckout, FakeSbomTool
 from traust_core.v1.errors import IntegrityError, ValidationError
 from traust_core.v1.models.assessment import AssessmentKind
 from traust_core.v1.models.dependencies import (
@@ -27,6 +28,7 @@ from traust_core.v1.models.dependencies import (
 )
 from traust_core.v1.models.vocabulary import Ecosystem, ManifestCoverageReason
 from traust_core.v1.providers.base import ProviderRegistry, Result
+from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.feeds import FeedProvider
 from traust_core.v1.providers.tools import ToolRequest
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
@@ -45,7 +47,11 @@ NO_LODASH = json.dumps(
 
 
 def exposure(
-    engine: Engine, tool: FakeSbomTool | None = None, *records: AdvisoryRecord
+    engine: Engine,
+    tool: FakeSbomTool | None = None,
+    *records: AdvisoryRecord,
+    clock: Clock | None = None,
+    checkout: object | None = None,
 ) -> ExposureService:
     uow = SqlTraustUnitOfWork(engine)
     return ExposureService(
@@ -56,6 +62,8 @@ def exposure(
         advisories=Lookup(*(records or (LODASH,))),  # type: ignore[arg-type]
         portfolio=PortfolioService(uow, PortfolioPolicy()),
         sbom_tool=tool or FakeSbomTool(raw=NO_LODASH),  # type: ignore[arg-type]
+        clock=clock,
+        checkout=checkout,  # type: ignore[arg-type]
     )
 
 
@@ -268,30 +276,69 @@ def test_a_pointer_to_a_scan_holding_no_coverage_is_refused(engine: Engine) -> N
         exposure(engine).unresolved_manifests(ref.id)
 
 
-class TimedSbomTool(FakeSbomTool):
-    """Reads the tree at a stated time, as two overlapping scans of one commit would."""
+class ReadClock:
+    """The time each scan reads the tree, in the order the scans start."""
 
-    def __init__(self) -> None:
-        super().__init__(raw=NO_LODASH)
-        self.at = datetime(2026, 11, 5, tzinfo=UTC)
+    def __init__(self, *reads: datetime) -> None:
+        self.reads = list(reads)
 
-    def acquire(self, request: ToolRequest) -> Result[bytes]:
-        found = super().acquire(request)
-        return Result(found.data, found.acquisition.model_copy(update={"acquired_at": self.at}))
+    def now(self) -> datetime:
+        return self.reads.pop(0) if self.reads else datetime(2026, 11, 6, tzinfo=UTC)
 
 
 def test_an_older_scan_finishing_late_never_displaces_a_newer_one(
     engine: Engine, tmp_path: Path
 ) -> None:
-    tool = TimedSbomTool()
-    ref, service = ref_id(engine), exposure(engine, tool)
-    newer, older = tool.at + timedelta(hours=1), tool.at
-    tool.at = newer
+    read = datetime(2026, 11, 5, 12, 0, 0, 999_999, tzinfo=UTC)
+    # the newer scan read 1µs later but in the same stored millisecond, then a full hour later
+    later, earlier = read + timedelta(hours=1), read
+    ref = ref_id(engine)
+    service = exposure(engine, clock=ReadClock(later, earlier))  # type: ignore[arg-type]
     service.ingest_dependencies(ref, checkout(tmp_path / "now", locked=True))
-    tool.at = older  # read the tree before the newer scan, recorded after it
-    service.ingest_dependencies(ref, checkout(tmp_path / "then", locked=False))
+    service.ingest_dependencies(ref, checkout(tmp_path / "then", locked=False))  # recorded last
     assert service.unresolved_manifests(ref) == ()
     assert coverage_runs(engine, ref) == 2
+
+
+class OvertakenSbomTool(FakeSbomTool):
+    """While its first scan runs, a newer scan of the same commit (reading `newer_raw`) is
+    recorded first."""
+
+    def __init__(self, newer_raw: bytes) -> None:
+        super().__init__(raw=NO_LODASH)
+        self.newer_raw = newer_raw
+        self.newer: Callable[[], object] | None = None
+
+    def acquire(self, request: ToolRequest) -> Result[bytes]:
+        if self.newer is not None:
+            newer, self.newer, older_raw = self.newer, None, self.raw
+            self.raw = self.newer_raw
+            newer()
+            self.raw = older_raw
+        return super().acquire(request)
+
+
+def test_the_fleet_sweep_returns_the_current_sbom_not_a_stale_scans(
+    engine: Engine, tmp_path: Path
+) -> None:
+    read = datetime(2026, 11, 5, tzinfo=UTC)
+    with_lodash = json.dumps(
+        {"bomFormat": "CycloneDX", "components": [{"purl": "pkg:npm/lodash@4.17.21"}],
+         "metadata": {"tools": {"components": [{"name": "syft", "version": "1.51.1"}]}}}
+    ).encode()  # fmt: skip
+    ref, tool = ref_id(engine), OvertakenSbomTool(with_lodash)
+    service = exposure(
+        engine,
+        tool,
+        clock=ReadClock(read, read + timedelta(hours=1)),  # type: ignore[arg-type]
+        checkout=FakeCheckout(checkout(tmp_path / "older", locked=False)),
+    )
+    newer_tree = checkout(tmp_path / "newer", locked=True)
+    tool.newer = lambda: service.ingest_dependencies(ref, newer_tree)
+    current = service.record_manifest_sbom(ref)
+    with SqlTraustUnitOfWork(engine) as uow:
+        assert current.id == uow.repository_refs.get(ref).manifest_sbom_id
+    assert service.unresolved_manifests(ref) == ()
 
 
 def test_an_image_shipping_the_vulnerable_version_is_pending_whatever_the_manifest(

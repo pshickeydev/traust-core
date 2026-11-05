@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from datetime import timedelta
+from uuid import uuid4
 
+import pytest
 import sqlalchemy as sa
 
 from tests.v1.repositories.tables.conftest import (
@@ -14,6 +16,7 @@ from tests.v1.repositories.tables.conftest import (
     repository_for,
     same_rows,
 )
+from traust_core.v1.errors import NotFoundError
 
 B = "b" * 40
 
@@ -161,3 +164,11 @@ def test_repositories_list_by_id(seed: Seed) -> None:
     seed.repository()
     assert same_rows(repositories.list_by_ids([one.id, two.id]), [one, two])  # type: ignore[list-item]
     assert repositories.list_by_ids([]) == []
+
+
+def test_a_ref_locked_for_update_is_the_ref_and_a_missing_one_raises(seed: Seed) -> None:
+    ref = seed.repository_ref()
+    assert ref.id is not None
+    assert seed.uow.repository_refs.get_for_update(ref.id) == ref
+    with pytest.raises(NotFoundError):
+        seed.uow.repository_refs.get_for_update(uuid4())

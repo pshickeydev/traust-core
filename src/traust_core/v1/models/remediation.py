@@ -634,18 +634,21 @@ class PropagationEvidence(Model):
     @classmethod
     def of(cls, package: AffectedPackage, fixed: Version, uptake: FixUptake) -> Self:
         """Each version the commit carries judged by the advisory's own spans, not one bound:
-        1.57.0 is past a first fix of 1.56.3 and still affected (fixed again in 1.57.1)."""
+        1.57.0 is past a first fix of 1.56.3 and still affected (fixed again in 1.57.1). An
+        uptake not observed (its manifest's coverage is unknown) can be pending, never consumed."""
         checked = tuple(
             c.model_copy(update={"consumed": None if hit is None else not hit})
             for c in uptake.checked
             for hit in [package.affects(c.version)]
         )
+        judged = (
+            FixUptakeState.CONSUMED if all(c.consumed for c in checked) else FixUptakeState.PENDING
+        )
         state = (
             uptake.state
             if not checked
-            else FixUptakeState.CONSUMED
-            if all(c.consumed for c in checked)
-            else FixUptakeState.PENDING
+            or (uptake.state == FixUptakeState.NOT_OBSERVED and judged == FixUptakeState.CONSUMED)
+            else judged
         )
         return cls(
             ecosystem=package.ecosystem,

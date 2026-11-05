@@ -18,7 +18,6 @@ from traust_core.v1.repositories import (
     SqlUnitOfWork,
     append_only_columns,
     apply_schema,
-    create_database_engine,
     record_columns,
 )
 
@@ -371,7 +370,9 @@ def test_failed_nested_transaction_recovers_only_after_rollback(
             uow.records.get(failed.id)
 
 
-def test_a_driver_error_from_ddl_is_a_repository_error() -> None:
-    engine = create_database_engine("sqlite://")
-    with pytest.raises(RepositoryError, match="apply schema failed"):
-        apply_schema(engine, ["CREATE TABLE t (id INTEGER)", "ALTER TABLE t ADD COLUMN id TEXT"])
+@pytest.mark.parametrize("backend", SQL_BACKENDS)
+def test_a_driver_error_from_ddl_is_a_repository_error(backend: str, tmp_path: Path) -> None:
+    with database(backend, tmp_path, metadata) as engine:
+        apply_schema(engine, ["CREATE TABLE ddl_twice (id INTEGER)"])
+        with pytest.raises(RepositoryError, match="apply schema failed"):
+            apply_schema(engine, ["ALTER TABLE ddl_twice ADD COLUMN id TEXT"])
