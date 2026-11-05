@@ -64,7 +64,7 @@ from traust_core.v1.repositories.objects import (
     ObjectKey,
     ObjectStore,
 )
-from traust_core.v1.services.exposure import REACHED_THROUGH, ExposureService
+from traust_core.v1.services.exposure import REACHED_THROUGH, UNKNOWN_COVERAGE, ExposureService
 from traust_core.v1.services.findings import FindingIntake, IdentityPolicy, TaxonomyPolicy
 from traust_core.v1.services.portfolio import PortfolioPolicy, PortfolioService
 from traust_core.v1.services.reporting import ReportingService
@@ -321,14 +321,14 @@ def test_images_built_from_the_commit_are_cross_checked(engine: Engine) -> None:
     assert exposure.prepare(found, other.id).evidence.sbom_scan == "module_not_in_sbom"
 
 
-def test_a_commit_outside_the_blast_radius_does_not_import_it(engine: Engine) -> None:
+def test_a_document_sbom_lacking_the_package_leaves_it_unknown(engine: Engine) -> None:
     [app] = refs(engine, 1)
     assert app.id is not None
     exposure = service(engine)
     exposure.ingest_sbom(sbom(("example.com/other", "v1.0.0")), app.id)
     prepared = exposure.prepare(advisory_id(exposure), app.id)
-    assert prepared.evidence == ImpactEvidence(l1_depends_on=False)
-    assert prepared.document("1").repos[0].classification == "not_imported"
+    assert prepared.evidence == ImpactEvidence(l1_depends_on=None, notes=UNKNOWN_COVERAGE)
+    assert prepared.document("1").repos[0].classification == "inconclusive"
     assert prepared.package == GRPC.affected[0]
 
 

@@ -5,6 +5,7 @@ from ipaddress import ip_address
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
+from uuid import UUID
 
 import pydantic
 import sqlalchemy as sa
@@ -249,6 +250,18 @@ class FeedsConfig(_Model):
     osv_access: Literal["api", "air-gapped"] = "api"  # air-gapped: exported OSV records only
 
 
+class DocsTarget(_Model):
+    """Official documentation coordinates of a product; no guides: discovered from its page."""
+
+    product_slug: str  # the contract's schema checks the shapes when traust.yaml loads
+    version: str
+    guides: tuple[str, ...] | None = None
+
+
+class ComplianceConfig(_Model):
+    docs_targets: dict[UUID, DocsTarget] = pydantic.Field(default_factory=dict)  # by product id
+
+
 class ExecutionConfig(_Model):
     sandbox: Literal["none", "podman"] = "none"  # how a target's own build and test code runs
 
@@ -316,6 +329,7 @@ class Config(_Model):
     forge_tokens: dict[str, str] = {}  # host -> env var holding its API token; absent: anonymous
     budgets: tuple[Budget, ...] = ()  # monthly spend per lane; absent lanes are never bound
     remediation: RemediationConfig = RemediationConfig()
+    compliance: ComplianceConfig = ComplianceConfig()
     locations: Locations = Locations()  # relative paths resolve against traust.yaml's directory
     feeds: FeedsConfig = FeedsConfig()
     execution: ExecutionConfig = ExecutionConfig()

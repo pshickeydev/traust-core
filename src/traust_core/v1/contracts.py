@@ -257,6 +257,12 @@ def ddl(area: Area, dialect: Dialect) -> list[str]:
     ]
 
 
+def manifest_sbom_binding_upgrade(dialect: Dialect) -> list[str]:
+    """The additive upgrade for a database whose `repository_ref` predates the manifest scan
+    pointer; apply it only when that column is absent. Old SBOMs keep unknown coverage."""
+    return storage_sql.manifest_sbom_binding_upgrade(dialect)
+
+
 def database_ddl(dialect: Dialect) -> list[str]:
     """Every namespace, in bootstrap order: the whole db contract."""
     return [s for area in AREAS for s in ddl(area, dialect)]

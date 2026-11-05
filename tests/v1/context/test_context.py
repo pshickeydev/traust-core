@@ -99,3 +99,18 @@ def test_recording_start_capabilities_parse_machine_assets_and_native_repositori
 def test_recording_start_rejects_malformed_capabilities(scope: dict[str, object]) -> None:
     with pytest.raises(ValueError):
         Config.model_validate({"recording": {"start": [scope]}})
+
+
+def test_a_local_database_from_before_the_manifest_scan_pointer_is_upgraded(
+    tmp_path: Path,
+) -> None:
+    with Context(Config(home=tmp_path)).database.begin() as conn:
+        conn.exec_driver_sql("DROP INDEX idx_repository_ref_manifest_sbom_assessment")
+        conn.exec_driver_sql("ALTER TABLE repository_ref DROP COLUMN manifest_sbom_assessment_id")
+    engine = Context(Config(home=tmp_path)).database
+    columns = {c["name"] for c in sa.inspect(engine).get_columns("repository_ref")}
+    assert "manifest_sbom_assessment_id" in columns
+    again = Context(Config(home=tmp_path)).database  # present: nothing applied twice
+    assert "manifest_sbom_assessment_id" in {
+        c["name"] for c in sa.inspect(again).get_columns("repository_ref")
+    }

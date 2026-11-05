@@ -706,8 +706,12 @@ class Context:
         if local:
             self.config.home.mkdir(parents=True, exist_ok=True)
         engine = create_database_engine(self.config.record_store_url())
-        if local and not sa.inspect(engine).get_table_names():
+        if local and not (tables := sa.inspect(engine).get_table_names()):
             apply_schema(engine, contracts.database_ddl(Dialect.of(engine)))
+        elif local and "repository_ref" in tables:
+            columns = {c["name"] for c in sa.inspect(engine).get_columns("repository_ref")}
+            if "manifest_sbom_assessment_id" not in columns:
+                apply_schema(engine, contracts.manifest_sbom_binding_upgrade(Dialect.of(engine)))
         return engine
 
     @cached_property

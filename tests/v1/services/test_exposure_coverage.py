@@ -13,7 +13,7 @@ from sqlalchemy.engine import Engine
 from tests.v1.repositories.tables.conftest import Seed
 from tests.v1.services.test_exposure_impact import LODASH, Lookup, engine
 from tests.v1.services.test_exposure_sweep import FakeSbomTool
-from traust_core.v1.errors import ValidationError
+from traust_core.v1.errors import IntegrityError, ValidationError
 from traust_core.v1.models.assessment import AssessmentKind
 from traust_core.v1.models.dependencies import (
     AdvisoryIdentifier,
@@ -29,6 +29,7 @@ from traust_core.v1.providers.base import ProviderRegistry
 from traust_core.v1.providers.feeds import FeedProvider
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.repositories.objects import InMemoryObjectStore
+from traust_core.v1.services.artifact_publishing import stored_bytes
 from traust_core.v1.services.exposure import ExposureService
 from traust_core.v1.services.findings import FindingIntake, IdentityPolicy, TaxonomyPolicy
 from traust_core.v1.services.portfolio import PortfolioPolicy, PortfolioService
@@ -79,7 +80,7 @@ def coverage_runs(engine: Engine, ref: UUID) -> int:
     return sum(a.kind == AssessmentKind.MANIFEST_SBOM for a in runs)
 
 
-def test_unresolved_manifests_are_recorded_once_beside_the_sbom(
+def test_each_scan_records_its_coverage_bound_to_its_sbom_and_itself(
     engine: Engine, tmp_path: Path
 ) -> None:
     ref, service = ref_id(engine), exposure(engine)
@@ -93,8 +94,18 @@ def test_unresolved_manifests_are_recorded_once_beside_the_sbom(
         ),
     )
     assert first.unresolved == again.unresolved == expected
+    assert first.sbom.id == again.sbom.id
     assert service.unresolved_manifests(ref) == expected
-    assert coverage_runs(engine, ref) == 1
+    assert coverage_runs(engine, ref) == 2
+    with SqlTraustUnitOfWork(engine) as uow:
+        current = uow.repository_refs.get(ref)
+        scans = [a for a in uow.assessments.list_for_ref(ref)]
+        [artifact] = uow.artifacts.list_for_assessment(current.manifest_sbom_assessment_id)
+    assert current.manifest_sbom_assessment_id == max(scans, key=lambda a: a.created_at).id
+    doc = json.loads(stored_bytes(service._objects, artifact))
+    assert doc["sbom_id"] == str(first.sbom.id)
+    assert doc["assessment_id"] == str(current.manifest_sbom_assessment_id)
+    assert doc["unresolved"] == {"npm": {"ui/package.json": "no-lockfile"}}
 
 
 def test_a_complete_read_records_no_unresolved_manifests(engine: Engine, tmp_path: Path) -> None:
@@ -104,11 +115,38 @@ def test_a_complete_read_records_no_unresolved_manifests(engine: Engine, tmp_pat
     assert coverage_runs(engine, ref) == 1
 
 
-def test_an_sbom_ingested_as_a_document_knows_no_unresolved_manifests(engine: Engine) -> None:
+def test_an_sbom_ingested_as_a_document_leaves_coverage_unknown(
+    engine: Engine, tmp_path: Path
+) -> None:
     ref, service = ref_id(engine), exposure(engine)
     service.ingest_sbom(NO_LODASH, ref)
-    assert service.unresolved_manifests(ref) == ()
+    assert service.unresolved_manifests(ref) is None
     assert coverage_runs(engine, ref) == 0
+    service.ingest_dependencies(ref, checkout(tmp_path, locked=True))
+    assert service.unresolved_manifests(ref) == ()
+    service.ingest_sbom(NO_LODASH, ref)  # the same package list: the scan pointer still clears
+    assert service.unresolved_manifests(ref) is None
+
+
+def test_coverage_bound_to_another_sbom_or_scan_is_refused(engine: Engine, tmp_path: Path) -> None:
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        mine = seed.repository_ref()
+        theirs = seed.repository_ref(seed.repository(url="https://github.com/org/other"))
+        uow.commit()
+    assert mine.id is not None and theirs.id is not None
+    ref, other, service = mine.id, theirs.id, exposure(engine)
+    service.ingest_dependencies(ref, checkout(tmp_path, locked=True))
+    service.ingest_dependencies(other, tmp_path)
+    with SqlTraustUnitOfWork(engine) as uow:
+        current = uow.repository_refs.get(ref)
+        stranger = uow.repository_refs.get(other).manifest_sbom_assessment_id
+        uow.repository_refs.update(
+            current.model_copy(update={"manifest_sbom_assessment_id": stranger})
+        )
+        uow.commit()
+    with pytest.raises(IntegrityError, match="bound to"):
+        service.unresolved_manifests(ref)
 
 
 @pytest.mark.parametrize(
@@ -138,7 +176,7 @@ def test_a_package_missing_beside_an_unresolved_manifest_is_unknown(
     assert fix.state == uptake
 
 
-def test_coverage_lands_before_the_sbom_so_a_failed_ingest_is_retried_whole(
+def test_a_failed_ingest_records_nothing_and_is_retried_whole(
     engine: Engine, tmp_path: Path
 ) -> None:
     ref, tool = ref_id(engine), FakeSbomTool(raw=b"not json")
