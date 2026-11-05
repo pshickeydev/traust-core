@@ -1216,7 +1216,10 @@ class VerificationService:
             a
             for a in runs
             if refs[a.repository_ref_id].sha == original_commit
-            and refs[a.repository_ref_id].name == patched.name
+            and (
+                a.repository_ref_id == patched.id
+                or (patched.name is not None and refs[a.repository_ref_id].name == patched.name)
+            )
         ]
         if not audits:
             log.warning(

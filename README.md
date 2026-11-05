@@ -58,10 +58,11 @@ The remaining correctness changes are:
   `first_party_divisor` produces a labelled estimate, not a measurement.
 - Executive language grouping respects the requested historical cutoff. Historical PQC
   remains explicitly unavailable; no current readiness is substituted.
-- Verification recording matches the original commit and verified ref name. If no audit
-  matches, the verification has no baseline and its resolution stays on its own ref:
-  a sole audit on another branch is not a fallback. Exact replay retains the originally
-  recorded baseline.
+- Verification baselines require the original commit and affirmative line identity:
+  the same recorded ref, or a matching non-null ref name. Null names alone do not
+  establish ancestry. Without a matching audit, the baseline remains unset; assessed
+  resolutions stay bound to their recorded refs, including unnamed refs, rather than
+  becoming line-free decisions that can close main. Exact replay retains its baseline.
 - Container image provenance is escaped as literal text inside authored report bodies.
   Stored provenance is unchanged, and container selection retains the existing
   `assessment_id` / `report_stem` contract.
