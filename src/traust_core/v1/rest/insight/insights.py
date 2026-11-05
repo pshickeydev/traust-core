@@ -16,6 +16,7 @@ from traust_core.v1.rest.insight.service import Insight
 router = APIRouter()
 
 Ids = Annotated[list[UUID] | None, Query()]
+Labels = Annotated[list[str] | None, Query()]
 
 
 @router.get("/v1/insights/{name}", responses=PROBLEMS(401, 404, 422))
@@ -29,12 +30,14 @@ def get_insight(
     bucket: TimeBucket = TimeBucket.MONTH,
     artifact_id: UUID | None = None,
     repository_id: UUID | None = None,
+    category: Labels = None,
 ) -> SerializeAsAny[ViewModel]:
     """One insight (a dashboard, rollup or export such as SARIF) for a scope at `as_of`, built on
     demand; one route for every insight, so a new one needs no route or SDK release."""
     filter = ViewFilter(
         product_ids=tuple(product_id or ()),
         team_ids=tuple(team_id or ()),
+        categories=tuple(category or ()),
         as_of=as_of,
         bucket=bucket,
         artifact_id=artifact_id,

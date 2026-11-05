@@ -85,6 +85,7 @@ def test_the_sarif_view_is_the_projection_of_the_baseline(core: Context) -> None
     assert len(rows) == 3  # the header and one row per finding: a title cannot forge rows
     assert "a \\| b" in rendered.markdown and "false_positive" in rendered.markdown
     assert "<img" not in rendered.html
+    assert "<img" not in rendered.markdown and "[docs](" not in rendered.markdown
 
 
 def test_the_sarif_view_states_the_repository_as_it_stood(core: Context) -> None:

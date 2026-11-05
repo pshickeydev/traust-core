@@ -49,3 +49,20 @@ def test_a_per_repository_insight_takes_its_repository_id(
     assert body["runs"][0]["properties"] == expected.runs[0]["properties"]  # type: ignore[attr-defined]
     missing = client.get(url, headers=bearer(context))
     assert missing.status_code == 422 and "repository_id" in missing.text
+
+
+def test_a_category_query_scopes_the_insight(context: Context, client: TestClient) -> None:
+    with SqlTraustUnitOfWork(context.database) as uow:
+        seed = Seed(uow)
+        ref = seed.repository_ref()
+        assessment = seed.assessment(ref)
+        repository = uow.repositories.get(ref.repository_id)
+        for label in ("crypto", "injection"):
+            finding = seed.finding(repository, title=f"{label} finding")
+            seed.finding_label(finding, taxonomy="category", label=label)
+            seed.occurrence(finding, assessment)
+        uow.commit()
+    url = "/v1/insights/sarif"
+    params = {"repository_id": str(ref.repository_id), "category": ["crypto"]}
+    body = client.get(url, params=params, headers=bearer(context)).json()
+    assert [r["message"]["text"] for r in body["runs"][0]["results"]] == ["crypto finding"]
