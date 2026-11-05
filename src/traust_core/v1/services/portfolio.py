@@ -620,15 +620,15 @@ class PortfolioService:
         return repository
 
     def _upstream(self, uow: InventoryUnitOfWork, parent_url: HttpsRepoUrl) -> Repository:
-        """A fork's parent row: the one registered at this URL, on GitHub (whose owner/repo is
-        case-insensitive) one registered in another case, else a new private row."""
-        if (found := uow.repositories.find_by_url(str(parent_url))) is not None:
-            return found
-        if self._hosts.get(parent_url.host) == "github" and (
-            found := uow.repositories.find_by_url_casefold(str(parent_url))
-        ):
-            return found
-        return uow.repositories.get_or_add(Repository(url=str(parent_url), public=False))
+        """A fork's parent row: the one registered (any case on GitHub), else a new private row."""
+        return _registered_repository(uow, parent_url, self._hosts) or uow.repositories.get_or_add(
+            Repository(url=str(parent_url), public=False)
+        )
+
+    def find_registered(self, url: HttpsRepoUrl) -> Repository | None:
+        """The repository registered at this URL, on GitHub in any case of owner/repo."""
+        with self._uow as uow:
+            return _registered_repository(uow, url, self._hosts)
 
     def register_ref(
         self, repository_id: UUID, sha: GitSha, name: RefName | None, kind: RefKind | None
@@ -1171,6 +1171,18 @@ def _owned(subject: CorpusSubject | None) -> tuple[OwnershipClass | None, str | 
     return (None, None) if subject is None else (subject.ownership, subject.business_unit)
 
 
+def _registered_repository(
+    uow: InventoryUnitOfWork, url: HttpsRepoUrl, hosts: Mapping[str, str]
+) -> Repository | None:
+    """The row registered at this URL; on GitHub, whose owner/repo is case-insensitive, one
+    registered in another case (a fork's lowercased parent, a differently typed import)."""
+    if (found := uow.repositories.find_by_url(str(url))) is not None:
+        return found
+    if hosts.get(url.host) == "github":
+        return uow.repositories.find_by_url_casefold(str(url))
+    return None
+
+
 def _registered(doc: CorpusRegistryArtifact, product: Product) -> CorpusSubject:
     subject = CorpusRegistry.of(doc).subject(str(product.id))
     assert subject is not None
@@ -1206,17 +1218,19 @@ class PortfolioSync:
     def import_repository(self, url: HttpsRepoUrl) -> SyncReport:
         """Register one repository with the visibility its forge reports and its fork's
         upstream linked; a known repository's missing upstream is back-filled."""
-        known = self._portfolio.find_repository(url)
+        known = self._portfolio.find_registered(url)
         if known is not None and known.id is not None:
             if known.upstream_id is None:
                 # lineage not linked yet: the forge may name a parent, or correct a parent
-                # placeholder's visibility. A forge outage still returns the known id.
+                # placeholder's visibility. A forge outage, or a host the forge provider
+                # can't ask, still returns the known id.
                 try:
                     info = self._sources.info(url).data
-                except SourceError as e:
+                except (SourceError, ValidationError) as e:
+                    why = e.observation_status if isinstance(e, SourceError) else e
                     return SyncReport(
                         unchanged=(known.id,),
-                        skipped=(f"{url}: forge facts not refreshed: {e.observation_status}",),
+                        skipped=(f"{url}: forge facts not refreshed: {why}",),
                     )
                 self._record_info(known.id, info)
             return SyncReport(unchanged=(known.id,))
@@ -1268,7 +1282,7 @@ class PortfolioSync:
         return report + SyncReport(skipped=tuple(sorted(named)))
 
     def _register(self, url: HttpsRepoUrl, visibility: str | None) -> SyncReport:
-        known = self._portfolio.find_repository(url)
+        known = self._portfolio.find_registered(url)
         repository = known or self._portfolio.register_repository(url, visibility == "public")
         assert repository.id is not None
         return SyncReport(**{"unchanged" if known else "added": (repository.id,)})

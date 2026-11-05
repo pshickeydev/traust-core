@@ -48,7 +48,7 @@ class Forge:
         heads: dict[str, str] | None = None,
         error: SourceError | None = None,
         described: RepoInfo | None = None,
-        info_error: SourceError | None = None,
+        info_error: SourceError | ValidationError | None = None,
     ) -> None:
         self.listing, self.visibility, self.heads, self.error = listing, visibility, heads, error
         self.described, self.info_error = described, info_error
@@ -404,3 +404,30 @@ def test_a_forge_outage_still_returns_a_known_repository(portfolio: PortfolioSer
     assert report.unchanged == (known.id,)
     assert report.skipped == (f"{url('example-org/api')}: forge facts not refreshed: unreachable",)
     assert portfolio.get_repository(known.id) == known  # nothing changed without the forge
+
+
+def test_a_parent_imported_in_another_case_is_the_forks_placeholder(
+    portfolio: PortfolioService,
+) -> None:
+    fork_forge = Forge(described=describing("example-org/fork", "Example-Org/API"))
+    fork = sync(portfolio, fork_forge).import_repository(url("example-org/fork")).added[0]
+    placeholder = portfolio.get_repository(fork).upstream_id
+    assert placeholder is not None
+
+    parent_forge = Forge(described=describing("Example-Org/API", None, fork=False))
+    report = sync(portfolio, parent_forge).import_repository(url("Example-Org/API"))
+    assert report == SyncReport(unchanged=(placeholder,))  # no second row
+    assert portfolio.get_repository(placeholder).public is True
+
+
+def test_a_host_the_forge_cannot_ask_still_returns_a_known_repository(
+    portfolio: PortfolioService,
+) -> None:
+    known = portfolio.register_repository(url("example-org/api"), public=True)
+    assert known.id is not None
+    forge = Forge(info_error=ValidationError("unsupported forge kind: example"))
+    report = sync(portfolio, forge).import_repository(url("example-org/api"))
+    assert report.unchanged == (known.id,)
+    assert report.skipped == (
+        f"{url('example-org/api')}: forge facts not refreshed: unsupported forge kind: example",
+    )
