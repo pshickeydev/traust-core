@@ -224,3 +224,10 @@ def test_any_of_an_advisorys_ecosystems_left_unresolved_makes_it_unknown(
     found = service.find_advisory(both.identifier)
     assert found is not None and found.advisory_id is not None
     assert service.prepare(found.advisory_id, ref).evidence.l1_depends_on is None
+
+
+def test_the_fleet_sweep_keeps_an_sbom_given_as_a_document(engine: Engine) -> None:
+    ref, service = ref_id(engine), exposure(engine)
+    kept = service.ingest_sbom(NO_LODASH, ref)
+    assert service.record_manifest_sbom(ref) == kept  # no checkout wired: nothing fetched
+    assert service.unresolved_manifests(ref) is None

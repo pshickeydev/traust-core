@@ -389,9 +389,10 @@ class ExposureService:
 
     def record_manifest_sbom(self, repository_ref_id: UUID) -> Sbom:
         """The commit's manifest SBOM: the one recorded, else the SBOM tool's over the commit's
-        manifests, fetched from its forge (the fleet sweep's door; a re-run never fetches)."""
+        manifests, fetched from its forge (the fleet sweep's door; a re-run never fetches). A
+        recorded SBOM given as a document stays, with its coverage unknown."""
         ref, repository = self._inventory.resolve(repository_ref_id)
-        if ref.manifest_sbom_id is not None and ref.manifest_sbom_assessment_id is not None:
+        if ref.manifest_sbom_id is not None:
             with self._uow as uow:
                 return uow.sboms.get(ref.manifest_sbom_id)
         if self._checkout is None:
@@ -484,11 +485,10 @@ class ExposureService:
         """The manifests the SBOM tool could not resolve on the commit, from the coverage of the
         scan that recorded its current SBOM. None is unknown: no such scan (an SBOM given as a
         document, or none). Coverage bound to another SBOM or scan raises."""
-        with self._uow as uow:
-            ref = self._inventory.get_ref(repository_ref_id)
-            if ref.manifest_sbom_assessment_id is None:
-                return None
-            [scan] = uow.assessments.list_by_ids([ref.manifest_sbom_assessment_id])
+        ref = self._inventory.get_ref(repository_ref_id)
+        if ref.manifest_sbom_assessment_id is None:
+            return None
+        [scan] = self._log.list_by_ids([ref.manifest_sbom_assessment_id])
         held = self._log.documents([scan], [ManifestCoverageArtifact.schema])
         if not held:
             raise IntegrityError(f"manifest scan {scan.id} on ref {ref.id} holds no coverage")
