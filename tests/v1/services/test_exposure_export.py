@@ -241,3 +241,23 @@ def test_export_keeps_only_the_latest_analysis_of_a_commit(engine: Engine) -> No
 def test_export_by_unknown_advisory_id_is_not_found(engine: Engine) -> None:
     with pytest.raises(NotFoundError):
         reads(engine).export_impacts(uuid4())
+
+
+def test_a_document_omitting_its_go_ecosystem_is_the_same_package_as_one_naming_it(
+    engine: Engine,
+) -> None:
+    exposure = reads(engine)
+    [ref] = refs(engine, 1)
+    assert ref.id is not None
+    exposure.ingest_sbom(sbom(("google.golang.org/grpc", "v1.56.2")), ref.id)
+    known = exposure.find_advisory(GHSA)
+    assert known is not None and known.advisory_id is not None
+    prepared = exposure.prepare(known.advisory_id, ref.id)
+    legacy = json.loads(prepared.document("1.0.0").payload)
+    assert legacy["metadata"].pop("ecosystem") == "go"
+    exposure.record(ref.id, ImpactAnalysisArtifact.from_document(legacy), source())
+    again = prepared.model_copy(update={"evidence": ImpactEvidence(notes="Reviewed again")})
+    latest = exposure.record(ref.id, again.document("1.0.0"), source(1))
+    exported = exposure.export_impacts(GHSA)
+    assert (exported.commits, exported.analyses) == (1, 1)
+    assert [row.artifact_id for row in exported.repos] == [latest.artifact_id]

@@ -1239,8 +1239,7 @@ class VerificationService:
         for repository_id in dict.fromkeys(repository_ids):
             refs = self._inventory.list_refs(repository_id)
             head = self._portfolio.default_ref(repository_id)
-            verified = {v.verification_id for v in self._verifications(repository_id)}
-            entries.append(self._sweep_entry(repository_id, head, refs, verified))
+            entries.append(self._sweep_entry(repository_id, head, refs))
             if include_branches:
                 default = default_line(refs)
                 branches: dict[str, RepositoryRef] = {}
@@ -1261,12 +1260,17 @@ class VerificationService:
                     ):
                         branches[ref.name] = ref
                         observed.add(ref.name)
+                completed = (
+                    {v.verification_id for v in self._verifications(repository_id)}
+                    if branches
+                    else set()
+                )
                 entries.extend(
                     self._sweep_entry(
                         repository_id,
                         ref,
                         refs,
-                        verified,
+                        completed,
                         branch=True,
                         observed=ref.name in observed,
                     )
@@ -1339,12 +1343,13 @@ class VerificationService:
         repository_id: UUID,
         head: RepositoryRef | None,
         refs: Sequence[RepositoryRef],
-        verified_ids: Collection[UUID],
+        verified_ids: Collection[UUID] | None = None,
         *,
         branch: bool = False,
         observed: bool = False,
     ) -> SweepEntry:
-        """A default entry weighs every line's evidence; a branch entry only its own line's."""
+        """A default entry weighs every line's evidence and every verification run that stated
+        a verdict; a branch entry only its own line's, and only `verified_ids`."""
         with self._uow:
             repository = self._inventory.get_repository(repository_id)
             shas = {r.id: r.sha for r in refs}
@@ -1374,6 +1379,9 @@ class VerificationService:
             return not line or baseline.repository_ref_id in line
 
         kinds = {a.id: a.kind for a in judged}
+        if verified_ids is None:
+            stated = {d.assessment_id for d in decided}
+            verified_ids = {a.id for a in judged if a.kind == VERIFICATION and a.id in stated}
         verified = [a for a in judged if a.id in verified_ids and on_line(a)]
         pinned = max(
             (a for a in judged if (a.id in reported or a.id in verified_ids) and on_line(a)),

@@ -155,6 +155,44 @@ def test_an_included_suppressed_result_is_queued_for_review_not_left_plain_open(
     assert services.findings.history(suppressed) == []
 
 
+def test_a_closed_suppression_review_is_never_reopened_by_a_rescan(
+    context: Context, engine: Engine
+) -> None:
+    services = context.services()
+    ref, raw = a_ref(engine), (SCANNERS / "codeql.sarif").read_bytes()
+    first = provenance()
+    _, plain = services.assessment.record_scan(ref, raw, CandidateFormat.SARIF, first)
+    _, included = services.assessment.record_scan(
+        ref, raw, CandidateFormat.SARIF, first, include_suppressed=True
+    )
+    [suppressed] = set(included.findings.values()) - set(plain.findings.values())
+    [queued] = services.findings.review.for_finding(suppressed)
+    assert queued.id is not None
+    services.findings.review.close_unreviewed(queued.id)
+    later = Provenance(
+        run_id=uuid4(), source=SourceType.VULN_SCAN_REPORT, occurred_at=WHEN + timedelta(days=1)
+    )
+    for again in (first, later, later):
+        services.assessment.record_scan(
+            ref, raw, CandidateFormat.SARIF, again, include_suppressed=True
+        )
+    [item] = services.findings.review.for_finding(suppressed)
+    assert (item.id, item.status) == (queued.id, "closed_unreviewed")
+
+
+def test_an_under_review_suppression_is_an_ordinary_result_and_queues_nothing(
+    context: Context, engine: Engine
+) -> None:
+    services = context.services()
+    doc = json.loads((SCANNERS / "codeql.sarif").read_bytes())
+    doc["runs"][0]["results"][1]["suppressions"] = [{"kind": "external", "status": "underReview"}]
+    ref, raw = a_ref(engine), json.dumps(doc).encode()
+    _, plain = services.assessment.record_scan(ref, raw, CandidateFormat.SARIF, provenance())
+    assert len(set(plain.findings.values())) == 2
+    for finding_id in plain.findings.values():
+        assert services.findings.review.for_finding(finding_id) == []
+
+
 def test_record_scan_needs_intake(engine: Engine) -> None:
     with pytest.raises(ConfigError, match="needs finding intake"):
         AssessmentService(SqlTraustUnitOfWork(engine)).record_scan(

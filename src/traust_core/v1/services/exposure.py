@@ -1550,14 +1550,15 @@ def _latest(rows: Sequence[_Recorded], until: datetime | None) -> list[_Recorded
 
 
 def _latest_members(rows: Sequence[_Recorded]) -> list[_Recorded]:
-    """The latest analysis of each commit, advisory and affected package version."""
-    latest: dict[tuple[UUID, UUID, str | None, str, str | None], _Recorded] = {}
+    """The latest analysis of each commit, advisory and affected package version; a document
+    that omits its ecosystem is Go, as the impact-analysis contract defines."""
+    latest: dict[tuple[UUID, UUID, str, str, str | None], _Recorded] = {}
     for row in rows:
         metadata = row.doc.metadata
         key = (
             row.analysis.repository_ref_id,
             row.analysis.advisory_id,
-            metadata.ecosystem,
+            metadata.ecosystem or Ecosystem.GO.value,
             metadata.module,
             row.doc.repos[0].version,
         )

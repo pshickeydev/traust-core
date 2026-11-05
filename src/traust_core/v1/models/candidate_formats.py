@@ -19,6 +19,9 @@ _LEVEL_TO_SEVERITY = {
     "note": "informational",
     "none": "informational",
 }
+# Strongest first; only accepted (or no status) suppresses: underReview is undecided (§3.35.3).
+_SUPPRESSION_STATUSES = ("accepted", "underReview", "rejected")
+_STANDING = _SUPPRESSION_STATUSES[0]
 _PRECISION_TO_CONFIDENCE = {"very-high": 0.95, "high": 0.85, "medium": 0.6, "low": 0.4}
 _DEPENDABOT_SEVERITY = {
     "critical": "critical",
@@ -96,10 +99,9 @@ def _sarif_run(
     by_location = _sarif_artifacts(artifacts)
     bound = _sarif_binding(run, repository_url, sha)
     for result in run.get("results") or []:
-        suppressions = result.get("suppressions") or []
-        if suppressions and not include_suppressed:
+        suppression = _sarif_suppression(result.get("suppressions"))
+        if suppression and suppression["status"] == _STANDING and not include_suppressed:
             continue
-        suppression = _sarif_suppression(suppressions)
         index = result.get("ruleIndex")
         rule = (
             rules[index]
@@ -137,16 +139,28 @@ def _sarif_run(
         }
 
 
-def _sarif_suppression(suppressions: list[dict[str, Any]]) -> Fields | None:
-    """The result's suppression state: accepted if any suppression stands (an absent status is
-    accepted), else under review if any is, else rejected; with every stated justification."""
-    if not suppressions:
+def _sarif_suppression(suppressions: Any) -> Fields | None:
+    """The result's suppression: accepted if any suppression stands (accepted or no status),
+    else under review if any is, else rejected; with every stated justification."""
+    if suppressions is None or suppressions == []:
         return None
-    statuses = {s.get("status") or "accepted" for s in suppressions}
-    status = next((v for v in ("accepted", "underReview") if v in statuses), "rejected")
-    reasons = dict.fromkeys(
-        j for s in suppressions if (j := (s.get("justification") or "").strip())
-    )
+    if not isinstance(suppressions, list) or not all(isinstance(s, dict) for s in suppressions):
+        raise ValidationError("sarif: a result's suppressions must be an array of objects")
+    statuses: set[str] = set()
+    reasons: dict[str, None] = {}
+    for suppression in suppressions:
+        status = suppression.get("status", _STANDING)
+        if not isinstance(status, str) or status not in _SUPPRESSION_STATUSES:
+            raise ValidationError(
+                f"sarif: suppression status {status!r} is not one of {_SUPPRESSION_STATUSES}"
+            )
+        justification = suppression.get("justification")
+        if justification is not None and not isinstance(justification, str):
+            raise ValidationError("sarif: a suppression justification must be a string")
+        statuses.add(status)
+        if justification and justification.strip():
+            reasons[justification.strip()] = None
+    status = next(v for v in _SUPPRESSION_STATUSES if v in statuses)
     return {"status": status, "justification": "; ".join(reasons) or None}
 
 

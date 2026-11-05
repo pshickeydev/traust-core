@@ -101,8 +101,16 @@ class FindingIntake:
                 for c, fp in zip(candidates, keys, strict=True)
             }
             for c in candidates:
-                if c.suppression is not None and c.suppression.stands:
-                    request(uow, taken[c.label][0], ReviewReason.MANUAL_QUEUE)
+                finding_id = taken[c.label][0]
+                if (
+                    c.suppression is not None
+                    and c.suppression.stands
+                    and not any(
+                        item.reason == ReviewReason.MANUAL_QUEUE
+                        for item in uow.review_items.list_for_finding(finding_id)
+                    )
+                ):
+                    request(uow, finding_id, ReviewReason.MANUAL_QUEUE)
             for occurrence_id, locations in pending.items():
                 for (path, line), span in locations.items():
                     saved = uow.locations.add(

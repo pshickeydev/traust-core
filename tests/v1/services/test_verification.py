@@ -1011,3 +1011,44 @@ def test_a_branch_sweep_reads_each_repositorys_verifications_once(
     sweep = service.sweep([w.repo.id for w in worlds], include_branches=True)
     assert len((*sweep.queued, *sweep.skipped)) == 2 * (1 + 3)
     assert sorted(read, key=str) == sorted((w.repo.id for w in worlds), key=str)
+
+
+def test_a_default_sweep_reads_no_verification_reports(
+    service: VerificationService, engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    world = World(engine)
+    audited(engine, world, world.base)
+    service.record(report(world, {world.ids[0]: "unresolved"}), provenance())
+
+    def unread(self: VerificationService, repository_id: UUID) -> Any:
+        pytest.fail(f"a default sweep read {repository_id}'s verification reports")
+
+    monkeypatch.setattr(VerificationService, "_verifications", unread)
+    (entry,) = (*(sweep := service.sweep([world.repo.id])).queued, *sweep.skipped)
+    assert entry.pinned_sha == PATCHED_SHA
+
+
+def test_a_default_sweep_counts_a_verdicted_run_without_a_report_as_development_did(
+    service: VerificationService, engine: Engine
+) -> None:
+    world = World(engine)
+    audited(engine, world, world.base)
+    head = moved_head(engine, world)
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        run = seed.assessment(head, kind="verification", occurred_at=WHEN)
+        seed.decision(
+            world.findings[0],
+            validity=None,
+            resolution="resolved",
+            assessment_id=run.id,
+            actor=None,
+            occurred_at=WHEN,
+        )
+        uow.commit()
+    (entry,) = (*(sweep := service.sweep([world.repo.id])).queued, *sweep.skipped)
+    assert (entry.verified_at_head, entry.pinned_sha, entry.skip) == (
+        True,
+        head.sha,
+        "already_verified",
+    )

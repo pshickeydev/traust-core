@@ -90,6 +90,48 @@ def test_an_included_suppressed_result_carries_its_suppression(
     assert suppressed.suppression == Suppression(status=status, justification=justification)
 
 
+@pytest.mark.parametrize(
+    ("suppressions", "imported"),
+    [
+        ([{"kind": "inSource", "status": "rejected"}], True),
+        ([{"kind": "external", "status": "underReview"}], True),
+        ([{"kind": "external", "status": "rejected"}, {"kind": "inSource"}], False),
+        ([{"kind": "external", "status": "accepted"}], False),
+        ([], True),
+    ],
+)
+def test_by_default_only_a_standing_suppression_hides_a_result(
+    suppressions: list[dict[str, str]], imported: bool
+) -> None:
+    def suppress(doc: dict[str, Any]) -> None:
+        doc["runs"][0]["results"][1]["suppressions"] = suppressions
+
+    labels = [c.label for c in parse(sarif(suppress), CandidateFormat.SARIF)]
+    assert ("go/log-injection#2" in labels) is imported
+
+
+@pytest.mark.parametrize(
+    "suppressions",
+    [
+        [{"kind": "external", "status": []}],
+        [{"kind": "external", "status": None}],
+        [{"kind": "external", "status": "underreview"}],
+        [{"kind": "external", "status": "accepted", "justification": 7}],
+        ["accepted"],
+        {"status": "accepted"},
+    ],
+)
+@pytest.mark.parametrize("include_suppressed", [False, True])
+def test_a_malformed_suppression_is_refused(suppressions: Any, include_suppressed: bool) -> None:
+    def suppress(doc: dict[str, Any]) -> None:
+        doc["runs"][0]["results"][1]["suppressions"] = suppressions
+
+    with pytest.raises(ValidationError, match="suppression"):
+        FindingCandidate.parse_many(
+            sarif(suppress), CandidateFormat.SARIF, REPO, include_suppressed=include_suppressed
+        )
+
+
 @pytest.mark.parametrize("format", [CandidateFormat.DEPENDABOT, CandidateFormat.GOVULNCHECK])
 def test_suppression_override_rejects_other_formats(format: CandidateFormat) -> None:
     with pytest.raises(ValidationError):

@@ -359,7 +359,8 @@ class Suppression(Model):
 
     @property
     def stands(self) -> bool:
-        return self.status != SuppressionStatus.REJECTED
+        """The result is suppressed; under review or rejected, it is an ordinary result."""
+        return self.status == SuppressionStatus.ACCEPTED
 
 
 class FindingCandidate(Model):
