@@ -12,7 +12,7 @@ make db-up && make perf-api-breakpoint # reader ramp to find where the API stops
 
 | File | What |
 |---|---|
-| `ops.js` | k6 gate scenarios: 50 runners claim + complete, 10 readers page `/v1/orders`, 10 read `/v1/feed`. Correctness gates (no failures, every claim 200/204) fail the run here; latency and throughput are gated by `run.py` |
+| `ops.js` | k6 gate scenarios: 50 runners claim + complete, 10 readers page `/v1/orders`, 10 read `/v1/feed`, 10 read `/v1/insights/findings-rollup` scoped to one product (the whole-portfolio cost is bounded in `../queries`). Correctness gates (no failures, every claim 200/204) fail the run here; latency and throughput are gated by `run.py` |
 | `breakpoint.js` | discovery ramp: the same 50 runners while readers climb 10 → 300 VUs. Correctness gates only; `run.py --breakpoint` prints where latency and throughput land, no gate |
 | `lib.js` | the scenarios and summary both scripts share (endpoints, metrics, request rates) |
 | `run.py` | copies the seeded database (`../seed.py`) so the mutating scenarios get a clean one, starts `traust-server` over it, mints a runner and a reader token, runs k6, then fails if any p95 is more than 20% over `baseline.json` or any request rate more than 20% under it; `--breakpoint` resets the order queue to ~70k queued first, so the ramp claims against a queue, not an empty pool |

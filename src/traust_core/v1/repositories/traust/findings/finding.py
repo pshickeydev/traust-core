@@ -39,6 +39,7 @@ class FindingRepository(MutableRecordRepository[Finding], Protocol):
     ) -> Finding | None: ...
 
     def list_for_repository(self, repository_id: UUID) -> list[Finding]: ...
+    def list_for_repositories(self, repository_ids: Collection[UUID]) -> list[Finding]: ...
     def list_for_advisory(self, advisory_id: UUID) -> list[Finding]: ...
     def list_by_ids(
         self, finding_ids: Collection[UUID], *, read_budget: RecordBudget | None = None
@@ -69,6 +70,9 @@ class SqlFindingRepository(SqlMutableRepository[Finding]):
 
     def list_for_repository(self, repository_id: UUID) -> list[Finding]:
         return self._many(f"list for {repository_id}", self.table.c.repository_id == repository_id)
+
+    def list_for_repositories(self, repository_ids: Collection[UUID]) -> list[Finding]:
+        return self._many_in("list for repositories", self.table.c.repository_id, repository_ids)
 
     def list_for_advisory(self, advisory_id: UUID) -> list[Finding]:
         return self._many(

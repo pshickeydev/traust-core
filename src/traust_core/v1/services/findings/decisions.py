@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from collections import defaultdict
 from collections.abc import Collection, Mapping, Sequence
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
@@ -256,6 +257,17 @@ class FindingDecisions:
                 if findings
                 else []
             )
+
+    def for_findings(
+        self, finding_ids: Collection[UUID], until: datetime | None = None
+    ) -> list[Decision]:
+        """Every decision on these findings, restated ones included, judgement order; those made
+        after `until` are left out."""
+        with self._uow as uow:
+            return [
+                normalize_decision(row)
+                for row in uow.decisions.list_for_findings(finding_ids, until=until)
+            ]
 
     def require_signable(self) -> None:
         """Refuse up front, writing nothing, when the ledger must sign and can't."""

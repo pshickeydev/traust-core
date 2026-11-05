@@ -116,6 +116,12 @@ class FakeFindings:
     def all(self, filter: Any) -> list[FindingView]:
         return [v for v in self.views if v.finding.repository_id == filter.repository_id]
 
+    def all_in(self, repository_ids: Any, as_of: Any = None) -> dict[UUID, list[FindingView]]:
+        return {
+            repository_id: [v for v in self.views if v.finding.repository_id == repository_id]
+            for repository_id in repository_ids
+        }
+
 
 class NoThreatModels:
     def attack_scenarios(self, repository_ids: Any, as_of: Any) -> list[Any]:

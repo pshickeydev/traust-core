@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from collections import Counter, defaultdict
-from collections.abc import Collection, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
@@ -296,6 +296,45 @@ class FindingService:
             )
         return sorted((v for v in views if filter.keeps(v)), key=_newest_first)
 
+    def all_in(
+        self, repository_ids: Collection[UUID], as_of: datetime | None = None
+    ) -> dict[UUID, list[FindingView]]:
+        """Every repository's findings newest first, keyed by repository id: the batched `all`
+        for a scope. The folded-disposition narrows are `list`'s; callers filter with the view's
+        own rules."""
+        by_repo: defaultdict[UUID, list[Finding]] = defaultdict(list)
+        grouped: defaultdict[UUID, list[FindingView]] = defaultdict(list)
+        with self._uow as uow:
+            for finding in uow.findings.list_for_repositories(repository_ids):
+                by_repo[finding.repository_id].append(finding)
+            batch: list[list[Finding]] = []
+            size = 0
+            for findings in by_repo.values():
+                if batch and size + len(findings) > _FACTS_BATCH:
+                    self._fold_batch(uow, batch, grouped, as_of)
+                    batch, size = [], 0
+                batch.append(findings)
+                size += len(findings)
+            if batch:
+                self._fold_batch(uow, batch, grouped, as_of)
+        for views in grouped.values():
+            views.sort(key=_newest_first)
+        return grouped
+
+    def _fold_batch(
+        self,
+        uow: TraustUnitOfWork,
+        batch: Sequence[Sequence[Finding]],
+        grouped: defaultdict[UUID, list[FindingView]],
+        as_of: datetime | None,
+    ) -> None:
+        # one facts load per bounded batch of whole repositories: a whole scope's ids at once
+        # would exceed the bind limit, and a repository's refs must be read once, not once per
+        # batch that happens to hold one of its findings
+        findings = [f for repo_findings in batch for f in repo_findings]
+        for view in self._views.views(uow, findings, as_of):
+            grouped[view.finding.repository_id].append(view)
+
     def on_ref(self, repository_ref_id: UUID) -> list[FindingView]:
         """Findings reported on this named line, with resolution folded on that line."""
         with self._uow as uow:
@@ -528,23 +567,43 @@ class FindingService:
         with self._uow as uow:
             findings = uow.findings.list_for_repository(filter.repository_id)
             facts = FindingFacts.load(uow, findings, until=filter.as_of)
-        first = {
-            f.id: facts.at[seen[0].assessment_id]
-            for f in findings
-            if f.id and (seen := facts.reported_by(f.id, filter.as_of))
-        }
-        if not first:
-            return []
-        end = filter.as_of or max(
-            [*facts.at.values(), *(d.occurred_at for ds in facts.decisions.values() for d in ds)]
-        )
-        replay = _Replay(self, facts, findings, filter, first)
-        points = []
-        window = bucket.window_of(min(first.values()))
-        while window.start <= end:
-            points.append(replay.point(window, min(window.end - _TICK, end)))
-            window = bucket.window_of(window.end)
-        return points
+        return _series(self, facts, findings, filter.keeps, bucket, filter.as_of)
+
+    def timelines(
+        self, repository_ids: Collection[UUID], bucket: TimeBucket, as_of: datetime | None = None
+    ) -> dict[UUID, list[FindingSeriesPoint]]:
+        """Each repository's series, keyed by repository id: the batched `timeline` for a scope.
+        Every finding counts; the folded-disposition narrows are `timeline`'s."""
+        by_repo: defaultdict[UUID, list[Finding]] = defaultdict(list)
+        series: dict[UUID, list[FindingSeriesPoint]] = {}
+        with self._uow as uow:
+            for finding in uow.findings.list_for_repositories(repository_ids):
+                by_repo[finding.repository_id].append(finding)
+            batch: list[tuple[UUID, list[Finding]]] = []
+            size = 0
+            for repository_id, findings in by_repo.items():
+                if batch and size + len(findings) > _FACTS_BATCH:
+                    self._replay_batch(uow, batch, series, bucket, as_of)
+                    batch, size = [], 0
+                batch.append((repository_id, findings))
+                size += len(findings)
+            if batch:
+                self._replay_batch(uow, batch, series, bucket, as_of)
+        return series
+
+    def _replay_batch(
+        self,
+        uow: TraustUnitOfWork,
+        batch: Sequence[tuple[UUID, list[Finding]]],
+        series: dict[UUID, list[FindingSeriesPoint]],
+        bucket: TimeBucket,
+        as_of: datetime | None,
+    ) -> None:
+        # one facts load per bounded batch of whole repositories: a whole scope's ids at once
+        # would exceed the bind limit, and one repository's facts must not span batches
+        facts = FindingFacts.load(uow, [f for _, findings in batch for f in findings], until=as_of)
+        for repository_id, findings in batch:
+            series[repository_id] = _series(self, facts, findings, _keeps_all, bucket, as_of)
 
     def _labels(self, repository_id: UUID, url: str, body: dict[str, Any]) -> dict[str, UUID]:
         """A report's own labels (`findings[].id`, `regressions[].id`) to the findings they are."""
@@ -660,6 +719,51 @@ def _merge(
 
 
 _TICK = timedelta(microseconds=1)
+_FACTS_BATCH = 1_000
+
+
+def _keeps_all(view: FindingView) -> bool:
+    return True
+
+
+def _series(
+    service: FindingService,
+    facts: FindingFacts,
+    findings: Sequence[Finding],
+    keeps: Callable[[FindingView], bool],
+    bucket: TimeBucket,
+    as_of: datetime | None,
+) -> list[FindingSeriesPoint]:
+    first = {
+        f.id: facts.at[seen[0].assessment_id]
+        for f in findings
+        if f.id and (seen := facts.reported_by(f.id, as_of))
+    }
+    if not first:
+        return []
+    replay = _Replay(service, facts, findings, keeps, first)
+    end = as_of or max(_end_times(facts, findings))
+    points = []
+    window = bucket.window_of(min(first.values()))
+    while window.start <= end:
+        points.append(replay.point(window, min(window.end - _TICK, end)))
+        window = bucket.window_of(window.end)
+    return points
+
+
+def _end_times(facts: FindingFacts, findings: Sequence[Finding]) -> list[datetime]:
+    """When the findings' history ends: their reports' and decisions' assessments, and the
+    decisions themselves."""
+    out = [d.occurred_at for f in findings if f.id for d in facts.decisions.get(f.id, ())]
+    for f in findings:
+        if f.id is None:
+            continue
+        for occurrence in facts.reported.get(f.id, ()):
+            out.append(facts.at[occurrence.assessment_id])
+        for decision in facts.decisions.get(f.id, ()):
+            if decision.assessment_id and (at := facts.at.get(decision.assessment_id)):
+                out.append(at)
+    return out
 
 
 def _keys(
@@ -718,7 +822,7 @@ class _Replay:
     service: FindingService
     facts: FindingFacts
     findings: Sequence[Finding]
-    filter: FindingFilter
+    keeps: Callable[[FindingView], bool]
     first: Mapping[UUID, datetime]
     views: dict[UUID, FindingView] = field(default_factory=dict)
     standing: dict[UUID, tuple[FindingState, Severity | None, float | None]] = field(
@@ -731,13 +835,20 @@ class _Replay:
     def __post_init__(self) -> None:
         self._by_id = {f.id: f for f in self.findings if f.id is not None}
         facts = self.facts
+        # only these findings' events: the facts may be shared with other repositories
         self._events = sorted(
             [
                 (facts.at[o.assessment_id], o.finding_id)
-                for os in facts.reported.values()
-                for o in os
+                for f in self.findings
+                if f.id
+                for o in facts.reported.get(f.id, ())
             ]
-            + [(d.occurred_at, d.finding_id) for ds in facts.decisions.values() for d in ds],
+            + [
+                (d.occurred_at, d.finding_id)
+                for f in self.findings
+                if f.id
+                for d in facts.decisions.get(f.id, ())
+            ],
             key=lambda e: e[0],
         )
         self._next = 0
@@ -753,7 +864,7 @@ class _Replay:
             was = self.views.get(finding_id)
             self.views[finding_id] = view
             self._unstand(finding_id)
-            if not self.filter.keeps(view):
+            if not self.keeps(view):
                 continue
             state = view.state()
             self._stand(finding_id, view, state)
