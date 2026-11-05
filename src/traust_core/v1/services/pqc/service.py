@@ -294,7 +294,7 @@ class PqcService:
 
     def _require_scanner(self) -> PqcScanner:
         if self._scanner is None:
-            raise ConfigError("prescan needs the pqc-scan provider (traust-engine registers it)")
+            raise ConfigError("prescan needs the pqc-scan provider (Context.register_pqc_scanner)")
         return self._scanner
 
     @staticmethod

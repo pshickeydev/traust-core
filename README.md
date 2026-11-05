@@ -417,6 +417,22 @@ flowchart LR
 | Add a named artifact | one line in `models/artifacts.py`: `class XArtifact(ArtifactDocument, name=…, schema=…, kind=…)` |
 | See an artifact's fields | `TriageArtifact.describe()` (field tree with types, required/optional); `TriageArtifact.schema_path()` |
 
+### PQC source scanner
+
+`providers.pqc.PqcScanTool` runs the configured `pqc-scan` binary over a supplied checkout.
+Register it with `Context.register_pqc_scanner(binary, rules, adapter_version=..., scan_commit=...)`;
+the binary and merged rules pack remain caller-owned inputs, not files vendored into core.
+The deployment's `ProcessRunner` must allow `pqc-scan`; its timeout and environment policy apply.
+
+The provider checks the binary's adjacent `.sha256` record, stamps the binary/rules, parses
+required coverage and raw findings, and retains CBOM bytes. Missing/malformed output and nonzero
+exits fail rather than becoming clean scans. Changed binary/rules during a run invalidate its result.
+These are raw facts, not readiness verdicts.
+
+`PqcService.prescan` remains the owner of post-processing, recorded facts and same-pack reuse;
+its crypto census requires an ingested manifest SBOM. Engine schedules work but does not own a
+second scanner implementation.
+
 ### PQC effort writes
 
 `PqcService.check` and new `record` admissions select the installed

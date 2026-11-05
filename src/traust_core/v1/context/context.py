@@ -122,7 +122,7 @@ from traust_core.v1.providers.mirror import FETCH_TIMEOUT_SECONDS, MirrorCheckou
 from traust_core.v1.providers.model_catalog import ModelCatalog, RegistryModelCatalog
 from traust_core.v1.providers.osv import ExportedAdvisoryLookup
 from traust_core.v1.providers.package_source import PackageSources
-from traust_core.v1.providers.pqc import PqcScanner
+from traust_core.v1.providers.pqc import PqcScanner, PqcScanTool
 from traust_core.v1.providers.priv_profile import PrivProfiler
 from traust_core.v1.providers.process import ProcessRunner
 from traust_core.v1.providers.product_definitions import ProductDefinitionsCache
@@ -308,7 +308,7 @@ class Context:
         self.feed_sources: ProviderRegistry[FeedSource] = ProviderRegistry("feed-source")
         self.advisories: AdvisoryLookup | None = None
         self.package_sources: PackageSources | None = None
-        self.pqc_scanner: PqcScanner | None = None  # traust-engine registers pqc-scan
+        self.pqc_scanner: PqcScanner | None = None
         # The register_* doors set these; the doors that read them raise without.
         self.fleet_fix_applier: FleetFixApplier | None = None
         self.fleet_fix_goldens: GoldenRunner | None = None
@@ -601,6 +601,19 @@ class Context:
     ) -> AdapterTool[Any]:
         self.tool_floors.update(self.toolchain.floors({t.name: t.binary for t in scanners}))
         return tool
+
+    def register_pqc_scanner(
+        self, binary: Path, rules: Path, *, adapter_version: str, scan_commit: str
+    ) -> None:
+        """Register the pinned scanner and rules pack used by PQC prescans."""
+        self.pqc_scanner = PqcScanTool(
+            self.process,
+            self.clock,
+            binary,
+            rules,
+            adapter_version=adapter_version,
+            scan_commit=scan_commit,
+        )
 
     def register_fleet_fix(self) -> None:
         """Apply fleet fixes and run their ast-grep golden tests over a writable checkout from

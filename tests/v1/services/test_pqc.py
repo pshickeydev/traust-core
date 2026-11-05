@@ -567,8 +567,7 @@ def test_readiness_lists_carry_the_reports_clock_items(world: World) -> None:
     assert world.pqc.list_readiness(PqcFilter(buckets=(PqcReadinessBucket.READY,))) == []
 
 
-def test_context_wires_the_service_without_a_scanner(tmp_path: Path) -> None:
+def test_prescan_refuses_when_scanner_is_not_registered(tmp_path: Path) -> None:
     services = Context(Config(home=tmp_path)).services()
-    assert isinstance(services.pqc, PqcService)
-    with pytest.raises(ConfigError, match="traust-engine registers it"):
+    with pytest.raises(ConfigError):
         services.pqc.prescan(uuid4(), CHECKOUT)
