@@ -193,6 +193,7 @@ MAX_FIX_COMMITS = 4  # backports repeat the same change; more commits only add A
 REACHED_THROUGH = "reached through a base image or an internal library; not listed itself"
 SURFACE = "{} surface: manifest-level, no reachability"
 UNRESOLVED = "not in the SBOM, but these manifests could not be resolved: {}"
+SHARED_FIX = "fix commits not mined: the advisory names several packages they can't tell apart"
 UNKNOWN_COVERAGE = "not in the SBOM, whose coverage is unknown: no manifest scan recorded it"
 _TICK = timedelta(microseconds=1)
 _SURFACES = frozenset({Ecosystem.ACTIONS, Ecosystem.DOCKER, Ecosystem.HELM})
@@ -641,8 +642,15 @@ class ExposureService:
             )
             for package, found in kept
         ]
+        coverage = self.unresolved_manifests(repository_ref_id)
+        unread = None if coverage is None else {m.ecosystem for m in coverage}
+        held = [
+            (package, rows)
+            for package, rows in candidates
+            if rows or unread is None or package.ecosystem in unread
+        ]
         prepared = []
-        for package, rows in [c for c in candidates if c[1]] or candidates:
+        for package, rows in held if any(rows for _, rows in held) else candidates:
             manifest = {r.dependency.version for r in rows if r.vulnerable and r.image_id is None}
             versions = sorted(manifest or {r.dependency.version for r in rows if r.vulnerable})
             for version in versions or [None]:
@@ -731,9 +739,15 @@ class ExposureService:
         symbols = _with_judged(None, judged)
         if checkout is not None and evidence.classification(package.ecosystem) in undecided:
             # This package's symbols only; govulncheck carries its own: Go never mines commits.
+            # Fix commits are the advisory's, so they speak for a package only when it is the
+            # advisory's one package.
             scoped = record.model_copy(update={"affected": (package,)})
             found = _published(scoped) or (
-                None if package.ecosystem == Ecosystem.GO else self._mined(record)
+                None
+                if package.ecosystem == Ecosystem.GO
+                else self._mined(record)
+                if len(record.affected) == 1
+                else SymbolResolution(status=SymbolStatus.DEGRADED, note=SHARED_FIX)
             )
             symbols = _with_judged(found, judged)
             query = ImpactQuery(
@@ -801,7 +815,6 @@ class ExposureService:
         classification = ImpactClassification(entry.classification)
         ecosystem = getattr(doc.metadata, "ecosystem", None)
         raw_scope = getattr(doc.metadata, "preparation_scope", None)
-        scope = None
         if raw_scope is not None:
             if ecosystem is None:
                 raise ValidationError("scoped impact analysis requires an ecosystem")
@@ -824,22 +837,6 @@ class ExposureService:
         record = self.find_advisory(AdvisoryIdentifier(doc.metadata.cve))
         if record is None or record.advisory_id is None:
             raise NotFoundError(f"advisory {doc.metadata.cve}: unknown to its source")
-        if scope is not None:
-            previous = self._recorded(
-                ImpactFilter(advisory_id=record.advisory_id, repository_ref_id=repository_ref_id),
-                include_findings=False,
-            )
-            for row in previous:
-                raw_previous = getattr(row.doc.metadata, "preparation_scope", None)
-                if raw_previous is None:
-                    continue
-                kept = ImpactPreparationScope.model_validate(raw_previous, from_attributes=True)
-                if kept.digest == scope.digest and frozenset(kept.members) != frozenset(
-                    scope.members
-                ):
-                    raise ValidationError(
-                        f"impact preparation scope {scope.digest}: inconsistent member set"
-                    )
         with self._uow as uow:
             ref, repository = self._inventory.resolve(repository_ref_id)
             if entry.repo != repo_label(repository.url):
@@ -1510,7 +1507,7 @@ class ExposureService:
             }[group_by]
         ]
 
-    def _recorded(self, filter: ImpactFilter, *, include_findings: bool = True) -> list[_Recorded]:
+    def _recorded(self, filter: ImpactFilter) -> list[_Recorded]:
         refs = None if filter.repository_ref_id is None else [filter.repository_ref_id]
         held = [
             (
@@ -1546,7 +1543,7 @@ class ExposureService:
             assert assessment.repository_ref_id is not None and advisory.id is not None
             filed = (
                 self._require_findings().occurrences(assessment_id=assessment.id)
-                if include_findings and classification == ImpactClassification.AFFECTED
+                if classification == ImpactClassification.AFFECTED
                 else []
             )
             analysis = ImpactAnalysis(
@@ -1713,44 +1710,59 @@ def _of(row: _Recorded, filter: ExposureFilter) -> bool:
 
 
 def _latest(rows: Sequence[_Recorded], until: datetime | None) -> list[_Recorded]:
-    """The latest complete preparation of each commit for each advisory recorded by `until`:
-    every package and version it declared, so a newer partial run never clears a complete one
-    and a complete newer snapshot drops what it no longer holds. A document without a scope
-    (recorded before scopes) is a snapshot of itself; one that omits its ecosystem is Go, as
-    the impact-analysis contract defines."""
-    member_rows: dict[tuple[UUID, UUID, str], dict[tuple[str, str, str | None], _Recorded]] = {}
-    expected: dict[tuple[UUID, UUID, str], frozenset[tuple[str, str, str | None]]] = {}
-    for row in rows:
+    """What stands for each commit and advisory by `until`: its latest-prepared complete
+    preparation (every package and version it declared), so a run finishing late or a newer
+    partial run never displaces a newer complete one; else its latest-prepared partial run, so
+    recorded verdicts (and the findings they filed) still show; else, for documents recorded
+    before scopes, the latest of each package and version. A document whose scope disagrees
+    with the members first recorded under its digest is left out, with a warning, rather than
+    failing every read of the advisory or displacing the scope it claims."""
+    Member = tuple[str, str, str | None]
+    scoped: dict[tuple[UUID, UUID, str], dict[Member, _Recorded]] = {}
+    declared: dict[tuple[UUID, UUID, str], frozenset[Member]] = {}
+    prepared: dict[tuple[UUID, UUID, str], str] = {}
+    legacy: dict[tuple[UUID, UUID], dict[Member, _Recorded]] = {}
+    for row in sorted(rows, key=lambda r: r.at):
         if not _by(row, until):
             continue
         metadata = row.doc.metadata
+        commit = (row.analysis.repository_ref_id, row.analysis.advisory_id)
         ecosystem = metadata.ecosystem or Ecosystem.GO.value
         member = (ecosystem, metadata.module, row.doc.repos[0].version)
         raw_scope = getattr(metadata, "preparation_scope", None)
         if raw_scope is None:
-            digest, declared = f"legacy:{row.analysis.assessment_id}", frozenset({member})
+            members = legacy.setdefault(commit, {})
         else:
             scope = ImpactPreparationScope.model_validate(raw_scope, from_attributes=True)
-            digest = scope.digest
-            declared = frozenset((m.ecosystem.value, m.module, m.version) for m in scope.members)
-        key = (row.analysis.repository_ref_id, row.analysis.advisory_id, digest)
-        if expected.setdefault(key, declared) != declared:
-            raise IntegrityError(f"impact preparation scope {digest}: inconsistent member set")
-        if member not in declared:
-            raise IntegrityError(f"impact preparation scope {digest}: undeclared packet {member}")
-        latest = member_rows.setdefault(key, {})
-        if member not in latest or latest[member].at < row.at:
-            latest[member] = row
-    snapshots: dict[tuple[UUID, UUID], tuple[tuple[datetime, UUID], list[_Recorded]]] = {}
-    for key, members in member_rows.items():
-        if frozenset(members) != expected[key]:
-            continue
-        complete = list(members.values())
-        at = max(row.at for row in complete)
+            key = (*commit, scope.digest)
+            stated = frozenset((m.ecosystem.value, m.module, m.version) for m in scope.members)
+            if declared.setdefault(key, stated) != stated or member not in stated:
+                log.warning(
+                    "impact analysis %s of ref %s: scope %s disagrees with its first members",
+                    row.analysis.assessment_id,
+                    commit[0],
+                    scope.digest,
+                )
+                continue
+            prepared[key] = max(prepared.get(key, ""), str(metadata.generated_at))
+            members = scoped.setdefault(key, {})
+        if member not in members or members[member].at < row.at:
+            members[member] = row
+    Rank = tuple[bool, str, tuple[datetime, UUID]]
+    standing: dict[tuple[UUID, UUID], tuple[Rank, list[_Recorded]]] = {}
+    for key, members in scoped.items():
+        rank = (
+            frozenset(members) == declared[key],
+            prepared[key],
+            max(r.at for r in members.values()),
+        )
         commit = (key[0], key[1])
-        if commit not in snapshots or snapshots[commit][0] < at:
-            snapshots[commit] = (at, complete)
-    return [row for _, complete in snapshots.values() for row in complete]
+        if commit not in standing or standing[commit][0] < rank:
+            standing[commit] = (rank, list(members.values()))
+    chosen = [r for _, found in standing.values() for r in found]
+    return chosen + [
+        r for commit, members in legacy.items() if commit not in standing for r in members.values()
+    ]
 
 
 def _worst(rows: Sequence[_Recorded]) -> list[_Recorded]:

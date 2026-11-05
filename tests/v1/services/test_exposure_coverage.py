@@ -384,3 +384,28 @@ def test_one_vulnerable_package_is_pending_beside_one_whose_coverage_is_unknown(
     assert propagated(evidence) == "pending"
     with pytest.raises(NotFoundError, match="coverage leaves the package unknown"):
         propagated(evidence[1:])
+
+
+def test_a_package_the_commit_lacks_is_still_assessed_where_its_ecosystem_went_unresolved(
+    engine: Engine, tmp_path: Path
+) -> None:
+    span = (AffectedSpan(introduced=Version("0"), fixed=Version("9.0.0")),)
+    both = AdvisoryRecord(
+        identifier=AdvisoryIdentifier("GHSA-held-npmx-0000"),
+        source="osv",
+        affected=(
+            AffectedPackage(ecosystem=Ecosystem.NPM, name="left-pad", spans=span),
+            AffectedPackage(ecosystem=Ecosystem.NPM, name="lodash", spans=span),
+            AffectedPackage(ecosystem=Ecosystem.PYPI, name="requests", spans=span),
+        ),
+    )
+    ref, service = ref_id(engine), exposure(engine, None, both)
+    service.ingest_dependencies(ref, checkout(tmp_path, locked=False))  # holds left-pad only
+    found = service.find_advisory(both.identifier)
+    assert found is not None and found.advisory_id is not None
+    prepared = {p.package.name: p for p in service.prepare(found.advisory_id, ref)}
+    # npm went unresolved (ui/package.json, no lockfile): lodash is unknown, not absent; pypi
+    # read complete, so requests, which the commit doesn't hold, needs no input
+    assert set(prepared) == {"left-pad", "lodash"}
+    assert prepared["lodash"].evidence.l1_depends_on is None
+    assert prepared["lodash"].document("1").repos[0].classification == "inconclusive"

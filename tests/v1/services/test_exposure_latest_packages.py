@@ -3,16 +3,20 @@ from __future__ import annotations
 import json
 from copy import deepcopy
 from datetime import timedelta
+from pathlib import Path
+from uuid import UUID
 
 import pytest
 from sqlalchemy.engine import Engine
 
 from tests.v1.services.test_exposure_impact import AT, GHSA, GRPC, engine, provenance, refs
 from tests.v1.services.test_exposure_reads import reads
+from tests.v1.services.test_exposure_sweep import FakeSbomTool
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.artifacts import ImpactAnalysisArtifact
 from traust_core.v1.models.common import PageRequest, TimeBucket
 from traust_core.v1.models.dependencies import (
+    AdvisoryRecord,
     AffectedPackage,
     AffectedSpan,
     ExposureDimension,
@@ -42,8 +46,20 @@ def inventory(*purls: str) -> bytes:
     ).encode()
 
 
+def scanned(engine: Engine, advisory: AdvisoryRecord) -> ExposureService:
+    """Reads whose SBOMs come from a manifest scan of a tree with nothing unresolved: coverage
+    is known complete, so a package the SBOM drops is gone, not unknown."""
+    return reads(engine, advisory=advisory, tool=FakeSbomTool())
+
+
+def scan(exposure: ExposureService, ref: UUID, raw: bytes, root: Path) -> None:
+    exposure._sbom_tool.raw = raw  # type: ignore[union-attr]
+    root.mkdir(parents=True, exist_ok=True)
+    exposure.ingest_dependencies(ref, root)
+
+
 @pytest.fixture
-def mixed(engine: Engine) -> ExposureService:
+def mixed(engine: Engine, tmp_path: Path) -> ExposureService:
     advisory = GRPC.model_copy(
         update={
             "affected": (
@@ -65,17 +81,19 @@ def mixed(engine: Engine) -> ExposureService:
             ),
         }
     )
-    exposure = reads(engine, advisory=advisory)
+    exposure = scanned(engine, advisory)
     [ref] = refs(engine, 1)
     assert ref.id is not None
-    exposure.ingest_sbom(
+    scan(
+        exposure,
+        ref.id,
         inventory(
             "pkg:golang/lib@1.0.5",
             "pkg:golang/lib@2.0.5",
             "pkg:golang/other@1.0.5",
             "pkg:npm/lib@1.0.5",
         ),
-        ref.id,
+        tmp_path / "first",
     )
     known = exposure.find_advisory(GHSA)
     assert known is not None and known.advisory_id is not None
@@ -156,12 +174,11 @@ def mixed(engine: Engine) -> ExposureService:
         ),
         day=3,
     )
-    exposure.ingest_sbom(
-        inventory(
-            "pkg:golang/lib@3.0.5",
-            "pkg:golang/other@1.0.5",
-        ),
+    scan(
+        exposure,
         ref.id,
+        inventory("pkg:golang/lib@3.0.5", "pkg:golang/other@1.0.5"),
+        tmp_path / "corrected",
     )
     corrected = {item.package.name: item for item in exposure.prepare(known.advisory_id, ref.id)}
     assert set(corrected) == {"lib", "other"}
@@ -175,7 +192,7 @@ def mixed(engine: Engine) -> ExposureService:
     "day,milliseconds,expected",
     [
         (0, -1, {}),
-        (0, 2, {}),
+        (0, 2, {"affected": 1}),  # a partial run's recorded verdicts show until one completes
         (0, 3, {"affected": 1}),
         (1, -1, {"affected": 1}),
         (1, 0, {"likely_affected": 1}),
@@ -270,7 +287,7 @@ def test_timeline_preserves_history_while_complete_corrected_inventory_clears_ol
 
 
 def test_ecosystem_filter_cannot_resurrect_affected_members_removed_by_a_complete_scope(
-    engine: Engine,
+    engine: Engine, tmp_path: Path
 ) -> None:
     advisory = GRPC.model_copy(
         update={
@@ -284,11 +301,11 @@ def test_ecosystem_filter_cannot_resurrect_affected_members_removed_by_a_complet
             )
         }
     )
-    exposure = reads(engine, advisory=advisory)
+    exposure = scanned(engine, advisory)
     [ref] = refs(engine, 1)
     assert ref.id is not None
     npm_inventory = ("pkg:npm/one@3.0.0", "pkg:npm/two@3.0.0")
-    exposure.ingest_sbom(inventory("pkg:golang/lib@1.0.0", *npm_inventory), ref.id)
+    scan(exposure, ref.id, inventory("pkg:golang/lib@1.0.0", *npm_inventory), tmp_path / "a")
     known = exposure.find_advisory(GHSA)
     assert known is not None and known.advisory_id is not None
     for item in exposure.prepare(known.advisory_id, ref.id):
@@ -304,7 +321,7 @@ def test_ecosystem_filter_cannot_resurrect_affected_members_removed_by_a_complet
                 }
             )
         exposure.record(ref.id, item.document("1"), provenance())
-    exposure.ingest_sbom(inventory(*npm_inventory), ref.id)
+    scan(exposure, ref.id, inventory(*npm_inventory), tmp_path / "b")
     corrected = exposure.prepare(known.advisory_id, ref.id)
     assert len(corrected) == 2 and all(item.package.ecosystem == NPM for item in corrected)
     for day, item in enumerate(corrected, start=1):
@@ -338,24 +355,53 @@ def test_ecosystem_filter_cannot_resurrect_affected_members_removed_by_a_complet
     }
 
 
-@pytest.mark.parametrize("invalid", ["missing-own-member", "same-digest-different-members"])
-def test_record_refuses_invalid_scope_membership_without_retaining_a_partial_assessment(
-    mixed: ExposureService,
-    invalid: str,
-) -> None:
-    report = mixed.export_impacts(GHSA)
-    [packet] = [row for row in report.repos if row.module == "lib"]
+def _restated(report: object, keep: str) -> tuple[UUID, ImpactAnalysisArtifact]:
+    [packet] = [row for row in report.repos if row.module == "lib"]  # type: ignore[attr-defined]
     document = deepcopy(packet.document)
     scope = document["metadata"]["preparation_scope"]
-    wanted = "other" if invalid == "missing-own-member" else "lib"
-    scope["members"] = [member for member in scope["members"] if member["module"] == wanted]
-    malformed = ImpactAnalysisArtifact.from_document(document)
+    scope["members"] = [member for member in scope["members"] if member["module"] == keep]
+    return packet.repository_ref_id, ImpactAnalysisArtifact.from_document(document)
+
+
+def test_record_refuses_a_document_outside_its_own_scope_without_a_partial_assessment(
+    mixed: ExposureService,
+) -> None:
+    report = mixed.export_impacts(GHSA)
+    ref, malformed = _restated(report, keep="other")
     before = mixed.impacts(ImpactFilter(), PageRequest(limit=100)).items
     with pytest.raises(ValidationError):
         mixed.record(
-            packet.repository_ref_id,
-            malformed,
-            provenance().model_copy(update={"occurred_at": AT + timedelta(days=6)}),
+            ref, malformed, provenance().model_copy(update={"occurred_at": AT + timedelta(days=6)})
         )
     assert mixed.impacts(ImpactFilter(), PageRequest(limit=100)).items == before
     assert mixed.export_impacts(GHSA) == report
+
+
+def test_a_later_document_restating_a_scope_digest_is_ignored_on_read(
+    mixed: ExposureService, caplog: pytest.LogCaptureFixture
+) -> None:
+    report = mixed.export_impacts(GHSA)
+    ref, restated = _restated(report, keep="lib")
+    mixed.record(
+        ref, restated, provenance().model_copy(update={"occurred_at": AT + timedelta(days=6)})
+    )
+    with caplog.at_level("WARNING", logger="traust_core.v1.services.exposure"):
+        again = mixed.export_impacts(GHSA)
+    assert again.repos == report.repos
+    assert "disagrees with its first members" in caplog.text
+
+
+def test_a_late_result_of_an_older_run_never_restores_what_a_newer_run_dropped(
+    mixed: ExposureService,
+) -> None:
+    before = mixed.export_impacts(GHSA)
+    [ref] = {row.repository_ref_id for row in before.repos}
+    old = mixed.impacts(ImpactFilter(), PageRequest(limit=100)).items[-1]  # the first run's
+    [stale] = [row for row in mixed._recorded(ImpactFilter()) if row.analysis == old]
+    mixed.record(
+        ref, stale.doc, provenance().model_copy(update={"occurred_at": AT + timedelta(days=9)})
+    )
+    after = mixed.export_impacts(GHSA)
+    assert {(r.module, r.version) for r in after.repos} == {
+        (r.module, r.version) for r in before.repos
+    }

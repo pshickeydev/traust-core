@@ -53,6 +53,7 @@ def reads(
     findings: bool = True,
     objects: InMemoryObjectStore | None = None,
     advisory: AdvisoryRecord = GRPC,
+    tool: object | None = None,
 ) -> ExposureService:
     uow = SqlTraustUnitOfWork(engine)
     return ExposureService(
@@ -64,6 +65,7 @@ def reads(
         portfolio=PortfolioService(uow, PortfolioPolicy()),
         clock=FixedClock(AT),
         findings=finding_service(engine) if findings else None,
+        sbom_tool=tool,  # type: ignore[arg-type]
     )
 
 

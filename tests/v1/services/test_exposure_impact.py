@@ -64,7 +64,12 @@ from traust_core.v1.repositories.objects import (
     ObjectKey,
     ObjectStore,
 )
-from traust_core.v1.services.exposure import REACHED_THROUGH, UNKNOWN_COVERAGE, ExposureService
+from traust_core.v1.services.exposure import (
+    REACHED_THROUGH,
+    SHARED_FIX,
+    UNKNOWN_COVERAGE,
+    ExposureService,
+)
 from traust_core.v1.services.findings import FindingIntake, IdentityPolicy, TaxonomyPolicy
 from traust_core.v1.services.portfolio import PortfolioPolicy, PortfolioService
 from traust_core.v1.services.reporting import ReportingService
@@ -400,14 +405,17 @@ def test_a_cve_asked_first_is_analyzed_through_its_aliases_packages(engine: Engi
     found = exposure.find_advisory(cve.identifier)
     assert found is not None and found.advisory_id is not None
     assert {r.repository_ref_id for r in exposure.affected(found.advisory_id)} == {app.id, fixed.id}
-    doc = one(exposure.prepare(found.advisory_id, app.id)).document("1")
+    # the SBOMs are documents: stdlib, which they don't list, is unknown rather than absent
+    by_module = {p.package.name: p for p in exposure.prepare(found.advisory_id, app.id)}
+    assert set(by_module) == {"golang.org/x/net", "stdlib"}
+    doc = by_module["golang.org/x/net"].document("1")
     assert doc.repos[0].classification == "inconclusive"
-    assert doc.metadata.module == "golang.org/x/net"
     assert doc.metadata.advisory_sources[:3] == ("osv/CVE-2023-39325", ghsa.source, go.source)
+    assert by_module["stdlib"].evidence.l1_depends_on is None
     later = exposure.find_advisory(go.identifier)
     assert later is not None and later.advisory_id == found.advisory_id
-    out = one(exposure.prepare(found.advisory_id, fixed.id)).document("1")
-    assert out.repos[0].classification == "version_not_in_range"
+    out = {p.package.name: p for p in exposure.prepare(found.advisory_id, fixed.id)}
+    assert out["golang.org/x/net"].document("1").repos[0].classification == "version_not_in_range"
 
 
 def affected_doc(prepared: ImpactInput) -> ImpactAnalysisArtifact:
@@ -1229,3 +1237,31 @@ def test_judged_symbols_are_recorded_without_a_checkout(engine: Engine) -> None:
     assert prepared.symbols is not None and prepared.symbols.status == "resolved"
     assert prepared.document("1").metadata.vulnerable_symbols == ("grpc.Server.Serve",)
     assert one(exposure.prepare(found, app.id)).symbols is None
+
+
+def test_fix_commits_are_not_mined_for_one_package_of_several(
+    engine: Engine, tmp_path: Path
+) -> None:
+    [app] = refs(engine, 1)
+    assert app.id is not None
+    single = maven("GHSA-twoo-0000-0000", references=(FIX,))
+    other = single.affected[0].model_copy(update={"name": "org.other:other"})
+    advisory = single.model_copy(update={"affected": (*single.affected, other)})
+    forge = Forge({"abc1234": LIB_PATCH})
+    exposure = mining(engine, forge, advisory)
+    exposure.ingest_sbom(
+        json.dumps(
+            {"bomFormat": "CycloneDX", "components": [{"purl": "pkg:maven/org.lib/lib@1.0.0"}]}
+        ).encode(),
+        app.id,
+    )
+    record = exposure.find_advisory(advisory.identifier)
+    assert record is not None and record.advisory_id is not None
+    prepared = {
+        p.package.name: p
+        for p in exposure.prepare(record.advisory_id, app.id, tmp_path, judged=("org.lib.X#y",))
+    }
+    held = prepared["org.lib:lib"]
+    assert held.symbols is not None and held.symbols.note == SHARED_FIX
+    assert [(s.symbol, s.source) for s in held.symbols.symbols] == [("org.lib.X#y", "judged")]
+    assert forge.asked == []
