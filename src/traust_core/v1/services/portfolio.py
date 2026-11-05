@@ -140,6 +140,11 @@ class Inventory:
         self._uow = uow
         self._hosts = dict(hosts or DEFAULT_FORGE_HOSTS)
 
+    @property
+    def hosts(self) -> Mapping[str, str]:
+        """The forge hosts and kinds its URL lookups resolve by."""
+        return dict(self._hosts)
+
     def get_repository(self, repository_id: UUID) -> Repository:
         with self._uow as uow:
             return uow.repositories.get(repository_id)
@@ -578,8 +583,9 @@ class PortfolioService:
             url = HttpsRepoUrl.parse(str(url), (url.host,))
         except (TypeError, ValueError) as exc:
             raise ValidationError("repository.url is invalid") from exc
-        with self._uow as uow:
+        with self._uow.write() as uow:
             # a GitHub repository registered in another case of owner/repo is this one
+            uow.repositories.lock_url(str(url))
             known = _registered_repository(uow, str(url), self._hosts)
             if known is not None:
                 repository, created = known, False
@@ -612,7 +618,7 @@ class PortfolioService:
         require_uuid(repository_id, "repository.id")
         if parent_url is not None and not isinstance(parent_url, HttpsRepoUrl):
             raise ValidationError("repository.parent_url must be an HttpsRepoUrl")
-        with self._uow as uow:
+        with self._uow.write() as uow:
             repository = uow.repositories.get(repository_id)
             update: dict[str, object] = {}
             if public is not None and public != repository.public:
@@ -628,6 +634,7 @@ class PortfolioService:
 
     def _upstream(self, uow: InventoryUnitOfWork, parent_url: HttpsRepoUrl) -> Repository:
         """A fork's parent row: the one registered (any case on GitHub), else a new private row."""
+        uow.repositories.lock_url(str(parent_url))
         found = _registered_repository(uow, str(parent_url), self._hosts)
         return found or uow.repositories.get_or_add(Repository(url=str(parent_url), public=False))
 
@@ -1179,7 +1186,11 @@ def _registered_repository(
     registered in another case (a fork's lowercased parent, a differently typed import)."""
     if (found := uow.repositories.find_by_url(url)) is not None:
         return found
-    if hosts.get((urlsplit(url).hostname or "").lower()) == "github":
+    try:
+        host = (urlsplit(url).hostname or "").lower()
+    except ValueError:  # a malformed URL names no registered repository
+        return None
+    if hosts.get(host) == "github":
         return uow.repositories.find_by_url_casefold(url)
     return None
 
