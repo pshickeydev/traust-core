@@ -79,7 +79,7 @@ from traust_core.v1.models.values import (
 from traust_core.v1.models.vocabulary import ComparisonStatus, OwnershipClass, RefKind, Severity
 from traust_core.v1.providers.base import ProviderRegistry
 from traust_core.v1.providers.clock import Clock, SystemClock
-from traust_core.v1.providers.sources import OwnerHint, RepoInfo, SourceProvider
+from traust_core.v1.providers.sources import OwnerHint, RepoInfo, SourceError, SourceProvider
 from traust_core.v1.providers.tools import ToolProvider
 from traust_core.v1.repositories.traust.inventory import InventoryUnitOfWork
 from traust_core.v1.services.artifact_publishing import ArtifactPublisher, Imported, PublishResult
@@ -328,11 +328,7 @@ class PortfolioService:
         observed = facts.status in (*OBSERVED, ComparisonStatus.NO_PINNED_SHA)
         with self._uow as uow:
             repository = uow.repositories.get(facts.repository_id)
-            upstream = (
-                uow.repositories.get_or_add(Repository(url=str(fork_of), public=False))
-                if fork_of
-                else None
-            )
+            upstream = self._upstream(uow, fork_of) if fork_of else None
             current = repository.model_copy(
                 update=dict(
                     public=repository.public
@@ -600,21 +596,39 @@ class PortfolioService:
             )
         return repository
 
-    def link_upstream(self, repository_id: UUID, parent_url: HttpsRepoUrl) -> Repository:
-        """Point a repository at its fork's parent: the parent is brought into the inventory
-        (private, until its own import says otherwise) when absent, found by URL when known."""
+    def record_repo_info(
+        self, repository_id: UUID, public: bool | None, parent_url: HttpsRepoUrl | None
+    ) -> Repository:
+        """What an import learned from the forge: the visibility it reports (None: it didn't
+        say) and a fork's parent, brought into the inventory (private, until its own import
+        says otherwise) when absent."""
         require_uuid(repository_id, "repository.id")
-        if not isinstance(parent_url, HttpsRepoUrl):
+        if parent_url is not None and not isinstance(parent_url, HttpsRepoUrl):
             raise ValidationError("repository.parent_url must be an HttpsRepoUrl")
         with self._uow as uow:
             repository = uow.repositories.get(repository_id)
-            upstream = uow.repositories.get_or_add(Repository(url=str(parent_url), public=False))
-            if repository.upstream_id != upstream.id:
-                repository = uow.repositories.update(
-                    repository.model_copy(update={"upstream_id": upstream.id})
-                )
+            update: dict[str, object] = {}
+            if public is not None and public != repository.public:
+                update["public"] = public
+            if parent_url is not None:
+                upstream = self._upstream(uow, parent_url)
+                if upstream.id != repository.upstream_id:
+                    update["upstream_id"] = upstream.id
+            if update:
+                repository = uow.repositories.update(repository.model_copy(update=update))
                 uow.commit()
         return repository
+
+    def _upstream(self, uow: InventoryUnitOfWork, parent_url: HttpsRepoUrl) -> Repository:
+        """A fork's parent row: the one registered at this URL, on GitHub (whose owner/repo is
+        case-insensitive) one registered in another case, else a new private row."""
+        if (found := uow.repositories.find_by_url(str(parent_url))) is not None:
+            return found
+        if self._hosts.get(parent_url.host) == "github" and (
+            found := uow.repositories.find_by_url_casefold(str(parent_url))
+        ):
+            return found
+        return uow.repositories.get_or_add(Repository(url=str(parent_url), public=False))
 
     def register_ref(
         self, repository_id: UUID, sha: GitSha, name: RefName | None, kind: RefKind | None
@@ -1195,18 +1209,27 @@ class PortfolioSync:
         known = self._portfolio.find_repository(url)
         if known is not None and known.id is not None:
             if known.upstream_id is None:
-                self._link_upstream(known.id, self._sources.info(url).data)
+                # lineage not linked yet: the forge may name a parent, or correct a parent
+                # placeholder's visibility. A forge outage still returns the known id.
+                try:
+                    info = self._sources.info(url).data
+                except SourceError as e:
+                    return SyncReport(
+                        unchanged=(known.id,),
+                        skipped=(f"{url}: forge facts not refreshed: {e.observation_status}",),
+                    )
+                self._record_info(known.id, info)
             return SyncReport(unchanged=(known.id,))
         info = self._sources.info(url).data
         report = self._register(url, info.visibility)
-        self._link_upstream((*report.added, *report.unchanged)[0], info)
+        self._record_info((*report.added, *report.unchanged)[0], info)
         return report
 
-    def _link_upstream(self, repository_id: UUID, info: RepoInfo) -> None:
-        """The fork's parent, normalized as an observation URL, as the repository's upstream."""
+    def _record_info(self, repository_id: UUID, info: RepoInfo) -> None:
+        """The forge's visibility and a fork's parent, normalized as an observation URL."""
+        public = None if info.visibility is None else info.visibility.lower() == "public"
         parent = _fork_parent_url(info.repo.host, info.fork, info.parent, self._hosts)
-        if parent is not None:
-            self._portfolio.link_upstream(repository_id, parent)
+        self._portfolio.record_repo_info(repository_id, public, parent)
 
     def import_branch(
         self, repository_id: UUID, url: HttpsRepoUrl, branch: RefName

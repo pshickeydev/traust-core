@@ -48,9 +48,10 @@ class Forge:
         heads: dict[str, str] | None = None,
         error: SourceError | None = None,
         described: RepoInfo | None = None,
+        info_error: SourceError | None = None,
     ) -> None:
         self.listing, self.visibility, self.heads, self.error = listing, visibility, heads, error
-        self.described = described
+        self.described, self.info_error = described, info_error
         self.calls: list[str] = []
 
     def _result(self, data):
@@ -64,6 +65,8 @@ class Forge:
 
     def info(self, repo: HttpsRepoUrl) -> Result[RepoInfo]:
         self.calls.append(f"info {repo}")
+        if self.info_error:
+            raise self.info_error
         return self._result(self.described or RepoInfo(repo=repo, visibility=self.visibility))
 
     def head(self, repo: HttpsRepoUrl, branch: str) -> Result[GitSha]:
@@ -368,3 +371,36 @@ def test_set_owners_never_closes_ownership_at_or_before_it_opened(
     with pytest.raises(ConflictError):
         portfolio.set_owners(repository.id, [], T0)
     assert ownerships(engine, repo) == [("Current", T0, None)]
+
+
+def test_a_parents_own_import_corrects_its_placeholder_visibility(
+    portfolio: PortfolioService,
+) -> None:
+    fork_forge = Forge(described=describing("example-org/fork", "example-org/api"))
+    sync(portfolio, fork_forge).import_repository(url("example-org/fork"))
+    parent = portfolio.find_repository(url("example-org/api"))
+    assert parent is not None and parent.id is not None and parent.public is False
+
+    parent_forge = Forge(described=describing("example-org/api", None, fork=False))
+    report = sync(portfolio, parent_forge).import_repository(url("example-org/api"))
+    assert report == SyncReport(unchanged=(parent.id,))
+    assert portfolio.get_repository(parent.id).public is True
+
+
+def test_a_fork_links_a_parent_registered_in_another_case(portfolio: PortfolioService) -> None:
+    parent = portfolio.register_repository(url("Example-Org/API"), public=True)
+    assert parent.id is not None
+    forge = Forge(described=describing("example-org/fork", "Example-Org/API"))
+    report = sync(portfolio, forge).import_repository(url("example-org/fork"))
+    assert portfolio.get_repository(report.added[0]).upstream_id == parent.id
+    assert portfolio.find_repository(url("example-org/api")) is None  # no second parent row
+
+
+def test_a_forge_outage_still_returns_a_known_repository(portfolio: PortfolioService) -> None:
+    known = portfolio.register_repository(url("example-org/api"), public=True)
+    assert known.id is not None
+    forge = Forge(info_error=SourceError("forge down", ComparisonStatus.UNREACHABLE))
+    report = sync(portfolio, forge).import_repository(url("example-org/api"))
+    assert report.unchanged == (known.id,)
+    assert report.skipped == (f"{url('example-org/api')}: forge facts not refreshed: unreachable",)
+    assert portfolio.get_repository(known.id) == known  # nothing changed without the forge
