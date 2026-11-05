@@ -76,6 +76,7 @@ NOT_ADMITTED = {
 # Arrays of new findings no door admits yet: each is an open gap with its tracking note.
 GAPS = {
     ("validation", "novel_findings"): "connectivity audit 2026-11-03 #6",
+    ("fuzz-campaign", "bugs"): "contracts #108: no kind records fuzz-campaign on development yet",
 }
 
 # Kinds recorded with a findings-bearing schema that admit none, and why.

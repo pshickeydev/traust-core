@@ -119,7 +119,11 @@ class RedHatDocSource:
     def fetch(self, product_id: UUID) -> Result[list[ProductDocument]]:
         target = self._targets.get(product_id)
         if target is None:
-            raise NotFoundError(f"product {product_id}: no docs.redhat.com slug/version declared")
+            raise NotFoundError(
+                f"product {product_id}: no docs.redhat.com slug/version declared; configure "
+                f"compliance.docs_targets[{product_id}] with product_slug and version "
+                "in traust.yaml"
+            )
         slug, version = _segment(target.product_slug), _segment(target.version)
         base = f"{OFFICIAL_DOCS}en/documentation/{slug}/{version}"
         pages = [

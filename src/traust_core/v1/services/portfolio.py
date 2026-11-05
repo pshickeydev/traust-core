@@ -615,15 +615,17 @@ class PortfolioService:
             uow.commit()
             return ref
 
-    def record_manifest_sbom(self, repository_ref_id: UUID, sbom_id: UUID) -> RepositoryRef:
-        """The SBOM read from the commit's source tree (manifests, lockfiles)."""
+    def record_manifest_sbom(
+        self, repository_ref_id: UUID, sbom_id: UUID, scan_id: UUID | None = None
+    ) -> RepositoryRef:
+        """The SBOM read from the commit's source tree (manifests, lockfiles), and the manifest
+        scan whose coverage is current: none for an SBOM given as a document, which clears it."""
         with self._uow as uow:
             ref = uow.repository_refs.get(repository_ref_id)
-            changed = ref.manifest_sbom_id != sbom_id
+            wanted = {"manifest_sbom_id": sbom_id, "manifest_sbom_assessment_id": scan_id}
+            changed = any(getattr(ref, k) != v for k, v in wanted.items())
             if changed:
-                ref = uow.repository_refs.update(
-                    ref.model_copy(update={"manifest_sbom_id": sbom_id})
-                )
+                ref = uow.repository_refs.update(ref.model_copy(update=wanted))
                 uow.commit()
         if changed:
             self._uow.after_commit(

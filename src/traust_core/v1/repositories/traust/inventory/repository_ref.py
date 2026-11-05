@@ -26,6 +26,7 @@ REPOSITORY_REF = TableSpec(
         sa.Column("is_default", sa.Boolean, nullable=False),
         text_column("sha"),
         uuid_column("manifest_sbom_id", nullable=True),
+        uuid_column("manifest_sbom_assessment_id", nullable=True),
     ),
 )
 

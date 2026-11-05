@@ -389,10 +389,6 @@ def configured_context(tmp_path: Path, targets: dict[str, object]) -> Context:
     return Context.from_file(path)
 
 
-@pytest.mark.todo(
-    "contracts pin 44a2825: traust.yaml compliance section",
-    legacy="traust-core@f950dd6/tests/v1/providers/tools/test_compliance_sources.py::test_file_configured_registered_product_reaches_curl_and_html_to_text",
-)
 def test_file_configured_registered_product_reaches_curl_and_html_to_text(
     tmp_path: Path, docs_transport: tuple[dict[str, tuple[int, bytes]], list[str]]
 ) -> None:
@@ -434,10 +430,6 @@ def test_explicit_product_target_reaches_the_same_transport(
     assert requests == [urlsplit(OFFICIAL_GUIDE).path]
 
 
-@pytest.mark.todo(
-    "contracts pin 44a2825: traust.yaml compliance section",
-    legacy="traust-core@f950dd6/tests/v1/providers/tools/test_compliance_sources.py::test_registered_product_with_no_target_refuses_without_transport",
-)
 def test_registered_product_with_no_target_refuses_without_transport(
     tmp_path: Path, docs_transport: tuple[dict[str, tuple[int, bytes]], list[str]]
 ) -> None:
@@ -450,10 +442,6 @@ def test_registered_product_with_no_target_refuses_without_transport(
     assert docs_transport[1] == []
 
 
-@pytest.mark.todo(
-    "contracts pin 44a2825: traust.yaml compliance section",
-    legacy="traust-core@f950dd6/tests/v1/providers/tools/test_compliance_sources.py::test_unknown_configured_product_refuses_before_transport",
-)
 def test_unknown_configured_product_refuses_before_transport(
     tmp_path: Path, docs_transport: tuple[dict[str, tuple[int, bytes]], list[str]]
 ) -> None:
@@ -464,10 +452,6 @@ def test_unknown_configured_product_refuses_before_transport(
     assert docs_transport[1] == []
 
 
-@pytest.mark.todo(
-    "contracts pin 44a2825: traust.yaml compliance section",
-    legacy="traust-core@f950dd6/tests/v1/providers/tools/test_compliance_sources.py::test_configured_transport_failure_is_not_replaced_with_content",
-)
 def test_configured_transport_failure_is_not_replaced_with_content(
     tmp_path: Path, docs_transport: tuple[dict[str, tuple[int, bytes]], list[str]]
 ) -> None:
@@ -481,10 +465,6 @@ def test_configured_transport_failure_is_not_replaced_with_content(
     assert requests == [urlsplit(OFFICIAL_GUIDE).path]
 
 
-@pytest.mark.todo(
-    "contracts pin 44a2825: traust.yaml compliance section",
-    legacy="traust-core@f950dd6/tests/v1/providers/tools/test_compliance_sources.py::test_invalid_product_docs_target_is_refused_by_real_file_loader",
-)
 @pytest.mark.parametrize(
     "target",
     [
@@ -509,10 +489,6 @@ def test_invalid_product_docs_target_is_refused_by_real_file_loader(
         configured_context(tmp_path, {str(uuid4()): target})
 
 
-@pytest.mark.todo(
-    "contracts pin 44a2825: traust.yaml compliance section",
-    legacy="traust-core@f950dd6/tests/v1/providers/tools/test_compliance_sources.py::test_product_docs_target_requires_product_uuid",
-)
 def test_product_docs_target_requires_product_uuid(tmp_path: Path) -> None:
     with pytest.raises(ConfigError):
         configured_context(tmp_path, {"example-platform": OFFICIAL_TARGET})

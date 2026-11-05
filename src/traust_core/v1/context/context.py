@@ -47,7 +47,13 @@ from traust_core.v1.context.tools import (
     load_toolchain,
     scanner_tools,
 )
-from traust_core.v1.errors import ConfigError, DocumentError, NotFoundError, ValidationError
+from traust_core.v1.errors import (
+    ConfigError,
+    DocumentError,
+    NotFoundError,
+    RepositoryError,
+    ValidationError,
+)
 from traust_core.v1.models.artifacts import (
     ARTIFACT_FOR_KIND,
     AdrRegistryArtifact,
@@ -613,11 +619,9 @@ class Context:
         )
 
     def register_compliance_sources(self, targets: Mapping[UUID, DocsTarget] | None = None) -> None:
-        """Read ADR registers and official docs; explicit product targets are checked against the
-        registered products."""
-        # NEED(contracts: traust.yaml `compliance.docs_targets`): the pinned config schema has no
-        # `compliance` section, so product docs targets come only from the caller until it does.
-        targets = {} if targets is None else targets
+        """Read ADR registers and official docs, for traust.yaml's `compliance.docs_targets` or
+        explicit product targets, each checked against the registered products."""
+        targets = self.config.compliance.docs_targets if targets is None else targets
         if targets:
             portfolio = PortfolioService(
                 SqlTraustUnitOfWork(self.database), PortfolioPolicy(), clock=self.clock
@@ -708,6 +712,8 @@ class Context:
         engine = create_database_engine(self.config.record_store_url())
         if local and not sa.inspect(engine).get_table_names():
             apply_schema(engine, contracts.database_ddl(Dialect.of(engine)))
+        else:
+            _manifest_scan_pointer(engine, upgrade=local)
         return engine
 
     @cached_property
@@ -1147,3 +1153,31 @@ def _sla_policy(path: Path) -> SlaPolicy:
         return SlaPolicy.model_validate(document)
     except ValueError as e:
         raise ConfigError(f"SLA policy {path}: {e}") from e
+
+
+def _manifest_scan_pointer(engine: Engine, *, upgrade: bool) -> None:
+    """contracts added `repository_ref.manifest_sbom_assessment_id`: a local store is upgraded; a
+    configured database's schema is its deployment's, so its absence is refused here rather
+    than failing every read of a commit."""
+    dialect = Dialect.of(engine)
+    schema = "traust" if dialect == Dialect.POSTGRES else None
+
+    def present() -> bool | None:
+        inspector = sa.inspect(engine)
+        if not inspector.has_table("repository_ref", schema=schema):
+            return None
+        columns = inspector.get_columns("repository_ref", schema=schema)
+        return any(c["name"] == "manifest_sbom_assessment_id" for c in columns)
+
+    if present() is not False:
+        return
+    if not upgrade:
+        raise ConfigError(
+            "the database's repository_ref predates manifest_sbom_assessment_id: apply "
+            "traust_core.v1.contracts.manifest_sbom_binding_upgrade(dialect) to it"
+        )
+    try:
+        apply_schema(engine, contracts.manifest_sbom_binding_upgrade(dialect))
+    except RepositoryError:
+        if not present():  # else another process opening the same store upgraded it first
+            raise
