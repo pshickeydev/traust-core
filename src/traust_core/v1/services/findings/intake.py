@@ -94,14 +94,18 @@ class FindingIntake:
             pending: dict[UUID, dict[tuple[str, int | None], CodeSpan]] = {}
             baselines: dict[UUID, set[tuple[str, int | None]]] = {}
             keys, kinds = self._fingerprints(repo, candidates, f"assessment {assessment_id}")
-            taken = {
-                c.label: self._take(
-                    uow, assessment_id, c, fp, catalog, pending, baselines, kind=kinds.get(fp)
+            took = [
+                (
+                    c,
+                    self._take(
+                        uow, assessment_id, c, fp, catalog, pending, baselines, kind=kinds.get(fp)
+                    ),
                 )
                 for c, fp in zip(candidates, keys, strict=True)
-            }
-            for c in candidates:
-                finding_id = taken[c.label][0]
+            ]
+            taken = {c.label: result for c, result in took}
+            # each candidate's own finding: two candidates may share a label
+            for c, (finding_id, _) in took:
                 if (
                     c.suppression is not None
                     and c.suppression.stands

@@ -16,6 +16,7 @@ from traust_core.v1 import contracts
 from traust_core.v1.errors import ConflictError, ForbiddenError, ValidationError
 from traust_core.v1.models import candidate_formats
 from traust_core.v1.models.base import AppendOnly, Entity, Model
+from traust_core.v1.models.candidate_formats import SuppressionStatus
 from traust_core.v1.models.common import CodeHash, CodeSpan, RepoPath
 from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.integrity import canonical_json, sha256_hex
@@ -341,14 +342,6 @@ def _owasp_llm(entry: Any) -> tuple[OwaspLlmCategory, ...]:
     if "owasp_llm_references" not in dir(entry):
         return ()
     return tuple(OwaspLlmCategory(c) for c in entry.owasp_llm_references)
-
-
-class SuppressionStatus(StrEnum):
-    """A scanner suppression's state, as SARIF names it."""
-
-    ACCEPTED = "accepted"
-    UNDER_REVIEW = "underReview"
-    REJECTED = "rejected"
 
 
 class Suppression(Model):

@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Iterator
+from enum import StrEnum
 from typing import Any
 
 from traust_core.v1.errors import ValidationError
@@ -19,9 +20,17 @@ _LEVEL_TO_SEVERITY = {
     "note": "informational",
     "none": "informational",
 }
+
+
 # Strongest first; only accepted (or no status) suppresses: underReview is undecided (§3.35.3).
-_SUPPRESSION_STATUSES = ("accepted", "underReview", "rejected")
-_STANDING = _SUPPRESSION_STATUSES[0]
+class SuppressionStatus(StrEnum):
+    """A scanner suppression's state, as SARIF names it."""
+
+    ACCEPTED = "accepted"
+    UNDER_REVIEW = "underReview"
+    REJECTED = "rejected"
+
+
 _PRECISION_TO_CONFIDENCE = {"very-high": 0.95, "high": 0.85, "medium": 0.6, "low": 0.4}
 _DEPENDABOT_SEVERITY = {
     "critical": "critical",
@@ -100,7 +109,11 @@ def _sarif_run(
     bound = _sarif_binding(run, repository_url, sha)
     for result in run.get("results") or []:
         suppression = _sarif_suppression(result.get("suppressions"))
-        if suppression and suppression["status"] == _STANDING and not include_suppressed:
+        if (
+            suppression
+            and suppression["status"] == SuppressionStatus.ACCEPTED
+            and not include_suppressed
+        ):
             continue
         index = result.get("ruleIndex")
         rule = (
@@ -139,7 +152,7 @@ def _sarif_run(
         }
 
 
-def _sarif_suppression(suppressions: Any) -> Fields | None:
+def _sarif_suppression(suppressions: object) -> Fields | None:
     """The result's suppression: accepted if any suppression stands (accepted or no status),
     else under review if any is, else rejected; with every stated justification."""
     if suppressions is None or suppressions == []:
@@ -149,10 +162,11 @@ def _sarif_suppression(suppressions: Any) -> Fields | None:
     statuses: set[str] = set()
     reasons: dict[str, None] = {}
     for suppression in suppressions:
-        status = suppression.get("status", _STANDING)
-        if not isinstance(status, str) or status not in _SUPPRESSION_STATUSES:
+        status = suppression.get("status", SuppressionStatus.ACCEPTED.value)
+        if not isinstance(status, str) or status not in set(SuppressionStatus):
             raise ValidationError(
-                f"sarif: suppression status {status!r} is not one of {_SUPPRESSION_STATUSES}"
+                f"sarif: suppression status {status!r} is not one of "
+                f"{tuple(s.value for s in SuppressionStatus)}"
             )
         justification = suppression.get("justification")
         if justification is not None and not isinstance(justification, str):
@@ -160,7 +174,7 @@ def _sarif_suppression(suppressions: Any) -> Fields | None:
         statuses.add(status)
         if justification and justification.strip():
             reasons[justification.strip()] = None
-    status = next(v for v in _SUPPRESSION_STATUSES if v in statuses)
+    status = next(s for s in SuppressionStatus if s in statuses)
     return {"status": status, "justification": "; ".join(reasons) or None}
 
 
