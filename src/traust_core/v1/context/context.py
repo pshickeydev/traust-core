@@ -613,6 +613,7 @@ class Context:
             rules,
             adapter_version=adapter_version,
             scan_commit=scan_commit,
+            load_yaml=yaml_documents,
         )
 
     def register_fleet_fix(self) -> None:

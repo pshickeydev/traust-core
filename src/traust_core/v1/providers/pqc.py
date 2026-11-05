@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import hashlib
-import re
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
 from typing import Protocol
 
@@ -59,10 +59,12 @@ class PqcScanTool:
         *,
         adapter_version: str,
         scan_commit: str,
+        load_yaml: Callable[[str], list[object]],
     ) -> None:
         self._process, self._clock = process, clock
         self._binary, self._rules = binary.resolve(), rules.resolve()
         self._adapter_version, self._scan_commit = adapter_version, scan_commit
+        self._load_yaml = load_yaml
 
     def check(self) -> Readiness:
         if not self._process.allows(str(self._binary)):
@@ -74,14 +76,23 @@ class PqcScanTool:
             return Readiness(ready=False, detail=str(exc))
         return Readiness(ready=True)
 
+    def _rule_files(self) -> list[Path]:
+        return sorted(
+            file
+            for file in self._rules.rglob("*")
+            if file.is_file() and not file.is_symlink() and file.suffix in {".yml", ".yaml"}
+        )
+
     def stamps(self) -> PqcStamps:
-        files = sorted(self._rules.glob("*.yml"))
+        files = self._rule_files()
         if not files:
             raise ConfigError(f"pqc-scan rules pack is empty: {self._rules}")
         digest = hashlib.sha256()
         for file in files:
-            digest.update(file.name.encode())
-            digest.update(file.read_bytes())
+            digest.update(file.relative_to(self._rules).as_posix().encode())
+            digest.update(b"\0")
+            with file.open("rb") as stream:
+                digest.update(hashlib.file_digest(stream, "sha256").digest())
         binary_sha = None
         if self._binary.is_file():
             with self._binary.open("rb") as stream:
@@ -100,9 +111,16 @@ class PqcScanTool:
         stamps = self.stamps()
         if stamps.binary_sha256 is None:
             raise ConfigError(f"pqc-scan binary is missing: {self._binary}")
-        rules = sum(
-            len(re.findall(r"(?m)^- id:", file.read_text())) for file in self._rules.glob("*.yml")
-        )
+        rules = 0
+        for file in self._rule_files():
+            try:
+                documents = self._load_yaml(file.read_text())
+            except (OSError, ValidationError) as exc:
+                raise ConfigError(f"pqc-scan rules could not be read: {file}") from exc
+            if len(documents) != 1 or not isinstance(documents[0], (dict, list)):
+                raise ConfigError(f"pqc-scan rules must be a mapping or sequence: {file}")
+            document = documents[0]
+            rules += len(document) if isinstance(document, list) else 1
         if rules == 0:
             raise ConfigError("pqc-scan pack has no rules")
         with tempfile.TemporaryDirectory(prefix="pqc-scan-") as directory:

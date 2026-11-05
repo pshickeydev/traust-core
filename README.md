@@ -429,6 +429,11 @@ required coverage and raw findings, and retains CBOM bytes. Missing/malformed ou
 exits fail rather than becoming clean scans. Changed binary/rules during a run invalidate its result.
 These are raw facts, not readiness verdicts.
 
+Rule discovery recursively includes regular `.yml` and `.yaml` files, excluding file symlinks.
+Counts accept the scanner's YAML mapping or sequence forms through Context's shared decoder.
+The fingerprint binds sorted relative paths and file-content hashes. This replaces the old
+root-only stamp format: previously cached stamps refresh once; historical records are not rewritten.
+
 `PqcService.prescan` remains the owner of post-processing, recorded facts and same-pack reuse;
 its crypto census requires an ingested manifest SBOM. Engine schedules work but does not own a
 second scanner implementation.

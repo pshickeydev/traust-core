@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from traust_core.v1.context import Config, Context
+from traust_core.v1.context.documents import yaml_documents
 from traust_core.v1.errors import ConfigError, IntegrityError, ServiceError, ValidationError
 from traust_core.v1.models.common import ToolRequest
 from traust_core.v1.models.inventory import RefName
@@ -43,6 +44,7 @@ def scanner(tmp_path: Path, report: object, *, code: int = 0) -> PqcScanTool:
         rules,
         adapter_version="1.4.0",
         scan_commit="be5c760",
+        load_yaml=yaml_documents,
     )
 
 
@@ -160,3 +162,24 @@ def test_registered_scanner_records_source_facts_and_reuses_the_same_pack(tmp_pa
     repeated = services.pqc.prescan(ref.id, request)
     assert repeated.assessment_id == first.assessment_id
     assert not repeated.scanned
+
+
+def test_nested_yaml_rules_change_pack_stamps_and_are_counted(tmp_path: Path) -> None:
+    provider = scanner(
+        tmp_path, {"summary": {"scanned_files": 1, "skipped_files": 0}, "findings": []}
+    )
+    initial = provider.stamps()
+    nested = tmp_path / "rules" / "nested"
+    nested.mkdir()
+    rule = nested / "one.yaml"
+    rule.write_text("id: NESTED\npattern: rsa\n")
+    expanded = provider.stamps()
+    assert not initial.same_pack(expanded)
+    assert provider.scan(ToolRequest(workspace=tmp_path)).data.rules_in_pack == 2
+    rule.write_text("id: NESTED\npattern: ecdsa\n")
+    changed = provider.stamps()
+    assert not expanded.same_pack(changed)
+    relocated = tmp_path / "rules" / "other"
+    relocated.mkdir()
+    rule.rename(relocated / rule.name)
+    assert not changed.same_pack(provider.stamps())
