@@ -7,7 +7,13 @@ from pydantic import JsonValue
 
 from traust_core.v1.models.artifacts import ComplianceAssessmentArtifact
 from traust_core.v1.models.compliance import COVERAGE_KEYS
-from traust_core.v1.rendering.markdown import Report, Section, Table
+from traust_core.v1.rendering.markdown import (
+    MarkdownRenderer,
+    Report,
+    Section,
+    Table,
+    markdown_text,
+)
 
 
 def assessment_report(document: ComplianceAssessmentArtifact) -> Report:
@@ -77,8 +83,34 @@ def assessment_report(document: ComplianceAssessmentArtifact) -> Report:
         generated_at=datetime.fromisoformat(metadata["generated_at"].replace("Z", "+00:00")),
         sections=tuple(sections),
         sources=(
-            f"scope:{metadata['scope_id']}",
+            *((f"scope:{metadata['scope_id']}",) if "scope_id" in metadata else ()),
             f"registry:sha256:{metadata['registry_hash']}",
             f"harness:{metadata['harness_version']}",
         ),
+    )
+
+
+def assessment_markdown(document: ComplianceAssessmentArtifact) -> bytes:
+    """`assessment_report` as Markdown, every value from the document escaped as plain text."""
+    report = assessment_report(document)
+    return MarkdownRenderer().render(
+        report.model_copy(
+            update={
+                "sections": tuple(map(_plain, report.sections)),
+                "sources": tuple(map(markdown_text, report.sources)),
+            }
+        )
+    )
+
+
+def _plain(section: Section) -> Section:
+    table = section.table
+    return section.model_copy(
+        update={
+            "heading": markdown_text(section.heading),
+            "table": table
+            and table.model_copy(
+                update={"rows": tuple(tuple(map(markdown_text, row)) for row in table.rows)}
+            ),
+        }
     )

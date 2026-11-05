@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
+from datetime import timedelta
+from typing import Any
 from uuid import UUID
 
 import pytest
 
+from tests.v1.repositories.tables.conftest import T0
 from tests.v1.services.findings.test_reads import service as finding_service
 from tests.v1.services.test_detection_quality_regression_pairs import (
     FIX,
     PRE,
+    REPO,
     Ledger,
 )
 from tests.v1.services.test_detection_quality_regression_pairs import (
@@ -18,12 +23,13 @@ from tests.v1.services.test_detection_quality_regression_pairs import (
 )
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.artifacts import BenchmarkTargetArtifact
-from traust_core.v1.models.findings import Validity
+from traust_core.v1.models.findings import Finding, Validity
 from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.repositories import InMemoryObjectStore
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services.artifact_publishing import ArtifactPublisher, PublishSpecs
 from traust_core.v1.services.detection_quality import DetectionQualityService
+from traust_core.v1.services.findings.facts import FindingFacts
 
 
 def quality(ledger: Ledger) -> DetectionQualityService:
@@ -114,3 +120,40 @@ def test_bootstrap_deduplicates_paths_from_distinct_recorded_spans(ledger: Ledge
 def test_bootstrap_refuses_an_invalid_limit(ledger: Ledger, limit: int) -> None:
     with pytest.raises(ValidationError, match="positive"):
         quality(ledger).bootstrap_benchmark(limit=limit)
+
+
+def test_bootstrap_expects_the_pre_fix_reports_paths_not_a_later_reports(ledger: Ledger) -> None:
+    finding_id = ledger.finding("cmd/run.go")
+    _, _, fixed = ledger.repos[REPO]
+    with ledger.uow as uow:
+        finding = uow.findings.get(finding_id)
+        later = ledger.seed.assessment(fixed, occurred_at=T0 + timedelta(hours=12))
+        ledger.seed.location(ledger.seed.occurrence(finding, later), path="cmd/moved.go")
+        uow.commit()
+    [target] = quality(ledger).bootstrap_benchmark().targets
+    assert target.pre_fix_sha == PRE
+    assert target.expected[0].paths == ("cmd/run.go",)
+
+
+def test_bootstrap_folds_no_more_findings_than_its_limit_needs(
+    ledger: Ledger, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for index in range(8):
+        ledger.finding(f"cmd/file-{index}.go")
+    service = quality(ledger)
+    expected = [t.id for t in service.bootstrap_benchmark().targets][:2]
+    folded: list[int] = []
+    load = FindingFacts.load
+
+    def counted(uow: Any, findings: Sequence[Finding], *args: Any, **kw: Any) -> FindingFacts:
+        folded.append(len(findings))
+        return load(uow, findings, *args, **kw)
+
+    monkeypatch.setattr(FindingFacts, "load", counted)
+    assert [t.id for t in service.bootstrap_benchmark(limit=2).targets] == expected
+    assert sum(folded) == 2
+
+
+def test_fixes_by_fingerprint_refuses_an_empty_batch(ledger: Ledger) -> None:
+    with pytest.raises(ValidationError, match="positive"):
+        next(finding_service(ledger.engine).fixes_by_fingerprint(Validity.CONFIRMED, 0))

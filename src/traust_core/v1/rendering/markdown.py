@@ -72,7 +72,7 @@ def inline(value: object) -> str:
 
 def markdown_text(value: object) -> str:
     """Plain structured text, not authored Markdown: no HTML, links or inline formatting."""
-    return re.sub(r"([\\`*_\[\]{}()#!~])", r"\\\1", escape(inline(value), quote=False))
+    return re.sub(r"([\\`*_\[\]{}()!~])", r"\\\1", escape(inline(value), quote=False))
 
 
 def markdown_table(columns: Sequence[str], rows: Sequence[Sequence[str]]) -> list[str]:

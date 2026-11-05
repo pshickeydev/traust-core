@@ -1239,7 +1239,8 @@ class VerificationService:
         for repository_id in dict.fromkeys(repository_ids):
             refs = self._inventory.list_refs(repository_id)
             head = self._portfolio.default_ref(repository_id)
-            entries.append(self._sweep_entry(repository_id, head, refs))
+            verified = {v.verification_id for v in self._verifications(repository_id)}
+            entries.append(self._sweep_entry(repository_id, head, refs, verified))
             if include_branches:
                 default = default_line(refs)
                 branches: dict[str, RepositoryRef] = {}
@@ -1253,12 +1254,21 @@ class VerificationService:
                     key=lambda a: (a.occurred_at, str(a.id)),
                 ):
                     ref = by_id[assessment.repository_ref_id]
-                    if ref.name in branches and assessment.status == ASSESSMENT_COMPLETED:
+                    if (
+                        ref.kind == RefKind.BRANCH
+                        and ref.name in branches
+                        and assessment.status == ASSESSMENT_COMPLETED
+                    ):
                         branches[ref.name] = ref
                         observed.add(ref.name)
                 entries.extend(
                     self._sweep_entry(
-                        repository_id, ref, refs, branch=True, observed=ref.name in observed
+                        repository_id,
+                        ref,
+                        refs,
+                        verified,
+                        branch=True,
+                        observed=ref.name in observed,
                     )
                     for _, ref in sorted(branches.items())
                 )
@@ -1329,14 +1339,16 @@ class VerificationService:
         repository_id: UUID,
         head: RepositoryRef | None,
         refs: Sequence[RepositoryRef],
+        verified_ids: Collection[UUID],
         *,
         branch: bool = False,
         observed: bool = False,
     ) -> SweepEntry:
+        """A default entry weighs every line's evidence; a branch entry only its own line's."""
         with self._uow:
             repository = self._inventory.get_repository(repository_id)
             shas = {r.id: r.sha for r in refs}
-            line = ref_line(head, refs) if branch and head else default_line(refs)
+            line = ref_line(head, refs) if branch and head else None
             views = self._findings.on_ref(head.id) if branch and head else None
             findings = (
                 {v.finding.id for v in views}
@@ -1362,7 +1374,6 @@ class VerificationService:
             return not line or baseline.repository_ref_id in line
 
         kinds = {a.id: a.kind for a in judged}
-        verified_ids = {v.verification_id for v in self._verifications(repository_id)}
         verified = [a for a in judged if a.id in verified_ids and on_line(a)]
         pinned = max(
             (a for a in judged if (a.id in reported or a.id in verified_ids) and on_line(a)),

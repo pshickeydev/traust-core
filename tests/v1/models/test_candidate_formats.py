@@ -11,7 +11,12 @@ import pytest
 
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.common import CodeSpan
-from traust_core.v1.models.findings import CandidateFormat, FindingCandidate
+from traust_core.v1.models.findings import (
+    CandidateFormat,
+    FindingCandidate,
+    Suppression,
+    SuppressionStatus,
+)
 
 SCANNERS = Path(__file__).parents[2] / "fixtures" / "findings" / "scanners"
 REPO = uuid4()
@@ -55,6 +60,34 @@ def test_suppressed_sarif_review_is_opt_in_and_keeps_claim_locations() -> None:
     ]
     assert candidates[1].description.startswith("Suppressed instance.")
     assert len(parse(sarif(), CandidateFormat.SARIF)) == 1
+
+
+@pytest.mark.parametrize(
+    ("suppressions", "status", "justification"),
+    [
+        ([{"kind": "external"}], SuppressionStatus.ACCEPTED, None),
+        (
+            [
+                {"kind": "inSource", "status": "rejected", "justification": "Not dead code"},
+                {"kind": "external", "status": "underReview", "justification": "Owner asked"},
+            ],
+            SuppressionStatus.UNDER_REVIEW,
+            "Not dead code; Owner asked",
+        ),
+        ([{"kind": "inSource", "status": "rejected"}], SuppressionStatus.REJECTED, None),
+    ],
+)
+def test_an_included_suppressed_result_carries_its_suppression(
+    suppressions: list[dict[str, str]], status: SuppressionStatus, justification: str | None
+) -> None:
+    def suppress(doc: dict[str, Any]) -> None:
+        doc["runs"][0]["results"][1]["suppressions"] = suppressions
+
+    plain, suppressed = FindingCandidate.parse_many(
+        sarif(suppress), CandidateFormat.SARIF, REPO, include_suppressed=True
+    )
+    assert plain.suppression is None
+    assert suppressed.suppression == Suppression(status=status, justification=justification)
 
 
 @pytest.mark.parametrize("format", [CandidateFormat.DEPENDABOT, CandidateFormat.GOVULNCHECK])

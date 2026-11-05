@@ -134,6 +134,27 @@ def test_suppressed_review_uses_same_scan_without_manufacturing_verdicts(
     assert replay.findings == included.findings
 
 
+def test_an_included_suppressed_result_is_queued_for_review_not_left_plain_open(
+    context: Context, engine: Engine
+) -> None:
+    services = context.services()
+    doc = json.loads((SCANNERS / "codeql.sarif").read_bytes())
+    doc["runs"][0]["results"][1]["suppressions"] = [
+        {"kind": "inSource", "status": "accepted", "justification": "Sanitised upstream"}
+    ]
+    ref, raw = a_ref(engine), json.dumps(doc).encode()
+    _, plain = services.assessment.record_scan(ref, raw, CandidateFormat.SARIF, provenance())
+    _, included = services.assessment.record_scan(
+        ref, raw, CandidateFormat.SARIF, provenance(), include_suppressed=True
+    )
+    [suppressed] = set(included.findings.values()) - set(plain.findings.values())
+    [queued] = services.findings.review.for_finding(suppressed)
+    assert (queued.reason, queued.status) == ("manual_queue", "pending")
+    for finding_id in plain.findings.values():
+        assert services.findings.review.for_finding(finding_id) == []
+    assert services.findings.history(suppressed) == []
+
+
 def test_record_scan_needs_intake(engine: Engine) -> None:
     with pytest.raises(ConfigError, match="needs finding intake"):
         AssessmentService(SqlTraustUnitOfWork(engine)).record_scan(

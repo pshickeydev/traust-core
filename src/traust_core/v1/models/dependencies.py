@@ -830,7 +830,8 @@ class ImpactExportRepo(ImpactAnalysis):
 
 
 class ImpactExport(Model):
-    """An advisory's latest analysis per commit, with its native evidence."""
+    """An advisory's latest analysis per commit and affected package version, with its native
+    evidence."""
 
     advisory_id: UUID
     advisory: AdvisoryIdentifier

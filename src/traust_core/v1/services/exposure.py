@@ -1244,7 +1244,7 @@ class ExposureService:
             canonical = uow.advisories.get(known.alias_of_id) if known.alias_of_id else known
         assert canonical.id is not None
         rows = sorted(
-            _latest(self._recorded(ImpactFilter(advisory_id=canonical.id)), None),
+            _latest_members(self._recorded(ImpactFilter(advisory_id=canonical.id))),
             key=lambda row: row.at,
             reverse=True,
         )
@@ -1545,6 +1545,23 @@ def _latest(rows: Sequence[_Recorded], until: datetime | None) -> list[_Recorded
     for row in rows:
         key = (row.analysis.repository_ref_id, row.analysis.advisory_id)
         if _by(row, until) and (key not in latest or latest[key].at < row.at):
+            latest[key] = row
+    return list(latest.values())
+
+
+def _latest_members(rows: Sequence[_Recorded]) -> list[_Recorded]:
+    """The latest analysis of each commit, advisory and affected package version."""
+    latest: dict[tuple[UUID, UUID, str | None, str, str | None], _Recorded] = {}
+    for row in rows:
+        metadata = row.doc.metadata
+        key = (
+            row.analysis.repository_ref_id,
+            row.analysis.advisory_id,
+            metadata.ecosystem,
+            metadata.module,
+            row.doc.repos[0].version,
+        )
+        if key not in latest or latest[key].at < row.at:
             latest[key] = row
     return list(latest.values())
 

@@ -96,8 +96,10 @@ def _sarif_run(
     by_location = _sarif_artifacts(artifacts)
     bound = _sarif_binding(run, repository_url, sha)
     for result in run.get("results") or []:
-        if result.get("suppressions") and not include_suppressed:
+        suppressions = result.get("suppressions") or []
+        if suppressions and not include_suppressed:
             continue
+        suppression = _sarif_suppression(suppressions)
         index = result.get("ruleIndex")
         rule = (
             rules[index]
@@ -131,7 +133,21 @@ def _sarif_run(
             "symbol": symbol,
             "hashes": _sarif_hashes(artifact, bound),
             "confidence": _PRECISION_TO_CONFIDENCE.get(rule_props.get("precision")),
+            "suppression": suppression,
         }
+
+
+def _sarif_suppression(suppressions: list[dict[str, Any]]) -> Fields | None:
+    """The result's suppression state: accepted if any suppression stands (an absent status is
+    accepted), else under review if any is, else rejected; with every stated justification."""
+    if not suppressions:
+        return None
+    statuses = {s.get("status") or "accepted" for s in suppressions}
+    status = next((v for v in ("accepted", "underReview") if v in statuses), "rejected")
+    reasons = dict.fromkeys(
+        j for s in suppressions if (j := (s.get("justification") or "").strip())
+    )
+    return {"status": status, "justification": "; ".join(reasons) or None}
 
 
 def _sarif_severity(

@@ -32,6 +32,7 @@ from traust_core.v1.models.vocabulary import ActorKind, FindingKind, ReviewItemS
 from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.services.artifact_publishing import AssessmentLog
 from traust_core.v1.services.findings.identity import IdentityPolicy
+from traust_core.v1.services.findings.review import request
 from traust_core.v1.services.findings.taxonomy import TaxonomyPolicy
 from traust_core.v1.services.portfolio import Inventory
 
@@ -99,6 +100,9 @@ class FindingIntake:
                 )
                 for c, fp in zip(candidates, keys, strict=True)
             }
+            for c in candidates:
+                if c.suppression is not None and c.suppression.stands:
+                    request(uow, taken[c.label][0], ReviewReason.MANUAL_QUEUE)
             for occurrence_id, locations in pending.items():
                 for (path, line), span in locations.items():
                     saved = uow.locations.add(

@@ -88,3 +88,31 @@ def test_hostile_target_values_cannot_forge_headings_or_rows(world: World) -> No
     ).decode()
     assert "\n# forged title" not in markdown
     assert "x # forged title \\| a \\| b \\|" in markdown
+
+
+def test_injected_html_and_links_in_document_values_render_as_plain_text(world: World) -> None:
+    evaluated = world.service.evaluate(seeded(world))
+    body = json.loads(evaluated.document.payload)
+    hostile = '<img src=x onerror="alert(1)"> [click](https://attacker.example)'
+    body["metadata"]["target"]["product"] = hostile
+    body["metadata"]["harness_version"] = hostile
+    [cited] = [result for result in body["results"] if result.get("evidence")][:1]
+    cited["reason"] = hostile
+    cited["evidence"][0]["locator"] = hostile
+    markdown = world.service.render_assessment(
+        ComplianceAssessmentArtifact.from_document(body)
+    ).decode()
+    assert "<img" not in markdown
+    assert "[click](" not in markdown
+    assert "&lt;img" in markdown
+    assert "\\[click\\]\\(https://attacker.example\\)" in markdown
+
+
+def test_an_assessment_without_a_scope_id_renders_without_a_scope_source(world: World) -> None:
+    evaluated = world.service.evaluate(seeded(world))
+    body = json.loads(evaluated.document.payload)
+    body["metadata"].pop("scope_id", None)
+    document = ComplianceAssessmentArtifact.from_document(body)
+    report = assessment_report(document)
+    assert not any(source.startswith("scope:") for source in report.sources)
+    assert "registry:sha256:" in world.service.render_assessment(document).decode()

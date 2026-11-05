@@ -343,6 +343,25 @@ def _owasp_llm(entry: Any) -> tuple[OwaspLlmCategory, ...]:
     return tuple(OwaspLlmCategory(c) for c in entry.owasp_llm_references)
 
 
+class SuppressionStatus(StrEnum):
+    """A scanner suppression's state, as SARIF names it."""
+
+    ACCEPTED = "accepted"
+    UNDER_REVIEW = "underReview"
+    REJECTED = "rejected"
+
+
+class Suppression(Model):
+    """A scanner's own suppression of a result it reported, and the reason it gave."""
+
+    status: SuppressionStatus
+    justification: str | None = None
+
+    @property
+    def stands(self) -> bool:
+        return self.status != SuppressionStatus.REJECTED
+
+
 class FindingCandidate(Model):
     """A reported finding before intake; a scanner that gives no severity reports `unrated`."""
 
@@ -364,6 +383,7 @@ class FindingCandidate(Model):
     policy: bool = False
     resources: tuple[str, ...] = ()
     finding_id: UUID | None = None  # the recorded finding this report confirms, not a new one
+    suppression: Suppression | None = None
 
     @classmethod
     def parse_many(
@@ -427,6 +447,7 @@ class FindingCandidate(Model):
                     else (),
                     reported_severity=ScannerSeverity(f["severity"] or ScannerSeverity.UNRATED),
                     confidence=Confidence(f["confidence"]) if f["confidence"] is not None else None,
+                    suppression=Suppression(**f["suppression"]) if f.get("suppression") else None,
                 )
             )
         return out
@@ -824,6 +845,14 @@ def effective_decisions(decisions: Sequence[Decision]) -> list[Decision]:
     ]
 
 
+def folded_resolutions(
+    decisions: Sequence[Decision], on_default_line: Mapping[UUID, bool]
+) -> list[Decision]:
+    """The resolving decisions `Disposition.fold` reads resolution from: the default line's,
+    else the line-free ones."""
+    return [s.decision for s in _on_line(_statements(decisions), on_default_line)]
+
+
 def _statements(decisions: Sequence[Decision]) -> list[_Statement]:
     return [_Statement(d) for d in effective_decisions(decisions)]
 
@@ -1035,10 +1064,11 @@ class FindingClock(Model):
 
 class FindingFix(Model):
     """A finding a standing decision says was fixed on a commit, with the commit it was last
-    reported on before that and the fixing decision's rationale."""
+    reported on before that, where that report placed it, and the fixing decision's rationale."""
 
     view: FindingView
     reported_ref_id: UUID
+    reported_locations: tuple[Location, ...]
     fixed_ref_id: UUID
     rationale: str | None = None
 

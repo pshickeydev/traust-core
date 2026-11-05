@@ -273,6 +273,44 @@ def test_verified_fix_mtta_excludes_retracted_fix_and_unmeasured_groups(repo: Re
     assert service(repo.engine).verified_fix_mtta(repo.filter) == []
 
 
+def test_verified_fix_mtta_counts_only_fixes_on_the_line_the_disposition_folds(
+    engine: Engine,  # noqa: F811
+) -> None:
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        repository = seed.repository(url=f"https://github.com/org/{uuid4()}")
+        default = seed.repository_ref(repository, is_default=True)
+        release = seed.repository_ref(repository, name="release-1", sha="b" * 40)
+        uow.commit()
+    on_default, on_release = Repo(engine, repository, default), Repo(engine, repository, release)
+    both = on_default.reported()
+    on_release.assessed(both, "verification", 2, resolution="resolved")
+    on_default.assessed(both, "verification", 5, resolution="resolved")
+    only = on_default.reported(severity="critical")
+    on_release.assessed(only, "verification", 1, resolution="resolved")
+
+    rows = service(engine).verified_fix_mtta(on_default.filter)
+
+    assert [(row.severity, row.findings, row.mtta_days) for row in rows] == [("high", 1, 5.0)]
+
+
+def test_verified_fix_mtta_starts_at_the_first_report_never_an_earlier_decision(
+    repo: Repo,
+) -> None:
+    finding = repo.reported(day=3)
+    repo.judged(finding, 0, validity="confirmed")
+    repo.assessed(finding, "verification", 5, resolution="resolved")
+    early = repo.reported(day=3, severity="medium")
+    repo.assessed(early, "verification", 1, resolution="resolved")
+
+    rows = service(repo.engine).verified_fix_mtta(repo.filter)
+
+    assert [(row.severity, row.findings, row.mtta_days) for row in rows] == [
+        ("high", 1, 2.0),
+        ("medium", 1, 0.0),
+    ]
+
+
 # timeline
 def test_timeline_replays_month_by_month(repo: Repo) -> None:
     fixed = repo.reported(severity="high", cvss_score=Decimal("7.5"))

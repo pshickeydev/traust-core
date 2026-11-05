@@ -950,3 +950,64 @@ def test_default_sweep_entries_name_their_head_ref(
         head.name,
         "observed_default",
     )
+
+
+def test_default_sweep_weighs_off_line_verifications_and_claims_as_development_did(
+    service: VerificationService, remediation: RemediationService, engine: Engine
+) -> None:
+    world = World(engine, findings=2)
+    audited(engine, world, world.base)
+    claimed = remediation.open([world.ids[1]], world.patched.id)  # type: ignore[list-item]
+    remediation.record_progress(claimed.work_item_id, RemediationStatus("forked"))
+    service.record(report(world, {world.ids[0]: "unresolved"}), provenance())
+    (entry,) = service.sweep([world.repo.id]).queued
+    assert (
+        entry.head_sha,
+        entry.pinned_sha,
+        entry.verified_at_head,
+        entry.claims,
+        entry.open_findings,
+        entry.tier,
+    ) == (BASE_SHA, PATCHED_SHA, False, 1, 2, "T1")
+
+
+def test_a_tag_of_a_branchs_name_never_replaces_the_branch_sweep_target(
+    service: VerificationService, engine: Engine
+) -> None:
+    world = World(engine)
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        branch = seed.repository_ref(world.repo, name="release-1", sha="b" * 40)
+        tag = seed.repository_ref(world.repo, name="release-1", kind="tag", sha="c" * 40)
+        seed.assessment(tag, kind="repo-state", occurred_at=WHEN)
+        uow.commit()
+    sweep = service.sweep([world.repo.id], include_branches=True)
+    [entry] = [e for e in (*sweep.queued, *sweep.skipped) if e.ref_name == "release-1"]
+    assert (entry.repository_ref_id, entry.head_sha, entry.head_source) == (
+        branch.id,
+        "b" * 40,
+        "registered_branch",
+    )
+
+
+def test_a_branch_sweep_reads_each_repositorys_verifications_once(
+    service: VerificationService, engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    worlds = [World(engine), World(engine)]
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        for world in worlds:
+            for name in ("release-1", "release-2"):
+                seed.repository_ref(world.repo, name=name, sha=uuid4().hex + "0" * 8)
+        uow.commit()
+    read: list[UUID] = []
+    verifications = VerificationService._verifications
+
+    def counted(self: VerificationService, repository_id: UUID) -> Any:
+        read.append(repository_id)
+        return verifications(self, repository_id)
+
+    monkeypatch.setattr(VerificationService, "_verifications", counted)
+    sweep = service.sweep([w.repo.id for w in worlds], include_branches=True)
+    assert len((*sweep.queued, *sweep.skipped)) == 2 * (1 + 3)
+    assert sorted(read, key=str) == sorted((w.repo.id for w in worlds), key=str)

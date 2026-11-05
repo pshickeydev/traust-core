@@ -35,6 +35,7 @@ from traust_core.v1.models.vocabulary import (
     ImpactManifestScan,
     SourceType,
 )
+from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 
 __all__ = ["engine"]
 
@@ -153,11 +154,6 @@ def test_export_preserves_native_evidence_array_presence(
     assert exported.evidence.l4_packages_found == (None if packages is None else tuple(packages))
 
 
-@pytest.mark.todo(
-    "multi-package latest impact snapshot",
-    legacy="traust-core@f950dd6/tests/v1/services/test_exposure_export.py::"
-    "test_export_keeps_distinct_modules_and_versions_and_latest_evidence_for_each",
-)
 def test_export_keeps_distinct_modules_and_versions_and_latest_evidence_for_each(
     engine: Engine,
 ) -> None:
@@ -177,13 +173,29 @@ def test_export_keeps_distinct_modules_and_versions_and_latest_evidence_for_each
     known = exposure.find_advisory(GHSA)
     assert known is not None and known.advisory_id is not None
     prepared = exposure.prepare(known.advisory_id, ref.id)
-    assert len(prepared) == 3
+    packages = {p.name: p for p in advisory.affected}
+    with SqlTraustUnitOfWork(engine) as uow:
+        named = {
+            found.dependency.package_id: uow.packages.get(found.dependency.package_id).name
+            for found in prepared.dependencies
+        }
+    members = [
+        prepared.model_copy(
+            update={
+                "package": packages[named[found.dependency.package_id]],
+                "dependencies": (found,),
+            }
+        )
+        for found in prepared.dependencies
+        if found.vulnerable
+    ]
+    assert len(members) == 3
     originals = {}
-    for item in prepared:
+    for item in members:
         doc = item.document("1.0.0")
         recorded = exposure.record(ref.id, doc, source())
         originals[(doc.metadata.module, doc.repos[0].version)] = recorded.artifact_id
-    updated = prepared[0].model_copy(update={"evidence": ImpactEvidence(notes="Reviewed again")})
+    updated = members[0].model_copy(update={"evidence": ImpactEvidence(notes="Reviewed again")})
     latest_doc = updated.document("1.0.0")
     latest = exposure.record(ref.id, latest_doc, source(1))
     originals[(latest_doc.metadata.module, latest_doc.repos[0].version)] = latest.artifact_id

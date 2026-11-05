@@ -305,3 +305,23 @@ def test_signature_verification_binds_historical_metadata_not_just_the_root(
     assert not result.passed
     assert result.integrity is not None
     assert [issue.check for issue in result.integrity.errors] == [IntegrityCheck.SIGNATURE]
+
+
+@pytest.mark.parametrize("mutation", ["unsigned", "tampered"])
+def test_a_fragment_qualified_layer_schema_still_requires_the_signature(
+    reporting: ReportingService,
+    tmp_path: Path,
+    signed_layer: dict[str, Any],
+    signing_keys: tuple[Path, Path, Path],
+    mutation: str,
+) -> None:
+    if mutation == "unsigned":
+        del signed_layer["metadata"]["merkle_root_signature"]
+    else:
+        signed_layer["events"][0]["rationale"] = "An attacker substituted a different rationale."
+    path = write(tmp_path, "historical.json", signed_layer)
+
+    (result,) = reporting.validate_reports(path, schema="layer#", signing_pubkey=signing_keys[1])
+
+    assert not result.passed
+    assert result.integrity is not None and not result.integrity.passed

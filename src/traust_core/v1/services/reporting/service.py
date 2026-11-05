@@ -104,7 +104,7 @@ class ReportingService:
             result = validate_report(str(file), text, contract, context, strict=strict)
             if (
                 signing_pubkey is not None
-                and name == FindingsLayerArtifact.schema
+                and name.partition("#")[0] == FindingsLayerArtifact.schema
                 and result.passed
             ):
                 try:
