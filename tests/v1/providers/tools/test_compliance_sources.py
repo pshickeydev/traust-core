@@ -529,6 +529,13 @@ def test_docs_target_validate_refuses_unsafe_or_duplicate_segments() -> None:
             target.validate()
 
 
+def test_parse_builds_only_a_valid_target() -> None:
+    assert DocsTarget.parse("p", "1", ["g"]) == DocsTarget("p", "1", ("g",))
+    for raw in (("p", ".."), ("p/q", "1"), ("p", "1", ["g", "g"])):
+        with pytest.raises(ValidationError):
+            DocsTarget.parse(*raw)  # type: ignore[arg-type]
+
+
 def test_an_explicit_invalid_target_is_a_config_error(tmp_path: Path) -> None:
     ctx, product_id = registered_product(tmp_path)
     with pytest.raises(ConfigError, match=f"docs target for product {product_id}"):

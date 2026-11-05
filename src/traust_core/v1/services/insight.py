@@ -5173,8 +5173,12 @@ class SarifView:
     def build(self, filter: ViewFilter) -> SarifLog:
         if filter.repository_id is None:
             raise ValidationError("the sarif view exports one repository: name its repository_id")
+        if filter.product_ids or filter.team_ids:
+            raise ValidationError("the sarif view is one repository: it takes no product or team")
         repository = self._portfolio.get_repository(filter.repository_id)
         views = self._findings.baseline(filter.repository_id, filter.as_of or self._clock.now())
+        if filter.categories:
+            views = [v for v in views if v.label(CATEGORY) in filter.categories]
         return SarifLog.model_validate(SarifExport().document(views, repository.url))
 
     def report(self, model: SarifLog, generated_at: datetime) -> Report:

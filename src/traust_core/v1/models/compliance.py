@@ -1137,6 +1137,12 @@ class DocsTarget:
     version: str
     guides: tuple[str, ...] = ()
 
+    @classmethod
+    def parse(cls, product_slug: str, version: str, guides: Iterable[str] = ()) -> DocsTarget:
+        target = cls(product_slug, version, tuple(guides))
+        target.validate()
+        return target
+
     def validate(self) -> None:
         docs_segment(self.product_slug)
         docs_segment(self.version)

@@ -28,6 +28,7 @@ def get_insight(
     as_of: UtcDatetime | None = None,
     bucket: TimeBucket = TimeBucket.MONTH,
     artifact_id: UUID | None = None,
+    repository_id: UUID | None = None,
 ) -> SerializeAsAny[ViewModel]:
     """One insight (a dashboard, rollup or export such as SARIF) for a scope at `as_of`, built on
     demand; one route for every insight, so a new one needs no route or SDK release."""
@@ -37,5 +38,6 @@ def get_insight(
         as_of=as_of,
         bucket=bucket,
         artifact_id=artifact_id,
+        repository_id=repository_id,
     )
     return insight.build(name, filter)

@@ -32,3 +32,20 @@ def test_an_unknown_insight_is_422_and_insights_need_a_token(
     url, params = "/v1/insights/findings-rollup", {"team_id": "x"}
     bad = client.get(url, params=params, headers=bearer(context))
     assert bad.status_code == 422
+
+
+def test_a_per_repository_insight_takes_its_repository_id(
+    context: Context, client: TestClient
+) -> None:
+    with SqlTraustUnitOfWork(context.database) as uow:
+        repository = Seed(uow).repository()
+        uow.commit()
+    url, params = "/v1/insights/sarif", {"repository_id": str(repository.id)}
+    body = client.get(url, params=params, headers=bearer(context)).json()
+    expected = context.services().insight.build(
+        ViewName.SARIF, ViewFilter(repository_id=repository.id)
+    )
+    assert body["$schema"] and body["runs"][0]["results"] == []
+    assert body["runs"][0]["properties"] == expected.runs[0]["properties"]  # type: ignore[attr-defined]
+    missing = client.get(url, headers=bearer(context))
+    assert missing.status_code == 422 and "repository_id" in missing.text

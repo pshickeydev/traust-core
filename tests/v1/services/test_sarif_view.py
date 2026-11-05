@@ -105,6 +105,31 @@ def test_the_sarif_view_needs_a_known_repository(core: Context) -> None:
         insight.build(ViewName.SARIF, ViewFilter(repository_id=uuid4()))
 
 
+def test_the_sarif_view_is_one_repository_never_a_product_or_team(core: Context) -> None:
+    repository_id, _ = reported(core)
+    insight = core.services().insight
+    for scope in ({"product_ids": (uuid4(),)}, {"team_ids": (uuid4(),)}):
+        with pytest.raises(ValidationError, match="takes no product or team"):
+            insight.build(ViewName.SARIF, ViewFilter(repository_id=repository_id, **scope))
+
+
+def test_a_category_scope_keeps_only_findings_with_those_labels(core: Context) -> None:
+    repository_id, ids = reported(core)
+    with SqlTraustUnitOfWork(core.database) as uow:
+        Seed(uow).finding_label(uow.findings.get(ids[0]), taxonomy="category", label="crypto")
+        uow.commit()
+    insight = core.services().insight
+
+    def results(*categories: str) -> list[str]:
+        scope = ViewFilter(repository_id=repository_id, categories=categories)
+        (run,) = SarifLog.model_validate(insight.build(ViewName.SARIF, scope)).runs
+        return [r["partialFingerprints"]["traustFindingId/v1"] for r in run["results"]]
+
+    assert sorted(results()) == sorted(map(str, ids))
+    assert results("crypto") == [str(ids[0])]
+    assert results("injection") == []
+
+
 def test_a_refresh_leaves_the_per_repository_sarif_view_out(tmp_path: Path) -> None:
     insight = Context(Config(home=tmp_path)).services().insight
     assert ViewName.SARIF not in insight.refresh(None, ViewFilter()).rendered
