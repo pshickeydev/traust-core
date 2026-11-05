@@ -6,22 +6,22 @@
 # built here is copied wholesale into the runtime, and native-extension .so
 # files are ABI-pinned per minor while the venv's script shebangs hardcode
 # the builder's interpreter path.
-FROM registry.access.redhat.com/hi/python:3.12-builder@sha256:08a3af100c8c595e348dac3a2a0ff96e3265bd63d0d17f2fe53504ae0b75f189 AS builder
+FROM registry.access.redhat.com/hi/python:3.12.16-builder@sha256:370dac28b556bdc990f9d04fc8d4ff5896bc5c412e49885f5e788b4c913b75f0 AS builder
 
 ARG UV_VERSION=0.7
 
 USER 0
 
 # git is required for uv to resolve the git-commit dependency pins
-# (traust-contracts, traust-ledger). Installed via microdnf (the base image
+# (traust-contracts, traust-ledger). Installed via dnf (the base image
 # is RPM-based). Both pins are public repositories and resolve without
 # credentials.
-RUN microdnf install -y git ca-certificates \
-    && microdnf clean all
+RUN dnf install -y git ca-certificates \
+  && dnf clean all
 
 RUN pip install --no-cache-dir "uv>=${UV_VERSION}"
 
-WORKDIR /build
+WORKDIR /app
 
 # Dependency layer first — cache-friendly when only source changes.
 COPY pyproject.toml uv.lock ./
@@ -30,12 +30,12 @@ COPY pyproject.toml uv.lock ./
 # the REST adapter; everything else core needs is in the main dependency set.
 RUN uv sync --frozen --extra rest --extra postgres --no-install-project
 
-COPY . .
-RUN uv build --wheel --out-dir /build/dist
+COPY src/ ./src/
+RUN uv build --wheel --out-dir /app/dist
 
 # Install the built wheel into the venv so the runtime stage gets a
 # single self-contained tree (traust-server console script included).
-RUN uv pip install --no-deps /build/dist/*.whl
+RUN uv pip install --no-deps /app/dist/*.whl
 
 # ── cosign source ───────────────────────────────────────────────────
 # Take the cosign binary from a digest-pinned hardened image rather than
@@ -48,7 +48,7 @@ FROM registry.access.redhat.com/hi/cosign:latest@sha256:b093a3ec46fab423d25333ca
 # Minimal hardened Python runtime. Runs as a non-root user (UID 65532) by
 # default and ships no package manager, so nothing is installed here.
 # Python minor must match the builder stage above (see note there).
-FROM registry.access.redhat.com/hi/python:3.12@sha256:14ce8115a8eb67f602070b85bee19e22856a760454e74afed17a23d41cc1ddc2 AS runtime
+FROM registry.access.redhat.com/hi/python:3.12.16@sha256:92e83dcf087d5ef02e6edaf218ab40c297227b8845da97db8f6766b698703d74
 
 # OCI labels. SOURCE_REVISION and VERSION are supplied by the build.
 ARG SOURCE_REVISION=unknown
@@ -77,17 +77,7 @@ COPY --from=cosign /usr/bin/cosign /usr/local/bin/cosign
 # No LICENSE file ships yet (pyproject declares Apache-2.0); add one under
 # /licenses when the repository gains it.
 
-# --chown: the runtime base image runs as a non-root UID (65532) and the
-# rewire RUN below executes as that user, so it must own the copied files.
-COPY --from=builder --chown=65532:65532 /build/.venv /app/.venv
-
-# The venv was created at /build/.venv in the builder stage, so its
-# console-script shebangs (traust-server, uvicorn, etc.) and `python`
-# symlinks point at builder paths that do not exist in the runtime image.
-# Rewire them to the runtime location. The runtime image ships no shell or
-# package manager, so this runs python (by absolute path, since the venv's
-# own symlinks are broken until fixed).
-RUN ["/usr/bin/python3.12", "-c", "import glob, os\nvenv_bin = '/app/.venv/bin'\nfor link, target in (('python3.12', '/usr/bin/python3.12'), ('python3', 'python3.12'), ('python', 'python3.12')):\n    path = os.path.join(venv_bin, link)\n    if os.path.lexists(path):\n        os.remove(path)\n    os.symlink(target, path)\nold = '#!/build/.venv/bin/python'\nnew = '#!/app/.venv/bin/python'\nfor script in glob.glob(os.path.join(venv_bin, '*')):\n    if not os.path.isfile(script) or os.path.islink(script):\n        continue\n    with open(script, 'rb+') as fh:\n        head = fh.read(len(old) + 8)\n        if head.startswith(old.encode()):\n            fh.seek(0)\n            fh.write(new.encode() + head[len(old):])"]
+COPY --from=builder /app/.venv /app/.venv
 
 ENV PATH="/app/.venv/bin:${PATH}" \
     PYTHONDONTWRITEBYTECODE=1 \
