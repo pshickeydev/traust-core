@@ -1205,32 +1205,26 @@ class VerificationService:
     def _audit_of(
         self, finding_ids: Sequence[UUID], original_commit: str, patched: RepositoryRef
     ) -> UUID | None:
-        """The reporting baseline on the verified line; an ambiguous shared SHA is not a line."""
+        """The original audit on the verified line, never another line at the same SHA."""
         runs = self._log.list_by_ids(
             {o.assessment_id for o in self._findings.occurrences(finding_ids=finding_ids)}
         )
         refs = {
             r.id: r for r in self._inventory.list_refs_by_ids({a.repository_ref_id for a in runs})
         }
-        audits = [a for a in runs if refs[a.repository_ref_id].sha == original_commit]
-        if not audits:
-            log.warning("no recorded run of %s reported the verified findings", original_commit)
-            return None
-        matching = [
+        audits = [
             a
-            for a in audits
-            if patched.name is not None and refs[a.repository_ref_id].name == patched.name
+            for a in runs
+            if refs[a.repository_ref_id].sha == original_commit
+            and refs[a.repository_ref_id].name == patched.name
         ]
-        if matching:
-            audits = matching
-        elif (
-            len({refs[a.repository_ref_id].name for a in audits if refs[a.repository_ref_id].name})
-            > 1
-        ):
-            raise ValidationError(
-                f"original commit {original_commit} was audited on several named lines; "
-                "metadata.patched_ref must identify the branch being verified"
+        if not audits:
+            log.warning(
+                "no recorded run of %s on line %s reported the verified findings",
+                original_commit,
+                patched.name,
             )
+            return None
         return max(audits, key=lambda a: a.occurred_at).id
 
     def list(self, filter: VerificationFilter, page: PageRequest) -> Page[Verification]:

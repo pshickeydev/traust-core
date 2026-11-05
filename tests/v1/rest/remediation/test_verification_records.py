@@ -105,7 +105,7 @@ def assert_problem(response: Response, status: int, detail: str) -> None:
 def test_admission_matches_the_owner_preserves_bytes_and_replays_without_writes(
     context: Context, client: TestClient, engine: Engine
 ) -> None:
-    world = World(engine)
+    world = World(engine, patched_name="main")
     audited(engine, world, world.base)
     item = opened(context.services().remediation, world)
     order = leased(context, world)
@@ -185,7 +185,7 @@ def test_source_verdicts_are_interpreted_only_by_the_owner(
     validity: str | None,
     is_open: bool,
 ) -> None:
-    world = World(engine)
+    world = World(engine, patched_name="main")
     audited(engine, world, world.base)
     order = leased(context, world)
     assert order.id is not None
@@ -363,7 +363,7 @@ def test_missing_or_bad_bearer_cannot_record(
 def test_only_the_live_lease_owner_can_close_and_replay(
     context: Context, client: TestClient, engine: Engine
 ) -> None:
-    world = World(engine)
+    world = World(engine, patched_name="main")
     audited(engine, world, world.base)
     order = leased(context, world)
     assert order.id is not None
