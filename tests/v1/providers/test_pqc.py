@@ -13,6 +13,7 @@ from traust_core.v1.context.documents import yaml_documents
 from traust_core.v1.errors import ConfigError, IntegrityError, ServiceError, ValidationError
 from traust_core.v1.models.common import ToolRequest
 from traust_core.v1.models.inventory import RefName
+from traust_core.v1.models.pqc import PqcFilter
 from traust_core.v1.models.values import GitSha, HttpsRepoUrl
 from traust_core.v1.models.vocabulary import RefKind
 from traust_core.v1.providers.clock import FixedClock
@@ -162,6 +163,19 @@ def test_registered_scanner_records_source_facts_and_reuses_the_same_pack(tmp_pa
     repeated = services.pqc.prescan(ref.id, request)
     assert repeated.assessment_id == first.assessment_id
     assert not repeated.scanned
+    scope = PqcFilter(repository_ref_ids=(ref.id,))
+    (state,) = services.pqc.scan_states(scope)
+    assert (state.assessment_id, state.basis, state.current) == (
+        first.assessment_id,
+        "source",
+        True,
+    )
+    nested = tmp_path / "rules" / "nested"
+    nested.mkdir()
+    (nested / "extra.yaml").write_text("id: EXTRA\npattern: ecdsa\n")
+    (stale,) = services.pqc.scan_states(scope)
+    assert stale.assessment_id == first.assessment_id
+    assert stale.current is False
 
 
 def test_nested_yaml_rules_change_pack_stamps_and_are_counted(tmp_path: Path) -> None:

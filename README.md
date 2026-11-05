@@ -441,6 +441,8 @@ root-only stamp format: previously cached stamps refresh once; historical record
 `PqcService.prescan` remains the owner of post-processing, recorded facts and same-pack reuse;
 its crypto census requires an ingested manifest SBOM. Engine schedules work but does not own a
 second scanner implementation.
+`PqcService.scan_states` compares recorded facts with the registered pack; a rule change marks
+the prior scan stale without rewriting its assessment or substituting an unmeasured state.
 
 ### PQC effort writes
 
