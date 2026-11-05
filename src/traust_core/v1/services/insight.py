@@ -120,6 +120,7 @@ from traust_core.v1.models.insight import (
     RepositoryRollup,
     ReviewCard,
     ReviewCards,
+    SarifLog,
     Scoreboard,
     SeverityCounts,
     SlaCounts,
@@ -5156,6 +5157,44 @@ def _sarif_result(view: FindingView, rule_index: int) -> dict[str, Any]:
     if disposition is not None and disposition.resolution == "resolved":
         result["baselineState"] = "absent"
     return result
+
+
+class SarifView:
+    """One repository's findings as they stood at `as_of`, as SARIF (findings sarif)."""
+
+    name = ViewName.SARIF
+    per_item = True
+
+    def __init__(self, findings: FindingService, portfolio: PortfolioService, clock: Clock) -> None:
+        self._findings = findings
+        self._portfolio = portfolio
+        self._clock = clock
+
+    def build(self, filter: ViewFilter) -> SarifLog:
+        if filter.repository_id is None:
+            raise ValidationError("the sarif view exports one repository: name its repository_id")
+        repository = self._portfolio.get_repository(filter.repository_id)
+        views = self._findings.baseline(filter.repository_id, filter.as_of or self._clock.now())
+        return SarifLog.model_validate(SarifExport().document(views, repository.url))
+
+    def report(self, model: SarifLog, generated_at: datetime) -> Report:
+        (run,) = model.runs
+        rows = [
+            (
+                r["ruleId"],
+                r["level"],
+                r["properties"]["traust/validity"],
+                "; ".join(s["justification"] for s in r.get("suppressions", ())),
+                r["message"]["text"],
+            )
+            for r in run["results"]
+        ]
+        columns = ("rule", "level", "validity", "suppressed", "title")
+        return Report(
+            title=f"SARIF: {run['properties']['traust/repository']}",
+            generated_at=generated_at,
+            sections=(_table_section("Results", columns, rows, "_No findings._"),),
+        )
 
 
 class OscalExport:

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from traust_core.v1.context.compliance_precision import compliance_precision_markdown
 from traust_core.v1.models.detection_quality import CheckPrecision, ComplianceCalibration
 from traust_core.v1.models.vocabulary import ComplianceFramework
+from traust_core.v1.rendering.compliance_precision import compliance_precision_markdown
 
 NIST = ComplianceFramework("nist-800-53-rev5")
 

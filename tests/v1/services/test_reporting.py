@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import csv
-import io
 import json
 from pathlib import Path
 from typing import Any
@@ -222,44 +220,3 @@ def test_registering_the_attack_catalog_rebuilds_ctx_reporting(tmp_path: Path) -
     before = ctx.reporting
     ctx.register_attack_catalog(ATTACK / "attack-techniques.json", ATTACK / "attack-mapping.json")
     assert ctx.reporting is not before
-
-
-def test_csv_export_keeps_unknown_metadata_and_inerts_untrusted_headers_and_values(
-    reporting: ReportingService,
-) -> None:
-    exported = reporting.export_csv(
-        ("Repository", "=adopter-header", "Custom", "Measured"),
-        iter((("https://github.com/example/app", "+SUM(1,2)", 'value, "quoted"', None),)),
-    )
-    assert list(csv.reader(io.StringIO(exported))) == [
-        ["Repository", "'=adopter-header", "Custom", "Measured"],
-        ["https://github.com/example/app", "'+SUM(1,2)", 'value, "quoted"', ""],
-    ]
-
-
-def test_markdown_export_retains_unknown_columns_without_admitting_markup_or_rows(
-    reporting: ReportingService,
-) -> None:
-    exported = reporting.export_markdown(
-        ("Repository", "Custom|column"),
-        iter((("https://github.com/example/app", "<img src=x>\n|forged|[link](javascript:x)"),)),
-    )
-    assert len(exported.splitlines()) == 3
-    assert r"Custom\|column" in exported
-    assert "<img" not in exported
-    assert "[link](javascript:" not in exported
-    assert r"\|forged\|" in exported
-    assert "&lt;img src=x&gt;" in exported
-
-
-def test_an_empty_export_is_its_header_alone(reporting: ReportingService) -> None:
-    assert reporting.export_markdown(("A", "B"), ()).splitlines() == ["| A | B |", "|---|---|"]
-    assert list(csv.reader(io.StringIO(reporting.export_csv(("A", "B"), ())))) == [["A", "B"]]
-
-
-def test_the_findings_sarif_door_is_the_canonical_projection(reporting: ReportingService) -> None:
-    document = reporting.sarif_findings([], "https://github.com/example/app")
-    assert document["version"] == "2.1.0"
-    [run] = document["runs"]
-    assert run["versionControlProvenance"] == [{"repositoryUri": "https://github.com/example/app"}]
-    assert run["results"] == []

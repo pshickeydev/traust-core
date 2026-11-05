@@ -24,7 +24,6 @@ from traust_core.v1.providers.correlation import (
     enrich_correlation,
 )
 from traust_core.v1.providers.sources import CheckoutRequest, Workspace
-from traust_core.v1.providers.tools.compliance_sources import DocsTarget
 from traust_core.v1.services.operations import FeedQuery, OpsService, Router, SpendService
 
 __all__ = [
@@ -37,7 +36,6 @@ __all__ = [
     "Context",
     "Correlation",
     "DatabaseConfig",
-    "DocsTarget",
     "FeedQuery",
     "Locations",
     "LoggingConfig",
