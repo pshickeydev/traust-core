@@ -179,7 +179,7 @@ def test_a_package_missing_beside_an_unresolved_manifest_is_unknown(
     service.ingest_dependencies(ref, checkout(tmp_path, locked=locked))
     found = service.find_advisory(LODASH.identifier)
     assert found is not None and found.advisory_id is not None
-    prepared = service.prepare(found.advisory_id, ref)
+    [prepared] = service.prepare(found.advisory_id, ref)
     assert prepared.evidence.l1_depends_on is depends
     assert prepared.document("1").repos[0].classification == classification
     assert ("ui/package.json" in (prepared.evidence.notes or "")) is not locked
@@ -215,7 +215,7 @@ def test_coverage_that_changes_back_is_read_as_it_is_now(engine: Engine, tmp_pat
     assert coverage_runs(engine, ref) == 3
 
 
-def test_any_of_an_advisorys_ecosystems_left_unresolved_makes_it_unknown(
+def test_each_package_is_unknown_only_where_its_own_ecosystem_went_unresolved(
     engine: Engine, tmp_path: Path
 ) -> None:
     both = AdvisoryRecord(
@@ -234,7 +234,9 @@ def test_any_of_an_advisorys_ecosystems_left_unresolved_makes_it_unknown(
     service.ingest_dependencies(ref, checkout(tmp_path, locked=False))
     found = service.find_advisory(both.identifier)
     assert found is not None and found.advisory_id is not None
-    assert service.prepare(found.advisory_id, ref).evidence.l1_depends_on is None
+    prepared = service.prepare(found.advisory_id, ref)
+    unknown = {p.package.name: p.evidence.l1_depends_on for p in prepared}
+    assert unknown == {"lodash": None, "requests": False}  # ui/package.json is npm, unlocked
 
 
 def test_the_fleet_sweep_keeps_an_sbom_given_as_a_document(engine: Engine) -> None:

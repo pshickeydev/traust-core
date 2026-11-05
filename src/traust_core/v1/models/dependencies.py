@@ -845,6 +845,19 @@ class ImpactExport(Model):
     repos: tuple[ImpactExportRepo, ...]
 
 
+class ImpactScopeMember(Model):
+    ecosystem: Ecosystem
+    module: str = Field(min_length=1)
+    version: Version | None
+
+
+class ImpactPreparationScope(Model):
+    """The complete package/version set prepared together from one dependency snapshot."""
+
+    digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    members: tuple[ImpactScopeMember, ...] = Field(min_length=1)
+
+
 class ImpactInput(SkillInput):
     """One commit against one advisory: what its SBOMs hold of the advisory's packages, and
     the evidence so far."""
@@ -856,6 +869,22 @@ class ImpactInput(SkillInput):
     products: tuple[str, ...] = ()
     tiers: tuple[ImpactTier, ...] = (ImpactTier.L1,)
     symbols: SymbolResolution | None = None
+    preparation_scope: ImpactPreparationScope | None = None
+
+    @property
+    def installed_version(self) -> Version | None:
+        held = [d.dependency for d in self.dependencies if d.vulnerable]
+        manifest = [d.dependency for d in self.dependencies if d.vulnerable and not d.image_id]
+        installed = manifest or held
+        return Version(installed[0].version) if installed else None
+
+    @property
+    def scope_member(self) -> ImpactScopeMember:
+        return ImpactScopeMember(
+            ecosystem=self.package.ecosystem,
+            module=self.package.name,
+            version=self.installed_version,
+        )
 
     def document(
         self, harness_version: str, feature_description: str | None = None
@@ -864,7 +893,7 @@ class ImpactInput(SkillInput):
         description (what capability must be in use) is the skill's judgement, kept as given."""
         classification = self.evidence.classification(self.package.ecosystem)
         manifest = [d.dependency for d in self.dependencies if d.vulnerable and not d.image_id]
-        version = manifest[0].version if manifest else None
+        version = self.installed_version
         fixed = self.package.fixed_in(Version(version) if version else None)
         counted = {c.value: int(c == classification) for c in ImpactClassification}
         found = self.symbols or SymbolResolution(status=SymbolStatus.NO_FIX_COMMIT)
@@ -894,6 +923,11 @@ class ImpactInput(SkillInput):
                         "binary_scan": ImpactTier.BINARY_SCAN in self.tiers,
                         "sweep": False,
                     },
+                    **(
+                        {"preparation_scope": self.preparation_scope.model_dump(mode="json")}
+                        if self.preparation_scope is not None
+                        else {}
+                    ),
                 },
                 "summary": {
                     "repos_in_blast_radius": 1,
