@@ -5105,6 +5105,11 @@ def _category(view: FindingView) -> str:
     return view.label("category") or "uncategorized"
 
 
+def _categories(view: FindingView) -> set[str]:
+    """Every category label, or the `uncategorized` rule SARIF files an unlabelled finding under."""
+    return {fl.label for fl in view.labels if fl.taxonomy == CATEGORY} or {_category(view)}
+
+
 def _sarif_location(loc: Location) -> dict[str, Any]:
     if _PSEUDO_PATH.match(loc.path):
         return {"logicalLocations": [{"fullyQualifiedName": loc.path}]}
@@ -5178,7 +5183,7 @@ class SarifView:
         repository = self._portfolio.get_repository(filter.repository_id)
         views = self._findings.baseline(filter.repository_id, filter.as_of or self._clock.now())
         if filter.categories:
-            views = [v for v in views if v.label(CATEGORY) in filter.categories]
+            views = [v for v in views if _categories(v) & set(filter.categories)]
         return SarifLog.model_validate(SarifExport().document(views, repository.url))
 
     def report(self, model: SarifLog, generated_at: datetime) -> Report:

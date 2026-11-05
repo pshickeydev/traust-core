@@ -116,7 +116,9 @@ def test_the_sarif_view_is_one_repository_never_a_product_or_team(core: Context)
 def test_a_category_scope_keeps_only_findings_with_those_labels(core: Context) -> None:
     repository_id, ids = reported(core)
     with SqlTraustUnitOfWork(core.database) as uow:
-        Seed(uow).finding_label(uow.findings.get(ids[0]), taxonomy="category", label="crypto")
+        seed, labelled = Seed(uow), uow.findings.get(ids[0])
+        for label in ("crypto", "injection"):  # the second label counts as much as the first
+            seed.finding_label(labelled, taxonomy="category", label=label)
         uow.commit()
     insight = core.services().insight
 
@@ -126,8 +128,9 @@ def test_a_category_scope_keeps_only_findings_with_those_labels(core: Context) -
         return [r["partialFingerprints"]["traustFindingId/v1"] for r in run["results"]]
 
     assert sorted(results()) == sorted(map(str, ids))
-    assert results("crypto") == [str(ids[0])]
-    assert results("injection") == []
+    assert results("crypto") == results("injection") == [str(ids[0])]
+    assert results("uncategorized") == [str(ids[1])]  # the rule SARIF files it under
+    assert results("secrets") == []
 
 
 def test_a_refresh_leaves_the_per_repository_sarif_view_out(tmp_path: Path) -> None:

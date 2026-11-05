@@ -1139,6 +1139,8 @@ class DocsTarget:
 
     @classmethod
     def parse(cls, product_slug: str, version: str, guides: Iterable[str] = ()) -> DocsTarget:
+        if isinstance(guides, str):
+            raise ValidationError("docs.redhat.com guides must be a collection of slugs, not one")
         target = cls(product_slug, version, tuple(guides))
         target.validate()
         return target
