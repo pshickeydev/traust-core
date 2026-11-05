@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import tempfile
 from collections.abc import Callable
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Protocol
 
-from pydantic import Field
+from pydantic import Field, field_validator
 
 from traust_core.v1.errors import (
     ConfigError,
@@ -20,7 +21,22 @@ from traust_core.v1.models.common import ToolRequest
 from traust_core.v1.models.pqc import PqcScan, PqcScanFinding, PqcStamps
 from traust_core.v1.providers.base import Acquisition, Readiness, Result
 from traust_core.v1.providers.clock import Clock
-from traust_core.v1.providers.process import ProcessRunner
+from traust_core.v1.providers.process import ProcessResult, ProcessRunner
+
+MAX_REPORT_BYTES = 16 << 20
+MAX_CBOM_BYTES = 16 << 20
+MAX_FINDINGS = 50_000
+MAX_PROCESS_OUTPUT_BYTES = 1 << 20
+
+
+class PqcOutputLimit(ServiceError):
+    pass
+
+
+class PqcScanError(ServiceError):
+    def __init__(self, result: ProcessResult) -> None:
+        super().__init__(f"pqc-scan failed (exit {result.returncode})")
+        self.result = result
 
 
 class PqcScanner(Protocol):
@@ -45,6 +61,13 @@ class ScannerSummary(Dto):
 class ScannerReport(Dto):
     summary: ScannerSummary
     findings: tuple[dict[str, object], ...]
+
+    @field_validator("findings", mode="before")
+    @classmethod
+    def _within_budget(cls, value: object) -> object:
+        if isinstance(value, (list, tuple)) and len(value) > MAX_FINDINGS:
+            raise PqcOutputLimit(f"pqc-scan findings exceed the {MAX_FINDINGS} finding limit")
+        return value
 
 
 class PqcScanTool:
@@ -72,6 +95,8 @@ class PqcScanTool:
         try:
             if self.stamps().binary_sha256 is None:
                 return Readiness(ready=False, detail=f"pqc-scan binary is missing: {self._binary}")
+            if not os.access(self._binary, os.X_OK):
+                return Readiness(ready=False, detail="pqc-scan binary is not executable")
         except (OSError, TraustError) as exc:
             return Readiness(ready=False, detail=str(exc))
         return Readiness(ready=True)
@@ -139,11 +164,14 @@ class PqcScanTool:
                 ],
                 check=False,
                 timeout_seconds=1800,
+                max_output_bytes=MAX_PROCESS_OUTPUT_BYTES,
             )
             if done.returncode != 0:
-                raise ServiceError(f"pqc-scan failed (exit {done.returncode})")
+                raise PqcScanError(done)
             try:
-                raw = ScannerReport.model_validate_json((output / "report.json").read_bytes())
+                raw = ScannerReport.model_validate_json(
+                    _read_output(output / "report.json", MAX_REPORT_BYTES, "report")
+                )
                 findings = tuple(_finding(item) for item in raw.findings)
             except (OSError, ValueError, TypeError, KeyError) as exc:
                 raise ValidationError("pqc-scan produced a missing or malformed report") from exc
@@ -156,7 +184,7 @@ class PqcScanTool:
                 skipped_files=raw.summary.skipped_files,
                 rules_in_pack=rules,
                 stamps=stamps,
-                cbom=cbom.read_bytes() if cbom.is_file() else None,
+                cbom=_read_output(cbom, MAX_CBOM_BYTES, "CBOM") if cbom.is_file() else None,
             )
         return Result(
             scan,
@@ -169,16 +197,39 @@ class PqcScanTool:
         )
 
 
+def _read_output(path: Path, maximum: int, label: str) -> bytes:
+    with path.open("rb") as stream:
+        data = stream.read(maximum + 1)
+    if len(data) > maximum:
+        raise PqcOutputLimit(f"pqc-scan {label} exceeds the {maximum} byte limit")
+    return data
+
+
 def _finding(item: dict[str, object]) -> PqcScanFinding:
-    location = item.get("location") or {}
+    location = item.get("location")
     evidence = item.get("evidence") or {}
     if not isinstance(location, dict) or not isinstance(evidence, dict):
         raise ValidationError("pqc-scan finding has invalid location or evidence")
+    file = location.get("file")
+    if not isinstance(file, str) or not file.strip():
+        raise ValidationError("pqc-scan finding has no source file")
+    path = PurePosixPath(file.replace("\\", "/"))
+    if (
+        path.is_absolute()
+        or PureWindowsPath(file).drive
+        or path == PurePosixPath(".")
+        or ".." in path.parts
+        or any(ord(char) < 32 or ord(char) == 127 for char in file)
+    ):
+        raise ValidationError("pqc-scan finding has an invalid source file")
+    line = location.get("line")
+    if line is not None and (type(line) is not int or line < 1):
+        raise ValidationError("pqc-scan finding has an invalid source line")
     return PqcScanFinding.model_validate(
         {
             "rule_id": item["rule_id"],
-            "file": location.get("file", ""),
-            "line": location.get("line"),
+            "file": file,
+            "line": line,
             "finding_id": item.get("finding_id"),
             "severity": item.get("severity"),
             "risk": item.get("risk"),

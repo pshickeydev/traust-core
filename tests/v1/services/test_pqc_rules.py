@@ -300,6 +300,29 @@ def test_zero_facts_carry_the_assertion_and_only_a_full_pack_is_a_verified_zero_
     )
 
 
+@pytest.mark.parametrize(("scanned", "skipped"), [(None, None), (0, 0), (0, 7), (-1, 0)])
+def test_an_unmeasured_or_nonpositive_scan_cannot_assert_no_crypto(
+    scanned: int | None, skipped: int | None
+) -> None:
+    unmeasured = scan().model_copy(update={"scanned_files": scanned, "skipped_files": skipped})
+    doc = F.facts_document(URL, STAMPS, [], unmeasured)
+    assert (doc.coverage.scanned_files, doc.coverage.skipped_files) == (scanned, skipped)
+    assert doc.coverage.no_crypto_detected_assertion is None
+    assert not R.zero_hit(doc)
+
+
+@pytest.mark.parametrize(
+    ("basis", "scanned"),
+    [("source", None), ("source", -1), ("source", 0), ("sbom-only", 40)],
+)
+def test_an_existing_assertion_is_not_verified_without_positive_source_coverage(
+    basis: str, scanned: int | None
+) -> None:
+    body = json.loads(F.facts_document(URL, STAMPS, [], scan()).payload)
+    body["coverage"].update(assessment_basis=basis, scanned_files=scanned)
+    assert not R.zero_hit(PqcFactsArtifact.from_document(body))
+
+
 def test_sbom_only_facts_are_components_with_null_coverage() -> None:
     packages = [
         CryptoFact(probe_id=P.PYTHON_CRYPTO_DEP, provider="python", detail="cryptography==43.0.1"),
@@ -633,9 +656,28 @@ def test_a_zero_hit_is_not_applicable_with_nothing_to_do() -> None:
     )  # fmt: skip
 
 
-def test_stamps_compare_by_adapter_and_rules() -> None:
-    assert STAMPS.same_pack(
-        STAMPS.model_copy(update={"binary_sha256": "x", "pqc_scan_commit": "y"})
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("adapter_version", "1.5.0"),
+        ("rules_sha256", "cd" * 32),
+        ("pqc_scan_commit", "new-commit"),
+        ("binary_sha256", "cd" * 32),
+    ],
+)
+def test_source_stamps_compare_every_scanner_identity_field(field: str, value: str) -> None:
+    assert STAMPS.same_pack(STAMPS)
+    changed = STAMPS.model_copy(update={field: value})
+    assert not STAMPS.same_pack(changed)
+    assert STAMPS.same_pack(changed, source=False) == (
+        field in ("pqc_scan_commit", "binary_sha256")
     )
-    assert not STAMPS.same_pack(STAMPS.model_copy(update={"adapter_version": "1.5.0"}))
-    assert not STAMPS.same_pack(STAMPS.model_copy(update={"rules_sha256": "cd" * 32}))
+
+
+def test_legacy_missing_binary_stamps_read_without_claiming_a_known_binary() -> None:
+    legacy = F.facts_document(URL, STAMPS, [], scan())
+    restored = F.read_stamps(legacy)
+    approved = STAMPS.model_copy(update={"binary_sha256": "cd" * 32})
+    assert restored.binary_sha256 is None
+    assert not restored.same_pack(approved)
+    assert restored.same_pack(approved, source=False)

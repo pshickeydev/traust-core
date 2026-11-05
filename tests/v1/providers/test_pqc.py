@@ -3,11 +3,12 @@ from __future__ import annotations
 import hashlib
 import json
 import sys
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
+import traust_core.v1.providers.pqc as pqc_provider
 from traust_core.v1.context import Config, Context
 from traust_core.v1.context.documents import yaml_documents
 from traust_core.v1.errors import ConfigError, IntegrityError, ServiceError, ValidationError
@@ -17,20 +18,30 @@ from traust_core.v1.models.pqc import PqcFilter
 from traust_core.v1.models.values import GitSha, HttpsRepoUrl
 from traust_core.v1.models.vocabulary import RefKind
 from traust_core.v1.providers.clock import FixedClock
-from traust_core.v1.providers.pqc import PqcScanTool
-from traust_core.v1.providers.process import ProcessRunner
+from traust_core.v1.providers.pqc import PqcOutputLimit, PqcScanError, PqcScanTool
+from traust_core.v1.providers.process import ProcessOutputLimit, ProcessRunner
 
 AT = datetime(2026, 10, 24, tzinfo=UTC)
 
 
-def scanner(tmp_path: Path, report: object, *, code: int = 0) -> PqcScanTool:
+def scanner(
+    tmp_path: Path,
+    report: object,
+    *,
+    code: int = 0,
+    stdout: bytes = b"",
+    stderr: bytes = b"",
+    cbom: bytes = b"cbom-fixture",
+) -> PqcScanTool:
     binary = tmp_path / "pqc-scan"
     binary.write_text(
         f"#!{sys.executable}\n"
         "import pathlib, sys\n"
         "output = pathlib.Path(sys.argv[sys.argv.index('--out-dir') + 1])\n"
         f"(output / 'report.json').write_text({json.dumps(report)!r})\n"
-        "(output / 'cbom.json').write_bytes(b'cbom-fixture')\n"
+        f"(output / 'cbom.json').write_bytes({cbom!r})\n"
+        f"sys.stdout.buffer.write({stdout!r})\n"
+        f"sys.stderr.buffer.write({stderr!r})\n"
         f"sys.exit({code})\n"
     )
     binary.chmod(0o700)
@@ -197,3 +208,170 @@ def test_nested_yaml_rules_change_pack_stamps_and_are_counted(tmp_path: Path) ->
     relocated.mkdir()
     rule.rename(relocated / rule.name)
     assert not changed.same_pack(provider.stamps())
+
+
+@pytest.mark.parametrize(
+    "location",
+    [
+        None,
+        {},
+        {"file": ""},
+        {"file": " \t"},
+        {"file": "../outside.go", "line": 1},
+        {"file": "/outside.go", "line": 1},
+        {"file": "C:\\outside.go", "line": 1},
+        {"file": "keys.go", "line": 0},
+        {"file": "keys.go", "line": True},
+        {"file": "keys.go", "line": "4"},
+    ],
+)
+def test_malformed_source_locations_cannot_become_source_facts(
+    tmp_path: Path, location: object
+) -> None:
+    finding = {"rule_id": "API_RSA"}
+    if location is not None:
+        finding["location"] = location
+    provider = scanner(
+        tmp_path,
+        {"summary": {"scanned_files": 1, "skipped_files": 0}, "findings": [finding]},
+    )
+    with pytest.raises(ValidationError):
+        provider.scan(ToolRequest(workspace=tmp_path))
+
+
+@pytest.mark.parametrize("output", ["report", "cbom"])
+def test_oversized_output_is_refused_before_becoming_scan_data(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, output: str
+) -> None:
+    report = {"summary": {"scanned_files": 1, "skipped_files": 0}, "findings": []}
+    provider = scanner(tmp_path, report)
+    if output == "report":
+        monkeypatch.setattr(pqc_provider, "MAX_REPORT_BYTES", len(json.dumps(report).encode()) - 1)
+    else:
+        monkeypatch.setattr(pqc_provider, "MAX_CBOM_BYTES", len(b"cbom-fixture") - 1)
+    with pytest.raises(PqcOutputLimit):
+        provider.scan(ToolRequest(workspace=tmp_path))
+
+
+def test_output_at_byte_limits_retains_coverage_and_cbom(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    report = {"summary": {"scanned_files": 1, "skipped_files": 0}, "findings": []}
+    provider = scanner(tmp_path, report)
+    monkeypatch.setattr(pqc_provider, "MAX_REPORT_BYTES", len(json.dumps(report).encode()))
+    monkeypatch.setattr(pqc_provider, "MAX_CBOM_BYTES", len(b"cbom-fixture"))
+    result = provider.scan(ToolRequest(workspace=tmp_path))
+    assert result.data.scanned_files == 1
+    assert result.data.cbom == b"cbom-fixture"
+
+
+def test_finding_budget_refuses_excess_hits_before_fact_conversion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider = scanner(
+        tmp_path,
+        {
+            "summary": {"scanned_files": 1, "skipped_files": 0},
+            "findings": [
+                {"rule_id": name, "location": {"file": "keys.go", "line": 1}}
+                for name in ("FIRST", "SECOND")
+            ],
+        },
+    )
+    monkeypatch.setattr(pqc_provider, "MAX_FINDINGS", 1)
+    with pytest.raises(PqcOutputLimit):
+        provider.scan(ToolRequest(workspace=tmp_path))
+
+
+def test_scanner_output_flood_is_a_bounded_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider = scanner(
+        tmp_path,
+        {"summary": {"scanned_files": 1, "skipped_files": 0}, "findings": []},
+        stdout=b"x" * 256,
+    )
+    monkeypatch.setattr(pqc_provider, "MAX_PROCESS_OUTPUT_BYTES", 64)
+    with pytest.raises(ProcessOutputLimit) as caught:
+        provider.scan(ToolRequest(workspace=tmp_path))
+    assert len(caught.value.result.stdout) + len(caught.value.result.stderr) <= 64
+
+
+def test_failure_diagnostics_remain_internal_not_in_errors_or_logs(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    diagnostic = b"synthetic-scanner-secret: unsupported rule fixture"
+    provider = scanner(
+        tmp_path,
+        {"summary": {"scanned_files": 1, "skipped_files": 0}, "findings": []},
+        code=7,
+        stderr=diagnostic,
+    )
+    caplog.set_level("DEBUG", logger="traust_core")
+    with pytest.raises(PqcScanError) as caught:
+        provider.scan(ToolRequest(workspace=tmp_path))
+    assert caught.value.result.returncode == 7
+    assert caught.value.result.stderr == diagnostic
+    assert diagnostic.decode() not in str(caught.value)
+    assert diagnostic.decode() not in caplog.text
+
+
+def test_readiness_refuses_a_checksum_valid_non_executable_binary(tmp_path: Path) -> None:
+    provider = scanner(
+        tmp_path, {"summary": {"scanned_files": 1, "skipped_files": 0}, "findings": []}
+    )
+    assert provider.check().ready
+    (tmp_path / "pqc-scan").chmod(0o600)
+    assert not provider.check().ready
+
+
+@pytest.mark.parametrize("change", ["binary", "commit"])
+def test_approved_scanner_changes_invalidate_and_rescan_recorded_source_facts(
+    tmp_path: Path, change: str
+) -> None:
+    scanner(
+        tmp_path,
+        {
+            "summary": {"scanned_files": 1, "skipped_files": 0},
+            "findings": [{"rule_id": "API_RSA", "location": {"file": "keys.go", "line": 1}}],
+        },
+    )
+    checkout = tmp_path / "source"
+    checkout.mkdir()
+    context = Context(
+        Config(home=tmp_path / "state"), clock=FixedClock(AT), process=ProcessRunner(["pqc-scan"])
+    )
+    binary = tmp_path / "pqc-scan"
+    context.register_pqc_scanner(
+        binary, tmp_path / "rules", adapter_version="1.4.0", scan_commit="original"
+    )
+    services = context.services()
+    repository = services.portfolio.register_repository(
+        HttpsRepoUrl.parse("https://github.com/example/scanner-change", context.config.forge_hosts),
+        public=False,
+    )
+    ref = services.portfolio.register_ref(
+        repository.id, GitSha.parse("b" * 40), RefName("main"), RefKind.BRANCH
+    )
+    services.exposure.ingest_sbom(b'{"bomFormat":"CycloneDX","components":[]}', ref.id)
+    request = ToolRequest(workspace=checkout)
+    first = services.pqc.prescan(ref.id, request)
+    scope = PqcFilter(repository_ref_ids=(ref.id,))
+    assert services.pqc.scan_states(scope)[0].current is True
+    if change == "binary":
+        binary.write_bytes(binary.read_bytes() + b"\n# approved rebuild\n")
+        binary.with_suffix(".sha256").write_text(hashlib.sha256(binary.read_bytes()).hexdigest())
+    context.clock = FixedClock(AT + timedelta(seconds=1))
+    context.register_pqc_scanner(
+        binary,
+        tmp_path / "rules",
+        adapter_version="1.4.0",
+        scan_commit="replacement" if change == "commit" else "original",
+    )
+    services = context.services()
+    stale = services.pqc.scan_states(scope)[0]
+    assert stale.assessment_id == first.assessment_id and stale.current is False
+    refreshed = services.pqc.prescan(ref.id, request)
+    assert refreshed.scanned and refreshed.assessment_id != first.assessment_id
+    current = services.pqc.scan_states(scope)[0]
+    assert current.assessment_id == refreshed.assessment_id and current.current is True

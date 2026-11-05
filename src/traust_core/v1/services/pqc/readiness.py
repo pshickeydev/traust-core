@@ -258,7 +258,9 @@ def zero_hit(facts_doc: PqcFactsArtifact) -> bool:
     body = _body(facts_doc)
     coverage = body["coverage"]
     return (
-        not body["facts"]
+        coverage["assessment_basis"] == "source"
+        and (coverage.get("scanned_files") or 0) > 0
+        and not body["facts"]
         and bool(coverage.get("no_crypto_detected_assertion"))
         and (coverage.get("rules_in_pack") or 0) > ZERO_HIT_MIN_RULES
     )
