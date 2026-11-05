@@ -14,7 +14,14 @@ import pytest
 
 from traust_core.v1.errors import NotFoundError, ValidationError
 from traust_core.v1.models.artifacts import VerificationArtifact
-from traust_core.v1.models.dependencies import FixUptakeState, Version
+from traust_core.v1.models.dependencies import (
+    AffectedPackage,
+    AffectedSpan,
+    ConsumedVersion,
+    FixUptake,
+    FixUptakeState,
+    Version,
+)
 from traust_core.v1.models.remediation import (
     PropagationEvidence,
     ScanFact,
@@ -341,3 +348,25 @@ def test_the_sweep_queues_by_tier_then_criticals_then_highs() -> None:
         ("T3", 0, 1),
     ]
     assert [e.skip for e in sweep.skipped] == ["already_verified"]
+
+
+def test_an_uptake_not_observed_can_be_pending_but_never_consumed() -> None:
+    package = AffectedPackage(
+        ecosystem=Ecosystem.NPM,
+        name="lodash",
+        spans=(AffectedSpan(introduced=Version("0"), fixed=Version("4.17.21")),),
+    )
+
+    def judged(*versions: str) -> FixUptakeState:
+        uptake = FixUptake(
+            state=FixUptakeState.NOT_OBSERVED,
+            checked=tuple(
+                ConsumedVersion(image_id=uuid4(), version=Version(v), consumed=None)
+                for v in versions
+            ),
+        )
+        return PropagationEvidence.of(package, Version("4.17.21"), uptake).state
+
+    assert judged("4.17.21") == FixUptakeState.NOT_OBSERVED
+    assert judged("4.17.20") == FixUptakeState.PENDING
+    assert judged() == FixUptakeState.NOT_OBSERVED

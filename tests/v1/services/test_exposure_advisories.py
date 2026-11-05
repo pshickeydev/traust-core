@@ -249,3 +249,38 @@ def test_without_a_lookup_finding_is_a_config_error(engine: Engine) -> None:
 def test_get_advisory_of_an_unknown_id_raises(engine: Engine) -> None:
     with pytest.raises(NotFoundError):
         service(engine, None).get_advisory(uuid4())
+
+
+def test_symbols_filled_from_an_alias_cite_that_alias(engine: Engine) -> None:
+    exposure = service(engine, FakeLookup(CVE, GO, GHSA))
+    record = exposure.find_advisory(CVE.identifier)
+    assert record is not None and record.advisory_id is not None
+    resolved = exposure.resolve_symbols(record.advisory_id)
+    assert resolved.symbols
+    assert {s.reference for s in resolved.symbols} == {GO.source}
+
+
+def test_each_symbol_cites_the_alias_that_published_it(engine: Engine) -> None:
+    def alias(identifier: str, *symbols: str) -> AdvisoryRecord:
+        lib = AffectedPackage(ecosystem=Ecosystem.GO, name="example.com/lib", symbols=symbols)
+        return AdvisoryRecord(
+            identifier=AdvisoryIdentifier(identifier), affected=(lib,), source=f"osv/{identifier}"
+        )
+
+    cve = AdvisoryRecord(
+        identifier=AdvisoryIdentifier("CVE-2026-0002"),
+        aliases=(AdvisoryIdentifier("GHSA-bbbb-bbbb-bbbb"), AdvisoryIdentifier("GO-2026-0002")),
+        source="osv/CVE-2026-0002",
+    )
+    lookup = FakeLookup(
+        cve, alias("GHSA-bbbb-bbbb-bbbb", "lib.A", "lib.B"), alias("GO-2026-0002", "lib.B", "lib.C")
+    )
+    exposure = service(engine, lookup)
+    record = exposure.find_advisory(cve.identifier)
+    assert record is not None and record.advisory_id is not None
+    cited = {s.symbol: s.reference for s in exposure.resolve_symbols(record.advisory_id).symbols}
+    assert cited == {
+        "lib.A": "osv/GHSA-bbbb-bbbb-bbbb",
+        "lib.B": "osv/GHSA-bbbb-bbbb-bbbb",
+        "lib.C": "osv/GO-2026-0002",
+    }

@@ -634,18 +634,21 @@ class PropagationEvidence(Model):
     @classmethod
     def of(cls, package: AffectedPackage, fixed: Version, uptake: FixUptake) -> Self:
         """Each version the commit carries judged by the advisory's own spans, not one bound:
-        1.57.0 is past a first fix of 1.56.3 and still affected (fixed again in 1.57.1)."""
+        1.57.0 is past a first fix of 1.56.3 and still affected (fixed again in 1.57.1). An
+        uptake not observed (its manifest's coverage is unknown) can be pending, never consumed."""
         checked = tuple(
             c.model_copy(update={"consumed": None if hit is None else not hit})
             for c in uptake.checked
             for hit in [package.affects(c.version)]
         )
+        judged = (
+            FixUptakeState.CONSUMED if all(c.consumed for c in checked) else FixUptakeState.PENDING
+        )
         state = (
             uptake.state
             if not checked
-            else FixUptakeState.CONSUMED
-            if all(c.consumed for c in checked)
-            else FixUptakeState.PENDING
+            or (uptake.state == FixUptakeState.NOT_OBSERVED and judged == FixUptakeState.CONSUMED)
+            else judged
         )
         return cls(
             ecosystem=package.ecosystem,
@@ -664,17 +667,17 @@ class Propagation(Model):
 
 
 def propagated(evidence: Sequence[PropagationEvidence]) -> CrossRepoPropagation:
-    """Pending while any package the commit carries is vulnerable, consumed once every one it
-    carries is fixed; carrying none is module_absent, which a verifier judges (it may be vendored
-    under another name)."""
+    """Pending while any package the commit carries is vulnerable, even beside a package whose
+    coverage is unknown; consumed once every one it carries is fixed; carrying none is
+    module_absent, which a verifier judges (it may be vendored under another name)."""
     states = {e.state for e in evidence}
+    if FixUptakeState.PENDING in states:
+        return CrossRepoPropagation("pending")
     if FixUptakeState.NOT_OBSERVED in states or not states:
         raise NotFoundError(
             "the component's commit has no SBOM yet, or one whose coverage leaves the package "
             "unknown: record one from its manifests first"
         )
-    if FixUptakeState.PENDING in states:
-        return CrossRepoPropagation("pending")
     held = states - {FixUptakeState.MODULE_ABSENT}
     return CrossRepoPropagation("consumed" if held else "module_absent")
 

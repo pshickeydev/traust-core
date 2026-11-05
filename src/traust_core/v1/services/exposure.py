@@ -402,9 +402,14 @@ class ExposureService:
             CheckoutRequest(repo=repository.url, ref=GitSha.parse(ref.sha), keep=MANIFESTS)
         ).data
         try:
-            return self.ingest_dependencies(repository_ref_id, fetched.path).sbom
+            self.ingest_dependencies(repository_ref_id, fetched.path)
         finally:
             self._checkout.release(fetched)
+        # a scan that read the tree before the current one records but doesn't become current
+        current = self._inventory.get_ref(repository_ref_id).manifest_sbom_id
+        assert current is not None
+        with self._uow as uow:
+            return uow.sboms.get(current)
 
     def _require_sbom_tool(self) -> ToolProvider[bytes]:
         if self._sbom_tool is None:
@@ -421,6 +426,9 @@ class ExposureService:
         sbom_tool = self._require_sbom_tool()
         portfolio = self._require_portfolio()
         unresolved = unresolved_manifests(checkout)
+        # When the tool reads the tree, at the precision every store keeps (SQLite: milliseconds).
+        now = self._clock.now()
+        read_at = now.replace(microsecond=now.microsecond // 1000 * 1000)
         scanned = sbom_tool.acquire(ToolRequest(workspace=checkout))
         tool, version = scanned.acquisition.provider, scanned.acquisition.version
         if version is None:
@@ -446,8 +454,15 @@ class ExposureService:
             sbom = uow.sboms.find_by_digest(contents.digest) or self._add_sbom(
                 uow, scanned.data, contents
             )
-            ref = self._inventory.get_ref(repository_ref_id)
+            # One scan of a commit is made current at a time, and an older scan finishing late
+            # never displaces a newer one: scans are ordered by when the tool read the tree.
+            ref = self._inventory.lock_ref(repository_ref_id)
             assert ref.id is not None and sbom.id is not None
+            current = (
+                self._log.list_by_ids([ref.manifest_sbom_assessment_id])
+                if ref.manifest_sbom_assessment_id
+                else []
+            )
             scan = self._log.open(
                 Assessment(
                     repository_ref_id=ref.id,
@@ -455,7 +470,7 @@ class ExposureService:
                     status=ASSESSMENT_COMPLETED,
                     assessor=tool,
                     assessor_version=version,
-                    occurred_at=self._clock.now(),
+                    occurred_at=read_at,
                 )
             )
             assert scan.id is not None
@@ -469,7 +484,8 @@ class ExposureService:
                 }
             )
             self._attach_document(uow, scan, coverage)
-            portfolio.record_manifest_sbom(repository_ref_id, sbom.id, scan.id)
+            if all(c.occurred_at <= read_at for c in current):
+                portfolio.record_manifest_sbom(repository_ref_id, sbom.id, scan.id)
             uow.commit()
         return DependencyIngest(
             repository_ref_id=repository_ref_id,
@@ -1055,9 +1071,13 @@ class ExposureService:
         # Two aliases may state one package with different spans: keep every span, so a version
         # only one of them covers is still in range.
         packages: dict[tuple[Ecosystem, str], AffectedPackage] = {}
-        for p in (p for alias in named for p in alias.affected):
-            kept = packages.get((p.ecosystem, p.name))
-            packages[(p.ecosystem, p.name)] = p if kept is None else _joined(kept, p)
+        for alias in named:
+            for p in alias.affected:
+                cited = p.model_copy(
+                    update={"symbol_sources": dict.fromkeys(p.symbols, alias.source)}
+                )
+                kept = packages.get((p.ecosystem, p.name))
+                packages[(p.ecosystem, p.name)] = cited if kept is None else _joined(kept, cited)
         return record.model_copy(
             update={
                 "affected": tuple(packages.values()),
@@ -1108,9 +1128,9 @@ class ExposureService:
         self, repository_ref_id: UUID, ecosystem: Ecosystem, name: str, fixed: Version
     ) -> FixUptake:
         """The package's versions in the commit's manifest SBOM and the images built from it,
-        each at or above `fixed`; a version that can't be ordered decides nothing. Not listed in the
-        manifest SBOM while a manifest of its ecosystem went unresolved, or its coverage is
-        unknown, is `not_observed`, whatever the images ship."""
+        each at or above `fixed`; a version that can't be ordered decides nothing. A vulnerable
+        version anywhere is `pending`; `consumed` and `module_absent` also need the manifest SBOM
+        to list the package or to be a complete read for its ecosystem, else `not_observed`."""
         with self._uow as uow:
             ref = self._inventory.get_ref(repository_ref_id)
             held = [(None, ref.manifest_sbom_id)] if ref.manifest_sbom_id else []
@@ -1123,11 +1143,7 @@ class ExposureService:
                 for d in uow.dependencies.list_for_sbom(sbom_id)
                 if d.package_id == package.id
             ]
-        # Images shipping a fixed version don't say what an unresolved manifest holds.
-        listed = any(image_id is None for image_id, _ in rows)
-        coverage = () if listed else self.unresolved_manifests(repository_ref_id)
-        unread = coverage is None or any(m.ecosystem == ecosystem for m in coverage)
-        if not any(sbom_id for _, sbom_id in held) or unread:
+        if not any(sbom_id for _, sbom_id in held):
             return FixUptake(state=FixUptakeState.NOT_OBSERVED)
         fix = version_key(fixed, ecosystem)
         checked = tuple(
@@ -1147,6 +1163,10 @@ class ExposureService:
             if verdicts == {True}
             else FixUptakeState.PENDING
         )
+        if state != FixUptakeState.PENDING and not any(i is None for i, _ in rows):
+            coverage = self.unresolved_manifests(repository_ref_id)
+            if coverage is None or any(m.ecosystem == ecosystem for m in coverage):
+                return FixUptake(state=FixUptakeState.NOT_OBSERVED, checked=checked)
         return FixUptake(state=state, checked=checked)
 
     def affected(self, advisory_id: UUID) -> list[AffectedDependency]:
@@ -1673,11 +1693,15 @@ def _sbom_packages(uow: TraustUnitOfWork, sbom_id: UUID) -> list[RefDependency]:
 
 
 def _joined(a: AffectedPackage, b: AffectedPackage) -> AffectedPackage:
-    """One package as two aliases state it: every span, listed version, import and symbol."""
+    """One package as two aliases state it: every span, listed version, import and symbol, each
+    symbol citing the first alias that published it."""
     return a.model_copy(
         update={
-            field: tuple(dict.fromkeys((*getattr(a, field), *getattr(b, field))))
-            for field in ("spans", "versions", "imports", "symbols")
+            **{
+                field: tuple(dict.fromkeys((*getattr(a, field), *getattr(b, field))))
+                for field in ("spans", "versions", "imports", "symbols")
+            },
+            "symbol_sources": {**b.symbol_sources, **a.symbol_sources},
         }
     )
 
@@ -1738,7 +1762,7 @@ def _published(record: AdvisoryRecord) -> SymbolResolution | None:
             symbol=symbol,
             source=SymbolSource.PUBLISHED,
             confidence=SymbolConfidence.HIGH,
-            reference=record.source,
+            reference=package.symbol_sources.get(symbol, record.source),
         )
         for package in record.affected
         for symbol in package.symbols
