@@ -480,13 +480,17 @@ class RemediationService:
         return self._forks.resolve(repository.url, None if mirror is None else mirror.url)
 
     def record_progress(self, work_item_id: UUID, status: RemediationStatus) -> WorkItem:
-        """Move the work item to `status` (forward only); the same status again is a no-op."""
+        """Move the work item to `status` (forward only); the same status again is a no-op.
+        A remediation scheduled on the item follows it, in the same transaction."""
         item = self.get(work_item_id)
         if item.advance(status) is item:
             return item
-        self._findings.decisions.record_resolution(
-            work_item_id, item.finding_ids, resolution_for(status), status
-        )
+        with self._uow as uow:
+            self._findings.decisions.record_resolution(
+                work_item_id, item.finding_ids, resolution_for(status), status
+            )
+            _sync_scheduled(uow, work_item_id, status)
+            uow.commit()
         self._uow.after_commit(
             lambda: log.info("work item %s: %s -> %s", work_item_id, item.status, status)
         )
@@ -524,9 +528,12 @@ class RemediationService:
         item = self._reported_item(wanted, digest)
         if item.report is not None:  # recorded before; finish a run that stopped part-way
             if item.status != status:
-                self._findings.decisions.record_resolution(
-                    item.work_item_id, wanted, resolution_for(status), status, item.report.id
-                )
+                with self._uow as uow:
+                    self._findings.decisions.record_resolution(
+                        item.work_item_id, wanted, resolution_for(status), status, item.report.id
+                    )
+                    _sync_scheduled(uow, item.work_item_id, status)
+                    uow.commit()
             return self.get(item.work_item_id)
         item.advance(status)
         published = (provenance.artifact or self._publisher.publish_ref(doc)).id
@@ -536,9 +543,12 @@ class RemediationService:
                 for finding_id in wanted:
                     self._findings.records.link_external(finding_id, JIRA, key)
             uow.commit()
-        self._findings.decisions.record_resolution(
-            item.work_item_id, wanted, resolution_for(status), status, report.id
-        )
+        with self._uow as uow:
+            self._findings.decisions.record_resolution(
+                item.work_item_id, wanted, resolution_for(status), status, report.id
+            )
+            _sync_scheduled(uow, item.work_item_id, status)
+            uow.commit()
         self._uow.after_commit(
             lambda: log.info("work item %s: report %s, %s", item.work_item_id, report.id, status)
         )
@@ -928,6 +938,14 @@ def _finding_id(ref: str) -> UUID:
         raise ValidationError(f"finding_ref {ref!r} is not a finding id from prepare") from None
 
 
+def _sync_scheduled(uow: TraustUnitOfWork, assessment_id: UUID, status: RemediationStatus) -> None:
+    """The remediation row linked to a work item follows it, never stepping back; on the
+    caller's transaction, so the row and the decision land or roll back together."""
+    linked = uow.remediations.find_by_assessment(assessment_id)
+    if linked is not None and (moved := linked.moved_on(status)) is not None:
+        uow.remediations.update(moved)
+
+
 VERIFICATION = AssessmentKind.VERIFICATION
 VERIFY_ASSESSOR = "skill:verify-remediation"
 # Classifier plan import table: execution-proven evidence without a grade is E1, so a
@@ -1118,8 +1136,9 @@ class VerificationService:
         run_order_id: UUID | None = None,
     ) -> Verification:
         """A verification report (`original_id` = finding id from prepare) as a `verification`
-        assessment of the patched commit: its verdicts as decisions, its regressions as findings.
-        Re-recording finishes a run that stopped part-way and otherwise changes nothing."""
+        assessment of the patched commit: its verdicts as decisions, its regressions as findings,
+        one transaction (a run that stops part-way leaves nothing behind). Re-recording changes
+        nothing; a remediation scheduled on the verified findings is revalidated with them."""
         if warnings := check_verification(doc):
             log.warning("verification report has %d warnings", len(warnings))
         meta = doc.metadata
@@ -1179,18 +1198,21 @@ class VerificationService:
         rationales = {
             i: " ".join(f.evidence.explanation.split())[:RATIONALE_CAP] for i, f in verdicts.items()
         }
-        for (validity, resolution, verdict), finding_ids in said.items():
-            self._findings.decisions.record_resolution(
-                assessment.id,
-                finding_ids,
-                resolution,
-                verdict,
-                report.id,
-                validity=validity,
-                fixed_repository_ref_id=ref.id if verdict in FIXED_VERDICTS else None,
-                rationales=rationales,
-                evidence_grade=VERIFIED_GRADE,
-            )
+        with self._uow as uow:
+            for (validity, resolution, verdict), finding_ids in said.items():
+                self._findings.decisions.record_resolution(
+                    assessment.id,
+                    finding_ids,
+                    resolution,
+                    verdict,
+                    report.id,
+                    validity=validity,
+                    fixed_repository_ref_id=ref.id if verdict in FIXED_VERDICTS else None,
+                    rationales=rationales,
+                    evidence_grade=VERIFIED_GRADE,
+                )
+            self._revalidate(uow, verdicts)
+            uow.commit()
         if not recorded:
             self._uow.after_commit(
                 lambda: log.info(
@@ -1201,6 +1223,22 @@ class VerificationService:
             v for v in self._verifications(repository_id) if v.verification_id == assessment.id
         )
         return verification
+
+    def _revalidate(self, uow: TraustUnitOfWork, verdicts: Mapping[UUID, Any]) -> None:
+        """The remediation rows covering the verified findings move to their revalidated
+        status — fixed when every verified finding of the effort is fixed, else still
+        vulnerable — never stepping back, on the verdicts' own transaction."""
+        covered: defaultdict[UUID, set[UUID]] = defaultdict(set)
+        for row in uow.remediation_findings.list_for_findings(verdicts):
+            covered[row.remediation_id].add(row.finding_id)
+        for remediation_id, finding_ids in covered.items():
+            fixed = all(verdicts[f].verdict in FIXED_VERDICTS for f in finding_ids)
+            status = RemediationStatus(
+                "revalidated_fixed" if fixed else "revalidated_still_vulnerable"
+            )
+            linked = uow.remediations.get(remediation_id)
+            if (moved := linked.moved_on(status)) is not None:
+                uow.remediations.update(moved)
 
     def _audit_of(
         self, finding_ids: Sequence[UUID], original_commit: str, patched: RepositoryRef

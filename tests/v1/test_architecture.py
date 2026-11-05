@@ -34,7 +34,14 @@ SERVICE_SECTION = {
     "ledger": "traust_ledger",
 }
 # Use cases that write several sections in one transaction declare TraustUnitOfWork.
-SPANS_SECTIONS = {"findings", "exposure", "validation", "remediation", "insight"}
+SPANS_SECTIONS = {
+    "findings",
+    "exposure",
+    "validation",
+    "remediation",
+    "remediation_scheduling",
+    "insight",
+}
 
 REPOSITORY_PACKAGES = {"traust", "traust_ops", "traust_ledger", "objects"}
 REPOSITORY_MODULES = {"__init__", "contract", "memory", "sql", "tables", "unit_of_work"}

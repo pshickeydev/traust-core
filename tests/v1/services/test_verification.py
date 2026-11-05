@@ -273,8 +273,11 @@ def test_recording_again_finishes_a_run_that_stopped_part_way(
     with pytest.raises(RuntimeError):
         service.record(doc, provenance())
     monkeypatch.undo()
-    (partial,) = service.list(VerificationFilter(repository_id=world.repo.id), PageRequest()).items  # type: ignore[arg-type]
-    assert [v.verdict for v in partial.verdicts] == ["resolved"]
+    # the verdicts are one transaction (as they already were through the record door):
+    # the stopped run left nothing behind to finish
+    assert not service.list(  # type: ignore[arg-type]
+        VerificationFilter(repository_id=world.repo.id), PageRequest()
+    ).items
     got = service.record(doc, provenance())
     assert {v.verdict for v in got.verdicts} == {"resolved", "unresolved"}
 

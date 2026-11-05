@@ -247,6 +247,7 @@ from traust_core.v1.services.remediation import (
     RemediationService,
     VerificationService,
 )
+from traust_core.v1.services.remediation_scheduling import RemediationSchedulingService
 from traust_core.v1.services.repo_checkout import RepoCheckoutService
 from traust_core.v1.services.reporting import ReportingService
 from traust_core.v1.services.validation import ValidationRecords, ValidationService
@@ -285,6 +286,7 @@ class Services:
     remediation: RemediationService
     insight: InsightService
     pqc: PqcService
+    remediation_scheduling: RemediationSchedulingService
     verification: VerificationService
     redaction: RedactionPolicy
     reporting: ReportingService
@@ -1062,6 +1064,7 @@ class Context:
             ),
             pqc=pqc,
             remediation=remediation,
+            remediation_scheduling=RemediationSchedulingService(uow, findings, remediation, ops),
             verification=VerificationService(
                 uow,
                 findings,
