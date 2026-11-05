@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from datetime import UTC
 from pathlib import Path
 from typing import Any
@@ -18,10 +18,13 @@ from traust_core.v1.models.artifacts import (
     TriageArtifact,
 )
 from traust_core.v1.models.assessment import AtlasCatalog, AttackCatalog
+from traust_core.v1.models.findings import FindingView
 from traust_core.v1.providers.clock import Clock, SystemClock
 from traust_core.v1.providers.report_files import ReportFiles
 from traust_core.v1.providers.sources import WorkspaceFiles
 from traust_core.v1.rendering import HtmlRenderer, MarkdownRenderer
+from traust_core.v1.rendering.csv import csv_table
+from traust_core.v1.rendering.markdown import Table, markdown_table, markdown_text
 from traust_core.v1.services.artifact_publishing import RedactionPolicy
 from traust_core.v1.services.insight import SarifExport, TriageView
 from traust_core.v1.services.ledger import LedgerService
@@ -62,6 +65,22 @@ class ReportingService:
         self._clock = clock or SystemClock()
         self._attack_catalog = attack_catalog
         self._atlas_catalog = atlas_catalog
+
+    def export_csv(
+        self, columns: Sequence[str], rows: Iterable[Sequence[str | int | float | None]]
+    ) -> str:
+        """Caller-supplied tabular data through the canonical formula-safe CSV renderer."""
+        return csv_table(_table(columns, rows))
+
+    def export_markdown(
+        self, columns: Sequence[str], rows: Iterable[Sequence[str | int | float | None]]
+    ) -> str:
+        """Caller-supplied tabular data as a Markdown table that admits no authored markup."""
+        table = _table(columns, rows)
+        cells = lambda values: [markdown_text(v) for v in values]  # noqa: E731
+        return (
+            "\n".join(markdown_table(cells(table.columns), [cells(r) for r in table.rows])) + "\n"
+        )
 
     def validate(self, payload: bytes, artifact: type[ArtifactDocument]) -> tuple[Issue, ...]:
         """The payload's issues against the artifact's contract schema; none means it conforms."""
@@ -176,7 +195,20 @@ class ReportingService:
     def sarif(self, document: ReportArtifact | CloudConfigAuditArtifact) -> dict[str, Any]:
         return SarifExport().report(document, self._sarif_tool_uri)
 
+    def sarif_findings(
+        self, findings: Sequence[FindingView], repository_url: str
+    ) -> dict[str, Any]:
+        """A caller-held findings baseline as the canonical SARIF projection."""
+        return SarifExport().document(findings, repository_url)
+
     def sarif_reports(self, root: Path) -> list[Path]:
         """The reports under `root` a SARIF sweep exports: one per baseline, the disposition-aware
         findings-current over its raw audit."""
         return self._files.sarif_reports(root)
+
+
+def _table(columns: Sequence[str], rows: Iterable[Sequence[str | int | float | None]]) -> Table:
+    return Table(
+        columns=tuple(columns),
+        rows=tuple(tuple("" if value is None else str(value) for value in row) for row in rows),
+    )

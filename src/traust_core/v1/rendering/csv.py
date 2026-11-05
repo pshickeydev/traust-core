@@ -14,7 +14,6 @@ def csv_table(table: Table) -> str:
     """The table as CSV, one header row; cells on one line, never read as formulas."""
     out = io.StringIO()
     writer = csv.writer(out, lineterminator="\n")
-    writer.writerow(table.columns)
-    for row in table.rows:
+    for row in (table.columns, *table.rows):  # a caller-supplied header is untrusted too
         writer.writerow(_FORMULA.sub(lambda m: "'" + m.group(0), inline(v)) for v in row)
     return out.getvalue()
