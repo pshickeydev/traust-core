@@ -667,17 +667,17 @@ class Propagation(Model):
 
 
 def propagated(evidence: Sequence[PropagationEvidence]) -> CrossRepoPropagation:
-    """Pending while any package the commit carries is vulnerable, consumed once every one it
-    carries is fixed; carrying none is module_absent, which a verifier judges (it may be vendored
-    under another name)."""
+    """Pending while any package the commit carries is vulnerable, even beside a package whose
+    coverage is unknown; consumed once every one it carries is fixed; carrying none is
+    module_absent, which a verifier judges (it may be vendored under another name)."""
     states = {e.state for e in evidence}
+    if FixUptakeState.PENDING in states:
+        return CrossRepoPropagation("pending")
     if FixUptakeState.NOT_OBSERVED in states or not states:
         raise NotFoundError(
             "the component's commit has no SBOM yet, or one whose coverage leaves the package "
             "unknown: record one from its manifests first"
         )
-    if FixUptakeState.PENDING in states:
-        return CrossRepoPropagation("pending")
     held = states - {FixUptakeState.MODULE_ABSENT}
     return CrossRepoPropagation("consumed" if held else "module_absent")
 

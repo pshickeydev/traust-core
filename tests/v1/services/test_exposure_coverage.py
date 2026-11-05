@@ -15,7 +15,7 @@ from sqlalchemy.engine import Engine
 from tests.v1.repositories.tables.conftest import Seed
 from tests.v1.services.test_exposure_impact import LODASH, Lookup, engine
 from tests.v1.services.test_exposure_sweep import FakeCheckout, FakeSbomTool
-from traust_core.v1.errors import IntegrityError, ValidationError
+from traust_core.v1.errors import IntegrityError, NotFoundError, ValidationError
 from traust_core.v1.models.assessment import AssessmentKind
 from traust_core.v1.models.dependencies import (
     AdvisoryIdentifier,
@@ -26,6 +26,7 @@ from traust_core.v1.models.dependencies import (
     UnresolvedManifest,
     Version,
 )
+from traust_core.v1.models.remediation import PropagationEvidence, propagated
 from traust_core.v1.models.vocabulary import Ecosystem, ManifestCoverageReason
 from traust_core.v1.providers.base import ProviderRegistry, Result
 from traust_core.v1.providers.clock import Clock
@@ -352,3 +353,32 @@ def test_an_image_shipping_the_vulnerable_version_is_pending_whatever_the_manife
     service.ingest_image_sbom(vulnerable_image, "sha256:" + "b" * 64, None, ref)
     fix = service.consumes_fix(ref, Ecosystem.NPM, "lodash", Version("4.17.21"))
     assert fix.state == FixUptakeState.PENDING
+
+
+def test_one_vulnerable_package_is_pending_beside_one_whose_coverage_is_unknown(
+    engine: Engine,
+) -> None:
+    span = (AffectedSpan(introduced=Version("0"), fixed=Version("4.17.21")),)
+    lodash, left_pad = (
+        AffectedPackage(ecosystem=Ecosystem.NPM, name=n, spans=span) for n in ("lodash", "left-pad")
+    )
+    ref, service = ref_id(engine), exposure(engine)
+    neither = {"bomFormat": "CycloneDX", "components": [{"purl": "pkg:npm/qs@6.0.0"}]}
+    service.ingest_sbom(json.dumps(neither).encode(), ref)  # a document: coverage unknown
+    image = json.dumps(
+        {"bomFormat": "CycloneDX",
+         "components": [{"purl": "pkg:npm/lodash@4.17.20"}, {"purl": "pkg:npm/left-pad@4.17.21"}]}
+    ).encode()  # fmt: skip
+    service.ingest_image_sbom(image, "sha256:" + "c" * 64, None, ref)
+    evidence = [
+        PropagationEvidence.of(
+            package,
+            Version("4.17.21"),
+            service.consumes_fix(ref, Ecosystem.NPM, package.name, Version("4.17.21")),
+        )
+        for package in (lodash, left_pad)
+    ]
+    assert [e.state for e in evidence] == [FixUptakeState.PENDING, FixUptakeState.NOT_OBSERVED]
+    assert propagated(evidence) == "pending"
+    with pytest.raises(NotFoundError, match="coverage leaves the package unknown"):
+        propagated(evidence[1:])
