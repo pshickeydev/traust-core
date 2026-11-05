@@ -1092,7 +1092,7 @@ class Context:
                     OscalExport(compliance),
                     SarifView(findings, portfolio, self.clock),
                     threats,
-                    LocView(code_facts, portfolio, findings),
+                    LocView(code_facts, portfolio, findings, clock=self.clock),
                     RemediationIndexView(remediation, portfolio),
                     FreshnessView(freshness, catalog, assessment, portfolio, self.clock),
                     executive,

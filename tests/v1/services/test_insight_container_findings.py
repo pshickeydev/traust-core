@@ -184,3 +184,28 @@ def test_container_view_is_single_item_and_left_out_of_a_full_refresh(context: C
     refreshed = context.services().insight.refresh(None, ViewFilter())
     assert ViewName.CONTAINER_FINDINGS not in refreshed.rendered
     assert ViewName.CONTAINER_FINDINGS not in refreshed.failed
+
+
+def test_container_image_provenance_is_literal_in_published_report_bodies(
+    context: Context, engine: Engine
+) -> None:
+    with SqlTraustUnitOfWork(engine) as uow:
+        ref = Seed(uow).repository_ref()
+        uow.commit()
+    assert ref.id is not None
+    image = "registry.example/apps/<img src=x onerror=alert(1)> [docs](evil)\n## forged"
+    assessment_id = record_container(context, ref.id, image + "@sha256:aaa", 0)
+    scope = ViewFilter(assessment_id=assessment_id, report_stem="widget-container-audit")
+    insight = context.services().insight
+    model = insight.build(ViewName.CONTAINER_FINDINGS, scope)
+    assert isinstance(model, ContainerFindings)
+    assert model.image_repository == image
+    report = insight.report(ViewName.CONTAINER_FINDINGS, scope)
+    assert "<img" not in report.sections[0].body
+    assert "[docs](evil)" not in report.sections[0].body
+    assert "\n## forged" not in report.sections[0].body
+    published = insight.publish(ViewName.CONTAINER_FINDINGS, scope)
+    assert "<img" not in published.markdown and "<img" not in published.html
+    assert "\n## forged" not in published.markdown
+    stored = context.services().assessment.report(assessment_id)
+    assert stored is not None and stored.metadata.repository == image + "@sha256:aaa"

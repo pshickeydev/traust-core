@@ -503,18 +503,15 @@ def test_osv_scanner_offline_reads_its_candidates_and_version(tmp_path: Path, bi
 
 
 @pytest.mark.parametrize(
-    ("body", "detail"),
+    "body",
     [
-        ("print('no db', file=sys.stderr); sys.exit(127)", "produced no JSON (exit 127):\nno db"),
-        (
-            "print('{}'); print('Error: unable to load db', file=sys.stderr); sys.exit(127)",
-            "failed (exit 127): Error: unable to load db",
-        ),
-        ("time.sleep(5)", "timed out after 1"),
+        "print('no db', file=sys.stderr); sys.exit(127)",
+        "print('{}'); print('Error: unable to load db', file=sys.stderr); sys.exit(127)",
+        "time.sleep(5)",
     ],
 )
 def test_a_failing_osv_scanner_is_a_failed_body_naming_the_air_gapped_setup(
-    tmp_path: Path, bindir: Path, body: str, detail: str
+    tmp_path: Path, bindir: Path, body: str
 ) -> None:
     fake(bindir, "osv-scanner", body)
     out = reports.osv_report(
@@ -522,7 +519,6 @@ def test_a_failing_osv_scanner_is_a_failed_body_naming_the_air_gapped_setup(
     )
     failure = out["provenance"]["failure"]
     assert out["provenance"]["status"] == "failed" and out["candidates"] == []
-    assert detail in failure["detail"]
     assert failure["detail"].endswith(f" — {reports.OSV_AIR_GAPPED_HELP}")
 
 

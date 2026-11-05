@@ -697,8 +697,11 @@ class RepositoryLoc(Model):
 
     repository_id: UUID
     repository_url: str
-    code: int = 0  # code lines, documentation languages excluded
-    total: int = 0
+    repository_ref_id: UUID | None = None
+    code_delta: int | None = None
+    total_delta: int | None = None
+    code: int | None = None
+    total: int | None = None
     primary: str | None = None
     languages: tuple[LanguageCount, ...] = ()
     unmeasured: str | None = None
@@ -711,10 +714,22 @@ class LanguageTotal(Model):
     documentation: bool
 
 
+class LocComparison(Model):
+    as_of: datetime
+    code: int
+    total: int
+    measured_repositories: int
+    comparable_repositories: int
+    code_delta: int
+    total_delta: int
+
+
 class LocDashboard(ViewModel):
     """Lines of code the scope's repositories hold, by language and repository, largest first."""
 
     code: int
+    as_of: datetime | None = None
+    comparison: LocComparison | None = None
     first_party_divisor: Decimal | None = None
     first_party_estimate: Decimal | None = None
     total: int

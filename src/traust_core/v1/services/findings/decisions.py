@@ -85,7 +85,6 @@ from traust_core.v1.services.findings.precedents import FindingPrecedents
 from traust_core.v1.services.findings.records import FindingRecords
 from traust_core.v1.services.findings.restatement import RestatementPolicy
 from traust_core.v1.services.findings.review import ReviewPolicy, request
-from traust_core.v1.services.insight import TriageView
 from traust_core.v1.services.ledger import LedgerService
 from traust_core.v1.services.lint import Lint, LintContext, LintReport
 from traust_core.v1.services.portfolio import Inventory
@@ -365,6 +364,9 @@ class FindingDecisions:
 
     def render(self, doc: TriageArtifact) -> bytes:
         """The triage as Markdown: a projection of the document, never a second source."""
+        # Insight imports finding policies while the package is initializing.
+        from traust_core.v1.services.insight import TriageView
+
         return MarkdownRenderer().render(TriageView().report(doc))
 
     def record(

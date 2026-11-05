@@ -207,6 +207,28 @@ def test_prescan_records_the_facts_of_the_scan_and_the_census(world: World) -> N
     )
 
 
+def test_context_artifacts_reads_facts_published_by_the_pqc_prescan(
+    engine: Engine, tmp_path: Path
+) -> None:
+    ctx = Context(Config(home=tmp_path), clock=FixedClock(AT))
+    ctx.__dict__["database"] = engine
+    ctx.pqc_scanner = FakeScanner()
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        ref = seed.repository_ref(seed.repository(url=URL), sha=SHA)
+        uow.commit()
+    assert ref.id is not None
+    services = ctx.services()
+    services.exposure.ingest_sbom(SBOM, ref.id)
+    done = services.pqc.prescan(ref.id, CHECKOUT)
+    reader = ctx.services().artifacts
+    [row] = reader.list_for_assessment(done.assessment_id, kind=PqcFactsArtifact.schema)
+    assert row.id is not None
+    doc = reader.read(row.id, PqcFactsArtifact)
+    assert type(reader.get(row.id)) is PqcFactsArtifact
+    assert doc.repository == URL and doc.payload == reader.payload(row.id)
+
+
 @pytest.mark.parametrize(
     ("field", "before", "after"),
     [

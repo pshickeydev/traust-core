@@ -836,11 +836,21 @@ class AssessmentService:
         return self._read(self._log.get(assessment_id))
 
     def latest(
-        self, repository_ref_id: UUID, kind: AssessmentKind, *, status: str | None = None
+        self,
+        repository_ref_id: UUID,
+        kind: AssessmentKind,
+        *,
+        status: str | None = None,
+        as_of: datetime | None = None,
     ) -> Assessment | None:
+        if as_of is not None and as_of.utcoffset() is None:
+            raise ValidationError("as_of must be timezone-aware")
         spellings = self._kind_spellings(kind)
         with self._uow as uow:
-            rows = [uow.assessments.latest(repository_ref_id, value, status) for value in spellings]
+            rows = [
+                uow.assessments.latest(repository_ref_id, value, status, as_of=as_of)
+                for value in spellings
+            ]
             found = max(
                 (row for row in rows if row is not None),
                 key=lambda row: (row.occurred_at, row.created_at, row.id),
@@ -988,10 +998,20 @@ class AssessmentService:
         return self.latest_on_default_lines([repository_id], kind).get(repository_id)
 
     def latest_on_default_lines(
-        self, repository_ids: Collection[UUID], kind: AssessmentKind
+        self,
+        repository_ids: Collection[UUID],
+        kind: AssessmentKind,
+        as_of: datetime | None = None,
     ) -> dict[UUID, Assessment]:
         """Each repository's latest completed assessment of `kind` on its default line; a
         repository with none is absent. A few statements per batch, not per repository."""
+        if as_of is not None:
+            held = self._held(
+                as_of, AssessmentFilter(kind=kind, status=ASSESSMENT_COMPLETED), repository_ids
+            )
+            return {
+                repository_id: rows[-1] for (repository_id, _), (rows, _) in held.items() if rows
+            }
         refs = self._inventory.list_refs_of(repository_ids)
         owner = {r.id: r.repository_id for r in refs}
         with self._uow as uow:

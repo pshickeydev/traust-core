@@ -60,10 +60,6 @@ def record(ctx: Context, ref_id: UUID, code: int, days: int) -> None:
     )
 
 
-@pytest.mark.todo(
-    "historical LoC reads",
-    legacy="traust-core@f950dd6/tests/v1/services/test_insight_loc_history.py::test_loc_selects_both_historical_head_and_measurement_without_future_leakage",
-)
 def test_loc_selects_both_historical_head_and_measurement_without_future_leakage(
     engine: Engine,
     tmp_path: Path,
@@ -189,12 +185,3 @@ def test_first_party_estimate_divides_measured_code_and_is_labelled_an_estimate(
     assert "First-party estimate: 120.0 code lines" in summary and "not a measurement" in summary
     plain = ctx.services().insight.build(ViewName.LOC, ViewFilter())
     assert plain.first_party_estimate is None
-
-
-def test_loc_refuses_a_comparison_until_historical_reads_exist(
-    engine: Engine, tmp_path: Path
-) -> None:
-    ctx = Context(Config(home=tmp_path), clock=FixedClock(T0 + 10 * DAY))
-    ctx.__dict__["database"] = engine
-    with pytest.raises(ValidationError, match="compare_as_of"):
-        ctx.services().insight.build(ViewName.LOC, ViewFilter(compare_as_of=T0))

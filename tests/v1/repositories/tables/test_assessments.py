@@ -31,6 +31,23 @@ def test_latest_is_by_occurred_at_not_insert_order(seed: Seed) -> None:
     assert seed.uow.assessments.latest(ref.id, "audit") == newer
 
 
+def test_latest_at_a_cutoff_is_inclusive_and_keeps_kind_status_and_ref_scope(seed: Seed) -> None:
+    ref = seed.repository_ref()
+    old = seed.assessment(ref, occurred_at=T0)
+    at = T0 + timedelta(days=1)
+    tied = [seed.assessment(ref, occurred_at=at) for _ in range(2)]
+    seed.assessment(ref, occurred_at=at + timedelta(days=1))
+    seed.assessment(ref, kind="threat_model", occurred_at=at)
+    seed.assessment(ref, status="degraded", occurred_at=at)
+    seed.assessment(seed.repository_ref(), occurred_at=at)
+    repo = seed.uow.assessments
+    assert repo.latest(ref.id, "audit", "completed", as_of=T0 - timedelta(seconds=1)) is None
+    assert repo.latest(ref.id, "audit", "completed", as_of=T0) == old
+    assert repo.latest(ref.id, "audit", "completed", as_of=at) == max(
+        tied, key=lambda row: (row.created_at, row.id)
+    )
+
+
 def test_latest_of_a_kind_and_status_across_refs(seed: Seed) -> None:
     u = seed.uow
     a, b, other = seed.repository_ref(), seed.repository_ref(), seed.repository_ref()

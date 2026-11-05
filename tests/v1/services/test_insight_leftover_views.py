@@ -536,7 +536,9 @@ def lang(name: str, code: int) -> LanguageCount:
 class FakeCodeFacts:
     measured: dict[UUID, LanguageStats | Exception]
 
-    def language_stats(self, repository_ref_id: UUID) -> LanguageStats:
+    def language_stats(
+        self, repository_ref_id: UUID, *, as_of: datetime | None = None
+    ) -> LanguageStats:
         found = self.measured[repository_ref_id]
         if isinstance(found, Exception):
             raise found
@@ -547,7 +549,7 @@ class FakeCodeFacts:
 class LocPortfolio(FakePortfolio):
     refs: dict[UUID, UUID] = field(default_factory=dict)
 
-    def default_ref(self, repository_id: UUID) -> Any:
+    def default_ref(self, repository_id: UUID, as_of: datetime | None = None) -> Any:
         ref = self.refs.get(repository_id)
         return None if ref is None else type("Ref", (), {"id": ref})()
 
@@ -640,11 +642,6 @@ def test_loc_ends_with_the_standard_population_block() -> None:
     assert "| With findings reported | 2 |" in text
     assert "| With a decision recorded | 1 |" in text
     assert "| With findings reported | 0 |" in md(loc({}, {}))
-
-
-def test_loc_refuses_a_point_in_time_it_cannot_read() -> None:
-    with pytest.raises(ValidationError, match="no as_of"):
-        loc({}, {}).build(ViewFilter(as_of=T0))
 
 
 def test_loc_never_hides_broken_measurements() -> None:

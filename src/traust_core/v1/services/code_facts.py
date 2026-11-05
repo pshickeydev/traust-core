@@ -4,6 +4,7 @@ import logging
 import re
 from collections import Counter
 from collections.abc import Sequence
+from datetime import datetime
 from typing import TypeVar
 from uuid import UUID
 
@@ -388,12 +389,22 @@ class CodeFactsService:
         scoped = tuple(NamespaceScope(namespace=ns, decision=d) for ns, d in decisions.items())
         return census.model_copy(update={"scope": scoped, "gaps": (*census.gaps, *denied)})
 
-    def collect(self, repository_ref_id: UUID, kinds: Sequence[CodeFactKind]) -> CollectResult:
+    def collect(
+        self,
+        repository_ref_id: UUID,
+        kinds: Sequence[CodeFactKind],
+        *,
+        as_of: datetime | None = None,
+    ) -> CollectResult:
         requested = set(kinds)
         unsupported = requested - {CodeFactKind.SYMBOL, CodeFactKind.LANGUAGES}
         if unsupported:
             raise ValidationError(f"unsupported code fact kinds: {', '.join(sorted(unsupported))}")
-        assessment = self._assessments.latest(repository_ref_id, AssessmentKind.TOOL_SCAN)
+        assessment = (
+            self._assessments.latest(repository_ref_id, AssessmentKind.TOOL_SCAN)
+            if as_of is None
+            else self._assessments.latest(repository_ref_id, AssessmentKind.TOOL_SCAN, as_of=as_of)
+        )
         if assessment is None:
             raise NotFoundError(f"no tool_scan assessment for ref {repository_ref_id}")
         if assessment.status != ASSESSMENT_COMPLETED:
@@ -500,8 +511,10 @@ class CodeFactsService:
             and (query.path is None or symbol.location.path == query.path)
         ][: query.limit]
 
-    def language_stats(self, repository_ref_id: UUID) -> LanguageStats:
-        result = self.collect(repository_ref_id, [CodeFactKind.LANGUAGES])
+    def language_stats(
+        self, repository_ref_id: UUID, *, as_of: datetime | None = None
+    ) -> LanguageStats:
+        result = self.collect(repository_ref_id, [CodeFactKind.LANGUAGES], as_of=as_of)
         stats = result.facts[0].detail
         assert isinstance(stats, LanguageStats)
         return stats

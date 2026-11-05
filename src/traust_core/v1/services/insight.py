@@ -91,6 +91,7 @@ from traust_core.v1.models.insight import (
     LanguageSeverity,
     LanguageTotal,
     LeastPrivilege,
+    LocComparison,
     LocDashboard,
     OscalAssessmentResults,
     PackageReach,
@@ -174,7 +175,7 @@ from traust_core.v1.models.vocabulary import (
     ValidationVerdict,
     Validity,
 )
-from traust_core.v1.providers.clock import Clock
+from traust_core.v1.providers.clock import Clock, SystemClock
 from traust_core.v1.rendering import (
     HtmlRenderer,
     MarkdownRenderer,
@@ -183,6 +184,7 @@ from traust_core.v1.rendering import (
     Table,
     csv_table,
     inline,
+    markdown_text,
 )
 from traust_core.v1.services.findings.intake import CATEGORY
 from traust_core.v1.services.findings.rating import CvssFloor, RatingConfig, RatingPolicy, SlaConfig
@@ -416,7 +418,7 @@ class ContainerFindingsView:
             sections=(
                 Section(
                     heading="Population",
-                    body=f"Image repository: {inline(model.image_repository)}. "
+                    body=f"Image repository: {markdown_text(model.image_repository)}. "
                     f"{len(model.reports)} stored container reports; {len(model.findings)} "
                     "distinct canonical findings. Decisions supply current disposition; "
                     "absence from a later report does not establish resolution.",
@@ -1402,41 +1404,81 @@ class LocView:
     name = ViewName.LOC
 
     def __init__(
-        self, code_facts: CodeFactsService, portfolio: PortfolioService, findings: FindingService
+        self,
+        code_facts: CodeFactsService,
+        portfolio: PortfolioService,
+        findings: FindingService,
+        clock: Clock | None = None,
     ) -> None:
         self._code_facts = code_facts
         self._portfolio = portfolio
         self._findings = findings
+        self._clock = clock or SystemClock()
 
     def build(self, filter: ViewFilter) -> LocDashboard:
-        if filter.as_of is not None:
-            raise ValidationError("the loc view reads the latest measurement; it takes no as_of")
-        # NEED(core: historical LoC reads): comparing needs default heads and language stats as
-        # of a past time (default_refs, collect and their assessment queries take no cutoff yet).
-        if filter.compare_as_of is not None:
-            raise ValidationError(
-                "the loc view reads the latest measurement; it takes no compare_as_of"
-            )
+        for at in (filter.as_of, filter.compare_as_of):
+            if at is not None and at.utcoffset() is None:
+                raise ValidationError("LoC timestamps must be timezone-aware")
+        at = filter.as_of or self._clock.now()
+        if filter.compare_as_of is not None and filter.compare_as_of >= at:
+            raise ValidationError("LoC comparison must precede as_of")
         _, _, repositories = _scope(self._portfolio, filter)
-        measured = [_measured(self._code_facts, self._portfolio, r) for r in repositories]
+        measured = [
+            _measured(self._code_facts, self._portfolio, r, filter.as_of) for r in repositories
+        ]
+        comparison = None
+        if filter.compare_as_of is not None:
+            prior_filter = filter.model_copy(update={"as_of": filter.compare_as_of})
+            _, _, prior_repositories = _scope(self._portfolio, prior_filter)
+            prior = {
+                r.id: _measured(self._code_facts, self._portfolio, r, filter.compare_as_of)
+                for r in prior_repositories
+            }
+            measured = [
+                r.model_copy(
+                    update={
+                        "code_delta": r.code - prior[r.repository_id].code,
+                        "total_delta": r.total - prior[r.repository_id].total,
+                    }
+                )
+                if r.code is not None
+                and r.total is not None
+                and r.repository_id in prior
+                and prior[r.repository_id].code is not None
+                and prior[r.repository_id].total is not None
+                else r
+                for r in measured
+            ]
+            comparison = LocComparison(
+                as_of=filter.compare_as_of,
+                code=sum(r.code for r in prior.values() if r.code is not None),
+                total=sum(r.total for r in prior.values() if r.total is not None),
+                measured_repositories=sum(not r.unmeasured for r in prior.values()),
+                comparable_repositories=sum(r.code_delta is not None for r in measured),
+                code_delta=sum(r.code_delta for r in measured if r.code_delta is not None),
+                total_delta=sum(r.total_delta for r in measured if r.total_delta is not None),
+            )
         totals: defaultdict[str, list[int]] = defaultdict(list)
         for r in measured:
             for language in r.languages:
                 totals[language.name].append(language.code)
         tallies = [
-            _tally(self._findings.all(FindingFilter(repository_id=r.id)))  # type: ignore[arg-type]
+            _tally(self._findings.all(FindingFilter(repository_id=r.id, as_of=filter.as_of)))  # type: ignore[arg-type]
             for r in repositories
         ]
+        code = sum(r.code for r in measured if r.code is not None)
         return LocDashboard(
-            code=sum(r.code for r in measured),
+            as_of=at,
+            comparison=comparison,
+            code=code,
             first_party_divisor=filter.first_party_divisor,
             first_party_estimate=(
-                Decimal(sum(r.code for r in measured)) / filter.first_party_divisor
+                Decimal(code) / filter.first_party_divisor
                 if filter.first_party_divisor is not None
                 and any(not r.unmeasured for r in measured)
                 else None
             ),
-            total=sum(r.total for r in measured),
+            total=sum(r.total for r in measured if r.total is not None),
             reported=sum(map(_reported, tallies)),
             dispositioned=sum(bool(t.decided) for t in tallies),
             languages=tuple(
@@ -1453,7 +1495,9 @@ class LocView:
                     key=lambda t: (-t.code, t.name),
                 )
             ),
-            repositories=tuple(sorted(measured, key=lambda r: (-r.code, r.repository_url))),
+            repositories=tuple(
+                sorted(measured, key=lambda r: (r.code is None, -(r.code or 0), r.repository_url))
+            ),
         )
 
     def report(self, model: LocDashboard, generated_at: datetime) -> Report:
@@ -1468,6 +1512,15 @@ class LocView:
                 f" First-party estimate: {model.first_party_estimate:,.1f} code lines "
                 f"(measured code / explicitly supplied divisor {model.first_party_divisor}; "
                 "not a measurement)."
+            )
+        if model.comparison is not None:
+            c = model.comparison
+            summary += (
+                f" Compared with {c.as_of.isoformat()}: {c.code_delta:+,} code lines "
+                f"and {c.total_delta:+,} total lines across {c.comparable_repositories} "
+                f"repositories measured at both points. Baseline: {c.code:,} code lines, "
+                f"{c.total:,} total lines, {c.measured_repositories} measured repositories. "
+                "Coverage changes are not counted as code growth."
             )
         return Report(
             title="Lines of code",
@@ -1490,9 +1543,15 @@ class LocView:
                 ),
                 _table_section(
                     "By repository",
-                    ("repository", "code lines", "all lines", "primary language"),
+                    ("repository", "code lines", "all lines", "primary language", "code change"),
                     [
-                        (r.repository_url, f"{r.code:,}", f"{r.total:,}", r.primary or "-")
+                        (
+                            r.repository_url,
+                            f"{r.code:,}",
+                            f"{r.total:,}",
+                            r.primary or "-",
+                            "-" if r.code_delta is None else f"{r.code_delta:+,}",
+                        )
                         for r in model.repositories
                         if not r.unmeasured
                     ],
@@ -1508,22 +1567,34 @@ class LocView:
                     len(model.repositories),
                     model.reported,
                     model.dispositioned,
-                    "lines measured at each repository's default-branch commit",
+                    "lines measured at the observed default-branch commit at the selected time",
                 ),
             ),
         )
 
 
 def _measured(
-    code_facts: CodeFactsService, portfolio: PortfolioService, repository: Repository
+    code_facts: CodeFactsService,
+    portfolio: PortfolioService,
+    repository: Repository,
+    as_of: datetime | None = None,
 ) -> RepositoryLoc:
     """The repository's latest measured languages at its default-branch commit, or why not."""
     found = RepositoryLoc(repository_id=repository.id, repository_url=repository.url)  # type: ignore[arg-type]
-    ref = portfolio.default_ref(repository.id)  # type: ignore[arg-type]
+    ref = (
+        portfolio.default_ref(repository.id)
+        if as_of is None
+        else portfolio.default_ref(repository.id, as_of)
+    )  # type: ignore[arg-type]
     if ref is None:
         return found.model_copy(update={"unmeasured": "no observed default-branch head"})
+    found = found.model_copy(update={"repository_ref_id": ref.id})
     try:
-        languages = code_facts.language_stats(ref.id).languages  # type: ignore[arg-type]
+        languages = (
+            code_facts.language_stats(ref.id)
+            if as_of is None
+            else code_facts.language_stats(ref.id, as_of=as_of)
+        ).languages  # type: ignore[arg-type]
     except (NotFoundError, ValidationError) as e:
         return found.model_copy(update={"unmeasured": str(e)})
     code = [lang for lang in languages if lang.name not in _DOC_LANGUAGES]
@@ -3171,7 +3242,7 @@ class ExecutiveSummaryView:
         hardening = [v for found in views.values() for v in found if _is(v, _HARDENING)]
         by_language: defaultdict[str, list[UUID]] = defaultdict(list)
         for r in repositories:
-            primary = _measured(self._code_facts, self._portfolio, r).primary
+            primary = _measured(self._code_facts, self._portfolio, r, filter.as_of).primary
             by_language[primary or "unknown"].append(r.id)  # type: ignore[arg-type]
         profiles = self._assessment.privileges(AssessmentFilter(), list(urls), filter.as_of)
         fleet = not (filter.product_ids or filter.team_ids)

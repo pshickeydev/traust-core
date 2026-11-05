@@ -1139,7 +1139,6 @@ class VerificationService:
             if named is None or named.id != repository_id:
                 raise ValidationError(f"{meta.repository} is not the findings' repository")
             ref = self._inventory.find_ref(repository_id, meta.patched_commit, meta.patched_ref)
-            baseline = self._audit_of(list(verdicts), meta.original_commit)
         recorded = self._log.find_recorded(
             [ref.id],  # type: ignore[list-item]
             VERIFICATION,
@@ -1154,6 +1153,7 @@ class VerificationService:
                     f"{assessment.run_order_id}, not {run_order_id}"
                 )
         else:
+            baseline = self._audit_of(list(verdicts), meta.original_commit, ref)
             published = (provenance.artifact or self._publisher.publish_ref(doc)).id
             assessment, report = self._log.add(
                 Assessment(
@@ -1202,19 +1202,31 @@ class VerificationService:
         )
         return verification
 
-    def _audit_of(self, finding_ids: Sequence[UUID], original_commit: str) -> UUID | None:
-        """The latest run that reported these findings on the verified commit: the baseline whose
-        line the verdicts resolve. None when no run of that commit is recorded."""
+    def _audit_of(
+        self, finding_ids: Sequence[UUID], original_commit: str, patched: RepositoryRef
+    ) -> UUID | None:
+        """The original audit on the verified line, never another line at the same SHA."""
         runs = self._log.list_by_ids(
             {o.assessment_id for o in self._findings.occurrences(finding_ids=finding_ids)}
         )
-        shas = {
-            r.id: r.sha
-            for r in self._inventory.list_refs_by_ids({a.repository_ref_id for a in runs})
+        refs = {
+            r.id: r for r in self._inventory.list_refs_by_ids({a.repository_ref_id for a in runs})
         }
-        audits = [a for a in runs if shas[a.repository_ref_id] == original_commit]
+        audits = [
+            a
+            for a in runs
+            if refs[a.repository_ref_id].sha == original_commit
+            and (
+                a.repository_ref_id == patched.id
+                or (patched.name is not None and refs[a.repository_ref_id].name == patched.name)
+            )
+        ]
         if not audits:
-            log.warning("no recorded run of %s reported the verified findings", original_commit)
+            log.warning(
+                "no recorded run of %s on line %s reported the verified findings",
+                original_commit,
+                patched.name,
+            )
             return None
         return max(audits, key=lambda a: a.occurred_at).id
 

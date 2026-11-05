@@ -418,16 +418,50 @@ AssessmentArtifact = (
 )
 PqcArtifact = PqcFactsArtifact | PqcReadinessArtifact | PqcDecisionTreeArtifact
 
-ANALYSIS_ARTIFACTS: tuple[type[ArtifactDocument], ...] = (
+ARTIFACT_TYPES: tuple[type[ArtifactDocument], ...] = (
+    ReportArtifact,
     SecurityAuditArtifact,
     FindingsCurrentArtifact,
     FindingsLayerArtifact,
     TriageArtifact,
     ThreatModelArtifact,
     ValidationArtifact,
+    ValidationPlanArtifact,
+    ValidationAuthorizationArtifact,
     VerificationArtifact,
     CloudConfigAuditArtifact,
     PrivProfileArtifact,
+    AdapterResultArtifact,
     RepoStateArtifact,
+    CodeFactsArtifact,
+    ManifestCoverageArtifact,
+    RunManifestArtifact,
+    IsolationReviewArtifact,
+    VulnFindingsArtifact,
+    ImpactAnalysisArtifact,
+    FuzzReportArtifact,
+    PqcFactsArtifact,
+    PqcReadinessArtifact,
+    PqcBlockersArtifact,
+    PqcVendorClaimsArtifact,
+    PqcDecisionTreeArtifact,
+    RemediationArtifact,
+    FleetFixArtifact,
+    ComplianceScopeArtifact,
+    ComplianceMappingArtifact,
+    CorpusRegistryArtifact,
+    ComplianceAssessmentArtifact,
+    DocVarianceArtifact,
+    AdrRegistryArtifact,
+    OrgParametersArtifact,
+    SlaPolicyArtifact,
+    ProductDefinitionsMapArtifact,
+    BenchmarkTargetArtifact,
+    BelowRangePacketsArtifact,
+    BelowRangeVerdictsArtifact,
+    SessionTask,
+    SessionResult,
 )
+ANALYSIS_ARTIFACTS = tuple(artifact for artifact in ARTIFACT_TYPES if artifact.kind is not None)
+ARTIFACT_FOR_SCHEMA = {artifact.schema: artifact.schema_type() for artifact in ARTIFACT_TYPES}
 ARTIFACT_FOR_KIND = {a.kind: a for a in ANALYSIS_ARTIFACTS if a.kind is not None}

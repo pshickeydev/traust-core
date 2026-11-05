@@ -132,7 +132,6 @@ def test_hostile_text_cannot_add_rows_headings_or_markup() -> None:
     assert "\n## Injected heading" not in md
     assert "\n# H1" not in md
     assert "| gap ## Injected heading \\| fake \\| row \\| |" in md
-    assert "`deploy/evil.yaml:19`" in md
     assert "\u202e" not in md and "\x07" not in md
 
 

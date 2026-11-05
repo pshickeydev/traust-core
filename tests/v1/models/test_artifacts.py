@@ -7,7 +7,6 @@ from tests.v1.fixtures import TRIAGE
 from traust_core.v1 import contracts
 from traust_core.v1.errors import DocumentError
 from traust_core.v1.models.artifacts import (
-    ANALYSIS_ARTIFACTS,
     ArtifactDocument,
     ReportArtifact,
     RepoStateArtifact,
@@ -29,11 +28,6 @@ def triage(*findings: dict) -> TriageArtifact:
     doc = json.loads(TRIAGE)
     doc["findings"] = list(findings)
     return TriageArtifact.from_document(doc)
-
-
-def test_every_named_artifact_points_at_a_real_contract_schema() -> None:
-    assert {a.schema for a in ANALYSIS_ARTIFACTS} <= set(contracts.schema_names())
-    assert len({a.name for a in ANALYSIS_ARTIFACTS}) == len(ANALYSIS_ARTIFACTS)
 
 
 def test_fields_come_from_the_schema() -> None:

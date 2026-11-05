@@ -88,7 +88,9 @@ class World:
     """A repository on its default branch, confirmed findings on that commit, and the patched
     commit on the fix branch."""
 
-    def __init__(self, engine: Engine, findings: int = 1, **finding: Any) -> None:
+    def __init__(
+        self, engine: Engine, findings: int = 1, patched_name: str | None = BRANCH, **finding: Any
+    ) -> None:
         with SqlTraustUnitOfWork(engine) as uow:
             seed = Seed(uow)
             self.repo: Repository = seed.repository(
@@ -97,7 +99,10 @@ class World:
             self.base: RepositoryRef = seed.repository_ref(self.repo, sha=BASE_SHA, is_default=True)
             seed.assessment(self.base, kind="repo-state", occurred_at=WHEN - timedelta(days=1))
             self.patched: RepositoryRef = seed.repository_ref(
-                self.repo, name=BRANCH, sha=PATCHED_SHA
+                self.repo,
+                name=patched_name,
+                kind="branch" if patched_name is not None else None,
+                sha=PATCHED_SHA,
             )
             self.findings: list[Finding] = [
                 seed.finding(self.repo, **finding) for _ in range(findings)
@@ -122,6 +127,10 @@ def report(
 ) -> VerificationArtifact:
     raw = json.loads(json.dumps(REPORT))
     raw["metadata"]["repository"] = world.repo.url
+    if world.patched.name is None:
+        del raw["metadata"]["patched_ref"]
+    else:
+        raw["metadata"]["patched_ref"] = world.patched.name
     template = raw["verified_findings"][0]
     verdicts = verdicts or dict.fromkeys(world.ids, "resolved")
     raw["verified_findings"] = []
@@ -178,7 +187,7 @@ def test_record_states_each_verdict_and_takes_the_regressions(
     context: Context,
     engine: Engine,
 ) -> None:
-    world = World(engine)
+    world = World(engine, patched_name="main")
     audited(engine, world, world.base)
     item = opened(remediation, world)
     got = service.record(report(world), provenance())
@@ -291,7 +300,7 @@ def test_each_verdict_maps_to_its_resolution(
     validity: str | None,
     is_open: bool,
 ) -> None:
-    world = World(engine)
+    world = World(engine, patched_name="main")
     audited(engine, world, world.base)
     doc = report(world, {world.ids[0]: verdict})
     if cross:
@@ -760,7 +769,7 @@ def test_a_merged_fix_is_a_claim_until_a_verification_resolves_it(
     context: Context,
     engine: Engine,
 ) -> None:
-    world = World(engine)
+    world = World(engine, patched_name="main")
     audited(engine, world, world.base)
     item = opened(remediation, world)
     remediation.record_progress(item.work_item_id, RemediationStatus("merged"))
@@ -781,7 +790,7 @@ def test_a_verified_fix_outranks_later_ungraded_progress(
     context: Context,
     engine: Engine,
 ) -> None:
-    world = World(engine)
+    world = World(engine, patched_name="main")
     audited(engine, world, world.base)
     item = opened(remediation, world)
     service.record(report(world, {world.ids[0]: "resolved"}), provenance())
@@ -794,13 +803,14 @@ def test_a_verified_fix_outranks_later_ungraded_progress(
 def test_a_verified_fix_resolves_the_audited_line_only(
     service: VerificationService, context: Context, engine: Engine
 ) -> None:
-    world = World(engine)
+    world = World(engine, patched_name="release-1")
     with SqlTraustUnitOfWork(engine) as uow:
         release = Seed(uow).repository_ref(world.repo, name="release-1", sha=BASE_SHA)
         uow.commit()
     audited(engine, world, release)
     got = service.record(report(world, {world.ids[0]: "resolved"}), provenance())
     assert got.repository_ref_id == world.patched.id
+    assert not context.services().findings.on_ref(world.patched.id)[0].is_open()
     assert context.services().findings.get(world.ids[0]).is_open()
 
 
@@ -923,6 +933,121 @@ def test_unfinished_verification_assessment_is_not_a_completed_result(
     assert service.list(VerificationFilter(repository_id=world.repo.id), PageRequest()).items == ()
     (entry,) = service.sweep([world.repo.id]).queued
     assert (entry.tier, entry.verified_at_head, entry.pinned_sha) == ("T3", False, BASE_SHA)
+
+
+def test_shared_sha_baseline_requires_the_verified_branch_and_does_not_break_replay(
+    service: VerificationService, context: Context, engine: Engine
+) -> None:
+    world = World(engine, patched_name="main")
+    audited(engine, world, world.base)
+    original = report(world, regressions=[], summary__regressions=0)
+    first = service.record(original, provenance())
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        release = seed.repository_ref(world.repo, name="release-1", sha=BASE_SHA)
+        patched = seed.repository_ref(world.repo, name="release-1", sha=PATCHED_SHA)
+        audit = seed.assessment(release, kind="secure-code", occurred_at=WHEN - timedelta(hours=1))
+        seed.occurrence(world.findings[0], audit)
+        uow.commit()
+    assert service.record(original, provenance()) == first
+    reopened = service.record(
+        report(world, {world.ids[0]: "unresolved"}, regressions=[], summary__regressions=0),
+        provenance(),
+    )
+    with SqlTraustUnitOfWork(engine) as uow:
+        assert (
+            uow.assessments.get(reopened.verification_id).baseline_assessment_id
+            == uow.assessments.get(first.verification_id).baseline_assessment_id
+        )
+    branch_report = report(
+        world, metadata__patched_ref="release-1", regressions=[], summary__regressions=0
+    )
+    result = service.record(branch_report, provenance())
+    assert result.repository_ref_id == patched.id
+    with SqlTraustUnitOfWork(engine) as uow:
+        stored = uow.assessments.get(result.verification_id)
+    assert stored.baseline_assessment_id == audit.id
+    assert not context.services().findings.on_ref(patched.id)[0].is_open()
+    assert context.services().findings.get(world.ids[0]).is_open()
+
+
+@pytest.mark.parametrize("audit_name", ["main", "release-1", None])
+def test_an_unaudited_line_never_borrows_another_original_audit(
+    service: VerificationService, context: Context, engine: Engine, audit_name: str | None
+) -> None:
+    world = World(engine)
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        audited_ref = (
+            world.base
+            if audit_name == "main"
+            else seed.repository_ref(
+                world.repo,
+                name=audit_name,
+                kind="branch" if audit_name else None,
+                sha=BASE_SHA,
+            )
+        )
+        original = seed.repository_ref(world.repo, name=BRANCH, sha=BASE_SHA)
+        uow.commit()
+    audited(engine, world, audited_ref)
+    doc = report(world, regressions=[], summary__regressions=0)
+    done = service.record(doc, provenance())
+    with SqlTraustUnitOfWork(engine) as uow:
+        assert uow.assessments.get(done.verification_id).baseline_assessment_id is None
+    assert done.repository_ref_id == world.patched.id
+    assert [(v.finding_id, v.verdict) for v in done.verdicts] == [(world.ids[0], "resolved")]
+    assert context.services().findings.on_ref(audited_ref.id)[0].is_open()
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        later = seed.assessment(original, kind="secure-code", occurred_at=WHEN)
+        seed.occurrence(world.findings[0], later)
+        uow.commit()
+    assert service.record(doc, provenance()) == done
+    with SqlTraustUnitOfWork(engine) as uow:
+        assert uow.assessments.get(done.verification_id).baseline_assessment_id is None
+    assert context.services().findings.on_ref(audited_ref.id)[0].is_open()
+
+
+def test_two_unnamed_refs_do_not_share_a_baseline_or_resolve_main(
+    service: VerificationService, context: Context, engine: Engine
+) -> None:
+    world = World(engine, patched_name=None)
+    with SqlTraustUnitOfWork(engine) as uow:
+        original = Seed(uow).repository_ref(world.repo, name=None, kind=None, sha=BASE_SHA)
+        uow.commit()
+    audited(engine, world, original)
+    audited(engine, world, world.patched)
+    findings = context.services().findings
+    assert findings.on_ref(world.base.id)[0].is_open()
+    done = service.record(report(world, regressions=[], summary__regressions=0), provenance())
+    with SqlTraustUnitOfWork(engine) as uow:
+        assert uow.assessments.get(done.verification_id).baseline_assessment_id is None
+    assert findings.on_ref(world.base.id)[0].is_open()
+    assert findings.get(world.ids[0]).is_open()
+    assert not findings.on_ref(world.patched.id)[0].is_open()
+
+
+def test_an_unnamed_ref_can_use_its_own_audit_as_a_baseline(
+    service: VerificationService, context: Context, engine: Engine
+) -> None:
+    world = World(engine, patched_name=None)
+    audited(engine, world, world.patched)
+    done = service.record(
+        report(
+            world,
+            metadata__original_commit=PATCHED_SHA,
+            regressions=[],
+            summary__regressions=0,
+        ),
+        provenance(),
+    )
+    with SqlTraustUnitOfWork(engine) as uow:
+        baseline = uow.assessments.get(done.verification_id).baseline_assessment_id
+        assert baseline is not None
+        assert uow.assessments.get(baseline).repository_ref_id == world.patched.id
+    assert context.services().findings.get(world.ids[0]).is_open()
+    assert not context.services().findings.on_ref(world.patched.id)[0].is_open()
 
 
 def test_sweep_markdown_renders_every_classified_entry_without_changing_state(

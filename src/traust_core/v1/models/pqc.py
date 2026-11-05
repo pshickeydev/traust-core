@@ -64,7 +64,7 @@ class PqcScan(Model):
     skipped_files: int | None = None
     rules_in_pack: int
     stamps: PqcStamps
-    cbom: bytes | None = None  # CycloneDX, as the scanner wrote it
+    cbom: bytes | None = None  # Native scanner CBOM bytes, preserved unchanged
 
 
 class PqcClock(Model):
