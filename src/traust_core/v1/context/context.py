@@ -732,8 +732,6 @@ class Context:
             apply_schema(engine, contracts.database_ddl(Dialect.of(engine)))
         else:
             _manifest_scan_pointer(engine, upgrade=local)
-            _remediation_tables(engine, upgrade=local)
-            _run_order_work_item(engine, upgrade=local)
         return engine
 
     @cached_property
@@ -1025,6 +1023,19 @@ class Context:
         sla_policies = ArtifactPublisher(
             PublishSpecs(PublishSpec(SlaPolicyArtifact)), self.object_store, uow
         )
+        verification = VerificationService(
+            uow,
+            findings,
+            remediation,
+            exposure,
+            assessment=assessment,
+            portfolio=portfolio,
+            clock=self.clock,
+            recording=ops,
+            publisher=ArtifactPublisher(
+                PublishSpecs(PublishSpec(VerificationArtifact)), self.object_store, uow
+            ),
+        )
         return Services(
             artifacts=ArtifactPublisher(PublishSpecs(), self.object_store, uow),
             redaction=RedactionPolicy(),
@@ -1076,19 +1087,9 @@ class Context:
             detection_quality=detection_quality,
             pqc=pqc,
             remediation=remediation,
-            remediation_scheduling=RemediationSchedulingService(uow, findings, remediation, ops),
-            verification=VerificationService(
-                uow,
-                findings,
-                remediation,
-                exposure,
-                assessment=assessment,
-                portfolio=portfolio,
-                clock=self.clock,
-                recording=ops,
-                publisher=ArtifactPublisher(
-                    PublishSpecs(PublishSpec(VerificationArtifact)), self.object_store, uow
-                ),
+            verification=verification,
+            remediation_scheduling=RemediationSchedulingService(
+                uow, findings, remediation, verification, ops
             ),
             insight=InsightService(
                 (
@@ -1185,63 +1186,6 @@ def _sla_policy(path: Path) -> SlaPolicy:
         return SlaPolicy.model_validate(document)
     except ValueError as e:
         raise ConfigError(f"SLA policy {path}: {e}") from e
-
-
-def _run_order_work_item(engine: Engine, *, upgrade: bool) -> None:
-    """contracts added `run_order.work_item_id`: a local store is upgraded; a configured
-    database's schema is its deployment's, so its absence is refused here rather than failing
-    the first order."""
-    dialect = Dialect.of(engine)
-    schema = "traust_ops" if dialect == Dialect.POSTGRES else None
-    table = "run_order" if dialect == Dialect.POSTGRES else "ops_run_order"
-
-    def present() -> bool | None:
-        inspector = sa.inspect(engine)
-        if not inspector.has_table(table, schema=schema):
-            return None
-        return any(c["name"] == "work_item_id" for c in inspector.get_columns(table, schema=schema))
-
-    if present() is not False:
-        return
-    if not upgrade:
-        raise ConfigError(
-            "the database's run_order predates work_item_id: apply "
-            "traust_core.v1.contracts.run_order_work_item_upgrade(dialect) to it"
-        )
-    try:
-        apply_schema(engine, contracts.run_order_work_item_upgrade(dialect))
-    except RepositoryError:
-        if not present():  # else another process opening the same store upgraded it first
-            raise
-
-
-def _remediation_tables(engine: Engine, *, upgrade: bool) -> None:
-    """contracts added `remediation` and `remediation_finding`: a local store gets them; a
-    configured database's schema is its deployment's, so their absence is refused here rather
-    than failing the first scheduling."""
-    dialect = Dialect.of(engine)
-    schema = "traust" if dialect == Dialect.POSTGRES else None
-
-    def present() -> bool | None:
-        inspector = sa.inspect(engine)
-        if not inspector.has_table("repository", schema=schema):
-            return None  # an empty database: the bootstrap creates every table
-        return inspector.has_table("remediation", schema=schema) and inspector.has_table(
-            "remediation_finding", schema=schema
-        )
-
-    if present() is not False:
-        return
-    if not upgrade:
-        raise ConfigError(
-            "the database predates the remediation scheduling tables: apply "
-            "traust_core.v1.contracts.remediation_tables_upgrade(dialect) to it"
-        )
-    try:
-        apply_schema(engine, contracts.remediation_tables_upgrade(dialect))
-    except RepositoryError:
-        if not present():  # else another process opening the same store upgraded it first
-            raise
 
 
 def _manifest_scan_pointer(engine: Engine, *, upgrade: bool) -> None:

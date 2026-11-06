@@ -172,6 +172,8 @@ class OrderRequest(Model):
     rule: str | None = None
     event_source: str | None = None
     work_item_id: UUID | None = None  # the remediation work item the order runs, if any
+    fork_url: str | None = None  # the mirror the effort runs on (remediate_finding only)
+    fork_branch: str | None = None  # its fix branch
 
 
 class DenyIssue(Model):
@@ -524,6 +526,8 @@ class RunOrder(Entity):
     started_at: datetime | None = None
     finished_at: datetime | None = None
     work_item_id: UUID | None = None  # the remediation work item the order runs, if any
+    fork_url: str | None = None  # the mirror the effort runs on (remediate_finding only)
+    fork_branch: str | None = None  # its fix branch
 
 
 FEED_ORDER_STATES = (*FINISHED_ORDER_STATES, OrderState.AWAITING_APPROVAL)

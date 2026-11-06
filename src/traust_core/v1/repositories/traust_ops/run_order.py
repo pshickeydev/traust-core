@@ -39,6 +39,8 @@ RUN_ORDER = TableSpec(
         timestamp_column("started_at", nullable=True),
         timestamp_column("finished_at", nullable=True),
         uuid_column("work_item_id", nullable=True),
+        text_column("fork_url", nullable=True),
+        text_column("fork_branch", nullable=True),
     ),
 )
 
@@ -65,6 +67,10 @@ class RunOrderRepository(MutableRecordRepository[RunOrder], Protocol):
     def list_for_repository(self, repository_id: UUID, state: OrderState) -> list[RunOrder]: ...
     def find_open(self, asset: str, repository_id: UUID | None) -> RunOrder | None:
         """An open order (planned through leased) for an asset and repository, if any."""
+        ...
+
+    def find_by_work_item(self, work_item_id: UUID) -> RunOrder | None:
+        """The order running a work item, if any (remediate_finding orders name theirs)."""
         ...
 
     def subjects(
@@ -199,6 +205,12 @@ class SqlRunOrderRepository(SqlMutableRepository[RunOrder]):
             self._select().where(c.asset == asset, c.state.in_(OPEN_ORDER_STATES), subject).limit(1)
         )
         row = self._execute(f"find open {asset} for {repository_id}", stmt).mappings().first()
+        return None if row is None else self._to_record(row)
+
+    def find_by_work_item(self, work_item_id: UUID) -> RunOrder | None:
+        c = self.table.c
+        stmt = self._select().where(c.work_item_id == work_item_id).limit(1)
+        row = self._execute(f"find order for work item {work_item_id}", stmt).mappings().first()
         return None if row is None else self._to_record(row)
 
     def search(
