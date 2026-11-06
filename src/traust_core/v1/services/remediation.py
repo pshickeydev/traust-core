@@ -1636,7 +1636,8 @@ class VerificationService:
         }
 
         def latest_so_far(
-            pairs: list[tuple[tuple[datetime, datetime], str]], moment: Any
+            pairs: list[tuple[tuple[datetime, datetime], str]],
+            moment: tuple[datetime, datetime],
         ) -> str | None:
             # the first verdict at the greatest order not past the moment: an equal-time tie
             # never turns on the verdict text (the max() _verified_on used)

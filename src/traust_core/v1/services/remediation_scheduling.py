@@ -17,7 +17,7 @@ from traust_core.v1.errors import ConflictError, NotFoundError, ValidationError
 from traust_core.v1.models.common import Page, PageRequest
 from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.inventory import RepositoryRef
-from traust_core.v1.models.operations import AssetName, OrderRequest, RunOrder
+from traust_core.v1.models.operations import AssetName, OrderRequest
 from traust_core.v1.models.remediation import OVER, WorkItem, furthest
 from traust_core.v1.models.remediation_scheduling import (
     RemediationFindingRequest,
@@ -146,15 +146,14 @@ class RemediationSchedulingService:
         order that runs it — or of its recorded report, once the order is gone."""
         item = self._remediation.get(work_item_id)
         order = self._ops.order_for_work_item(work_item_id)
-        fork_url, fork_branch = self._fork_facts(item, order)
-        if fork_url is None or fork_branch is None:
+        if order is None or order.fork_url is None or order.fork_branch is None:
             raise NotFoundError(f"work item {work_item_id} schedules no remediation")
         effort = ScheduledEffort(
             work_item=item,
-            fork_url=fork_url,
-            fork_branch=fork_branch,
+            fork_url=order.fork_url,
+            fork_branch=order.fork_branch,
             status=item.status,
-            order_id=None if order is None else order.id,
+            order_id=order.id,
         )
         if order is not None and order.repository_id is not None:
             effort = effort.model_copy(update={"status": self._status(effort, order.repository_id)})
@@ -210,16 +209,15 @@ class RemediationSchedulingService:
                 continue
             if (item := items.get(order.work_item_id)) is None:
                 continue
-            fork_url, fork_branch = self._fork_facts(item, order)
-            if fork_url is None or fork_branch is None:
+            if order.fork_url is None or order.fork_branch is None:
                 continue  # an order that names no fork runs no scheduled fix
             seen.add(order.work_item_id)
             made.append(
                 (
                     ScheduledEffort(
                         work_item=item,
-                        fork_url=fork_url,
-                        fork_branch=fork_branch,
+                        fork_url=order.fork_url,
+                        fork_branch=order.fork_branch,
                         status=item.status,
                         order_id=order.id,
                     ),
@@ -282,17 +280,6 @@ class RemediationSchedulingService:
             )
         return standing
 
-    def _fork_facts(self, item: WorkItem, order: RunOrder | None) -> tuple[str | None, str | None]:
-        """Where the effort's fix lives, for reading: the order's fork facts while it runs,
-        then the recorded report's (the durable record) once the order is gone. What makes an
-        effort scheduled is the order itself — `_live` never falls back."""
-        if order is not None and order.fork_url is not None and order.fork_branch is not None:
-            return order.fork_url, order.fork_branch
-        return (
-            None if item.fork is None else str(item.fork.url),
-            item.fix_branch,
-        )
-
     def _live(
         self, finding_ids: set[UUID], repository_id: UUID, fork_url: str, fork_branch: str
     ) -> ScheduledEffort | None:
@@ -311,7 +298,8 @@ class RemediationSchedulingService:
                 status=item.status,
                 order_id=order.id,
             )
-            if self._status(effort, repository_id) in OVER:
+            effective = self._status(effort, repository_id)
+            if effective in OVER:
                 continue
             if set(item.finding_ids) != finding_ids:
                 listed = ", ".join(sorted(map(str, set(item.finding_ids) & finding_ids)))
@@ -321,7 +309,7 @@ class RemediationSchedulingService:
                     f"work item {item.work_item_id} already schedules these findings on "
                     f"{order.fork_url} {order.fork_branch}"
                 )
-            return effort
+            return effort.model_copy(update={"status": effective})
         return None
 
     def _patch_ref(self, repository_id: UUID) -> RepositoryRef:
