@@ -62,7 +62,7 @@ export function setup() {
 
 // The dashboard's heaviest view family: an insight built on demand. Scoped to one product so
 // the read is request-shaped (the whole-portfolio cost is bounded by perf/queries, which sees
-// the statements); unscoped at fixture volume it is a ~75s build, not a gateable request.
+// the statements); unscoped at fixture volume the build runs to minutes, not a gateable request.
 export function readInsight(data) {
   const res = http.get(`${BASE}/v1/insights/findings-rollup?product_id=${data.product}`, READER);
   insightLatency.add(res.timings.duration);

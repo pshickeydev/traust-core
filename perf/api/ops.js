@@ -1,6 +1,7 @@
-// Ops REST API load: 50 runners claim/complete while readers page orders, the feed and the
-// dashboard's heaviest insight view. Run through perf/api/run.py (seeds Postgres, starts
-// traust-server, mints tokens, compares the result to perf/api/baseline.json).
+// Ops REST API load: runners claim/complete while readers page orders, the feed and one insight
+// view. Scenario weights live here alone (the README describes what, not how many). Run through
+// perf/api/run.py (seeds Postgres, starts traust-server, mints tokens, compares the result to
+// perf/api/baseline.json).
 import { claim, listOrders, readFeed, readInsight, setup, summary } from './lib.js';
 
 const DURATION = __ENV.DURATION || '20s';
