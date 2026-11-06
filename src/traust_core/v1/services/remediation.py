@@ -62,6 +62,7 @@ from traust_core.v1.models.operations import (
     OrderReason,
     OrderRequest,
     OrderState,
+    RecordKind,
     RunOrder,
     WorkerId,
 )
@@ -551,7 +552,7 @@ class RemediationService:
         with self._recording.recording(
             order_id=run_order_id,
             principal=principal,
-            kind="remediation",
+            kind=RecordKind.REMEDIATION,
             repository_id=repository.id,
             provenance=provenance,
         ) as order:
@@ -1221,7 +1222,7 @@ class VerificationService:
         with self._recording.recording(
             order_id=run_order_id,
             principal=principal,
-            kind="verification",
+            kind=RecordKind.VERIFICATION,
             repository_id=repository.id,
             provenance=provenance,
         ):

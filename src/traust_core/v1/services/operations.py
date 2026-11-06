@@ -52,6 +52,7 @@ from traust_core.v1.models.operations import (
     PreflightRequest,
     PreflightResult,
     RecordingStartScope,
+    RecordKind,
     Refusal,
     RescanEventSource,
     Route,
@@ -90,14 +91,14 @@ from traust_core.v1.services.provider_catalog import ProviderBinding, ProviderCa
 
 log = logging.getLogger(__name__)
 
-_RECORDING_SOURCES = {
-    "assessment": SourceType.VULN_SCAN_REPORT,
-    "triage": SourceType.TRIAGE_REPORT,
-    "validation": SourceType.VALIDATION_REPORT,
-    "verification": SourceType.VERIFICATION_REPORT,
+_RECORDING_SOURCES: Final[Mapping[RecordKind, SourceType]] = {
+    RecordKind.ASSESSMENT: SourceType.VULN_SCAN_REPORT,
+    RecordKind.TRIAGE: SourceType.TRIAGE_REPORT,
+    RecordKind.VALIDATION: SourceType.VALIDATION_REPORT,
+    RecordKind.VERIFICATION: SourceType.VERIFICATION_REPORT,
     # NEED(contracts: remediation source type): contracts' source-type has no remediation
     # value; the remediation report records under its triage source until one lands.
-    "remediation": SourceType.TRIAGE_REPORT,
+    RecordKind.REMEDIATION: SourceType.TRIAGE_REPORT,
 }
 
 # A stage may run only after its predecessor left a completed order for the subject. Stages
@@ -110,11 +111,11 @@ _RECORDING_SOURCES = {
 # required: the gate enforces what the config declares. Remediation's plan-level gate is a
 # disposition, which lives on the findings service behind OpsService (a wiring cycle), so a
 # finished triage order is its record until that door is reachable.
-_PRIOR_RECORD_KIND: Final[Mapping[str, str]] = {
-    "triage": "assessment",
-    "remediation": "triage",
-    "validation": "triage",
-    "verification": "remediation",
+_PRIOR_RECORD_KIND: Final[Mapping[RecordKind, RecordKind]] = {
+    RecordKind.TRIAGE: RecordKind.ASSESSMENT,
+    RecordKind.REMEDIATION: RecordKind.TRIAGE,
+    RecordKind.VALIDATION: RecordKind.TRIAGE,
+    RecordKind.VERIFICATION: RecordKind.REMEDIATION,
 }
 
 # Ordering counts a predecessor that actually ran. FINISHED_ORDER_STATES also covers refused,
@@ -177,7 +178,7 @@ class OpsService:
         *,
         degraded_keys: Callable[[], Collection[str]] = tuple,
         spend: SpendService | None = None,
-        recording_assets: Mapping[str, Collection[str]] | None = None,
+        recording_assets: Mapping[RecordKind | str, Collection[str]] | None = None,
         recording_starts: Sequence[RecordingStartScope] = (),
         inventory: Inventory | None = None,
         assessments: AssessmentLog | None = None,
@@ -188,8 +189,10 @@ class OpsService:
         self._config_manifests: dict[tuple[ConfigDigest, ...], UUID] = {}
         self._degraded_keys = degraded_keys
         self._spend = spend or SpendService(uow, clock, ())
+        # The context hands config sections as plain strings; an unknown kind is a typo in
+        # the wiring, refused here rather than silently ungating a stage.
         self._recording_assets = {
-            kind: frozenset(assets) for kind, assets in (recording_assets or {}).items()
+            RecordKind(kind): frozenset(assets) for kind, assets in (recording_assets or {}).items()
         }
         self._recording_starts = tuple(recording_starts)
         self._inventory = inventory
@@ -290,25 +293,7 @@ class OpsService:
             )
         issues: list[DenyIssue] = []
         if repository_id is not None:
-            if self._inventory is None:
-                raise ConfigError("subject checks need the inventory door")
-            try:
-                self._inventory.get_repository(repository_id)
-                if not self._inventory.has_default_ref(repository_id):
-                    # Registered (a row) is not onboarded (a default line imported): a
-                    # subject with no commits has nothing for a run to work on.
-                    issues.append(
-                        DenyIssue(
-                            code=DenyCode.SUBJECT_UNKNOWN,
-                            detail=f"repository {repository_id} has no imported default line",
-                        )
-                    )
-            except NotFoundError:
-                issues.append(
-                    DenyIssue(
-                        code=DenyCode.SUBJECT_UNKNOWN, detail=f"no repository {repository_id}"
-                    )
-                )
+            issues.extend(self._subject_issues(repository_id))
         issues.extend(self._ordering_issues(asset, repository_id))
         if lane is not None:
             verdict = self._spend.check_budget(lane, None)
@@ -326,6 +311,27 @@ class OpsService:
                     )
                 )
         return tuple(issues)
+
+    def _subject_issues(self, repository_id: UUID) -> tuple[DenyIssue, ...]:
+        """The subject gate, shared by every door that starts a run: the repository must be
+        registered and onboarded (an imported default line — registered alone is not a
+        subject, for preflight, submit and recording start alike)."""
+        if self._inventory is None:
+            raise ConfigError("subject checks need the inventory door")
+        try:
+            self._inventory.get_repository(repository_id)
+        except NotFoundError:
+            return (
+                DenyIssue(code=DenyCode.SUBJECT_UNKNOWN, detail=f"no repository {repository_id}"),
+            )
+        if not self._inventory.has_default_ref(repository_id):
+            return (
+                DenyIssue(
+                    code=DenyCode.SUBJECT_UNKNOWN,
+                    detail=f"repository {repository_id} has no imported default line",
+                ),
+            )
+        return ()
 
     def _may_request(
         self, asset: AssetName, repository_id: UUID | None, principal: Principal
@@ -345,15 +351,26 @@ class OpsService:
         its predecessor's completed order on the very subject. A subjectless order cannot show
         one, so it is refused rather than queued unverified."""
         kind = self._stage_of(asset)
+        if kind is None:
+            return
         prior = _PRIOR_RECORD_KIND.get(kind)
         if prior is None:
             return
         prior_assets = self._recording_assets.get(prior, frozenset())
-        if prior == "remediation":
+        if prior is RecordKind.REMEDIATION:
             # Verification follows remediation specifically: only the native scheduling
-            # asset unlocks it, never the triage allowlist's ordinary names.
-            prior_assets = prior_assets & {REMEDIATE_FINDING}
-        elif kind == "remediation":
+            # asset unlocks it, never the triage allowlist's ordinary names. A deployment
+            # that wires no remediation asset leaves that alias empty, so verification's
+            # prerequisite falls back to ordinary triage: a completed stage before it,
+            # never nothing (Qodo 392).
+            remediation = prior_assets & {REMEDIATE_FINDING}
+            prior_assets = (
+                remediation
+                if remediation
+                else self._recording_assets.get(RecordKind.TRIAGE, frozenset())
+                - {REMEDIATE_FINDING}
+            )
+        elif kind is RecordKind.REMEDIATION:
             # Remediation rides the triage allowlist; its predecessor is triage's work,
             # not another remediation order.
             prior_assets = prior_assets - {REMEDIATE_FINDING}
@@ -375,20 +392,24 @@ class OpsService:
                 detail=f"{asset} needs a completed {prior} order for the subject first",
             )
 
-    def _stage_of(self, asset: AssetName) -> str | None:
+    def _stage_of(self, asset: AssetName) -> RecordKind | None:
         """The one record kind an asset runs as, or None when ungated. The context copies the
         triage allowlist into a remediation key (contracts has no recording.remediation
         section yet), so that alias cannot disambiguate a name: REMEDIATE_FINDING is the only
         remediation asset, every other name resolves among the primary kinds, and an asset on
-        several of those is ambiguous — the config validator refuses such bindings."""
+        several of those is ambiguous. RecordingConfig refuses such bindings, so more than one
+        answer here means the service was wired outside the config: refuse the run rather
+        than guess its stage."""
         if asset == REMEDIATE_FINDING:
-            return "remediation"
+            return RecordKind.REMEDIATION
         kinds = [
-            k
+            RecordKind(k)
             for k, assets in self._recording_assets.items()
-            if k != "remediation" and asset in assets
+            if k != RecordKind.REMEDIATION and asset in assets
         ]
-        return kinds[0] if len(kinds) == 1 else None
+        if len(kinds) > 1:
+            raise ConfigError(f"asset {asset} is bound to several record kinds")
+        return kinds[0] if kinds else None
 
     def plan(
         self, request: OrderRequest, principal: Principal, config: Sequence[ConfigDigest] = ()
@@ -557,7 +578,10 @@ class OpsService:
             raise ForbiddenError("recording start is outside the machine's asset/repository scope")
         if self._inventory is None:
             raise ConfigError("recording start requires inventory reads (Context wires them)")
-        self._inventory.get_repository(request.repository_id)
+        if issues := (*self._subject_issues(request.repository_id),):
+            # The subject gate submit and preflight enforce; a recording start is a run, so
+            # a registered-but-never-imported repository cannot lease one either.
+            raise PolicyDenied(issues)
         if issues := tuple(self._ordering_issues(request.asset, request.repository_id)):
             # The same stage ordering submit and preflight enforce; a recording start is a run.
             raise PolicyDenied(issues)
@@ -601,7 +625,7 @@ class OpsService:
         self,
         order_id: UUID,
         principal: Principal,
-        kind: str,
+        kind: RecordKind,
         repository_id: UUID,
         provenance: Provenance,
     ) -> Iterator[RunOrder]:

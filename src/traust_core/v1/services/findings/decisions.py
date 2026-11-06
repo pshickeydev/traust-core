@@ -53,7 +53,7 @@ from traust_core.v1.models.findings import (
 from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.models.inventory import DEFAULT_FORGE_HOSTS
-from traust_core.v1.models.operations import REMEDIATE_FINDING
+from traust_core.v1.models.operations import REMEDIATE_FINDING, RecordKind
 from traust_core.v1.models.validation import (
     ValidationAttempt,
     ValidationFilter,
@@ -397,7 +397,7 @@ class FindingDecisions:
         triaged = self._log.get(assessment_id)
         repository_id = self._inventory.get_ref(triaged.repository_ref_id).repository_id
         with self._recording.recording(
-            run_order_id, principal, "triage", repository_id, provenance
+            run_order_id, principal, RecordKind.TRIAGE, repository_id, provenance
         ) as order:
             if order.asset == REMEDIATE_FINDING:
                 raise ForbiddenError(
@@ -735,7 +735,7 @@ class FindingDecisions:
             raise ForbiddenError("validation recording exceeds a single order's repository scope")
         (repository_id,) = repositories
         with self._recording.recording(
-            run_order_id, principal, "validation", repository_id, provenance
+            run_order_id, principal, RecordKind.VALIDATION, repository_id, provenance
         ):
             return self.record_validation(doc, provenance, bindings, run_order_id=run_order_id)
 

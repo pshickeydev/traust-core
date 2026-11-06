@@ -14,7 +14,7 @@ from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import T0
 from tests.v1.services.test_portfolio_sync import Forge, listed, url
 from traust_core.v1.errors import ValidationError
-from traust_core.v1.models.identity import Principal
+from traust_core.v1.models.identity import IdentitySource, Principal
 from traust_core.v1.models.inventory import OrgName, ProductSlug, RefName, TeamName
 from traust_core.v1.models.observation import ComparisonStatus
 from traust_core.v1.models.onboarding import (
@@ -23,18 +23,28 @@ from traust_core.v1.models.onboarding import (
     PlannedOrder,
     RepositorySpec,
 )
-from traust_core.v1.models.operations import AssetName, OrderState
+from traust_core.v1.models.operations import AssetName, OrderRequest, OrderState
 from traust_core.v1.models.vocabulary import ActorKind
 from traust_core.v1.providers.clock import FixedClock
-from traust_core.v1.providers.sources import SourceError
+from traust_core.v1.providers.sources import RepoInfo, SourceError
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.repositories.objects.store import InMemoryObjectStore
 from traust_core.v1.services.artifact_publishing import ArtifactPublisher, PublishSpecs
 from traust_core.v1.services.onboarding import OnboardingService
 from traust_core.v1.services.operations import OpsService
-from traust_core.v1.services.portfolio import PortfolioPolicy, PortfolioService, PortfolioSync
+from traust_core.v1.services.portfolio import (
+    Inventory,
+    PortfolioPolicy,
+    PortfolioService,
+    PortfolioSync,
+)
 
-OPERATOR = Principal(identity="operator@example.com", kind=ActorKind("human"), display="operator")
+OPERATOR = Principal(
+    identity="operator@example.com",
+    kind=ActorKind("human"),
+    display="operator",
+    verified_by=IdentitySource.OIDC,
+)
 AUDIT = AssetName("secure-code-audit")
 API, CLI, WEB = url("example-org/api"), url("example-org/cli"), url("example-org/web")
 
@@ -65,7 +75,12 @@ def onboarding(
     uow: SqlTraustUnitOfWork, portfolio: PortfolioService, forge: Forge
 ) -> OnboardingService:
     clock = FixedClock(T0)
-    ops = OpsService(uow, clock, ArtifactPublisher(PublishSpecs(), InMemoryObjectStore(), uow))
+    ops = OpsService(
+        uow,
+        clock,
+        ArtifactPublisher(PublishSpecs(), InMemoryObjectStore(), uow),
+        inventory=Inventory(uow),
+    )
     sync = PortfolioSync(portfolio, forge, clock=clock)  # type: ignore[arg-type]
     return OnboardingService(portfolio, sync, ops, clock=clock)
 
@@ -161,3 +176,22 @@ def test_onboarding_a_known_repository_shows_a_forge_refresh_it_couldnt_make(
     assert len(result.skipped) == 1 and "forge facts not refreshed" in result.skipped[0]
     assert f"onboarding repository {known.id}: forge facts not refreshed" in caplog.text
     assert str(API) not in caplog.text  # the log names the id, not the URL
+
+
+def test_an_onboarded_repository_is_a_subject_when_the_forge_names_a_default_branch(
+    onboarding: OnboardingService, uow: SqlTraustUnitOfWork, forge: Forge
+) -> None:
+    """The import records the default branch's line, so a run may be asked for right after
+    onboarding — no observation needed first (Qodo 392: subject gate after onboarding)."""
+    forge.described = RepoInfo(repo=API, default_branch="main", visibility="public")
+    result = onboarding.onboard(
+        request(label="Example", repositories=[{"url": API, "refs": ["main"]}]), OPERATOR
+    )
+    repository_id = result.repository_ids[0]
+    with uow:
+        ref = uow.repository_refs.default(repository_id)
+        assert ref is not None and (ref.name, ref.sha) == ("main", "c" * 40)
+    order = onboarding._ops.submit(
+        OrderRequest(asset=AUDIT, priority=0, repository_id=repository_id), OPERATOR
+    )
+    assert order.state is OrderState.QUEUED

@@ -23,6 +23,7 @@ from traust_core.v1.models.operations import (
     OrderFilter,
     OrderRequest,
     RecordingStartScope,
+    RecordKind,
     RunOrder,
     StartRecordingRequest,
 )
@@ -43,6 +44,7 @@ def engine(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[Engine]:
 def context(engine: Engine, tmp_path: Path) -> Context:
     with SqlTraustUnitOfWork(engine) as uow:
         repository = Seed(uow).repository()
+        Seed(uow).repository_ref(repository, is_default=True)
         uow.commit()
     assert repository.id is not None
     context = Context(
@@ -143,7 +145,7 @@ def test_verified_machine_starts_its_scoped_run_and_can_record(
         occurred_at=order.started_at,
     )
     with context.services().ops.recording(
-        order.id, principal(context), "verification", order.repository_id, provenance
+        order.id, principal(context), RecordKind.VERIFICATION, order.repository_id, provenance
     ):
         pass
     assert context.services().ops.get(order.id) == order
@@ -227,6 +229,8 @@ def test_start_requires_server_owned_identity_asset_and_repository_capabilities(
 def test_even_an_explicitly_granted_repository_must_exist(
     context: Context, client: TestClient
 ) -> None:
+    """A granted but missing repository is the same subject miss preflight and submit report:
+    subject_unknown, not a silent grant bypass."""
     missing = uuid4()
     scope = context.config.recording.start[0].model_copy(update={"repository_ids": (missing,)})
     context.config = context.config.model_copy(
@@ -236,7 +240,31 @@ def test_even_an_explicitly_granted_repository_must_exist(
     response = client.post(
         URL, json=request(context).model_dump(mode="json"), headers=runner(context)
     )
-    assert response.status_code == 404, response.text
+    assert response.status_code == 403, response.text
+    assert response.json()["code"] == "subject_unknown"
+    assert orders(context) == before
+
+
+def test_a_granted_repository_needs_an_imported_default_line(
+    context: Context, client: TestClient, engine: Engine
+) -> None:
+    """A machine scope cannot lease a run on a repository registered but never imported:
+    the subject gate preflight and submit enforce applies to recording start too."""
+    with SqlTraustUnitOfWork(engine) as uow:
+        bare = Seed(uow).repository(url="https://github.com/org/bare-1")
+        uow.commit()
+    assert bare.id is not None
+    scope = context.config.recording.start[0].model_copy(update={"repository_ids": (bare.id,)})
+    context.config = context.config.model_copy(
+        update={"recording": context.config.recording.model_copy(update={"start": (scope,)})}
+    )
+    before = orders(context)
+    response = client.post(
+        URL, json=request(context).model_dump(mode="json"), headers=runner(context)
+    )
+    assert response.status_code == 403, response.text
+    assert response.json()["code"] == "subject_unknown"
+    assert "no imported default line" in response.json()["detail"]
     assert orders(context) == before
 
 

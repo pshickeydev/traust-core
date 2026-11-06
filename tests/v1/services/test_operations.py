@@ -1165,6 +1165,49 @@ def test_verification_follows_remediation_not_ordinary_triage(engine: Engine) ->
     assert order.state == OrderState.QUEUED
 
 
+def test_verification_keeps_a_prerequisite_when_remediation_is_not_wired(engine: Engine) -> None:
+    """A deployment without remediation on its allowlist falls back to ordinary triage for
+    verification's prerequisite: a completed stage before it, never nothing (Qodo 392)."""
+    unwired = OpsService(
+        SqlTraustUnitOfWork(engine),
+        FixedClock(T0),
+        publisher(engine),
+        inventory=Inventory(SqlTraustUnitOfWork(engine)),
+        recording_assets={
+            "assessment": ("assessment",),
+            "triage": ("triage",),
+            "verification": ("verify",),
+        },
+    )
+    repo = subject(engine)
+    seeded(engine, asset="assessment", repository_id=repo, state="succeeded")
+    with pytest.raises(PolicyDenied) as denied:
+        unwired.submit(OrderRequest(asset="verify", priority=1, repository_id=repo), OPERATOR)
+    assert denied.value.deny_code == "ordering_violated"
+    seeded(engine, asset="triage", repository_id=repo, state="succeeded")
+    order = unwired.submit(OrderRequest(asset="verify", priority=1, repository_id=repo), OPERATOR)
+    assert order.state == OrderState.QUEUED
+
+
+def test_an_asset_bound_to_two_kinds_outside_the_config_is_a_config_error(engine: Engine) -> None:
+    """RecordingConfig refuses ambiguous bindings, so a service wired with the same asset on
+    two kinds was built outside the config: refuse the run rather than guess its stage
+    (Qodo 392) — the gate is never silently skipped."""
+    ambiguous = OpsService(
+        SqlTraustUnitOfWork(engine),
+        FixedClock(T0),
+        publisher(engine),
+        inventory=Inventory(SqlTraustUnitOfWork(engine)),
+        recording_assets={
+            "assessment": ("audit",),
+            "triage": ("audit", "triage"),
+        },
+    )
+    repo = subject(engine)
+    with pytest.raises(ConfigError, match="several record kinds"):
+        ambiguous.submit(OrderRequest(asset="audit", priority=1, repository_id=repo), OPERATOR)
+
+
 def test_a_registered_repository_without_an_imported_line_is_not_a_subject(engine: Engine) -> None:
     """Onboarding is an imported default line, not a registered row: a repository that was
     never imported has nothing for a run to work on, so the subject gate refuses it."""

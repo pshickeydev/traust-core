@@ -682,6 +682,28 @@ class PortfolioService:
             uow.commit()
             return ref
 
+    def mark_default_branch(
+        self, repository_id: UUID, sha: GitSha, branch: RefName
+    ) -> RepositoryRef:
+        """The default branch's commit, recorded as the repository's default line — the
+        subject a run works on, before any observation runs. The line is added when absent
+        and flagged when already imported: a named line is immutable once recorded, so the
+        default flag is what a new answer moves."""
+        with self._uow as uow:
+            ref = uow.repository_refs.get_or_add(
+                RepositoryRef(
+                    repository_id=repository_id,
+                    name=branch,
+                    kind=RefKind.BRANCH,
+                    is_default=True,
+                    sha=str(sha),
+                )
+            )
+            if not ref.is_default:
+                ref = uow.repository_refs.update(ref.model_copy(update={"is_default": True}))
+            uow.commit()
+            return ref
+
     def record_manifest_sbom(
         self, repository_ref_id: UUID, sbom_id: UUID, scan_id: UUID | None = None
     ) -> RepositoryRef:
@@ -1284,17 +1306,28 @@ class PortfolioSync:
         return report
 
     def _record_info(self, repository_id: UUID, info: RepoInfo) -> None:
-        """The forge's visibility and a fork's parent, normalized as an observation URL."""
+        """What an import learned from the forge: the visibility it reports (None: it didn't
+        say), a fork's parent, and the default branch's line — the observation's default ref
+        without needing a run, so an imported repository is a subject from the start."""
         public = _is_public(info.visibility)
         parent = _fork_parent_url(info.repo.host, info.fork, info.parent, self._hosts)
         self._portfolio.record_repo_info(repository_id, public, parent)
+        if info.default_branch is not None:
+            head = self._sources.head(info.repo, info.default_branch).data
+            self._portfolio.mark_default_branch(repository_id, head, RefName(info.default_branch))
 
     def import_branch(
         self, repository_id: UUID, url: HttpsRepoUrl, branch: RefName
     ) -> RepositoryRef:
-        """Register the commit a branch points at now."""
+        """Register the commit a branch points at now; the branch the forge calls default is
+        the repository's default line (a named line is immutable once recorded, so the head
+        just imported gets its flag)."""
         head = self._sources.head(url, branch).data
-        return self._portfolio.register_ref(repository_id, head, branch, RefKind.BRANCH)
+        ref = self._portfolio.register_ref(repository_id, head, branch, RefKind.BRANCH)
+        default = self._sources.info(url).data.default_branch
+        if default == branch:
+            self._portfolio.mark_default_branch(repository_id, head, branch)
+        return ref
 
     def owner_hints(self, url: HttpsRepoUrl) -> list[OwnerHint]:
         """Forge handles that may own a repository (OWNERS approvers, top contributors); hints

@@ -29,6 +29,21 @@ ProviderName = NewType("ProviderName", str)
 ModelName = NewType("ModelName", str)
 SkillName = NewType("SkillName", str)
 
+
+class RecordKind(StrEnum):
+    """The report kinds a recording order can run as. The stage gates resolve an asset's kind
+    from the recording config alone, so a kind outside this closed set cannot be wired and
+    a misspelling is a type error, not a silently skipped gate."""
+
+    ASSESSMENT = "assessment"
+    TRIAGE = "triage"
+    VALIDATION = "validation"
+    VERIFICATION = "verification"
+    # NEED(contracts: remediation recording section): contracts' recording config has no
+    # remediation key yet; the door shares the triage allowlist until one lands.
+    REMEDIATION = "remediation"
+
+
 # The native remediation-scheduling asset: contracts' recording config has no remediation
 # section yet, so its orders ride the triage allowlist and only this name tells them apart.
 REMEDIATE_FINDING = AssetName("remediate_finding")
