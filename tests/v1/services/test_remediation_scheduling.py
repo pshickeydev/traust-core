@@ -22,6 +22,7 @@ from tests.v1.services.test_verification import report as verification_report
 from traust_core.v1.context import Config, Context
 from traust_core.v1.context.config import ProcessConfig
 from traust_core.v1.errors import ConflictError, ForbiddenError, NotFoundError, ValidationError
+from traust_core.v1.models.common import PageRequest
 from traust_core.v1.models.identity import IdentitySource, Principal
 from traust_core.v1.models.operations import OrderState, RecordingStartScope
 from traust_core.v1.models.remediation_scheduling import Remediation, RemediationFindingRequest
@@ -91,6 +92,15 @@ def pairs(finding_ids: list[UUID], repository_ids: list[UUID]) -> list[Remediati
     ]
 
 
+def fork_of(engine: Engine, request: list[RemediationFindingRequest]) -> str:
+    """The repository's remediation fork under PRIVATE (ForkPolicy: the fork org's mirror)."""
+    if not request:  # refused before any fork is resolved
+        return "https://github.com/mirror-org/none"
+    with SqlTraustUnitOfWork(engine) as uow:
+        url = uow.repositories.get(request[0].repository_id).url
+    return f"https://github.com/mirror-org/{url.rsplit('/', 1)[-1]}"
+
+
 def row(engine: Engine, remediation_id: UUID | None) -> Any:
     assert remediation_id is not None
     with SqlTraustUnitOfWork(engine) as uow:
@@ -114,9 +124,14 @@ def test_create_schedules_the_row_the_findings_the_work_item_and_the_order(
     service: RemediationSchedulingService, context: Context, engine: Engine
 ) -> None:
     repository_id, finding_ids, repository_ids = seeded(engine, findings=2)
-    scheduled = service.create(FORK, BRANCH, pairs(finding_ids, repository_ids), PERSON)
+    scheduled = service.create(
+        fork_of(engine, pairs(finding_ids, repository_ids)),
+        BRANCH,
+        pairs(finding_ids, repository_ids),
+        PERSON,
+    )
     assert (scheduled.fork_url, scheduled.fork_branch, scheduled.status) == (
-        FORK,
+        fork_of(engine, pairs(finding_ids, repository_ids)),
         BRANCH,
         "candidate",
     )
@@ -142,10 +157,14 @@ def test_create_schedules_the_same_findings_once(
 ) -> None:
     repository_id, finding_ids, repository_ids = seeded(engine, findings=2)
     request = pairs(finding_ids, repository_ids)
-    first = service.create(FORK, BRANCH, request + request, PERSON)  # a retried pair is a no-op
-    assert service.create(FORK, BRANCH, list(reversed(request)), PERSON) == first
+    first = service.create(
+        fork_of(engine, request + request), BRANCH, request + request, PERSON
+    )  # a retried pair is a no-op
+    assert (
+        service.create(fork_of(engine, request), BRANCH, list(reversed(request)), PERSON) == first
+    )
     assert len(queued_orders(engine, repository_id)) == 1
-    assert service.list() == [first]
+    assert list(service.list(PageRequest()).items) == [first]
 
 
 def test_create_refuses_what_it_cannot_schedule(
@@ -171,7 +190,7 @@ def test_create_refuses_what_it_cannot_schedule(
             RemediationFindingRequest(finding_id=f, repository_id=r) for f, r in finding_pairs
         ]
         with pytest.raises(ValidationError, match=message):
-            service.create(FORK, BRANCH, request, PERSON)
+            service.create(fork_of(engine, request), BRANCH, request, PERSON)
     with pytest.raises(NotFoundError, match="finding"):
         service.create(
             FORK,
@@ -179,7 +198,7 @@ def test_create_refuses_what_it_cannot_schedule(
             [RemediationFindingRequest(finding_id=uuid4(), repository_id=repository_id)],
             PERSON,
         )
-    assert service.list() == []
+    assert list(service.list(PageRequest()).items) == []
 
 
 def test_create_refuses_a_fork_that_is_not_https_or_a_branch_git_would_reject(
@@ -188,7 +207,7 @@ def test_create_refuses_a_fork_that_is_not_https_or_a_branch_git_would_reject(
     _, finding_ids, repository_ids = seeded(engine)
     request = pairs(finding_ids, repository_ids)
     for fork in ("http://github.com/example-mirrors/example-service", "github.com/x/y", "https://"):
-        with pytest.raises(ValidationError, match="repo url"):
+        with pytest.raises(ValidationError, match="remediation fork"):
             service.create(fork, BRANCH, request, PERSON)
     for branch in (
         "",
@@ -217,8 +236,8 @@ def test_create_refuses_a_fork_that_is_not_https_or_a_branch_git_would_reject(
         "fix/x.lock/next",
     ):
         with pytest.raises(ValidationError, match="fork_branch"):
-            service.create(FORK, branch, request, PERSON)
-    assert service.list() == []
+            service.create(fork_of(engine, request), branch, request, PERSON)
+    assert list(service.list(PageRequest()).items) == []
 
 
 def test_create_needs_the_repositorys_default_line_to_patch(
@@ -233,11 +252,12 @@ def test_create_needs_the_repositorys_default_line_to_patch(
         )
         uow.commit()
         repository_id, finding_id = repo.id, finding.id
+    lone = [RemediationFindingRequest(finding_id=finding_id, repository_id=repository_id)]
     with pytest.raises(ValidationError, match="no single default ref"):
         service.create(
-            FORK,
+            fork_of(engine, lone),
             BRANCH,
-            [RemediationFindingRequest(finding_id=finding_id, repository_id=repository_id)],
+            lone,
             PERSON,
         )
 
@@ -250,15 +270,34 @@ def test_get_and_list_filter_the_scheduled_efforts(
 ) -> None:
     repository_id, finding_ids, repository_ids = seeded(engine, findings=2)
     other_repository, other_findings, other_repos = seeded(engine)
-    first = service.create(FORK, BRANCH, pairs(finding_ids[:1], repository_ids[:1]), PERSON)
-    second = service.create(FORK, BRANCH, pairs(finding_ids[1:], repository_ids[1:]), PERSON)
-    third = service.create(FORK, BRANCH, pairs(other_findings, other_repos), PERSON)
-    assert service.list() == [first, second, third]
-    assert service.list(repository_id=repository_id) == [first, second]
-    assert service.list(finding_id=finding_ids[0]) == [first]
-    assert service.list(repository_id=other_repository) == [third]
-    assert service.list(status=RemediationStatus("candidate")) == [first, second, third]
-    assert service.list(status=RemediationStatus("merged")) == []
+    first = service.create(
+        fork_of(engine, pairs(finding_ids[:1], repository_ids[:1])),
+        BRANCH,
+        pairs(finding_ids[:1], repository_ids[:1]),
+        PERSON,
+    )
+    second = service.create(
+        fork_of(engine, pairs(finding_ids[1:], repository_ids[1:])),
+        BRANCH,
+        pairs(finding_ids[1:], repository_ids[1:]),
+        PERSON,
+    )
+    third = service.create(
+        fork_of(engine, pairs(other_findings, other_repos)),
+        BRANCH,
+        pairs(other_findings, other_repos),
+        PERSON,
+    )
+    assert list(service.list(PageRequest()).items) == [first, second, third]
+    assert list(service.list(PageRequest(), repository_id=repository_id).items) == [first, second]
+    assert list(service.list(PageRequest(), finding_id=finding_ids[0]).items) == [first]
+    assert list(service.list(PageRequest(), repository_id=other_repository).items) == [third]
+    assert list(service.list(PageRequest(), status=RemediationStatus("candidate")).items) == [
+        first,
+        second,
+        third,
+    ]
+    assert service.list(PageRequest(), status=RemediationStatus("merged")).items == ()
     detail = service.get(second.id)
     assert detail.remediation == second
     assert [f.finding_id for f in detail.findings] == [finding_ids[1]]
@@ -273,7 +312,12 @@ def test_record_progress_moves_the_scheduled_row_with_the_work_item(
     service: RemediationSchedulingService, context: Context, engine: Engine
 ) -> None:
     _, finding_ids, repository_ids = seeded(engine)
-    scheduled = service.create(FORK, BRANCH, pairs(finding_ids, repository_ids), PERSON)
+    scheduled = service.create(
+        fork_of(engine, pairs(finding_ids, repository_ids)),
+        BRANCH,
+        pairs(finding_ids, repository_ids),
+        PERSON,
+    )
     remediation = context.services().remediation
     remediation.record_progress(scheduled.assessment_id, RemediationStatus("forked"))
     assert row(engine, scheduled.id).status == "forked"
@@ -287,7 +331,12 @@ def test_record_moves_the_scheduled_row_with_the_report(
     service: RemediationSchedulingService, context: Context, engine: Engine
 ) -> None:
     _, finding_ids, repository_ids = seeded(engine)
-    scheduled = service.create(FORK, BRANCH, pairs(finding_ids, repository_ids), PERSON)
+    scheduled = service.create(
+        fork_of(engine, pairs(finding_ids, repository_ids)),
+        BRANCH,
+        pairs(finding_ids, repository_ids),
+        PERSON,
+    )
     done = context.services().remediation.record(report(finding_ids), provenance())
     assert done.status == "checks_passed"
     assert row(engine, scheduled.id).status == "checks_passed"
@@ -301,7 +350,7 @@ def test_work_items_without_a_scheduled_effort_record_as_before(
     item = remediation.open(finding_ids, default_ref(engine, repository_id))
     remediation.record_progress(item.work_item_id, RemediationStatus("forked"))
     done = remediation.record(report(finding_ids), provenance())
-    assert (done.status, service.list()) == ("checks_passed", [])
+    assert (done.status, list(service.list(PageRequest()).items)) == ("checks_passed", [])
 
 
 def test_a_verification_revalidates_the_scheduled_row(
@@ -310,7 +359,13 @@ def test_a_verification_revalidates_the_scheduled_row(
     world = World(engine, patched_name="main")
     audited(engine, world, world.base)
     scheduled = service.create(
-        FORK, world.patched.name, pairs(world.ids, [world.repo.id] * len(world.ids)), PERSON
+        fork_of(engine, pairs(world.ids, [world.repo.id] * len(world.ids))),
+        world.patched.name,
+        pairs(world.ids, [world.repo.id] * len(world.ids)),
+        PERSON,
+    )
+    context.services().remediation.record(
+        report(world.ids, fork__fix_commit=world.patched.sha), provenance()
     )
     fixed = context.services().verification.record(
         verification_report(world), verification_provenance()
@@ -325,7 +380,13 @@ def test_a_verification_that_leaves_a_finding_open_marks_the_effort_still_vulner
     world = World(engine, findings=2, patched_name="main")
     audited(engine, world, world.base)
     scheduled = service.create(
-        FORK, world.patched.name, pairs(world.ids, [world.repo.id] * len(world.ids)), PERSON
+        fork_of(engine, pairs(world.ids, [world.repo.id] * len(world.ids))),
+        world.patched.name,
+        pairs(world.ids, [world.repo.id] * len(world.ids)),
+        PERSON,
+    )
+    context.services().remediation.record(
+        report(world.ids, fork__fix_commit=world.patched.sha), provenance()
     )
     got = context.services().verification.record(
         verification_report(world, {world.ids[0]: "resolved", world.ids[1]: "unresolved"}),
@@ -345,8 +406,13 @@ def test_only_a_verified_person_or_a_granted_machine_may_schedule(
     service = context.services().remediation_scheduling
     unverified = PERSON.model_copy(update={"verified_by": None})
     for who in (unverified, MACHINE):
-        with pytest.raises(ForbiddenError, match="may not ask for remediate_finding"):
-            service.create(FORK, BRANCH, pairs(finding_ids[:1], repository_ids[:1]), who)
+        with pytest.raises(ForbiddenError, match="not allowed to ask for remediate_finding"):
+            service.create(
+                fork_of(engine, pairs(finding_ids[:1], repository_ids[:1])),
+                BRANCH,
+                pairs(finding_ids[:1], repository_ids[:1]),
+                who,
+            )
     grant = RecordingStartScope(
         principal=MACHINE.ref, assets=(REMEDIATE_FINDING,), repository_ids=(repository_id,)
     )
@@ -354,7 +420,12 @@ def test_only_a_verified_person_or_a_granted_machine_may_schedule(
         update={"recording": context.config.recording.model_copy(update={"start": (grant,)})}
     )
     granted = context.services().remediation_scheduling
-    made = granted.create(FORK, BRANCH, pairs(finding_ids[1:2], repository_ids[1:2]), MACHINE)
+    made = granted.create(
+        fork_of(engine, pairs(finding_ids[1:2], repository_ids[1:2])),
+        BRANCH,
+        pairs(finding_ids[1:2], repository_ids[1:2]),
+        MACHINE,
+    )
     assert made.status == "candidate"
     other = RecordingStartScope(
         principal=MACHINE.ref, assets=(REMEDIATE_FINDING,), repository_ids=(uuid4(),)
@@ -364,7 +435,10 @@ def test_only_a_verified_person_or_a_granted_machine_may_schedule(
     )
     with pytest.raises(ForbiddenError):  # a grant for another repository is no grant here
         context.services().remediation_scheduling.create(
-            FORK, BRANCH, pairs(finding_ids[2:], repository_ids[2:]), MACHINE
+            fork_of(engine, pairs(finding_ids[2:], repository_ids[2:])),
+            BRANCH,
+            pairs(finding_ids[2:], repository_ids[2:]),
+            MACHINE,
         )
 
 
@@ -375,19 +449,34 @@ def test_prepare_hands_the_runner_the_scheduled_fork_and_branch(
     service: RemediationSchedulingService, context: Context, engine: Engine
 ) -> None:
     _, finding_ids, repository_ids = seeded(engine)
-    scheduled = service.create(FORK, BRANCH, pairs(finding_ids, repository_ids), PERSON)
+    scheduled = service.create(
+        fork_of(engine, pairs(finding_ids, repository_ids)),
+        BRANCH,
+        pairs(finding_ids, repository_ids),
+        PERSON,
+    )
     prepared = context.services().remediation.prepare(scheduled.assessment_id)
-    assert (str(prepared.fork.url), prepared.fix_branch) == (FORK, BRANCH)
+    expected = fork_of(engine, pairs(finding_ids, repository_ids))
+    assert (str(prepared.fork.url), prepared.fix_branch) == (expected, BRANCH)
 
 
-def test_a_fork_on_a_host_the_deployment_does_not_know_is_refused(
+def test_a_fork_other_than_the_repositorys_remediation_fork_is_refused(
     service: RemediationSchedulingService, engine: Engine
 ) -> None:
+    # never a public repository: the fork is the policy's (the fork org's private mirror),
+    # not whatever the caller names, the upstream itself included
     _, finding_ids, repository_ids = seeded(engine)
-    with pytest.raises(ValidationError, match="host not allowed"):
-        service.create(
-            "https://forge.example.net/org/repo", BRANCH, pairs(finding_ids, repository_ids), PERSON
-        )
+    request = pairs(finding_ids, repository_ids)
+    with SqlTraustUnitOfWork(engine) as uow:
+        upstream = uow.repositories.get(repository_ids[0]).url
+    for fork in (
+        upstream,
+        "https://github.com/someone-else/public-copy",
+        "https://forge.example.net/o/r",
+    ):
+        with pytest.raises(ValidationError, match="remediation fork"):
+            service.create(fork, BRANCH, request, PERSON)
+    assert list(service.list(PageRequest()).items) == []
 
 
 # scheduling the same findings again
@@ -397,12 +486,27 @@ def test_a_retry_after_a_report_returns_the_effort_and_an_overlap_conflicts(
     service: RemediationSchedulingService, context: Context, engine: Engine
 ) -> None:
     repository_id, finding_ids, repository_ids = seeded(engine, findings=2)
-    scheduled = service.create(FORK, BRANCH, pairs(finding_ids[:1], repository_ids[:1]), PERSON)
+    scheduled = service.create(
+        fork_of(engine, pairs(finding_ids[:1], repository_ids[:1])),
+        BRANCH,
+        pairs(finding_ids[:1], repository_ids[:1]),
+        PERSON,
+    )
     context.services().remediation.record(report(finding_ids[:1]), provenance())
-    again = service.create(FORK, BRANCH, pairs(finding_ids[:1], repository_ids[:1]), PERSON)
+    again = service.create(
+        fork_of(engine, pairs(finding_ids[:1], repository_ids[:1])),
+        BRANCH,
+        pairs(finding_ids[:1], repository_ids[:1]),
+        PERSON,
+    )
     assert again.id == scheduled.id and len(queued_orders(engine, repository_id)) == 1
     with pytest.raises(ConflictError, match="already covers"):
-        service.create(FORK, BRANCH, pairs(finding_ids, repository_ids), PERSON)
+        service.create(
+            fork_of(engine, pairs(finding_ids, repository_ids)),
+            BRANCH,
+            pairs(finding_ids, repository_ids),
+            PERSON,
+        )
 
 
 def test_a_second_request_waits_for_the_first_and_finds_its_effort(
@@ -414,7 +518,7 @@ def test_a_second_request_waits_for_the_first_and_finds_its_effort(
     request = pairs(finding_ids, repository_ids)
     done: list[object] = []
     gate = threading.Event()
-    original = RemediationSchedulingService._scheduled
+    original = RemediationSchedulingService._live
 
     def held(self: RemediationSchedulingService, *args: Any) -> Any:
         found = original(self, *args)
@@ -428,14 +532,20 @@ def test_a_second_request_waits_for_the_first_and_finds_its_effort(
         try:
             ctx = Context(Config(home=context.config.home, remediation=PRIVATE, process=GIT))
             ctx.__dict__["database"] = own
-            done.append(ctx.services().remediation_scheduling.create(FORK, BRANCH, request, PERSON))
+            done.append(
+                ctx.services().remediation_scheduling.create(
+                    fork_of(engine, request), BRANCH, request, PERSON
+                )
+            )
         finally:
             own.dispose()
 
     with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(RemediationSchedulingService, "_scheduled", held)
+        mp.setattr(RemediationSchedulingService, "_live", held)
         first = threading.Thread(
-            target=lambda: done.append(service.create(FORK, BRANCH, request, PERSON))
+            target=lambda: done.append(
+                service.create(fork_of(engine, request), BRANCH, request, PERSON)
+            )
         )
         first.start()
         gate.wait(timeout=10)
@@ -450,16 +560,22 @@ def test_a_second_request_waits_for_the_first_and_finds_its_effort(
 # revalidation is the verified effort's, every finding's, and the latest verdict's
 
 
-def test_a_verification_of_another_branch_leaves_the_effort(
+def test_a_verification_of_another_commit_leaves_the_effort(
     service: RemediationSchedulingService, context: Context, engine: Engine
 ) -> None:
     world = World(engine, patched_name="main")
     audited(engine, world, world.base)
     scheduled = service.create(
-        FORK, BRANCH, pairs(world.ids, [world.repo.id] * len(world.ids)), PERSON
+        fork_of(engine, pairs(world.ids, [world.repo.id] * len(world.ids))),
+        BRANCH,
+        pairs(world.ids, [world.repo.id] * len(world.ids)),
+        PERSON,
+    )
+    context.services().remediation.record(
+        report(world.ids, fork__fix_commit="0" * 40), provenance()
     )
     context.services().verification.record(verification_report(world), verification_provenance())
-    assert row(engine, scheduled.id).status == "candidate"
+    assert row(engine, scheduled.id).status == "checks_passed"  # not this fix's commit
 
 
 def test_a_verification_of_some_of_an_efforts_findings_leaves_it(
@@ -468,12 +584,18 @@ def test_a_verification_of_some_of_an_efforts_findings_leaves_it(
     world = World(engine, findings=2, patched_name="main")
     audited(engine, world, world.base)
     scheduled = service.create(
-        FORK, world.patched.name, pairs(world.ids, [world.repo.id] * len(world.ids)), PERSON
+        fork_of(engine, pairs(world.ids, [world.repo.id] * len(world.ids))),
+        world.patched.name,
+        pairs(world.ids, [world.repo.id] * len(world.ids)),
+        PERSON,
+    )
+    context.services().remediation.record(
+        report(world.ids, fork__fix_commit=world.patched.sha), provenance()
     )
     context.services().verification.record(
         verification_report(world, {world.ids[0]: "resolved"}), verification_provenance()
     )
-    assert row(engine, scheduled.id).status == "candidate"  # B unverified: not fixed yet
+    assert row(engine, scheduled.id).status == "checks_passed"  # B unverified: not fixed yet
 
 
 def test_the_latest_revalidation_replaces_the_one_before() -> None:
@@ -492,7 +614,19 @@ def test_list_applies_every_filter_given(
     service: RemediationSchedulingService, engine: Engine
 ) -> None:
     repository_id, finding_ids, repository_ids = seeded(engine, findings=2)
-    a = service.create(FORK, BRANCH, pairs(finding_ids[:1], repository_ids[:1]), PERSON)
-    service.create(FORK, BRANCH, pairs(finding_ids[1:], repository_ids[1:]), PERSON)
-    assert service.list(repository_id=repository_id, finding_id=finding_ids[0]) == [a]
-    assert service.list(repository_id=uuid4(), finding_id=finding_ids[0]) == []
+    a = service.create(
+        fork_of(engine, pairs(finding_ids[:1], repository_ids[:1])),
+        BRANCH,
+        pairs(finding_ids[:1], repository_ids[:1]),
+        PERSON,
+    )
+    service.create(
+        fork_of(engine, pairs(finding_ids[1:], repository_ids[1:])),
+        BRANCH,
+        pairs(finding_ids[1:], repository_ids[1:]),
+        PERSON,
+    )
+    assert list(
+        service.list(PageRequest(), repository_id=repository_id, finding_id=finding_ids[0]).items
+    ) == [a]
+    assert service.list(PageRequest(), repository_id=uuid4(), finding_id=finding_ids[0]).items == ()

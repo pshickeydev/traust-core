@@ -13,13 +13,15 @@ from tests.v1.rest.conftest import bearer, same_as_in_process
 from tests.v1.rest.ops.conftest import runner
 from tests.v1.rest.remediation.test_verification_records import body as record_body
 from tests.v1.rest.remediation.test_verification_records import leased
+from tests.v1.services.test_remediation import provenance as remediation_provenance
+from tests.v1.services.test_remediation import report as remediation_report
 from tests.v1.services.test_verification import World, audited, report
 from traust_core.v1.context import Context
+from traust_core.v1.models.common import PageRequest
 from traust_core.v1.models.operations import RecordingStartScope
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 
 URL = "/v1/remediations"
-FORK = "https://github.com/example-mirrors/example-service"
 BRANCH = "fix/1f0e8dad-e8d3-4c1e-9a1a-8b2f6b0d1b7c/title"
 
 
@@ -38,9 +40,14 @@ def seeded(engine: Engine, *, findings: int = 1) -> tuple[str, list[str]]:
         return str(repo.id), [str(f.id) for f in made]
 
 
-def schedule(repository_id: str, finding_ids: list[str], branch: str = BRANCH) -> dict[str, object]:
+def schedule(
+    engine: Engine, repository_id: str, finding_ids: list[str], branch: str = BRANCH
+) -> dict[str, object]:
+    """The request, on the repository's remediation fork (ForkPolicy: the fork org's mirror)."""
+    with SqlTraustUnitOfWork(engine) as uow:
+        url = uow.repositories.get(UUID(repository_id)).url
     return {
-        "fork_url": FORK,
+        "fork_url": f"https://github.com/mirror-org/{url.rsplit('/', 1)[-1]}",
         "fork_branch": branch,
         "findings": [{"finding_id": f, "repository_id": repository_id} for f in finding_ids],
     }
@@ -50,14 +57,18 @@ def test_the_door_schedules_and_the_reads_match_in_process(
     context: Context, client: TestClient, engine: Engine
 ) -> None:
     repository_id, finding_ids = seeded(engine, findings=2)
-    made = client.post(URL, json=schedule(repository_id, finding_ids), headers=bearer(context))
+    made = client.post(
+        URL, json=schedule(engine, repository_id, finding_ids), headers=bearer(context)
+    )
     assert made.status_code == 200, made.text
     service = context.services().remediation_scheduling
-    (scheduled,) = service.list()
+    (scheduled,) = service.list(PageRequest()).items
     assert made.json() == scheduled.model_dump(mode="json")
     listed = client.get(URL, headers=bearer(context))
     assert listed.status_code == 200
-    assert listed.json() == [r.model_dump(mode="json") for r in service.list()]
+    assert listed.json()["items"] == [
+        r.model_dump(mode="json") for r in service.list(PageRequest()).items
+    ]
     one = client.get(f"{URL}/{scheduled.id}", headers=bearer(context))
     same_as_in_process(one.json(), service.get(scheduled.id))
     filtered = client.get(
@@ -65,17 +76,18 @@ def test_the_door_schedules_and_the_reads_match_in_process(
         params={"repository_id": repository_id, "finding_id": finding_ids[0]},
         headers=bearer(context),
     )
-    assert [r["id"] for r in filtered.json()] == [str(scheduled.id)]
+    assert [r["id"] for r in filtered.json()["items"]] == [str(scheduled.id)]
     by_status = client.get(URL, params={"status": "candidate"}, headers=bearer(context))
-    assert [r["id"] for r in by_status.json()] == [str(scheduled.id)]
-    assert client.get(URL, params={"status": "merged"}, headers=bearer(context)).json() == []
+    assert [r["id"] for r in by_status.json()["items"]] == [str(scheduled.id)]
+    merged = client.get(URL, params={"status": "merged"}, headers=bearer(context))
+    assert merged.json()["items"] == []
 
 
 def test_the_door_needs_a_token_and_a_body_it_can_schedule(
     context: Context, client: TestClient, engine: Engine
 ) -> None:
     repository_id, finding_ids = seeded(engine)
-    body = schedule(repository_id, finding_ids)
+    body = schedule(engine, repository_id, finding_ids)
     assert client.post(URL, json=body).status_code == 401
     assert client.get(URL).status_code == 401
     bad_forks = [
@@ -87,18 +99,18 @@ def test_the_door_needs_a_token_and_a_body_it_can_schedule(
         response = client.post(URL, json=invalid, headers=bearer(context))
         assert response.status_code == 422, invalid
     missing = client.post(
-        URL, json=schedule(repository_id, [str(uuid4())]), headers=bearer(context)
+        URL, json=schedule(engine, repository_id, [str(uuid4())]), headers=bearer(context)
     )
     assert missing.status_code == 404
     assert client.get(f"{URL}/{uuid4()}", headers=bearer(context)).status_code == 404
-    assert context.services().remediation_scheduling.list() == []
+    assert context.services().remediation_scheduling.list(PageRequest()).items == ()
 
 
 def test_a_machine_identity_may_schedule(
     context: Context, client: TestClient, engine: Engine
 ) -> None:
     repository_id, finding_ids = seeded(engine, findings=2)
-    first = schedule(repository_id, finding_ids[:1])
+    first = schedule(engine, repository_id, finding_ids[:1])
     refused = client.post(URL, json=first, headers=runner(context))
     assert refused.status_code == 403, refused.text  # no recording.start grant: no scheduling
     grant = RecordingStartScope(
@@ -109,7 +121,9 @@ def test_a_machine_identity_may_schedule(
     context.config = context.config.model_copy(
         update={"recording": context.config.recording.model_copy(update={"start": (grant,)})}
     )
-    made = client.post(URL, json=schedule(repository_id, finding_ids[1:]), headers=runner(context))
+    made = client.post(
+        URL, json=schedule(engine, repository_id, finding_ids[1:]), headers=runner(context)
+    )
     assert made.status_code == 200, made.text
     assert made.json()["status"] == "candidate"
 
@@ -122,11 +136,16 @@ def test_a_verification_recorded_through_the_door_revalidates_the_effort(
     assert world.repo.id is not None
     made = client.post(
         URL,
-        json=schedule(str(world.repo.id), [str(f) for f in world.ids], branch=world.patched.name),
+        json=schedule(
+            engine, str(world.repo.id), [str(f) for f in world.ids], branch=world.patched.name
+        ),
         headers=bearer(context),
     )
     assert made.status_code == 200, made.text
     remediation_id = made.json()["id"]
+    context.services().remediation.record(
+        remediation_report(world.ids, fork__fix_commit=world.patched.sha), remediation_provenance()
+    )
     order = leased(context, world)
     recorded = client.post(
         "/v1/verification-records",

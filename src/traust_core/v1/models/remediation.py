@@ -309,6 +309,7 @@ class WorkItem(Model):
     evidence: tuple[EvidenceItem, ...] = ()
     report: ArtifactRef | None = None
     fix_branch: str | None = None
+    fix_commit: str | None = None  # the remediation report's fork.fix_commit
 
     def advance(self, status: RemediationStatus) -> WorkItem:
         """The item at `status`: forward only, nothing after merged or abandoned."""

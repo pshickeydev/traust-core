@@ -1064,9 +1064,7 @@ class Context:
             ),
             pqc=pqc,
             remediation=remediation,
-            remediation_scheduling=RemediationSchedulingService(
-                uow, findings, remediation, ops, hosts
-            ),
+            remediation_scheduling=RemediationSchedulingService(uow, findings, remediation, ops),
             verification=VerificationService(
                 uow,
                 findings,

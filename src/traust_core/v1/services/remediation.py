@@ -304,16 +304,9 @@ class RemediationService:
         item = self.get(work_item_id)
         subject = self._inventory.subject(item.repository_ref_id, work_item_id)
         views = self._findings.list_by_ids(item.finding_ids)
-        with self._uow as uow:
-            scheduled = uow.remediations.find_by_assessment(work_item_id)
-        # a scheduled effort names where its fix lives (SCI's chosen target, the console's);
-        # its host is a configured forge (checked at scheduling) and `record` still refuses a
-        # public fork
-        fork = (
-            self._forks.of(_url(scheduled.fork_url), ForkVisibility.PRIVATE)
-            if scheduled is not None
-            else item.fork or self.resolve_fork(subject.repository_id)
-        )
+        # a scheduled effort's fork is the policy's (checked at scheduling); its branch is the
+        # one the scheduler named
+        scheduled = self._findings.scheduled.find_by_work_item(work_item_id)
         return RemediationInput(
             subject=subject,
             findings=FindingContext(),
@@ -329,7 +322,7 @@ class RemediationService:
                 )
                 for v in views
             ),
-            fork=fork,
+            fork=item.fork or self.resolve_fork(subject.repository_id),
             fix_branch=scheduled.fork_branch
             if scheduled is not None
             else self._forks.fix_branch(views[0].finding.id, views[0].finding.title),  # type: ignore[arg-type]
@@ -501,7 +494,7 @@ class RemediationService:
             self._findings.decisions.record_resolution(
                 work_item_id, item.finding_ids, resolution_for(status), status
             )
-            _sync_scheduled(uow, work_item_id, status)
+            self._findings.scheduled.follow(work_item_id, status)
             uow.commit()
         self._uow.after_commit(
             lambda: log.info("work item %s: %s -> %s", work_item_id, item.status, status)
@@ -544,7 +537,7 @@ class RemediationService:
                     self._findings.decisions.record_resolution(
                         item.work_item_id, wanted, resolution_for(status), status, item.report.id
                     )
-                    _sync_scheduled(uow, item.work_item_id, status)
+                    self._findings.scheduled.follow(item.work_item_id, status)
                     uow.commit()
             return self.get(item.work_item_id)
         item.advance(status)
@@ -559,7 +552,7 @@ class RemediationService:
             self._findings.decisions.record_resolution(
                 item.work_item_id, wanted, resolution_for(status), status, report.id
             )
-            _sync_scheduled(uow, item.work_item_id, status)
+            self._findings.scheduled.follow(item.work_item_id, status)
             uow.commit()
         self._uow.after_commit(
             lambda: log.info("work item %s: report %s, %s", item.work_item_id, report.id, status)
@@ -889,6 +882,7 @@ class RemediationService:
                 ),
                 "report": ArtifactRef(id=report.id, name=doc.name, digest=report.digest),
                 "fix_branch": doc.fork.fix_branch,
+                "fix_commit": doc.fork.fix_commit,
             }
         )
 
@@ -948,14 +942,6 @@ def _finding_id(ref: str) -> UUID:
         return UUID(ref)
     except ValueError:
         raise ValidationError(f"finding_ref {ref!r} is not a finding id from prepare") from None
-
-
-def _sync_scheduled(uow: TraustUnitOfWork, assessment_id: UUID, status: RemediationStatus) -> None:
-    """The remediation row linked to a work item follows it, never stepping back; on the
-    caller's transaction, so the row and the decision land or roll back together."""
-    linked = uow.remediations.find_by_assessment_for_update(assessment_id)
-    if linked is not None and (moved := linked.moved_on(status)) is not None:
-        uow.remediations.update(moved)
 
 
 VERIFICATION = AssessmentKind.VERIFICATION
@@ -1148,9 +1134,10 @@ class VerificationService:
         run_order_id: UUID | None = None,
     ) -> Verification:
         """A verification report (`original_id` = finding id from prepare) as a `verification`
-        assessment of the patched commit: its verdicts as decisions, its regressions as findings,
-        one transaction (a run that stops part-way leaves nothing behind). Re-recording changes
-        nothing; a remediation scheduled on the verified findings is revalidated with them."""
+        assessment of the patched commit: its verdicts as decisions, its regressions as findings.
+        The verdicts and the revalidation of the remediations scheduled on them are one
+        transaction; the assessment, report and regressions recorded before them stay if that
+        fails, and re-recording finishes the run. Re-recording a finished run changes nothing."""
         if warnings := check_verification(doc):
             log.warning("verification report has %d warnings", len(warnings))
         meta = doc.metadata
@@ -1223,7 +1210,7 @@ class VerificationService:
                     rationales=rationales,
                     evidence_grade=VERIFIED_GRADE,
                 )
-            self._revalidate(uow, verdicts, meta.patched_ref)
+            self._revalidate({f: v.verdict for f, v in verdicts.items()}, meta.patched_commit)
             uow.commit()
         if not recorded:
             self._uow.after_commit(
@@ -1236,32 +1223,28 @@ class VerificationService:
         )
         return verification
 
-    def _revalidate(
-        self, uow: TraustUnitOfWork, verdicts: Mapping[UUID, Any], patched_ref: str | None
-    ) -> None:
+    def _revalidate(self, verdicts: Mapping[UUID, str], patched_commit: str) -> None:
         """The scheduled efforts this report verified move to their revalidated status, on the
-        verdicts' own transaction. An effort is this report's when its fix branch is the ref
-        verified (a report on the same finding elsewhere says nothing about this fix). It is
-        fixed only when every finding it covers is verified fixed; still vulnerable when any
-        verified one isn't; left as is while some it covers are unverified and the rest fixed."""
-        if patched_ref is None:
-            return
-        linked = {r.remediation_id for r in uow.remediation_findings.list_for_findings(verdicts)}
-        for remediation_id in sorted(linked, key=str):
-            effort = uow.remediations.get_for_update(remediation_id)
-            if effort.fork_branch != patched_ref:
+        verdicts' own transaction. An effort is this report's when the commit verified is its
+        work item's recorded fix commit (a report on the same finding at another commit, on the
+        upstream or another fork, says nothing about this fix). It is fixed only when every
+        finding it covers is verified fixed; still vulnerable when any verified one isn't; left
+        as is while some it covers are unverified and the rest fixed."""
+        for effort, covers in self._findings.scheduled.efforts_covering(verdicts):
+            assert effort.id is not None
+            if effort.assessment_id is None:
                 continue
-            rows = uow.remediation_findings.list_for_remediation(remediation_id)
-            covered = [r.finding_id for r in rows]
-            said = [verdicts[f].verdict in FIXED_VERDICTS for f in covered if f in verdicts]
+            fixed_at = self._remediation.get(effort.assessment_id).fix_commit
+            if fixed_at is None or not patched_commit.startswith(fixed_at):
+                continue
+            said = [verdicts[f] in FIXED_VERDICTS for f in covers if f in verdicts]
             if not all(said):
                 status = RemediationStatus("revalidated_still_vulnerable")
-            elif len(said) == len(covered):
+            elif len(said) == len(covers):
                 status = RemediationStatus("revalidated_fixed")
             else:
                 continue
-            if (moved := effort.moved_on(status)) is not None:
-                uow.remediations.update(moved)
+            self._findings.scheduled.move(effort.id, status)
 
     def _audit_of(
         self, finding_ids: Sequence[UUID], original_commit: str, patched: RepositoryRef

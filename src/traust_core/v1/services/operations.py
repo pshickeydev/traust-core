@@ -344,8 +344,8 @@ class OpsService:
             and self._in_start_scope(principal, asset, repository_id)
         ):
             raise ForbiddenError(
-                f"{principal.ref} may not ask for {asset} on repository {repository_id}: a "
-                "verified person, or a machine granted it in recording.start, may"
+                f"not allowed to ask for {asset} on repository {repository_id}: a verified "
+                "person, or a machine granted it in recording.start, may"
             )
 
     def _in_start_scope(self, principal: Principal, asset: AssetName, repository_id: UUID) -> bool:
