@@ -215,7 +215,9 @@ def view_schema(name: str) -> dict[str, JsonValue]:
 
 @cache
 def _view_validator(name: str) -> Draft202012Validator:
-    return Draft202012Validator(view_schema(name), format_checker=FormatChecker())
+    return Draft202012Validator(
+        view_schema(name), registry=_registry(), format_checker=FormatChecker()
+    )
 
 
 def validate_view(name: str, document: JsonValue) -> None:
