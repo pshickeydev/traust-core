@@ -953,10 +953,8 @@ def _scoped_findings(
     """The scope (`_scope`) and each repository's findings as of the filter's point in time;
     a category scope keeps only findings carrying one of those category labels."""
     products, shipped, repositories = _scope(portfolio, filter)
-    views = {
-        r.id: findings.all(FindingFilter(repository_id=r.id, as_of=filter.as_of))  # type: ignore[arg-type]
-        for r in repositories
-    }
+    found = findings.all_in([r.id for r in repositories], filter.as_of)  # type: ignore[misc,arg-type]
+    views = {r.id: found.get(r.id, []) for r in repositories}  # type: ignore[misc,arg-type]
     if filter.categories:
         wanted = set(filter.categories)
         views = {rid: [v for v in vs if v.label(CATEGORY) in wanted] for rid, vs in views.items()}
@@ -1174,15 +1172,14 @@ class FindingsTrendView:
         _, _, repositories = _scope(self._portfolio, filter)
         by_bucket: defaultdict[datetime, list[FindingSeriesPoint]] = defaultdict(list)
         dispositioned: Counter[datetime] = Counter()
-        accepted: list[AcceptedRisk] = []
-        for r in repositories:
-            query = FindingFilter(repository_id=r.id, as_of=as_of)  # type: ignore[arg-type]
+        ids = [r.id for r in repositories]  # type: ignore[misc]
+        for points in self._findings.timelines(ids, filter.bucket, as_of).values():
             decided = 0
-            for point in self._findings.timeline(query, filter.bucket):
+            for point in points:
                 decided += point.decisions
                 by_bucket[point.bucket].append(point)
                 dispositioned[point.bucket] += decided > 0
-            accepted += self._accepted(r, query)
+        accepted = self._accepted(repositories, as_of)
         window = filter.window
         points = tuple(
             _summed(bucket, points, dispositioned[bucket])
@@ -1204,21 +1201,32 @@ class FindingsTrendView:
             ),
         )
 
-    def _accepted(self, repository: Repository, query: FindingFilter) -> list[AcceptedRisk]:
-        """The repository's accepted findings, each with its latest risk acceptance."""
-        views = [v for v in self._findings.all(query) if _is(v, FindingState.ACCEPTED)]
+    def _accepted(self, repositories: Sequence[Repository], as_of: datetime) -> list[AcceptedRisk]:
+        """The scope's accepted findings, each with its latest risk acceptance."""
+        views = [
+            v
+            for vs in self._findings.all_in(
+                [r.id for r in repositories],
+                as_of,  # type: ignore[misc,arg-type]
+            ).values()
+            for v in vs
+            if _is(v, FindingState.ACCEPTED)
+        ]
         if not views:
             return []
+        urls = {r.id: r.url for r in repositories}
         accepted_by = {
             d.finding_id: d
-            for d in self._findings.decisions.for_repository(repository.id)  # type: ignore[arg-type]
+            for d in self._findings.decisions.for_findings(
+                {v.finding.id for v in views},
+                until=as_of,  # type: ignore[arg-type]
+            )
             if d.resolution == DispositionResolution.RISK_ACCEPTED
-            and (query.as_of is None or d.occurred_at <= query.as_of)
         }
         return [
             AcceptedRisk(
                 finding_id=v.finding.id,  # type: ignore[arg-type]
-                repository_url=repository.url,
+                repository_url=urls[v.finding.repository_id],
                 title=v.finding.title,
                 severity=v.effective_severity,
                 cvss_score=v.occurrence.cvss_score if v.occurrence else None,
@@ -1590,10 +1598,11 @@ class LocView:
         for r in measured:
             for language in r.languages:
                 totals[language.name].append(language.code)
-        tallies = [
-            _tally(self._findings.all(FindingFilter(repository_id=r.id, as_of=filter.as_of)))  # type: ignore[arg-type]
-            for r in repositories
-        ]
+        found = self._findings.all_in(
+            [r.id for r in repositories],
+            filter.as_of,  # type: ignore[misc,arg-type]
+        )
+        tallies = [_tally(found.get(r.id, ())) for r in repositories]  # type: ignore[misc,arg-type]
         code = sum(r.code for r in measured if r.code is not None)
         return LocDashboard(
             as_of=at,

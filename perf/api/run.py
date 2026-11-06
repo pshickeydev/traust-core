@@ -35,8 +35,8 @@ SUMMARY = HERE.parent.parent / ".perf" / "api-summary.json"
 BREAKPOINT_SUMMARY = HERE.parent.parent / ".perf" / "api-breakpoint.json"
 API_DATABASE = "traust_perf_api"
 REGRESSION = 1.20  # a run more than 20% slower, or more than 20% lower throughput, fails
-LATENCY_KEYS = ("claim_p95_ms", "list_p95_ms", "feed_p95_ms")
-RATE_KEYS = ("claim_rps", "list_rps", "feed_rps", "http_reqs_rate")
+LATENCY_KEYS = ("claim_p95_ms", "list_p95_ms", "feed_p95_ms", "insight_p95_ms")
+RATE_KEYS = ("claim_rps", "list_rps", "feed_rps", "insight_rps", "http_reqs_rate")
 GATE_KEYS = LATENCY_KEYS + RATE_KEYS
 QUEUE_DEPTH = 70_000  # the breakpoint ramp must claim against a queue, not an empty pool
 
@@ -220,11 +220,12 @@ def main(argv: list[str] | None = None) -> int:
         drop_copy(url)
 
     summary = json.loads(summary_path.read_text())
-    if any(summary.get(k) is None for k in LATENCY_KEYS):
-        sys.exit(f"k6 produced no latencies: {summary}")
     if args.breakpoint:
+        # the ramp's scenarios are the gate's subset; its summary prints what it measured
         print(json.dumps(summary, indent=2))
         return code
+    if any(summary.get(k) is None for k in LATENCY_KEYS):
+        sys.exit(f"k6 produced no latencies: {summary}")
     return code or gate(summary, args.update_baseline)
 
 

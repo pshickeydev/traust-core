@@ -201,14 +201,9 @@ class SqlAssessmentRepository(SqlAppendOnlyRepository[Assessment]):
     def list_by_ids(
         self, assessment_ids: Collection[UUID], *, read_budget: RecordBudget | None = None
     ) -> list[Assessment]:
-        if not assessment_ids:
-            return []
-        c = self.table.c
-        return self._many(
-            f"{len(assessment_ids)} by id",
-            c.id.in_(list(assessment_ids)),
-            read_budget=read_budget,
-        )
+        # batched: a whole scope's occurrences and decisions can reference more assessments
+        # than one statement can bind
+        return self._many_in("list by id", self.table.c.id, assessment_ids, read_budget=read_budget)
 
     def search(
         self,

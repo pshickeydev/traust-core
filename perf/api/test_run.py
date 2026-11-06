@@ -5,29 +5,17 @@ from perf.api import run
 
 def _summary(latency: float = 100.0, rps: float = 200.0) -> dict[str, float]:
     return {
-        "claim_p95_ms": latency,
-        "list_p95_ms": latency,
-        "feed_p95_ms": latency,
-        "claim_rps": rps,
-        "list_rps": rps,
-        "feed_rps": rps,
-        "http_reqs_rate": rps * 2,
+        key: rps * 2 if key == "http_reqs_rate" else rps if key.endswith("_rps") else latency
+        for key in run.GATE_KEYS
     }
 
 
 def _baseline(path, latency: float = 100.0, rps: float = 200.0, rate_keys: bool = True) -> None:
     body = {
-        "claim_p95_ms": latency,
-        "list_p95_ms": latency,
-        "feed_p95_ms": latency,
+        key: rps * 2 if key == "http_reqs_rate" else rps if key.endswith("_rps") else latency
+        for key in run.GATE_KEYS
+        if rate_keys or not (key.endswith("_rps") or key == "http_reqs_rate")
     }
-    if rate_keys:
-        body |= {
-            "claim_rps": rps,
-            "list_rps": rps,
-            "feed_rps": rps,
-            "http_reqs_rate": rps * 2,
-        }
     path.write_text(json.dumps(body))
 
 

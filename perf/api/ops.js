@@ -1,7 +1,8 @@
-// Ops REST API load: 50 runners claim/complete while readers page orders and the feed.
-// Run through perf/api/run.py (seeds Postgres, starts traust-server, mints tokens, compares
-// the result to perf/api/baseline.json). Targets come from the folder README.
-import { claim, listOrders, readFeed, summary } from './lib.js';
+// Ops REST API load: runners claim/complete while readers page orders, the feed and one insight
+// view. Scenario weights live here alone (the README describes what, not how many). Run through
+// perf/api/run.py (seeds Postgres, starts traust-server, mints tokens, compares the result to
+// perf/api/baseline.json).
+import { claim, listOrders, readFeed, readInsight, setup, summary } from './lib.js';
 
 const DURATION = __ENV.DURATION || '20s';
 
@@ -10,6 +11,7 @@ export const options = {
     claim_contention: { executor: 'constant-vus', vus: 50, duration: DURATION, exec: 'claim' },
     order_reads: { executor: 'constant-vus', vus: 10, duration: DURATION, exec: 'listOrders' },
     feed_reads: { executor: 'constant-vus', vus: 10, duration: DURATION, exec: 'readFeed' },
+    insight_reads: { executor: 'constant-vus', vus: 2, duration: DURATION, exec: 'readInsight' },
   },
   // Correctness gates fail the run here; latency and throughput are gated against baseline.json
   // by run.py (a run more than 20% slower, or more than 20% lower throughput, fails), since
@@ -20,7 +22,7 @@ export const options = {
   },
 };
 
-export { claim, listOrders, readFeed };
+export { claim, listOrders, readFeed, readInsight, setup };
 
 export function handleSummary(data) {
   return { [__ENV.SUMMARY || '.perf/api-summary.json']: JSON.stringify(summary(data), null, 2) };

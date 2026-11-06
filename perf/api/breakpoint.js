@@ -1,7 +1,8 @@
-// Discovery ramp: 50 runners keep claiming while the readers climb 10 -> 300 VUs, to find
-// where the API stops holding. Not gated against a baseline; run.py prints where latency and
-// throughput land. Run through perf/api/run.py --breakpoint (which also resets the order queue,
-// so the ramp measures a queue, not an empty pool).
+// Discovery ramp: the runners keep claiming while the readers climb to the ramp's ceiling
+// (weights live in the stages below), to find where the API stops holding. Not gated against
+// a baseline; run.py prints where latency and throughput land. Run through perf/api/run.py
+// --breakpoint (which also resets the order queue, so the ramp measures a queue, not an empty
+// pool).
 import { claim, listOrders, readFeed, summary } from './lib.js';
 
 const CLAIM_VUS = 50;

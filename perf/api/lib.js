@@ -15,6 +15,8 @@ export const feedLatency = new Trend('feed_latency', true);
 export const claimReqs = new Counter('claim_requests');
 export const listReqs = new Counter('list_requests');
 export const feedReqs = new Counter('feed_requests');
+export const insightLatency = new Trend('insight_latency', true);
+export const insightReqs = new Counter('insight_requests');
 
 export function claim() {
   const res = http.post(`${BASE}/v1/orders/claim`, JSON.stringify({ lease_seconds: 300 }), RUNNER);
@@ -45,6 +47,32 @@ export function readFeed() {
   check(res, { 'feed is 200': (r) => r.status === 200 });
 }
 
+export function setup() {
+  const res = http.get(`${BASE}/v1/products?limit=1`, READER);
+  if (res.status !== 200) {
+    console.log(`products ${res.status} ${JSON.stringify(res.error)} ${String(res.body).slice(0, 200)}`);
+  }
+  check(res, { 'products list is 200': (r) => r.status === 200 });
+  const product = res.json('items.0.id');
+  if (!product) {
+    throw new Error('no product to scope the insight read to');
+  }
+  return { product };
+}
+
+// The dashboard's heaviest view family: an insight built on demand. Scoped to one product so
+// the read is request-shaped (the whole-portfolio cost is bounded by perf/queries, which sees
+// the statements); unscoped at fixture volume the build runs to minutes, not a gateable request.
+export function readInsight(data) {
+  const res = http.get(`${BASE}/v1/insights/findings-rollup?product_id=${data.product}`, READER);
+  insightLatency.add(res.timings.duration);
+  insightReqs.add(1);
+  if (res.status !== 200) {
+    console.log(`insight ${res.status} ${JSON.stringify(res.error)} ${String(res.body).slice(0, 200)}`);
+  }
+  check(res, { 'insight is 200': (r) => r.status === 200 });
+}
+
 // Latency plus per-scenario request rates, so a run that collapsed to near-zero throughput
 // cannot pass on flat latency alone.
 export function summary(data, extra = {}) {
@@ -54,9 +82,11 @@ export function summary(data, extra = {}) {
     claim_p95_ms: p95('claim_latency'),
     list_p95_ms: p95('list_latency'),
     feed_p95_ms: p95('feed_latency'),
+    insight_p95_ms: p95('insight_latency'),
     claim_rps: rate('claim_requests'),
     list_rps: rate('list_requests'),
     feed_rps: rate('feed_requests'),
+    insight_rps: rate('insight_requests'),
     http_reqs_rate: rate('http_reqs'),
     ...extra,
   };
