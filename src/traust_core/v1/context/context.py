@@ -771,7 +771,7 @@ class Context:
             spend=spend,
             recording_assets=self.config.recording.model_dump(exclude={"start"}),
             recording_starts=self.config.recording.start,
-            inventory=Inventory(uow),
+            inventory=Inventory(uow, hosts),
         )
         validation_records = ValidationRecords(uow, self.object_store, findings=FindingRecords(uow))
         precedents = FindingPrecedents(uow, validation=validation_records)
@@ -868,7 +868,7 @@ class Context:
             findings=findings,
             checkout=self.checkouts,
         )
-        sync = PortfolioSync(portfolio, sources, clock=self.clock)
+        sync = PortfolioSync(portfolio, sources, clock=self.clock, hosts=hosts)
         catalog = ProviderCatalog(
             self.tools,
             self.feeds,
@@ -1014,7 +1014,7 @@ class Context:
                 advisories=self.advisories,
                 sources=self.package_sources,
                 feed_sources=self.feed_sources,
-                inventory=Inventory(uow),
+                inventory=Inventory(uow, hosts),
                 portfolio=portfolio,
                 log=AssessmentLog(uow),
                 intake=intake,

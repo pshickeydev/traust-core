@@ -33,6 +33,8 @@ class RepositoryRepository(MutableRecordRepository[Repository], Protocol):
     def get_or_add(self, record: Repository) -> Repository: ...
     def get_or_add_with_status(self, record: Repository) -> tuple[Repository, bool]: ...
     def find_by_url(self, url: str) -> Repository | None: ...
+    def find_by_url_casefold(self, url: str) -> Repository | None: ...
+    def lock_url(self, url: str) -> None: ...
     def find_private_mirror(self, upstream_id: UUID) -> Repository | None: ...
     def list_by_ids(self, repository_ids: Collection[UUID]) -> list[Repository]: ...
     def search(self, *, limit: int, after: tuple[datetime, UUID] | None) -> list[Repository]: ...
@@ -54,6 +56,22 @@ class SqlRepositoryRepository(SqlMutableRepository[Repository]):
 
     def find_by_url(self, url: str) -> Repository | None:
         return self._one(f"find {url}", self.table.c.url == url)
+
+    def find_by_url_casefold(self, url: str) -> Repository | None:
+        """The oldest repository whose URL matches ignoring case (GitHub's owner/repo)."""
+        # NEED(contracts): an index on repository(lower(url)); until then this scans the
+        # repository table, like find_private_mirror.
+        found = self._many(f"find casefold {url}", sa.func.lower(self.table.c.url) == url.lower())
+        return found[0] if found else None
+
+    def lock_url(self, url: str) -> None:
+        """Hold, until the transaction ends, a Postgres advisory lock covering this URL in any
+        case, so two writers spelling one GitHub repository differently can't both insert a
+        row. SQLite needs none: the caller holds its one write lock (`uow.write()`)."""
+        # NEED(contracts): a unique index on repository(lower(url)) would make this a constraint.
+        if self._connection.dialect.name == "postgresql":
+            lock = sa.func.pg_advisory_xact_lock(sa.func.hashtext(url.lower()))
+            self._execute(f"lock {url}", sa.select(lock))
 
     def find_private_mirror(self, upstream_id: UUID) -> Repository | None:
         """A non-public repository that forks `upstream_id` (the oldest, when several do)."""

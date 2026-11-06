@@ -244,7 +244,7 @@ class ExposureService:
         checkout: RepoCheckoutService | None = None,
     ) -> None:
         self._uow = uow
-        self._inventory = Inventory(uow)
+        self._inventory = Inventory(uow, hosts)
         self._log = AssessmentLog(uow)
         self._findings = FindingRecords(uow)
         self._intake = intake

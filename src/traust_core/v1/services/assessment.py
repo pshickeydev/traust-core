@@ -177,7 +177,7 @@ class AssessmentService:
         recording: OpsService | None = None,
     ) -> None:
         self._uow = uow
-        self._inventory = Inventory(uow)
+        self._inventory = Inventory(uow, hosts)
         self._log = AssessmentLog(uow)
         self._intake = intake
         self._clock = clock or SystemClock()

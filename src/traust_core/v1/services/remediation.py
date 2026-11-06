@@ -173,6 +173,11 @@ class ForkPolicy:
         self._config = config
         self._kinds = {h.lower(): k for h, k in forge_hosts.items()}
 
+    @property
+    def hosts(self) -> Mapping[str, str]:
+        """The deployment's forge hosts and their kinds."""
+        return dict(self._kinds)
+
     def resolve(self, repository_url: str, mirror_url: str | None) -> Fork:
         if mirror_url is not None:
             return self.of(_url(mirror_url), ForkVisibility.PRIVATE)
@@ -241,7 +246,7 @@ class RemediationService:
         goldens: GoldenRunner | None = None,
     ) -> None:
         self._uow = uow
-        self._inventory = Inventory(uow)
+        self._inventory = Inventory(uow, forks.hosts)
         self._log = AssessmentLog(uow)
         self._assessment = assessment
         self._findings = findings
@@ -957,7 +962,7 @@ class VerificationService:
         recording: OpsService | None = None,
     ) -> None:
         self._uow = uow
-        self._inventory = Inventory(uow)
+        self._inventory = Inventory(uow, portfolio.inventory.hosts)
         self._log = AssessmentLog(uow)
         self._assessment = assessment
         self._portfolio = portfolio
