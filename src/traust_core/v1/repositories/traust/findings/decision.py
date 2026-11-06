@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Collection
 from datetime import datetime
+from heapq import merge
 from typing import Any, Protocol
 from uuid import UUID
 
@@ -130,16 +131,20 @@ class SqlDecisionRepository(SqlAppendOnlyRepository[Decision]):
         *,
         read_budget: RecordBudget | None = None,
     ) -> list[Decision]:
+        """Decisions on these findings, those made after `until` left out, in judgement order;
+        read in bounded batches so a whole scope's ids cannot exceed the bind limit."""
         c = self.table.c
-        where = [c.finding_id.in_(finding_ids)]
-        if until is not None:
-            where.append(c.occurred_at <= until)
-        return self._many(
-            f"list for {len(finding_ids)} findings",
-            *where,
-            order_by=(c.occurred_at,),
-            read_budget=read_budget,
+        pages = (
+            self._many(
+                f"list for {len(finding_ids)} findings",
+                c.finding_id.in_(batch),
+                *([] if until is None else [c.occurred_at <= until]),
+                order_by=(c.occurred_at,),
+                read_budget=read_budget,
+            )
+            for batch in self._batches(finding_ids)
         )
+        return list(merge(*pages, key=lambda d: (d.occurred_at, d.created_at, d.id)))
 
     def list_since(self, since: datetime, limit: int) -> list[Decision]:
         c = self.table.c

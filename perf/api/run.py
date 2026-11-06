@@ -220,11 +220,12 @@ def main(argv: list[str] | None = None) -> int:
         drop_copy(url)
 
     summary = json.loads(summary_path.read_text())
-    if any(summary.get(k) is None for k in LATENCY_KEYS):
-        sys.exit(f"k6 produced no latencies: {summary}")
     if args.breakpoint:
+        # the ramp's scenarios are the gate's subset; its summary prints what it measured
         print(json.dumps(summary, indent=2))
         return code
+    if any(summary.get(k) is None for k in LATENCY_KEYS):
+        sys.exit(f"k6 produced no latencies: {summary}")
     return code or gate(summary, args.update_baseline)
 
 

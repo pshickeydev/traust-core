@@ -29,6 +29,15 @@ def test_findings_known_as_an_advisory(seed: Seed) -> None:
     assert seed.uow.findings.list_for_advisory(advisory.id) == [known]
 
 
+def test_findings_of_several_repositories_in_one_batched_read(seed: Seed) -> None:
+    repo, other, out = seed.repository(), seed.repository(), seed.repository()
+    mine = [seed.finding(repo), seed.finding(other)]
+    seed.finding(out)  # a repository the batch does not name
+    found = seed.uow.findings.list_for_repositories([repo.id, other.id])
+    assert same_rows(found, mine)
+    assert seed.uow.findings.list_for_repositories([]) == []
+
+
 def test_finding_title_can_be_corrected(seed: Seed) -> None:
     finding = seed.finding(title="SQLi")
     updated = seed.uow.findings.update(finding.model_copy(update={"title": "SQL injection"}))
