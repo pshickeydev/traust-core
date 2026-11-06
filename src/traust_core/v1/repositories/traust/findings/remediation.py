@@ -93,7 +93,15 @@ class SqlRemediationRepository(SqlMutableRepository[Remediation]):
         after: tuple[datetime, UUID] | None,
     ) -> list[Remediation]:
         """A keyset page of efforts, oldest first: at a status, scheduled on a repository's or
-        a finding's rows (each filter given applies)."""
+        a finding's rows (each filter given applies).
+
+        The repository and finding filters read `remediation_finding` — the junction
+        table `SqlRemediationFindingRepository` owns — in this one keyset query over
+        the aggregate's child table, the same deliberate read `spend_event` makes of
+        `run_order`. `ScheduledRemediations` owns the table's writes; resolving the
+        ids through it instead (two queries, an id set handed to `search`) is a
+        decision for the owners, not this repository's to make silently.
+        """
         c = self.table.c
         where: list[sa.ColumnElement[bool]] = []
         if status is not None:
