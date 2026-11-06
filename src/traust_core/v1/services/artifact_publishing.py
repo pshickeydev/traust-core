@@ -22,7 +22,7 @@ from traust_core.v1.models.analysis_results import ResultKind
 from traust_core.v1.models.artifacts import ARTIFACT_FOR_SCHEMA, ArtifactDocument
 from traust_core.v1.models.assessment import Artifact, Assessment
 from traust_core.v1.models.base import Dto
-from traust_core.v1.models.common import ArtifactRef, TimeWindow
+from traust_core.v1.models.common import ArtifactRef, RecordBudget, TimeWindow
 from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.models.redaction import (
     PAYMENT_CARD_PATTERN,
@@ -150,9 +150,11 @@ class AssessmentLog:
                 for artifact in uow.artifacts.list_by_ids(ids[start : start + _BATCH])
             ]
 
-    def list_by_ids(self, assessment_ids: Collection[UUID]) -> list[Assessment]:
+    def list_by_ids(
+        self, assessment_ids: Collection[UUID], *, read_budget: RecordBudget | None = None
+    ) -> list[Assessment]:
         with self._uow as uow:
-            return uow.assessments.list_by_ids(assessment_ids)
+            return uow.assessments.list_by_ids(assessment_ids, read_budget=read_budget)
 
     def list_at(self, timestamps: Mapping[UUID, datetime]) -> list[Assessment]:
         items = tuple(timestamps.items())
@@ -164,31 +166,54 @@ class AssessmentLog:
             ]
 
     def list_of(
-        self, kind: str | None, repository_ref_ids: Sequence[UUID] | None = None
+        self,
+        kind: str | None,
+        repository_ref_ids: Sequence[UUID] | None = None,
+        *,
+        read_budget: RecordBudget | None = None,
     ) -> list[Assessment]:
         """The assessments of `kind` (any when None) on the refs, or on every ref when None."""
         if repository_ref_ids is None:
-            return self._scan(kind)
+            return self._scan(kind, read_budget=read_budget)
         with self._uow as uow:
             return [
                 a
                 for i in range(0, len(repository_ref_ids), _BATCH)
-                for a in uow.assessments.list_for_refs(repository_ref_ids[i : i + _BATCH], kind)
+                for a in uow.assessments.list_for_refs(
+                    repository_ref_ids[i : i + _BATCH], kind, read_budget=read_budget
+                )
             ]
 
-    def list_within(self, window: TimeWindow, kind: str | None = None) -> list[Assessment]:
+    def list_within(
+        self,
+        window: TimeWindow,
+        kind: str | None = None,
+        *,
+        read_budget: RecordBudget | None = None,
+    ) -> list[Assessment]:
         """The assessments of `kind` (any when None) that occurred in the window, newest first."""
-        return self._scan(kind, window.start, window.end)
+        return self._scan(kind, window.start, window.end, read_budget=read_budget)
 
     def _scan(
-        self, kind: str | None, since: datetime | None = None, until: datetime | None = None
+        self,
+        kind: str | None,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        *,
+        read_budget: RecordBudget | None = None,
     ) -> list[Assessment]:
         found: list[Assessment] = []
         after = None
         with self._uow as uow:
             while page := uow.assessments.search(
-                kind=kind, since=since, until=until, limit=_BATCH, after=after
+                kind=kind,
+                since=since,
+                until=until,
+                limit=min(_BATCH, read_budget.remaining + 1) if read_budget else _BATCH,
+                after=after,
             ):
+                if read_budget is not None:
+                    read_budget.consume(len(page))
                 found += page
                 after = (page[-1].occurred_at, page[-1].id)
         return found

@@ -29,7 +29,14 @@ from traust_core.v1.models.artifacts import (
 )
 from traust_core.v1.models.assessment import ASSESSMENT_COMPLETED, Assessment, AssessmentKind
 from traust_core.v1.models.code_facts import CodeFactKind, ConfigFact, SanitizerFact, SymbolFact
-from traust_core.v1.models.common import Page, PageRequest, Provenance, TimeWindow, ToolRequest
+from traust_core.v1.models.common import (
+    Page,
+    PageRequest,
+    Provenance,
+    RecordBudget,
+    TimeWindow,
+    ToolRequest,
+)
 from traust_core.v1.models.detection_quality import (
     COMPLIANCE_PRECISION_GATE,
     RULEABLE_LANGS,
@@ -513,17 +520,31 @@ class DetectionQualityService:
             novel_sample=_novel_sample(hits, truth),
         )
 
-    def critical_misses(self, window: TimeWindow) -> list[CriticalMiss]:
+    def critical_misses(
+        self, window: TimeWindow, *, max_records: int | None = None
+    ) -> list[CriticalMiss]:
         """Critical findings first reported in the window that an earlier audit of the repository
         missed; a miss at a path the audit did report on is listed for adjudication."""
-        reported = [a for a in self._log.list_within(window) if a.kind not in _NOT_CAMPAIGN]
+        read_budget = (
+            RecordBudget(max_records, "critical misses") if max_records is not None else None
+        )
+        reported = [
+            a
+            for a in self._log.list_within(window, read_budget=read_budget)
+            if a.kind not in _NOT_CAMPAIGN
+        ]
         new = self._first_reported(
-            {o.finding_id for a in reported for o in self._findings.occurrences(assessment_id=a.id)}  # type: ignore[arg-type]
+            {
+                o.finding_id
+                for a in reported
+                for o in self._findings.occurrences(assessment_id=a.id, read_budget=read_budget)
+            },
+            read_budget=read_budget,
         )
         new = {f: a for f, a in new.items() if window.start <= a.occurred_at < window.end}
         audits: dict[UUID, list[Assessment]] = {}
         misses = []
-        for view in self._findings.list_by_ids(new) if new else []:
+        for view in self._findings.list_by_ids(new, read_budget=read_budget) if new else []:
             if (
                 view.effective_severity != Severity.CRITICAL
                 or view.state() == FindingState.FALSE_POSITIVE
@@ -531,15 +552,21 @@ class DetectionQualityService:
                 continue
             repository_id, found = view.finding.repository_id, new[view.finding.id]  # type: ignore[index]
             if repository_id not in audits:
-                refs = [r.id for r in self._inventory.list_refs(repository_id) if r.id]
-                audits[repository_id] = self._log.list_of(AssessmentKind.SECURE_CODE, refs)
+                refs = [
+                    r.id
+                    for r in self._inventory.list_refs(repository_id, read_budget=read_budget)
+                    if r.id
+                ]
+                audits[repository_id] = self._log.list_of(
+                    AssessmentKind.SECURE_CODE, refs, read_budget=read_budget
+                )
             earlier = [a for a in audits[repository_id] if _when(a) < _when(found)]
             if not earlier:
                 continue
             missed_by = max(earlier, key=_when)
             assert missed_by.id is not None and found.id is not None
             paths = {canon_path(loc.path) for loc in view.locations}
-            reported_at = {p for _, p in self._located(missed_by.id)}
+            reported_at = {p for _, p in self._located(missed_by.id, read_budget=read_budget)}
             misses.append(
                 CriticalMiss(
                     finding_id=view.finding.id,  # type: ignore[arg-type]
@@ -1209,24 +1236,36 @@ class DetectionQualityService:
             frozenset(c for v in confirmed for c in v.cwes),
         )
 
-    def _located(self, assessment_id: UUID) -> list[tuple[str | None, str]]:
+    def _located(
+        self, assessment_id: UUID, *, read_budget: RecordBudget | None = None
+    ) -> list[tuple[str | None, str]]:
         """(rule, path) for each place the assessment reported something, once per occurrence."""
         rules = {
             o.id: o.rule
-            for o in self._findings.occurrences(assessment_id=assessment_id)
+            for o in self._findings.occurrences(
+                assessment_id=assessment_id, read_budget=read_budget
+            )
             if o.id is not None
         }
         pairs = {
-            (loc.occurrence_id, canon_path(loc.path)) for loc in self._findings.locations(rules)
+            (loc.occurrence_id, canon_path(loc.path))
+            for loc in self._findings.locations(rules, read_budget=read_budget)
         }
         return [(rules[o], p) for o, p in sorted(pairs, key=lambda x: (str(x[0]), x[1]))]
 
-    def _first_reported(self, finding_ids: set[UUID]) -> dict[UUID, Assessment]:
+    def _first_reported(
+        self, finding_ids: set[UUID], *, read_budget: RecordBudget | None = None
+    ) -> dict[UUID, Assessment]:
         """The campaign assessment that first reported each finding."""
         if not finding_ids:
             return {}
-        occurrences = self._findings.occurrences(finding_ids=finding_ids)
-        runs = {a.id: a for a in self._log.list_by_ids({o.assessment_id for o in occurrences})}
+        occurrences = self._findings.occurrences(finding_ids=finding_ids, read_budget=read_budget)
+        runs = {
+            a.id: a
+            for a in self._log.list_by_ids(
+                {o.assessment_id for o in occurrences}, read_budget=read_budget
+            )
+        }
         first: dict[UUID, Assessment] = {}
         for o in occurrences:
             run = runs[o.assessment_id]

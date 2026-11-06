@@ -23,6 +23,7 @@ from sqlalchemy.engine import Connection
 
 from traust_core.v1.errors import NotFoundError, RepositoryError
 from traust_core.v1.models.base import AppendOnly, Entity, Model
+from traust_core.v1.models.common import RecordBudget
 from traust_core.v1.repositories.sql import (
     Dialect,
     RecordUuid,
@@ -200,7 +201,12 @@ class SqlTableRepository(SqlRepository, Generic[R]):
         return None if row is None else self._to_record(row)
 
     def _many_in(
-        self, operation: str, column: sa.ColumnElement[Any], values: Collection[Any]
+        self,
+        operation: str,
+        column: sa.ColumnElement[Any],
+        values: Collection[Any],
+        *,
+        read_budget: RecordBudget | None = None,
     ) -> list[R]:
         """Rows whose `column` is one of `values`, read in bounded batches.
 
@@ -208,7 +214,11 @@ class SqlTableRepository(SqlRepository, Generic[R]):
         which per-batch queries cannot preserve when values span batches.
         """
         batches = self._batches(values)
-        rows = [row for batch in batches for row in self._many(operation, column.in_(batch))]
+        rows = [
+            row
+            for batch in batches
+            for row in self._many(operation, column.in_(batch), read_budget=read_budget)
+        ]
         return sorted(rows, key=lambda r: (r.created_at, r.id))
 
     @staticmethod
@@ -222,13 +232,19 @@ class SqlTableRepository(SqlRepository, Generic[R]):
         operation: str,
         *where: sa.ColumnElement[bool],
         order_by: Sequence[sa.ColumnElement[Any]] = (),
+        read_budget: RecordBudget | None = None,
     ) -> list[R]:
         stmt = (
             self._select()
             .where(*where)
             .order_by(*order_by, self.table.c.created_at, self.table.c.id)
         )
-        return [self._to_record(r) for r in self._execute(operation, stmt).mappings()]
+        if read_budget is not None:
+            stmt = stmt.limit(read_budget.remaining + 1)
+        rows = [self._to_record(r) for r in self._execute(operation, stmt).mappings()]
+        if read_budget is not None:
+            read_budget.consume(len(rows))
+        return rows
 
     def _page(
         self,

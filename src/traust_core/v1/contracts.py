@@ -9,7 +9,7 @@ from importlib import resources
 from importlib.metadata import distribution
 from pathlib import Path
 from types import MappingProxyType, ModuleType
-from typing import Any, Literal
+from typing import Any, Literal, TypeAlias, cast
 
 from jsonschema import Draft202012Validator, FormatChecker
 from jsonschema import ValidationError as SchemaViolation
@@ -27,6 +27,7 @@ from traust_core.v1.errors import ConfigError, DocumentError, Issue
 Dialect = Literal["sqlite", "postgres"]
 Area = Literal["traust", "traust_ops", "traust_ledger"]
 AREAS: tuple[Area, ...] = ("traust", "traust_ops", "traust_ledger")
+JsonValue: TypeAlias = str | int | float | bool | list["JsonValue"] | dict[str, "JsonValue"] | None
 
 
 @cache
@@ -204,9 +205,12 @@ def validate_config(name: str, document: Any) -> None:
     _check(name, _config_validator(name), document)
 
 
-def view_schema(name: str) -> dict[str, Any]:
+def view_schema(name: str) -> dict[str, JsonValue]:
     """A `views_schema/v1` contract for an on-demand, non-persisted view."""
-    return _read_json(_root() / "views_schema/v1" / f"{name}.schema.json")
+    return cast(
+        dict[str, JsonValue],
+        _read_json(_root() / "views_schema/v1" / f"{name}.schema.json"),
+    )
 
 
 @cache
@@ -214,7 +218,7 @@ def _view_validator(name: str) -> Draft202012Validator:
     return Draft202012Validator(view_schema(name), format_checker=FormatChecker())
 
 
-def validate_view(name: str, document: Any) -> None:
+def validate_view(name: str, document: JsonValue) -> None:
     _check(name, _view_validator(name), document)
 
 

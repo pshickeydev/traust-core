@@ -25,7 +25,14 @@ from traust_core.v1.models.assessment import (
     AssessmentKind,
     AuditScope,
 )
-from traust_core.v1.models.common import Cursor, Page, PageRequest, Provenance, every_item
+from traust_core.v1.models.common import (
+    Cursor,
+    Page,
+    PageRequest,
+    Provenance,
+    RecordBudget,
+    every_item,
+)
 from traust_core.v1.models.corpus import CorpusRegistry, CorpusSubject
 from traust_core.v1.models.findings import SubjectRef
 from traust_core.v1.models.inventory import (
@@ -174,16 +181,26 @@ class Inventory:
         with self._uow as uow:
             return uow.repositories.find_by_url(str(url))
 
-    def list_refs(self, repository_id: UUID, sha: str | None = None) -> list[RepositoryRef]:
+    def list_refs(
+        self,
+        repository_id: UUID,
+        sha: str | None = None,
+        *,
+        read_budget: RecordBudget | None = None,
+    ) -> list[RepositoryRef]:
         """The repository's refs, or only those of one commit."""
         with self._uow as uow:
-            refs = uow.repository_refs.list_for(repository_id)
+            refs = uow.repository_refs.list_for(repository_id, read_budget=read_budget)
         return [r for r in refs if sha is None or r.sha == sha]
 
-    def list_refs_of(self, repository_ids: Collection[UUID]) -> list[RepositoryRef]:
+    def list_refs_of(
+        self, repository_ids: Collection[UUID], *, read_budget: RecordBudget | None = None
+    ) -> list[RepositoryRef]:
         """Every recorded ref of the repositories, read in bounded batches."""
         with self._uow as uow:
-            return uow.repository_refs.list_for_repositories(repository_ids)
+            return uow.repository_refs.list_for_repositories(
+                repository_ids, read_budget=read_budget
+            )
 
     def list_refs_by_ids(self, repository_ref_ids: Collection[UUID]) -> list[RepositoryRef]:
         with self._uow as uow:

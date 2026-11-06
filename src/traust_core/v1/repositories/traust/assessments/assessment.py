@@ -8,6 +8,7 @@ from uuid import UUID
 import sqlalchemy as sa
 
 from traust_core.v1.models.assessment import Assessment
+from traust_core.v1.models.common import RecordBudget
 from traust_core.v1.repositories.tables import (
     TRAUST,
     RecordRepository,
@@ -58,10 +59,16 @@ class AssessmentRepository(RecordRepository[Assessment], Protocol):
     ) -> list[Assessment]: ...
     def list_for_ref(self, repository_ref_id: UUID) -> list[Assessment]: ...
     def list_for_refs(
-        self, repository_ref_ids: Collection[UUID], kind: str | None = None
+        self,
+        repository_ref_ids: Collection[UUID],
+        kind: str | None = None,
+        *,
+        read_budget: RecordBudget | None = None,
     ) -> list[Assessment]: ...
     def list_for_run_order(self, run_order_id: UUID) -> list[Assessment]: ...
-    def list_by_ids(self, assessment_ids: Collection[UUID]) -> list[Assessment]: ...
+    def list_by_ids(
+        self, assessment_ids: Collection[UUID], *, read_budget: RecordBudget | None = None
+    ) -> list[Assessment]: ...
     def search(
         self,
         *,
@@ -191,11 +198,17 @@ class SqlAssessmentRepository(SqlAppendOnlyRepository[Assessment]):
             f"list for order {run_order_id}", self.table.c.run_order_id == run_order_id
         )
 
-    def list_by_ids(self, assessment_ids: Collection[UUID]) -> list[Assessment]:
+    def list_by_ids(
+        self, assessment_ids: Collection[UUID], *, read_budget: RecordBudget | None = None
+    ) -> list[Assessment]:
         if not assessment_ids:
             return []
         c = self.table.c
-        return self._many(f"{len(assessment_ids)} by id", c.id.in_(list(assessment_ids)))
+        return self._many(
+            f"{len(assessment_ids)} by id",
+            c.id.in_(list(assessment_ids)),
+            read_budget=read_budget,
+        )
 
     def search(
         self,
@@ -227,7 +240,11 @@ class SqlAssessmentRepository(SqlAppendOnlyRepository[Assessment]):
         return self._page("feed", limit=limit, after=after, oldest_first=True)
 
     def list_for_refs(
-        self, repository_ref_ids: Collection[UUID], kind: str | None = None
+        self,
+        repository_ref_ids: Collection[UUID],
+        kind: str | None = None,
+        *,
+        read_budget: RecordBudget | None = None,
     ) -> list[Assessment]:
         c = self.table.c
         where = [c.repository_ref_id.in_(repository_ref_ids)]
@@ -237,4 +254,5 @@ class SqlAssessmentRepository(SqlAppendOnlyRepository[Assessment]):
             f"list {kind or 'all'} for {len(repository_ref_ids)} refs",
             *where,
             order_by=(c.occurred_at,),
+            read_budget=read_budget,
         )

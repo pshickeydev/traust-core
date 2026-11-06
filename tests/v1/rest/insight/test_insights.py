@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta
+from decimal import Decimal
+
 import pytest
 from fastapi.testclient import TestClient
 
-from tests.v1.repositories.tables.conftest import Seed
+from tests.v1.repositories.tables.conftest import T0, Seed
 from tests.v1.rest.conftest import bearer, same_as_in_process
 from tests.v1.services.test_detection_quality_doors import WINDOW, Campaign, World
 from traust_core.v1 import contracts
 from traust_core.v1.context import Context
+from traust_core.v1.models.common import TimeBucket
 from traust_core.v1.models.insight import ViewFilter, ViewName
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 
@@ -35,6 +39,15 @@ def test_an_unknown_insight_is_422_and_insights_need_a_token(
     url, params = "/v1/insights/findings-rollup", {"team_id": "x"}
     bad = client.get(url, params=params, headers=bearer(context))
     assert bad.status_code == 422
+
+
+def test_a_snapshot_insight_refuses_an_explicit_window(
+    context: Context, client: TestClient
+) -> None:
+    params = {"window_start": WINDOW.start.isoformat(), "window_end": WINDOW.end.isoformat()}
+    response = client.get("/v1/insights/findings-rollup", params=params, headers=bearer(context))
+    assert response.status_code == 422
+    assert response.headers["content-type"] == "application/problem+json"
 
 
 def test_a_per_repository_insight_takes_its_repository_id(
@@ -92,6 +105,78 @@ def test_critical_misses_uses_the_existing_insight_registry_and_native_populatio
     }
     assert body["window"] == WINDOW.model_dump(mode="json")
     assert client.get("/v1/insights/critical-misses", params=params).status_code == 401
+
+
+def test_critical_misses_http_refuses_an_explicit_product_scope(
+    context: Context, client: TestClient, campaign: Campaign
+) -> None:
+    with SqlTraustUnitOfWork(context.database) as uow:
+        product = Seed(uow).product()
+        uow.commit()
+    params = {
+        "window_start": WINDOW.start.isoformat(),
+        "window_end": WINDOW.end.isoformat(),
+        "product_id": str(product.id),
+    }
+    response = client.get("/v1/insights/critical-misses", params=params, headers=bearer(context))
+    assert response.status_code == 422
+    assert response.headers["content-type"] == "application/problem+json"
+
+
+@pytest.mark.parametrize("name", [ViewName.FINDINGS_TREND, ViewName.PROGRAM])
+def test_window_consumers_honor_the_requested_range_over_native_storage(
+    context: Context, client: TestClient, campaign: Campaign, name: ViewName
+) -> None:
+    with SqlTraustUnitOfWork(context.database) as uow:
+        seed = Seed(uow)
+        seed.spend_event(cost_usd=2, occurred_at=WINDOW.start)
+        seed.spend_event(cost_usd=9, occurred_at=WINDOW.end)
+        uow.commit()
+    params = {
+        "window_start": WINDOW.start.isoformat(),
+        "window_end": WINDOW.end.isoformat(),
+        "as_of": WINDOW.end.isoformat(),
+        "bucket": "day",
+    }
+    response = client.get(f"/v1/insights/{name.value}", params=params, headers=bearer(context))
+    assert response.status_code == 200
+    filter = ViewFilter(window=WINDOW, as_of=WINDOW.end, bucket=TimeBucket.DAY)
+    same_as_in_process(response.json(), context.services().insight.build(name, filter))
+    body = response.json()
+    if name == ViewName.FINDINGS_TREND:
+        assert [datetime.fromisoformat(point["bucket"]) for point in body["points"]] == [
+            WINDOW.start,
+            WINDOW.start + timedelta(days=1),
+        ]
+        unwindowed = client.get(
+            f"/v1/insights/{name.value}",
+            params={"as_of": WINDOW.end.isoformat(), "bucket": "day"},
+            headers=bearer(context),
+        )
+        assert unwindowed.status_code == 200
+        assert len(unwindowed.json()["points"]) > len(body["points"])
+    else:
+        assert Decimal(body["spend"]["attributed_usd"]) + Decimal(
+            body["spend"]["unattributed_usd"]
+        ) == Decimal("2")
+
+
+def test_critical_misses_http_accepts_31_days_but_refuses_a_wider_range(
+    context: Context, client: TestClient, campaign: Campaign
+) -> None:
+    params = {
+        "window_start": T0.isoformat(),
+        "window_end": (T0 + timedelta(days=31)).isoformat(),
+    }
+    response = client.get("/v1/insights/critical-misses", params=params, headers=bearer(context))
+    assert response.status_code == 200
+    assert {row["finding_id"] for row in response.json()["misses"]} == {
+        str(campaign.ids[name]) for name in ("area", "missed", "benchmark-first")
+    }
+    params["window_end"] = (T0 + timedelta(days=31, microseconds=1)).isoformat()
+    refused = client.get("/v1/insights/critical-misses", params=params, headers=bearer(context))
+    assert refused.status_code == 422
+    assert refused.headers["content-type"] == "application/problem+json"
 
 
 @pytest.mark.parametrize(

@@ -5,7 +5,7 @@ import logging
 import re
 from collections import Counter, defaultdict
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
-from datetime import UTC, date, datetime, time
+from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from functools import partial
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
@@ -217,6 +217,10 @@ class View(Protocol):
     def report(self, model: Any, generated_at: datetime) -> Report: ...
 
 
+def _accepts_window(view: View) -> bool:
+    return bool(getattr(view, "accepts_window", getattr(view, "windowed", False)))
+
+
 class InsightService:
     """Dashboards are derived views: built on demand and rendered, never stored."""
 
@@ -232,16 +236,16 @@ class InsightService:
         self._sla_policies = sla_policies
 
     def build(self, view: ViewName, filter: ViewFilter) -> ViewModel:
-        return self._view(view).build(filter)
+        return self._view(view, filter).build(filter)
 
     def report(self, view: ViewName, filter: ViewFilter) -> Report:
         """The view as a report for a person (markdown, html)."""
-        found = self._view(view)
+        found = self._view(view, filter)
         return found.report(found.build(filter), filter.as_of or self._clock.now())
 
     def publish(self, view: ViewName, filter: ViewFilter) -> RenderedView:
         """The view's model and its markdown and html renders; core writes no files."""
-        found = self._view(view)
+        found = self._view(view, filter)
         model = found.build(filter)
         report = found.report(model, filter.as_of or self._clock.now())
         export = getattr(found, "export", None)
@@ -274,7 +278,13 @@ class InsightService:
         fails doesn't stop the rest; a windowed view with no window covers the month of `as_of`.
         A ConfigError is the deployment's, not one view's, so it stops the refresh."""
         names = (
-            [n for n, v in self._views.items() if not getattr(v, "per_item", False)]
+            [
+                n
+                for n, v in self._views.items()
+                if not getattr(v, "per_item", False)
+                and (filter.window is None or _accepts_window(v))
+                and ((supports := getattr(v, "supports_filter", None)) is None or supports(filter))
+            ]
             if views is None
             else list(dict.fromkeys(views))
         )
@@ -296,14 +306,17 @@ class InsightService:
                 failed[name] = f"{type(e).__name__}: {e}"
         return RefreshResult(rendered=rendered, failed=failed)
 
-    def _view(self, name: ViewName) -> View:
+    def _view(self, name: ViewName, filter: ViewFilter | None = None) -> View:
         try:
-            return self._views[name]
+            found = self._views[name]
         except KeyError:
             known = ", ".join(sorted(self._views)) or "none"
             raise ValidationError(
                 f"view {name.value!r} is not built; built views: {known}"
             ) from None
+        if filter is not None and filter.window is not None and not _accepts_window(found):
+            raise ValidationError(f"{name.value} does not support a window")
+        return found
 
 
 class CriticalMissesView:
@@ -313,9 +326,13 @@ class CriticalMissesView:
     def __init__(self, detection_quality: DetectionQualityService) -> None:
         self._detection_quality = detection_quality
 
+    @staticmethod
+    def supports_filter(filter: ViewFilter) -> bool:
+        return not filter.model_dump(exclude={"window"}, exclude_defaults=True)
+
     def build(self, filter: ViewFilter) -> CriticalMisses:
-        unsupported = filter.model_dump(exclude={"window"}, exclude_defaults=True)
-        if unsupported:
+        if not self.supports_filter(filter):
+            unsupported = filter.model_dump(exclude={"window"}, exclude_defaults=True)
             raise ValidationError(
                 "critical-misses supports only a global window; unsupported filters: "
                 + ", ".join(sorted(unsupported))
@@ -327,11 +344,14 @@ class CriticalMissesView:
             raise ValidationError("critical-misses requires timezone-aware window boundaries")
         if window.start >= window.end:
             raise ValidationError("critical-misses requires window start before end")
+        if window.end - window.start > timedelta(days=31):
+            raise ValidationError("critical-misses requires a window of at most 31 days")
         model = CriticalMisses(
             window=window,
-            misses=tuple(self._detection_quality.critical_misses(window)),
+            misses=tuple(self._detection_quality.critical_misses(window, max_records=10_000)),
         )
-        contracts.validate_view(self.name, model.model_dump(mode="json"))
+        document: dict[str, contracts.JsonValue] = model.model_dump(mode="json")
+        contracts.validate_view(self.name, document)
         return model
 
     def report(self, model: CriticalMisses, generated_at: datetime) -> Report:
@@ -1142,6 +1162,7 @@ class FindingsTrendView:
     weighted by each repository's resolutions."""
 
     name = ViewName.FINDINGS_TREND
+    accepts_window = True
 
     def __init__(self, findings: FindingService, portfolio: PortfolioService, clock: Clock) -> None:
         self._findings = findings

@@ -7,6 +7,7 @@ from uuid import UUID
 import sqlalchemy as sa
 
 from traust_core.v1.errors import NotFoundError
+from traust_core.v1.models.common import RecordBudget
 from traust_core.v1.models.inventory import RepositoryRef
 from traust_core.v1.repositories.tables import (
     TRAUST,
@@ -42,8 +43,12 @@ class RepositoryRefRepository(MutableRecordRepository[RepositoryRef], Protocol):
         """A named ref by (repository, name, sha); name None = the bare commit."""
         ...
 
-    def list_for(self, repository_id: UUID) -> list[RepositoryRef]: ...
-    def list_for_repositories(self, repository_ids: Collection[UUID]) -> list[RepositoryRef]: ...
+    def list_for(
+        self, repository_id: UUID, *, read_budget: RecordBudget | None = None
+    ) -> list[RepositoryRef]: ...
+    def list_for_repositories(
+        self, repository_ids: Collection[UUID], *, read_budget: RecordBudget | None = None
+    ) -> list[RepositoryRef]: ...
     def list_by_ids(self, repository_ref_ids: Collection[UUID]) -> list[RepositoryRef]: ...
     def default(self, repository_id: UUID) -> RepositoryRef | None: ...
     def list_for_manifest_sbom(self, sbom_id: UUID) -> list[RepositoryRef]: ...
@@ -77,11 +82,24 @@ class SqlRepositoryRefRepository(SqlMutableRepository[RepositoryRef]):
             f"find {name or 'bare'}@{sha}", c.repository_id == repository_id, named, c.sha == sha
         )
 
-    def list_for(self, repository_id: UUID) -> list[RepositoryRef]:
-        return self._many(f"list for {repository_id}", self.table.c.repository_id == repository_id)
+    def list_for(
+        self, repository_id: UUID, *, read_budget: RecordBudget | None = None
+    ) -> list[RepositoryRef]:
+        return self._many(
+            f"list for {repository_id}",
+            self.table.c.repository_id == repository_id,
+            read_budget=read_budget,
+        )
 
-    def list_for_repositories(self, repository_ids: Collection[UUID]) -> list[RepositoryRef]:
-        return self._many_in("list for repositories", self.table.c.repository_id, repository_ids)
+    def list_for_repositories(
+        self, repository_ids: Collection[UUID], *, read_budget: RecordBudget | None = None
+    ) -> list[RepositoryRef]:
+        return self._many_in(
+            "list for repositories",
+            self.table.c.repository_id,
+            repository_ids,
+            read_budget=read_budget,
+        )
 
     def list_by_ids(self, repository_ref_ids: Collection[UUID]) -> list[RepositoryRef]:
         return self._many_in(

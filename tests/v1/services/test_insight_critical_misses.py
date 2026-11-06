@@ -13,7 +13,7 @@ import sqlalchemy as sa
 from sqlalchemy.engine import Engine
 
 from tests.v1.conftest import SQL_BACKENDS, contract_db
-from tests.v1.repositories.tables.conftest import T0
+from tests.v1.repositories.tables.conftest import T0, Seed
 from tests.v1.services.test_detection_quality import report
 from tests.v1.services.test_detection_quality_doors import DAY, WINDOW, Campaign, World
 from traust_core.v1 import contracts
@@ -22,7 +22,13 @@ from traust_core.v1.errors import DocumentError, ValidationError
 from traust_core.v1.models.artifacts import SecurityAuditArtifact
 from traust_core.v1.models.common import TimeBucket, TimeWindow
 from traust_core.v1.models.detection_quality import MissReason
-from traust_core.v1.models.insight import CriticalMisses, ExecutivePanel, ViewFilter, ViewName
+from traust_core.v1.models.insight import (
+    CriticalMisses,
+    ExecutivePanel,
+    FindingsRollup,
+    ViewFilter,
+    ViewName,
+)
 from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.rendering import HtmlRenderer, MarkdownRenderer
@@ -135,6 +141,21 @@ def test_window_is_inclusive_at_start_and_exclusive_at_end(
 
 
 @pytest.mark.parametrize("door", ["build", "report", "publish"])
+def test_a_full_31_day_window_preserves_the_native_population(
+    context: Context, campaign: Campaign, door: str
+) -> None:
+    window = TimeWindow(start=WINDOW.start, end=WINDOW.start + 31 * DAY)
+    insight = context.services().insight
+    model = insight.build(ViewName.CRITICAL_MISSES, ViewFilter(window=window))
+    assert isinstance(model, CriticalMisses)
+    assert model.window == window
+    assert {row.finding_id for row in model.misses} == {
+        campaign.ids[name] for name in ("area", "missed", "benchmark-first")
+    }
+    assert getattr(insight, door)(ViewName.CRITICAL_MISSES, ViewFilter(window=window))
+
+
+@pytest.mark.parametrize("door", ["build", "report", "publish"])
 def test_invalid_or_missing_windows_are_refused_before_any_repository_read(
     context: Context, engine: Engine, door: str
 ) -> None:
@@ -145,6 +166,7 @@ def test_invalid_or_missing_windows_are_refused_before_any_repository_read(
         ViewFilter(window=TimeWindow(start=T0, end=(T0 + DAY).replace(tzinfo=None))),
         ViewFilter(window=TimeWindow(start=T0, end=T0)),
         ViewFilter(window=TimeWindow(start=T0 + DAY, end=T0)),
+        ViewFilter(window=TimeWindow(start=T0, end=T0 + 31 * DAY + timedelta(microseconds=1))),
     ]
 
     def refuse_read(*args: Any) -> None:
@@ -216,6 +238,42 @@ def test_refresh_keeps_the_existing_current_month_fallback(
     assert {row.finding_id for row in model.misses} == {
         campaign.ids[name] for name in ("area", "missed", "benchmark-first")
     }
+
+
+@pytest.mark.parametrize("scope", ["product", "as_of"])
+def test_implicit_refresh_omits_global_only_views_without_discarding_the_requested_scope(
+    context: Context, engine: Engine, scope: str
+) -> None:
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        product = seed.product()
+        repository = seed.repository()
+        ref = seed.repository_ref(repository)
+        seed.component(seed.release(product), ref)
+        assessment = seed.assessment(ref, occurred_at=T0)
+        seed.occurrence(seed.finding(repository, title="Included"), assessment, severity="critical")
+        other = seed.repository()
+        later = seed.assessment(seed.repository_ref(other), occurred_at=T0 + 2 * DAY)
+        seed.occurrence(seed.finding(other, title="Excluded"), later, severity="critical")
+        uow.commit()
+    assert product.id is not None
+    filter = (
+        ViewFilter(product_ids=(product.id,)) if scope == "product" else ViewFilter(as_of=T0 + DAY)
+    )
+    insight = context.services().insight
+    implicit = insight.refresh(None, filter)
+    assert ViewName.CRITICAL_MISSES not in implicit.rendered
+    assert ViewName.CRITICAL_MISSES not in implicit.failed
+    assert ViewName.FINDINGS_ROLLUP not in implicit.failed
+    model = implicit.rendered[ViewName.FINDINGS_ROLLUP].model
+    assert isinstance(model, FindingsRollup)
+    assert [finding.title for finding in model.top] == ["Included"]
+    explicit = insight.refresh([ViewName.CRITICAL_MISSES], filter)
+    assert ViewName.CRITICAL_MISSES not in explicit.rendered
+    assert ViewName.CRITICAL_MISSES in explicit.failed
+    for door in ("build", "report", "publish"):
+        with pytest.raises(ValidationError):
+            getattr(insight, door)(ViewName.CRITICAL_MISSES, filter)
 
 
 def test_current_disposition_is_retained_without_a_historical_claim(
