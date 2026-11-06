@@ -26,6 +26,7 @@ from traust_core.v1.models.assessment import (
 from traust_core.v1.models.common import (
     Page,
     PageRequest,
+    RecordBudget,
     TimeBucket,
     TimeWindow,
 )
@@ -135,13 +136,15 @@ class FindingService:
             (view,) = self._views.views(uow, [uow.findings.get(finding_id)])
         return view
 
-    def list_by_ids(self, finding_ids: Collection[UUID]) -> list[FindingView]:
+    def list_by_ids(
+        self, finding_ids: Collection[UUID], *, read_budget: RecordBudget | None = None
+    ) -> list[FindingView]:
         """These findings as they stand; NotFoundError names any that don't exist."""
         with self._uow as uow:
-            found = uow.findings.list_by_ids(finding_ids)
+            found = uow.findings.list_by_ids(finding_ids, read_budget=read_budget)
             if missing := set(finding_ids) - {f.id for f in found}:
                 raise NotFoundError(f"findings {', '.join(sorted(map(str, missing)))}")
-            return self._views.views(uow, found, as_of=None)
+            return self._views.views(uow, found, as_of=None, read_budget=read_budget)
 
     def list_by_cwe(self, cwe: str) -> list[FindingView]:
         """Every finding tagged with this CWE, in any repository (a fleet fix's targets)."""
@@ -248,21 +251,27 @@ class FindingService:
         return moves
 
     def occurrences(
-        self, *, assessment_id: UUID | None = None, finding_ids: Collection[UUID] | None = None
+        self,
+        *,
+        assessment_id: UUID | None = None,
+        finding_ids: Collection[UUID] | None = None,
+        read_budget: RecordBudget | None = None,
     ) -> list[Occurrence]:
         """What one assessment reported, or every report of these findings (exactly one)."""
         if (assessment_id is None) == (finding_ids is None):
             raise ValidationError("occurrences of an assessment or of findings, exactly one")
         with self._uow as uow:
             if assessment_id is not None:
-                return uow.occurrences.list_for_assessment(assessment_id)
+                return uow.occurrences.list_for_assessment(assessment_id, read_budget=read_budget)
             assert finding_ids is not None
-            return uow.occurrences.list_for_findings(finding_ids)
+            return uow.occurrences.list_for_findings(finding_ids, read_budget=read_budget)
 
-    def locations(self, occurrence_ids: Collection[UUID]) -> list[Location]:
+    def locations(
+        self, occurrence_ids: Collection[UUID], *, read_budget: RecordBudget | None = None
+    ) -> list[Location]:
         """Where these occurrences were reported, by occurrence, path and line."""
         with self._uow as uow:
-            return uow.locations.list_for_occurrences(occurrence_ids)
+            return uow.locations.list_for_occurrences(occurrence_ids, read_budget=read_budget)
 
     def rule_hits(self) -> list[Occurrence]:
         """Every occurrence a scanner rule reported."""

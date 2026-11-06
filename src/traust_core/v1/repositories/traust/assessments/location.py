@@ -6,6 +6,7 @@ from uuid import UUID
 
 import sqlalchemy as sa
 
+from traust_core.v1.models.common import RecordBudget
 from traust_core.v1.models.findings import Location
 from traust_core.v1.repositories.tables import (
     TRAUST,
@@ -33,7 +34,9 @@ LOCATION = TableSpec(
 
 class LocationRepository(RecordRepository[Location], Protocol):
     def list_for_occurrence(self, occurrence_id: UUID) -> list[Location]: ...
-    def list_for_occurrences(self, occurrence_ids: Collection[UUID]) -> list[Location]: ...
+    def list_for_occurrences(
+        self, occurrence_ids: Collection[UUID], *, read_budget: RecordBudget | None = None
+    ) -> list[Location]: ...
     def list_with_symbols(self, symbols: Collection[str]) -> list[Location]: ...
     def list_with_symbols_page(
         self, symbols: Collection[str], limit: int, after: tuple[str, UUID] | None = None
@@ -52,12 +55,15 @@ class SqlLocationRepository(SqlAppendOnlyRepository[Location]):
             order_by=(c.path, c.line_start),
         )
 
-    def list_for_occurrences(self, occurrence_ids: Collection[UUID]) -> list[Location]:
+    def list_for_occurrences(
+        self, occurrence_ids: Collection[UUID], *, read_budget: RecordBudget | None = None
+    ) -> list[Location]:
         c = self.table.c
         return self._many(
             f"list for {len(occurrence_ids)} occurrences",
             _of(c, c.occurrence_id.in_(list(occurrence_ids))),
             order_by=(c.occurrence_id, c.path, c.line_start),
+            read_budget=read_budget,
         )
 
     def list_with_symbols(self, symbols: Collection[str]) -> list[Location]:

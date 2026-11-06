@@ -6,6 +6,7 @@ from datetime import datetime
 from uuid import UUID
 
 from traust_core.v1.errors import IntegrityError, NotFoundError
+from traust_core.v1.models.common import RecordBudget
 from traust_core.v1.models.findings import (
     Finding,
     FindingExternalRef,
@@ -35,9 +36,14 @@ class FindingViewQuery:
         as_of: datetime | None = None,
         *,
         facts: FindingFacts | None = None,
+        read_budget: RecordBudget | None = None,
     ) -> list[FindingView]:
-        facts = facts if facts is not None else FindingFacts.load(uow, findings, until=as_of)
-        return self._views(uow, findings, as_of, facts)
+        facts = (
+            facts
+            if facts is not None
+            else FindingFacts.load(uow, findings, until=as_of, read_budget=read_budget)
+        )
+        return self._views(uow, findings, as_of, facts, read_budget=read_budget)
 
     def _views(
         self,
@@ -45,6 +51,8 @@ class FindingViewQuery:
         findings: Sequence[Finding],
         as_of: datetime | None,
         facts: FindingFacts,
+        *,
+        read_budget: RecordBudget | None = None,
     ) -> list[FindingView]:
         latest_ids = [
             seen[-1].id
@@ -52,7 +60,11 @@ class FindingViewQuery:
             if finding.id and (seen := facts.reported_by(finding.id, as_of)) and seen[-1].id
         ]
         places: defaultdict[UUID, list[Location]] = defaultdict(list)
-        for location in uow.locations.list_for_occurrences(latest_ids) if latest_ids else ():
+        for location in (
+            uow.locations.list_for_occurrences(latest_ids, read_budget=read_budget)
+            if latest_ids
+            else ()
+        ):
             places[location.occurrence_id].append(location)
         return [
             view

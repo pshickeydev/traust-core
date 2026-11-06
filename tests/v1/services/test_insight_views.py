@@ -209,6 +209,44 @@ def test_the_program_view_needs_a_window(context: Context) -> None:
         context.services().insight.build(ViewName.PROGRAM, ViewFilter())
 
 
+@pytest.mark.parametrize("name", [ViewName.FINDINGS_TREND, ViewName.PROGRAM])
+def test_optional_and_required_window_consumers_keep_their_window_on_every_door(
+    context: Context, engine: Engine, name: ViewName
+) -> None:
+    seed_findings(engine)
+    seed_program(engine)
+    insight = context.services().insight
+    filter = ViewFilter(window=WEEK, bucket=TimeBucket.WEEK)
+    model = insight.build(name, filter)
+    if isinstance(model, FindingsTrend):
+        assert [point.bucket for point in model.points] == [T0, T0 + 7 * DAY]
+    else:
+        assert isinstance(model, ProgramMetrics)
+        assert model.window == WEEK and model.spend.total_usd == Decimal("2.5")
+    assert insight.publish(name, filter).model == model
+    insight.report(name, filter)
+    refreshed = insight.refresh([name], filter)
+    assert not refreshed.failed and refreshed.rendered[name].model == model
+
+
+def test_implicit_window_refresh_selects_only_window_consumers(
+    context: Context, engine: Engine
+) -> None:
+    seed_findings(engine)
+    seed_program(engine)
+    insight = context.services().insight
+    filter = ViewFilter(window=WEEK)
+    implicit = insight.refresh(None, filter)
+    assert ViewName.FINDINGS_ROLLUP not in implicit.rendered
+    assert ViewName.FINDINGS_ROLLUP not in implicit.failed
+    assert {ViewName.FINDINGS_TREND, ViewName.PROGRAM} <= set(implicit.rendered)
+    assert ViewName.FINDINGS_TREND not in implicit.failed
+    assert ViewName.PROGRAM not in implicit.failed
+    explicit = insight.refresh([ViewName.FINDINGS_ROLLUP], filter)
+    assert ViewName.FINDINGS_ROLLUP not in explicit.rendered
+    assert ViewName.FINDINGS_ROLLUP in explicit.failed
+
+
 def published_triage(context: Context, engine: Engine) -> Any:
     publisher = ArtifactPublisher(
         PublishSpecs(PublishSpec(TriageArtifact)), context.object_store, SqlTraustUnitOfWork(engine)
@@ -246,7 +284,7 @@ def test_the_triage_view_needs_a_document_and_a_reader(
 def test_refresh_of_every_view_leaves_single_item_renders_out(
     context: Context, engine: Engine
 ) -> None:
-    result = context.services().insight.refresh(None, ViewFilter(window=WEEK))
+    result = context.services().insight.refresh(None, ViewFilter())
     assert ViewName.TRIAGE not in {*result.rendered, *result.failed}
     assert {ViewName.FINDINGS_ROLLUP, ViewName.FINDINGS_TREND, ViewName.PROGRAM} <= set(
         result.rendered

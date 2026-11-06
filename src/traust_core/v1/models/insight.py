@@ -21,6 +21,7 @@ from traust_core.v1.models.code_facts import LanguageCount
 from traust_core.v1.models.common import TimeBucket, TimeWindow
 from traust_core.v1.models.compliance import ComplianceRollup, DocVariance
 from traust_core.v1.models.dependencies import ExposureRollup
+from traust_core.v1.models.detection_quality import CriticalMiss
 from traust_core.v1.models.findings import (
     Decision,
     FindingRollup,
@@ -48,6 +49,7 @@ class ViewName(StrEnum):
     FINDINGS_ROLLUP = "findings-rollup"
     CONTAINER_FINDINGS = "container-findings"
     INSECURE_PATTERNS = "insecure-patterns"
+    CRITICAL_MISSES = "critical-misses"
     FINDINGS_TREND = "findings-trend"
     COVERAGE = "coverage"
     LOC = "loc"
@@ -77,6 +79,11 @@ class ViewName(StrEnum):
 
 # Each view's model is a contracts JSON schema (I4); shapes land with the view's slice.
 class ViewModel(Model): ...
+
+
+class CriticalMisses(ViewModel):
+    window: TimeWindow
+    misses: tuple[CriticalMiss, ...]
 
 
 class ExecutivePanel(StrEnum):
