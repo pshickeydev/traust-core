@@ -106,7 +106,7 @@ def fork_of(engine: Engine, request: list[RemediationFindingRequest]) -> str:
     return f"https://github.com/mirror-org/{url.rsplit('/', 1)[-1]}"
 
 
-def folded(service: RemediationSchedulingService, effort: ScheduledEffort) -> Any:
+def folded(service: RemediationSchedulingService, effort: ScheduledEffort) -> RemediationStatus:
     """The effort's effective status, folded from its decisions and the verification verdicts
     on its fix (what the removed scheduled row's status sync kept)."""
     return service.get(effort.work_item.work_item_id).status

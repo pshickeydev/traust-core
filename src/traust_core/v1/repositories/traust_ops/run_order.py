@@ -208,8 +208,15 @@ class SqlRunOrderRepository(SqlMutableRepository[RunOrder]):
         return None if row is None else self._to_record(row)
 
     def find_by_work_item(self, work_item_id: UUID) -> RunOrder | None:
+        """The oldest order naming the work item — the one that scheduled its effort, should
+        a second ever name it."""
         c = self.table.c
-        stmt = self._select().where(c.work_item_id == work_item_id).limit(1)
+        stmt = (
+            self._select()
+            .where(c.work_item_id == work_item_id)
+            .order_by(c.created_at, c.id)
+            .limit(1)
+        )
         row = self._execute(f"find order for work item {work_item_id}", stmt).mappings().first()
         return None if row is None else self._to_record(row)
 

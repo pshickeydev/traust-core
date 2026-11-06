@@ -3,7 +3,7 @@ button). One call opens the work item (candidate decisions, one per finding) and
 order that runs the fix, carrying the fork facts — nothing before it started remediation
 alone. There is no scheduling table (contracts#117): the effort is the work item, its status
 folded from its decisions; the fork facts ride the order until the run's report records them;
-a verification's verdicts fold back at read (RemediationService.revalidated)."""
+a verification's verdicts fold back at read (VerificationService.revalidated_verdicts)."""
 
 from __future__ import annotations
 
@@ -177,7 +177,11 @@ class RemediationSchedulingService:
             for e, _ in self._efforts(repository_id)
             if (status is None or e.status == status)
             and (finding_id is None or finding_id in e.work_item.finding_ids)
-            and (after is None or (e.work_item.opened_at, str(e.work_item.work_item_id)) > after)
+            and (
+                after is None
+                or (e.work_item.opened_at, str(e.work_item.work_item_id))
+                > (after[0], str(after[1]))
+            )
         ]
         return Page.of(
             efforts[: page.limit + 1],
@@ -188,48 +192,86 @@ class RemediationSchedulingService:
     def _efforts(self, repository_id: UUID | None) -> list[tuple[ScheduledEffort, UUID | None]]:
         """Every scheduled effort, oldest first: the orders that run one, each with its work
         item and its effective status folded (an item whose findings were never recorded — a
-        run that stopped between open()'s commits — is nothing to work on, not an error)."""
-        orders = self._ops.work_item_orders(REMEDIATE_FINDING, repository_id)
+        run that stopped between open()'s commits — is nothing to work on, not an error). One
+        order per work item — the oldest's, the one that scheduled it: a second order for the
+        same work item is not a second effort."""
+        orders = sorted(
+            self._ops.work_item_orders(REMEDIATE_FINDING, repository_id),
+            key=lambda o: (o.created_at, o.id),
+        )
         items = {
             i.work_item_id: i
             for i in self._remediation.items_for({o.work_item_id for o in orders if o.work_item_id})
         }
-        efforts = []
+        made: list[tuple[ScheduledEffort, UUID | None]] = []
+        seen: set[UUID] = set()
         for order in orders:
-            if order.work_item_id is None or (item := items.get(order.work_item_id)) is None:
+            if order.work_item_id is None or order.work_item_id in seen:
+                continue
+            if (item := items.get(order.work_item_id)) is None:
                 continue
             fork_url, fork_branch = self._fork_facts(item, order)
             if fork_url is None or fork_branch is None:
                 continue  # an order that names no fork runs no scheduled fix
-            effort = ScheduledEffort(
-                work_item=item,
-                fork_url=fork_url,
-                fork_branch=fork_branch,
-                status=item.status,
-                order_id=order.id,
-            )
-            efforts.append(
+            seen.add(order.work_item_id)
+            made.append(
                 (
-                    effort.model_copy(update={"status": self._status(effort, order.repository_id)})
-                    if order.repository_id is not None
-                    else effort,
+                    ScheduledEffort(
+                        work_item=item,
+                        fork_url=fork_url,
+                        fork_branch=fork_branch,
+                        status=item.status,
+                        order_id=order.id,
+                    ),
                     order.repository_id,
                 )
             )
+        # one covering fold per repository, shared by its efforts (their newer-effort check)
+        covering: dict[UUID, list[WorkItem]] = {}
+        for repository in {repo for _, repo in made if repo is not None}:
+            wanted = {
+                f
+                for effort, repo in made
+                if repo == repository
+                for f in effort.work_item.finding_ids
+            }
+            covering[repository] = self._remediation.covering(repository, wanted)
+        efforts = [
+            (
+                effort.model_copy(
+                    update={"status": self._status(effort, repository, covering[repository])}
+                ),
+                repository,
+            )
+            if repository is not None
+            else (effort, repository)
+            for effort, repository in made
+        ]
         return sorted(
             efforts, key=lambda e: (e[0].work_item.opened_at, e[0].work_item.work_item_id)
         )
 
-    def _status(self, effort: ScheduledEffort, repository_id: UUID) -> RemediationStatus:
+    def _status(
+        self,
+        effort: ScheduledEffort,
+        repository_id: UUID,
+        candidates: list[WorkItem] | None = None,
+    ) -> RemediationStatus:
         """The effort's effective status: its work item's, then each verification's verdict on
         its fix as it happened — the two revalidated verdicts rank alike, so the latest
         verification wins between them; otherwise the furthest, never stepping back. An effort
         that is over stays over once a newer one covers any of its findings."""
         item = effort.work_item
+        others = (
+            candidates
+            if candidates is not None
+            else self._remediation.covering(repository_id, item.finding_ids)
+        )
         newer = any(
             other.opened_at > item.opened_at
-            for other in self._remediation.covering(repository_id, item.finding_ids)
-            if other.work_item_id != item.work_item_id
+            and other.work_item_id != item.work_item_id
+            and set(other.finding_ids).intersection(item.finding_ids)
+            for other in others
         )
         standing = item.status
         for verdict in self._verification.revalidated_verdicts(item, effort.fork_branch):
@@ -241,8 +283,9 @@ class RemediationSchedulingService:
         return standing
 
     def _fork_facts(self, item: WorkItem, order: RunOrder | None) -> tuple[str | None, str | None]:
-        """Where the effort's fix lives: the order's fork facts while it runs, then the
-        recorded report's (the durable record) once the order is gone."""
+        """Where the effort's fix lives, for reading: the order's fork facts while it runs,
+        then the recorded report's (the durable record) once the order is gone. What makes an
+        effort scheduled is the order itself — `_live` never falls back."""
         if order is not None and order.fork_url is not None and order.fork_branch is not None:
             return order.fork_url, order.fork_branch
         return (
@@ -257,25 +300,26 @@ class RemediationSchedulingService:
         recorded since); the same findings for another target, or an overlap, conflict."""
         for item in self._remediation.covering(repository_id, finding_ids):
             order = self._ops.order_for_work_item(item.work_item_id)
-            fork, branch = self._fork_facts(item, order)
-            if fork is None or branch is None:
-                continue  # a work item no order ever ran: not a scheduled effort
+            if (
+                order is None or order.fork_url is None or order.fork_branch is None
+            ):  # a manually opened work item, or one no order ever ran: not a scheduled effort
+                continue
             effort = ScheduledEffort(
                 work_item=item,
-                fork_url=fork,
-                fork_branch=branch,
+                fork_url=order.fork_url,
+                fork_branch=order.fork_branch,
                 status=item.status,
-                order_id=None if order is None else order.id,
+                order_id=order.id,
             )
             if self._status(effort, repository_id) in OVER:
                 continue
             if set(item.finding_ids) != finding_ids:
                 listed = ", ".join(sorted(map(str, set(item.finding_ids) & finding_ids)))
                 raise ConflictError(f"work item {item.work_item_id} already covers {listed}")
-            if (fork, branch) != (fork_url, fork_branch):
+            if (order.fork_url, order.fork_branch) != (fork_url, fork_branch):
                 raise ConflictError(
                     f"work item {item.work_item_id} already schedules these findings on "
-                    f"{fork} {branch}"
+                    f"{order.fork_url} {order.fork_branch}"
                 )
             return effort
         return None

@@ -1364,29 +1364,6 @@ class VerificationService:
         )
         return verification
 
-    def _verified_on(
-        self, patched: RepositoryRef, finding_ids: Collection[UUID]
-    ) -> dict[UUID, tuple[tuple[datetime, datetime], str]]:
-        """Each finding's latest verdict on this commit (`_verdict_order`)."""
-        history = {f: self._findings.history(f) for f in finding_ids}
-        runs = {
-            a.id: _verdict_order(a)
-            for a in self._log.list_by_ids(
-                {d.assessment_id for ds in history.values() for d in ds if d.assessment_id}
-            )
-            if a.kind == VERIFICATION and a.repository_ref_id == patched.id
-        }
-        latest = {}
-        for finding_id, decisions in history.items():
-            said = [
-                (runs[d.assessment_id], str(d.reason))
-                for d in decisions
-                if d.assessment_id in runs and d.reason
-            ]
-            if said:
-                latest[finding_id] = max(said, key=lambda s: s[0])
-        return latest
-
     def _audit_of(
         self, finding_ids: Sequence[UUID], original_commit: str, patched: RepositoryRef
     ) -> UUID | None:
@@ -1650,19 +1627,31 @@ class VerificationService:
         if not runs:
             return []
         said = {
-            f: sorted(
+            f: [
                 (runs[d.assessment_id], str(d.reason))
                 for d in decisions
                 if d.assessment_id in runs and d.reason
-            )
+            ]
             for f, decisions in history.items()
         }
+
+        def latest_so_far(
+            pairs: list[tuple[tuple[datetime, datetime], str]], moment: Any
+        ) -> str | None:
+            # the first verdict at the greatest order not past the moment: an equal-time tie
+            # never turns on the verdict text (the max() _verified_on used)
+            best: tuple[tuple[datetime, datetime], str] | None = None
+            for order, verdict in pairs:
+                if order <= moment and (best is None or order > best[0]):
+                    best = (order, verdict)
+            return None if best is None else best[1]
+
         verdicts: list[RemediationStatus] = []
         for moment in sorted(set(runs.values())):
             latest = {
-                f: upto[-1]
+                f: verdict
                 for f, pairs in said.items()
-                if (upto := [v for o, v in pairs if o <= moment])
+                if (verdict := latest_so_far(pairs, moment)) is not None
             }
             if not latest:
                 continue
