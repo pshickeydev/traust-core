@@ -630,3 +630,37 @@ def test_list_applies_every_filter_given(
         service.list(PageRequest(), repository_id=repository_id, finding_id=finding_ids[0]).items
     ) == [a]
     assert service.list(PageRequest(), repository_id=uuid4(), finding_id=finding_ids[0]).items == ()
+
+
+def test_replaying_an_older_verification_never_reverses_a_newer_one(
+    service: RemediationSchedulingService, context: Context, engine: Engine
+) -> None:
+    world = World(engine, findings=2, patched_name="main")
+    audited(engine, world, world.base)
+    request = pairs(world.ids, [world.repo.id] * len(world.ids))
+    scheduled = service.create(fork_of(engine, request), world.patched.name, request, PERSON)
+    context.services().remediation.record(
+        report(world.ids, fork__fix_commit=world.patched.sha), provenance()
+    )
+    verification = context.services().verification
+    older = verification_report(world, {world.ids[0]: "resolved", world.ids[1]: "unresolved"})
+    verification.record(older, verification_provenance())
+    assert row(engine, scheduled.id).status == "revalidated_still_vulnerable"
+    verification.record(verification_report(world), verification_provenance())
+    assert row(engine, scheduled.id).status == "revalidated_fixed"
+    verification.record(older, verification_provenance())  # the older report delivered again
+    assert row(engine, scheduled.id).status == "revalidated_fixed"
+
+
+def test_the_right_commit_on_another_branch_leaves_the_effort(
+    service: RemediationSchedulingService, context: Context, engine: Engine
+) -> None:
+    world = World(engine, patched_name="main")
+    audited(engine, world, world.base)
+    request = pairs(world.ids, [world.repo.id] * len(world.ids))
+    scheduled = service.create(fork_of(engine, request), BRANCH, request, PERSON)
+    context.services().remediation.record(
+        report(world.ids, fork__fix_commit=world.patched.sha), provenance()
+    )
+    context.services().verification.record(verification_report(world), verification_provenance())
+    assert row(engine, scheduled.id).status == "checks_passed"  # main is not the fix branch

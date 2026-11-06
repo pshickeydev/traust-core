@@ -149,3 +149,30 @@ def test_a_store_another_process_upgraded_first_opens(
     assert "manifest_sbom_assessment_id" in {
         c["name"] for c in sa.inspect(engine).get_columns("repository_ref")
     }
+
+
+def _without_remediation_tables(home: Path) -> None:
+    with Context(Config(home=home)).database.begin() as conn:
+        conn.exec_driver_sql("DROP TABLE remediation_finding")
+        conn.exec_driver_sql("DROP TABLE remediation")
+
+
+def test_a_local_database_from_before_the_scheduling_tables_gets_them(tmp_path: Path) -> None:
+    _without_remediation_tables(tmp_path)
+    engine = Context(Config(home=tmp_path)).database
+    tables = set(sa.inspect(engine).get_table_names())
+    assert {"remediation", "remediation_finding"} <= tables
+    again = Context(Config(home=tmp_path)).database  # present: nothing applied twice
+    assert {"remediation", "remediation_finding"} <= set(sa.inspect(again).get_table_names())
+
+
+def test_a_configured_database_missing_the_scheduling_tables_is_refused_with_its_upgrade(
+    tmp_path: Path,
+) -> None:
+    _without_remediation_tables(tmp_path)
+    configured = Config(
+        home=tmp_path / "elsewhere",
+        database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'traust.db'}"),
+    )
+    with pytest.raises(ConfigError, match="remediation_tables_upgrade"):
+        _ = Context(configured).database

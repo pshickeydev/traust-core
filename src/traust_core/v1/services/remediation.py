@@ -945,6 +945,7 @@ def _finding_id(ref: str) -> UUID:
 
 
 VERIFICATION = AssessmentKind.VERIFICATION
+_PAST_REVALIDATION = frozenset({"merged", "abandoned"})
 VERIFY_ASSESSOR = "skill:verify-remediation"
 # Classifier plan import table: execution-proven evidence without a grade is E1, so a
 # verdict outranks ungraded progress and tracker statements, as legacy's source tiers did.
@@ -1188,6 +1189,12 @@ class VerificationService:
                 digest,
             )
         assert assessment.id is not None and report.id is not None
+        # a report delivered again after its run finished has already revalidated: replaying an
+        # older one must not move a scheduled effort back past a newer verdict
+        replay = bool(recorded) and all(
+            any(d.assessment_id == assessment.id for d in self._findings.history(f))
+            for f in verdicts
+        )
         if doc.regressions:
             self._findings.intake.accept(assessment.id, regression_candidates(doc, repository_id))
         said: defaultdict[tuple[Any, ...], list[UUID]] = defaultdict(list)
@@ -1210,7 +1217,9 @@ class VerificationService:
                     rationales=rationales,
                     evidence_grade=VERIFIED_GRADE,
                 )
-            self._revalidate({f: v.verdict for f, v in verdicts.items()}, meta.patched_commit)
+            if not replay:
+                verdict_of = {f: v.verdict for f, v in verdicts.items()}
+                self._revalidate(verdict_of, meta.patched_commit, ref.name)
             uow.commit()
         if not recorded:
             self._uow.after_commit(
@@ -1223,16 +1232,23 @@ class VerificationService:
         )
         return verification
 
-    def _revalidate(self, verdicts: Mapping[UUID, str], patched_commit: str) -> None:
+    def _revalidate(
+        self, verdicts: Mapping[UUID, str], patched_commit: str, patched_ref: str | None
+    ) -> None:
         """The scheduled efforts this report verified move to their revalidated status, on the
-        verdicts' own transaction. An effort is this report's when the commit verified is its
-        work item's recorded fix commit (a report on the same finding at another commit, on the
-        upstream or another fork, says nothing about this fix). It is fixed only when every
-        finding it covers is verified fixed; still vulnerable when any verified one isn't; left
-        as is while some it covers are unverified and the rest fixed."""
+        verdicts' own transaction. An effort is this report's when the ref verified is its fix
+        branch and the commit verified is its work item's recorded fix commit (a report on the
+        same findings at another commit or branch, on the upstream or another fork, says nothing
+        about this fix). It is fixed only when every finding it covers is verified fixed; still
+        vulnerable when any verified one isn't; left as is while some it covers are unverified
+        and the rest fixed. Merged or abandoned efforts are past revalidation."""
         for effort, covers in self._findings.scheduled.efforts_covering(verdicts):
             assert effort.id is not None
-            if effort.assessment_id is None:
+            if (
+                effort.assessment_id is None
+                or effort.status in _PAST_REVALIDATION
+                or effort.fork_branch != patched_ref
+            ):
                 continue
             fixed_at = self._remediation.get(effort.assessment_id).fix_commit
             if fixed_at is None or not patched_commit.startswith(fixed_at):

@@ -731,6 +731,7 @@ class Context:
             apply_schema(engine, contracts.database_ddl(Dialect.of(engine)))
         else:
             _manifest_scan_pointer(engine, upgrade=local)
+            _remediation_tables(engine, upgrade=local)
         return engine
 
     @cached_property
@@ -1172,6 +1173,35 @@ def _sla_policy(path: Path) -> SlaPolicy:
         return SlaPolicy.model_validate(document)
     except ValueError as e:
         raise ConfigError(f"SLA policy {path}: {e}") from e
+
+
+def _remediation_tables(engine: Engine, *, upgrade: bool) -> None:
+    """contracts added `remediation` and `remediation_finding`: a local store gets them; a
+    configured database's schema is its deployment's, so their absence is refused here rather
+    than failing the first scheduling."""
+    dialect = Dialect.of(engine)
+    schema = "traust" if dialect == Dialect.POSTGRES else None
+
+    def present() -> bool | None:
+        inspector = sa.inspect(engine)
+        if not inspector.has_table("repository", schema=schema):
+            return None  # an empty database: the bootstrap creates every table
+        return inspector.has_table("remediation", schema=schema) and inspector.has_table(
+            "remediation_finding", schema=schema
+        )
+
+    if present() is not False:
+        return
+    if not upgrade:
+        raise ConfigError(
+            "the database predates the remediation scheduling tables: apply "
+            "traust_core.v1.contracts.remediation_tables_upgrade(dialect) to it"
+        )
+    try:
+        apply_schema(engine, contracts.remediation_tables_upgrade(dialect))
+    except RepositoryError:
+        if not present():  # else another process opening the same store upgraded it first
+            raise
 
 
 def _manifest_scan_pointer(engine: Engine, *, upgrade: bool) -> None:
