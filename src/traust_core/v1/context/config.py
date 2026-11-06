@@ -354,7 +354,7 @@ class Config(_Model):
     def _expand_home(cls, value: Path) -> Path:
         return value.expanduser()
 
-    @pydantic.field_validator("forge_hosts")
+    @pydantic.field_validator("forge_hosts", "forge_tokens")
     @classmethod
     def _lowercase_hosts(cls, value: dict[str, str]) -> dict[str, str]:
         # URL parsing lowercases hostnames, so a lookup by a mixed-case key would never match

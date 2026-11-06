@@ -125,10 +125,8 @@ def test_a_waiting_writer_keeps_the_first_writers_repository_as_it_was(
         assert uow.repositories.get(first.id) == first  # type: ignore[arg-type]
 
 
-@pytest.mark.integration
 def test_a_metadata_write_waits_for_a_visibility_change_and_keeps_it(engine: Engine) -> None:
-    if engine.dialect.name != "postgresql":
-        pytest.skip("row locks are Postgres's; SQLite has one writer")
+    # Postgres: B waits on A's row lock; SQLite: on A's write lock. Either way B reads after A
     portfolio = PortfolioService(SqlTraustUnitOfWork(engine), PortfolioPolicy())
     fork = portfolio.register_repository(
         HttpsRepoUrl.parse("https://github.com/mirror-org/api", ["github.com"]), public=False
@@ -156,3 +154,17 @@ def test_a_metadata_write_waits_for_a_visibility_change_and_keeps_it(engine: Eng
     writer.join(timeout=30)
     assert done and done[0].public is True and done[0].upstream_id is not None
     assert portfolio.get_repository(fork.id).public is True  # the change stands
+
+
+def test_a_mixed_case_configured_private_host_keeps_its_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("EXAMPLE_FORGE_TOKEN", "token-for-tests")
+    config = Config(
+        home=tmp_path,
+        forge_hosts={"github.com": "github", "GitHub.Example.com": "github"},
+        forge_tokens={"GitHub.Example.com": "EXAMPLE_FORGE_TOKEN"},
+    )
+    assert config.forge_tokens == {"github.example.com": "EXAMPLE_FORGE_TOKEN"}
+    api = Context(config).forge_api
+    assert api.headers("github.example.com") == {"Authorization": "Bearer token-for-tests"}

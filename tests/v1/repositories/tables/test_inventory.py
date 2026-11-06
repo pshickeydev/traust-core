@@ -172,3 +172,11 @@ def test_a_ref_locked_for_update_is_the_ref_and_a_missing_one_raises(seed: Seed)
     assert seed.uow.repository_refs.get_for_update(ref.id) == ref
     with pytest.raises(NotFoundError):
         seed.uow.repository_refs.get_for_update(uuid4())
+
+
+def test_repository_get_for_update_finds_the_row_or_raises(seed: Seed) -> None:
+    repository = seed.repository()
+    assert repository.id is not None
+    assert seed.uow.repositories.get_for_update(repository.id) == repository
+    with pytest.raises(NotFoundError, match="repository"):
+        seed.uow.repositories.get_for_update(uuid4())

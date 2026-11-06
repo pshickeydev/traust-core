@@ -625,15 +625,6 @@ class PortfolioService:
             )
         return repository
 
-    def lineage_observed(self, repository_id: UUID) -> bool:
-        """Whether a repo-state observation has recorded the forge's word on this repository's
-        fork lineage (it links or clears `upstream_id`); without assessments, nothing has."""
-        return (
-            self._assessment is not None
-            and self._assessment.latest_on_default_line(repository_id, AssessmentKind.REPO_STATE)
-            is not None
-        )
-
     def record_repo_info(
         self, repository_id: UUID, public: bool | None, parent_url: HttpsRepoUrl | None
     ) -> Repository:
@@ -1261,11 +1252,13 @@ class PortfolioSync:
 
     def import_repository(self, url: HttpsRepoUrl) -> SyncReport:
         """Register one repository with the visibility its forge reports and its fork's
-        upstream linked. A known repository with no upstream is asked once more, until an
-        observation has recorded its lineage (then a non-fork is settled, not re-asked)."""
+        upstream linked. A known repository with no upstream is asked again on every import:
+        nothing stored says the forge already called it a non-fork."""
         known = self._portfolio.find_repository(url)
         if known is not None and known.id is not None:
-            if known.upstream_id is None and not self._portfolio.lineage_observed(known.id):
+            # NEED(contracts: repo-state records the forge's fork answer, a non-fork included):
+            # until then a non-fork costs one forge call per import
+            if known.upstream_id is None:
                 # lineage not known yet: the forge may name a parent, or correct a parent
                 # placeholder's visibility. A forge outage, or a host the forge provider
                 # can't ask, still returns the known id.

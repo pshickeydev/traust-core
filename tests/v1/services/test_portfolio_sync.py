@@ -485,20 +485,16 @@ def test_a_new_repository_is_registered_with_its_final_visibility(
     assert registered.updated_at == registered.created_at  # written once, not flipped after
 
 
-def test_a_known_repository_whose_lineage_was_observed_is_not_asked_again(
-    tmp_path: Path,
-) -> None:
+def test_an_observation_without_a_fork_answer_never_stops_a_later_link(tmp_path: Path) -> None:
     context = Context(Config(home=tmp_path))
     portfolio = context.services().portfolio
-    plain = portfolio.register_repository(url("example-org/plain"), public=True)
-    observed = portfolio.register_repository(url("example-org/observed"), public=True)
-    with SqlTraustUnitOfWork(context.database) as uow:
+    fork = portfolio.register_repository(url("example-org/fork"), public=False)
+    with SqlTraustUnitOfWork(context.database) as uow:  # observed, the forge silent on forks
         ref = Seed(uow).repository_ref(Seed(uow).repository(), is_default=True)
-        ref = uow.repository_refs.update(ref.model_copy(update={"repository_id": observed.id}))
+        ref = uow.repository_refs.update(ref.model_copy(update={"repository_id": fork.id}))
         Seed(uow).assessment(ref, kind="repo_state")
         uow.commit()
-    forge = Forge()
-    assert portfolio.lineage_observed(observed.id) and not portfolio.lineage_observed(plain.id)  # type: ignore[arg-type]
-    sync(portfolio, forge).import_repository(url("example-org/observed"))
-    sync(portfolio, forge).import_repository(url("example-org/plain"))
-    assert forge.calls == [f"info {url('example-org/plain')}"]  # the observed one settled
+    forge = Forge(described=describing("example-org/fork", "example-org/api"))
+    sync(portfolio, forge).import_repository(url("example-org/fork"))
+    assert forge.calls == [f"info {url('example-org/fork')}"]  # still asked
+    assert portfolio.get_repository(fork.id).upstream_id is not None  # type: ignore[arg-type]
