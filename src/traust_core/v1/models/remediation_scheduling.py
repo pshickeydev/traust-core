@@ -30,9 +30,15 @@ class ScheduledEffort(Model):
     """One scheduled remediation effort: the work item (the effort itself — its findings, its
     report once recorded) and the fork facts of the order that runs it, with the effort's
     effective status — the work item's, or past it a verification's verdict on its fix. The
-    handle is `work_item.work_item_id`."""
+    handle is `work_item.work_item_id`.
+
+    `repository_id` names the repository the effort's findings belong to (the order's, which
+    the work-item pairing keeps equal to the work item's commit): consumers that did not ask
+    by repository — the engine's feed-driven trigger, the console's unfiltered lists — read
+    it here instead of resolving the work item's ref."""
 
     work_item: WorkItem
+    repository_id: UUID
     fork_url: str
     fork_branch: str
     status: RemediationStatus

@@ -135,6 +135,7 @@ class RemediationSchedulingService:
         )
         return ScheduledEffort(
             work_item=item,
+            repository_id=repository_id,
             fork_url=str(fork.url),
             fork_branch=fork_branch,
             status=item.status,
@@ -143,21 +144,23 @@ class RemediationSchedulingService:
 
     def get(self, work_item_id: UUID) -> ScheduledEffort:
         """One scheduled effort: its work item (the effort itself) and the fork facts of the
-        order that runs it — or of its recorded report, once the order is gone."""
+        order that runs it."""
         item = self._remediation.get(work_item_id)
         order = self._ops.order_for_work_item(work_item_id)
         if order is None or order.fork_url is None or order.fork_branch is None:
             raise NotFoundError(f"work item {work_item_id} schedules no remediation")
+        # A work-item order's repository is never null: the pairing trigger holds it to the
+        # work item's commit's repository (contracts#117's run_order_work_item_of_repository).
+        assert order.repository_id is not None
         effort = ScheduledEffort(
             work_item=item,
+            repository_id=order.repository_id,
             fork_url=order.fork_url,
             fork_branch=order.fork_branch,
             status=item.status,
             order_id=order.id,
         )
-        if order is not None and order.repository_id is not None:
-            effort = effort.model_copy(update={"status": self._status(effort, order.repository_id)})
-        return effort
+        return effort.model_copy(update={"status": self._status(effort, order.repository_id)})
 
     def list(
         self,
@@ -212,10 +215,14 @@ class RemediationSchedulingService:
             if order.fork_url is None or order.fork_branch is None:
                 continue  # an order that names no fork runs no scheduled fix
             seen.add(order.work_item_id)
+            # A work-item order's repository is never null (the pairing trigger); the
+            # effort carries it so consumers that did not ask by repository read no ref.
+            assert order.repository_id is not None
             made.append(
                 (
                     ScheduledEffort(
                         work_item=item,
+                        repository_id=order.repository_id,
                         fork_url=order.fork_url,
                         fork_branch=order.fork_branch,
                         status=item.status,
@@ -293,6 +300,7 @@ class RemediationSchedulingService:
                 continue
             effort = ScheduledEffort(
                 work_item=item,
+                repository_id=repository_id,
                 fork_url=order.fork_url,
                 fork_branch=order.fork_branch,
                 status=item.status,
