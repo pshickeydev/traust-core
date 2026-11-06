@@ -732,6 +732,7 @@ class Context:
         else:
             _manifest_scan_pointer(engine, upgrade=local)
             _remediation_tables(engine, upgrade=local)
+            _run_order_work_item(engine, upgrade=local)
         return engine
 
     @cached_property
@@ -1173,6 +1174,34 @@ def _sla_policy(path: Path) -> SlaPolicy:
         return SlaPolicy.model_validate(document)
     except ValueError as e:
         raise ConfigError(f"SLA policy {path}: {e}") from e
+
+
+def _run_order_work_item(engine: Engine, *, upgrade: bool) -> None:
+    """contracts added `run_order.work_item_id`: a local store is upgraded; a configured
+    database's schema is its deployment's, so its absence is refused here rather than failing
+    the first order."""
+    dialect = Dialect.of(engine)
+    schema = "traust_ops" if dialect == Dialect.POSTGRES else None
+    table = "run_order" if dialect == Dialect.POSTGRES else "ops_run_order"
+
+    def present() -> bool | None:
+        inspector = sa.inspect(engine)
+        if not inspector.has_table(table, schema=schema):
+            return None
+        return any(c["name"] == "work_item_id" for c in inspector.get_columns(table, schema=schema))
+
+    if present() is not False:
+        return
+    if not upgrade:
+        raise ConfigError(
+            "the database's run_order predates work_item_id: apply "
+            "traust_core.v1.contracts.run_order_work_item_upgrade(dialect) to it"
+        )
+    try:
+        apply_schema(engine, contracts.run_order_work_item_upgrade(dialect))
+    except RepositoryError:
+        if not present():  # else another process opening the same store upgraded it first
+            raise
 
 
 def _remediation_tables(engine: Engine, *, upgrade: bool) -> None:

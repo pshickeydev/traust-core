@@ -144,7 +144,13 @@ def test_a_verification_recorded_through_the_door_revalidates_the_effort(
     assert made.status_code == 200, made.text
     remediation_id = made.json()["id"]
     context.services().remediation.record(
-        remediation_report(world.ids, fork__fix_commit=world.patched.sha), remediation_provenance()
+        remediation_report(
+            world.ids,
+            fork__url=made.json()["fork_url"],
+            fork__fix_branch=world.patched.name,
+            fork__fix_commit=world.patched.sha,
+        ),
+        remediation_provenance(),
     )
     order = leased(context, world)
     recorded = client.post(

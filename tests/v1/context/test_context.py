@@ -176,3 +176,32 @@ def test_a_configured_database_missing_the_scheduling_tables_is_refused_with_its
     )
     with pytest.raises(ConfigError, match="remediation_tables_upgrade"):
         _ = Context(configured).database
+
+
+def _without_run_order_work_item(home: Path) -> None:
+    with Context(Config(home=home)).database.begin() as conn:
+        conn.exec_driver_sql("DROP INDEX idx_ops_run_order_work_item")
+        conn.exec_driver_sql("ALTER TABLE ops_run_order DROP COLUMN work_item_id")
+
+
+def _run_order_columns(engine: sa.Engine) -> set[str]:
+    return {c["name"] for c in sa.inspect(engine).get_columns("ops_run_order")}
+
+
+def test_a_local_database_from_before_run_order_work_item_is_upgraded(tmp_path: Path) -> None:
+    _without_run_order_work_item(tmp_path)
+    assert "work_item_id" in _run_order_columns(Context(Config(home=tmp_path)).database)
+    again = Context(Config(home=tmp_path)).database  # present: nothing applied twice
+    assert "work_item_id" in _run_order_columns(again)
+
+
+def test_a_configured_database_missing_run_order_work_item_is_refused_with_its_upgrade(
+    tmp_path: Path,
+) -> None:
+    _without_run_order_work_item(tmp_path)
+    configured = Config(
+        home=tmp_path / "elsewhere",
+        database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'traust.db'}"),
+    )
+    with pytest.raises(ConfigError, match="run_order_work_item_upgrade"):
+        _ = Context(configured).database

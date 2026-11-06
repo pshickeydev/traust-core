@@ -107,6 +107,12 @@ def row(engine: Engine, remediation_id: UUID | None) -> Any:
         return uow.remediations.get(remediation_id)
 
 
+def pushed(scheduled: Remediation, finding_ids: list[UUID], **changes: Any) -> Any:
+    """A remediation report of the fix pushed where it was scheduled."""
+    where = {"fork__url": scheduled.fork_url, "fork__fix_branch": scheduled.fork_branch}
+    return report(finding_ids, **{**where, **changes})
+
+
 def queued_orders(engine: Engine, repository_id: UUID) -> list[Any]:
     with SqlTraustUnitOfWork(engine) as uow:
         return uow.run_orders.list_for_repository(repository_id, OrderState.QUEUED)
@@ -150,6 +156,7 @@ def test_create_schedules_the_row_the_findings_the_work_item_and_the_order(
         "queued",
         "human:analyst@example.com",
     )
+    assert order.work_item_id == detail.assessment.work_item_id  # the runner prepares this one
 
 
 def test_create_schedules_the_same_findings_once(
@@ -337,7 +344,7 @@ def test_record_moves_the_scheduled_row_with_the_report(
         pairs(finding_ids, repository_ids),
         PERSON,
     )
-    done = context.services().remediation.record(report(finding_ids), provenance())
+    done = context.services().remediation.record(pushed(scheduled, finding_ids), provenance())
     assert done.status == "checks_passed"
     assert row(engine, scheduled.id).status == "checks_passed"
 
@@ -365,7 +372,7 @@ def test_a_verification_revalidates_the_scheduled_row(
         PERSON,
     )
     context.services().remediation.record(
-        report(world.ids, fork__fix_commit=world.patched.sha), provenance()
+        pushed(scheduled, world.ids, fork__fix_commit=world.patched.sha), provenance()
     )
     fixed = context.services().verification.record(
         verification_report(world), verification_provenance()
@@ -386,7 +393,7 @@ def test_a_verification_that_leaves_a_finding_open_marks_the_effort_still_vulner
         PERSON,
     )
     context.services().remediation.record(
-        report(world.ids, fork__fix_commit=world.patched.sha), provenance()
+        pushed(scheduled, world.ids, fork__fix_commit=world.patched.sha), provenance()
     )
     got = context.services().verification.record(
         verification_report(world, {world.ids[0]: "resolved", world.ids[1]: "unresolved"}),
@@ -492,7 +499,7 @@ def test_a_retry_after_a_report_returns_the_effort_and_an_overlap_conflicts(
         pairs(finding_ids[:1], repository_ids[:1]),
         PERSON,
     )
-    context.services().remediation.record(report(finding_ids[:1]), provenance())
+    context.services().remediation.record(pushed(scheduled, finding_ids[:1]), provenance())
     again = service.create(
         fork_of(engine, pairs(finding_ids[:1], repository_ids[:1])),
         BRANCH,
@@ -572,7 +579,7 @@ def test_a_verification_of_another_commit_leaves_the_effort(
         PERSON,
     )
     context.services().remediation.record(
-        report(world.ids, fork__fix_commit="0" * 40), provenance()
+        pushed(scheduled, world.ids, fork__fix_commit="0" * 40), provenance()
     )
     context.services().verification.record(verification_report(world), verification_provenance())
     assert row(engine, scheduled.id).status == "checks_passed"  # not this fix's commit
@@ -590,7 +597,7 @@ def test_a_verification_of_some_of_an_efforts_findings_leaves_it(
         PERSON,
     )
     context.services().remediation.record(
-        report(world.ids, fork__fix_commit=world.patched.sha), provenance()
+        pushed(scheduled, world.ids, fork__fix_commit=world.patched.sha), provenance()
     )
     context.services().verification.record(
         verification_report(world, {world.ids[0]: "resolved"}), verification_provenance()
@@ -640,7 +647,7 @@ def test_replaying_an_older_verification_never_reverses_a_newer_one(
     request = pairs(world.ids, [world.repo.id] * len(world.ids))
     scheduled = service.create(fork_of(engine, request), world.patched.name, request, PERSON)
     context.services().remediation.record(
-        report(world.ids, fork__fix_commit=world.patched.sha), provenance()
+        pushed(scheduled, world.ids, fork__fix_commit=world.patched.sha), provenance()
     )
     verification = context.services().verification
     older = verification_report(world, {world.ids[0]: "resolved", world.ids[1]: "unresolved"})
@@ -660,7 +667,86 @@ def test_the_right_commit_on_another_branch_leaves_the_effort(
     request = pairs(world.ids, [world.repo.id] * len(world.ids))
     scheduled = service.create(fork_of(engine, request), BRANCH, request, PERSON)
     context.services().remediation.record(
-        report(world.ids, fork__fix_commit=world.patched.sha), provenance()
+        pushed(scheduled, world.ids, fork__fix_commit=world.patched.sha), provenance()
     )
     context.services().verification.record(verification_report(world), verification_provenance())
     assert row(engine, scheduled.id).status == "checks_passed"  # main is not the fix branch
+
+
+def test_a_fork_the_inventory_records_as_public_takes_no_fix(
+    service: RemediationSchedulingService, context: Context, engine: Engine
+) -> None:
+    _, finding_ids, repository_ids = seeded(engine)
+    request = pairs(finding_ids, repository_ids)
+    fork = fork_of(engine, request)
+    with SqlTraustUnitOfWork(engine) as uow:
+        Seed(uow).repository(url=fork, public=True)  # the forge says the mirror is public
+        uow.commit()
+    with pytest.raises(ValidationError, match="public repository"):
+        service.create(fork, BRANCH, request, PERSON)
+    # nor does a report on an unscheduled work item that pushed there
+    remediation = context.services().remediation
+    item = remediation.open(finding_ids, default_ref(engine, repository_ids[0]))
+    with pytest.raises(ValidationError, match="public repository"):
+        remediation.record(report(finding_ids, fork__url=fork), provenance())
+    assert remediation.get(item.work_item_id).report is None
+
+
+def test_a_report_pushed_elsewhere_than_scheduled_is_refused(
+    service: RemediationSchedulingService, context: Context, engine: Engine
+) -> None:
+    _, finding_ids, repository_ids = seeded(engine)
+    request = pairs(finding_ids, repository_ids)
+    scheduled = service.create(fork_of(engine, request), BRANCH, request, PERSON)
+    remediation = context.services().remediation
+    elsewhere = {
+        "another fork": report(finding_ids, fork__fix_branch=BRANCH),
+        "another branch": pushed(scheduled, finding_ids, fork__fix_branch="fix/other"),
+    }
+    for case, doc in elsewhere.items():
+        with pytest.raises(ValidationError, match="not the scheduled"):
+            remediation.record(doc, provenance())
+        assert row(engine, scheduled.id).status == "candidate", case
+    assert remediation.record(pushed(scheduled, finding_ids), provenance()).report is not None
+
+
+def test_a_verification_that_fails_part_way_leaves_nothing_behind(
+    service: RemediationSchedulingService,
+    context: Context,
+    engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    world = World(engine, patched_name="main")
+    audited(engine, world, world.base)
+    request = pairs(world.ids, [world.repo.id] * len(world.ids))
+    scheduled = service.create(fork_of(engine, request), world.patched.name, request, PERSON)
+    context.services().remediation.record(
+        pushed(scheduled, world.ids, fork__fix_commit=world.patched.sha), provenance()
+    )
+    verification = context.services().verification
+
+    def recorded() -> tuple[int, int]:
+        with SqlTraustUnitOfWork(engine) as uow:
+            runs = [
+                a
+                for a in uow.assessments.list_for_ref(world.patched.id)
+                if a.kind == "verification"
+            ]  # type: ignore[arg-type]
+            return len(runs), len(uow.findings.list_for_repository(world.repo.id))  # type: ignore[arg-type]
+
+    before = recorded()
+
+    def broken(*_: Any) -> None:
+        raise RuntimeError("revalidation failed")
+
+    monkeypatch.setattr(type(verification), "_revalidate", broken)
+    doc = verification_report(world)
+    assert doc.regressions  # the report brings findings of its own
+    with pytest.raises(RuntimeError, match="revalidation failed"):
+        verification.record(doc, verification_provenance())
+    assert recorded() == before  # no assessment, report or regression stayed
+    assert row(engine, scheduled.id).status == "checks_passed"
+    monkeypatch.undo()
+    verification.record(doc, verification_provenance())  # the retry records it whole
+    assert recorded()[0] == before[0] + 1
+    assert row(engine, scheduled.id).status == "revalidated_fixed"

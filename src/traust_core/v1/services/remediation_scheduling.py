@@ -114,12 +114,14 @@ class RemediationSchedulingService:
                 ),
                 wanted,
             )
-            # NEED(contracts: run_order names the work item it runs): the order carries only its
-            # asset and repository, so the runner takes the repository's oldest pending work
-            # item (`RemediationService.next_pending`, the skill's `remediation next`)
+            # the order names the work item it runs: the runner prepares that one, never the
+            # repository's oldest pending item
             order = self._ops.submit(
                 OrderRequest(
-                    asset=REMEDIATE_FINDING, priority=_ASKED_NOW, repository_id=repository_id
+                    asset=REMEDIATE_FINDING,
+                    priority=_ASKED_NOW,
+                    repository_id=repository_id,
+                    work_item_id=item.work_item_id,
                 ),
                 principal,
             )
