@@ -52,10 +52,10 @@ def scanned(engine: Engine, advisory: AdvisoryRecord) -> ExposureService:
     return reads(engine, advisory=advisory, tool=FakeSbomTool())
 
 
-def scan(exposure: ExposureService, ref: UUID, raw: bytes, root: Path) -> None:
+def scan(exposure: ExposureService, ref_id: UUID, raw: bytes, root: Path) -> None:
     exposure._sbom_tool.raw = raw  # type: ignore[union-attr]
     root.mkdir(parents=True, exist_ok=True)
-    exposure.ingest_dependencies(ref, root)
+    exposure.ingest_dependencies(ref_id, root)
 
 
 @pytest.fixture
@@ -367,11 +367,13 @@ def test_record_refuses_a_document_outside_its_own_scope_without_a_partial_asses
     mixed: ExposureService,
 ) -> None:
     report = mixed.export_impacts(GHSA)
-    ref, malformed = _restated(report, keep="other")
+    ref_id, malformed = _restated(report, keep="other")
     before = mixed.impacts(ImpactFilter(), PageRequest(limit=100)).items
     with pytest.raises(ValidationError):
         mixed.record(
-            ref, malformed, provenance().model_copy(update={"occurred_at": AT + timedelta(days=6)})
+            ref_id,
+            malformed,
+            provenance().model_copy(update={"occurred_at": AT + timedelta(days=6)}),
         )
     assert mixed.impacts(ImpactFilter(), PageRequest(limit=100)).items == before
     assert mixed.export_impacts(GHSA) == report
@@ -381,9 +383,9 @@ def test_a_later_document_restating_a_scope_digest_is_ignored_on_read(
     mixed: ExposureService, caplog: pytest.LogCaptureFixture
 ) -> None:
     report = mixed.export_impacts(GHSA)
-    ref, restated = _restated(report, keep="lib")
+    ref_id, restated = _restated(report, keep="lib")
     mixed.record(
-        ref, restated, provenance().model_copy(update={"occurred_at": AT + timedelta(days=6)})
+        ref_id, restated, provenance().model_copy(update={"occurred_at": AT + timedelta(days=6)})
     )
     with caplog.at_level("WARNING", logger="traust_core.v1.services.exposure"):
         again = mixed.export_impacts(GHSA)
@@ -395,11 +397,11 @@ def test_a_late_result_of_an_older_run_never_restores_what_a_newer_run_dropped(
     mixed: ExposureService,
 ) -> None:
     before = mixed.export_impacts(GHSA)
-    [ref] = {row.repository_ref_id for row in before.repos}
+    [ref_id] = {row.repository_ref_id for row in before.repos}
     old = mixed.impacts(ImpactFilter(), PageRequest(limit=100)).items[-1]  # the first run's
     [stale] = [row for row in mixed._recorded(ImpactFilter()) if row.analysis == old]
     mixed.record(
-        ref, stale.doc, provenance().model_copy(update={"occurred_at": AT + timedelta(days=9)})
+        ref_id, stale.doc, provenance().model_copy(update={"occurred_at": AT + timedelta(days=9)})
     )
     after = mixed.export_impacts(GHSA)
     assert {(r.module, r.version) for r in after.repos} == {

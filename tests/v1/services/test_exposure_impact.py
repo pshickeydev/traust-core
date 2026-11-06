@@ -19,6 +19,7 @@ from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import Seed
 from traust_core.v1.errors import (
     ConfigError,
+    ConflictError,
     NotFoundError,
     RepositoryError,
     ServiceError,
@@ -1265,3 +1266,20 @@ def test_fix_commits_are_not_mined_for_one_package_of_several(
     assert held.symbols is not None and held.symbols.note == SHARED_FIX
     assert [(s.symbol, s.source) for s in held.symbols.symbols] == [("org.lib.X#y", "judged")]
     assert forge.asked == []
+
+
+def test_a_scan_landing_while_a_commit_is_prepared_is_refused(engine: Engine) -> None:
+    [app] = refs(engine, 1)
+    assert app.id is not None
+    exposure = service(engine)
+    exposure.ingest_sbom(sbom(("google.golang.org/grpc", "v1.56.2")), app.id)
+    found = advisory_id(exposure)
+    walk = exposure._reach
+
+    def overtaken(start: set[UUID], version: str | None = None):  # type: ignore[no-untyped-def]
+        exposure.ingest_sbom(sbom(("google.golang.org/grpc", "v1.58.3")), app.id)
+        return walk(start, version)
+
+    exposure._reach = overtaken  # type: ignore[method-assign]
+    with pytest.raises(ConflictError, match="changed while it was prepared"):
+        exposure.prepare(found, app.id)

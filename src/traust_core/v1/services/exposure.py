@@ -624,6 +624,7 @@ class ExposureService:
                 raise NoManifestSbomError(repository_ref_id)
             images = uow.images.list_built_from(repository_ref_id)
             kept = [(p, uow.packages.find(p.ecosystem, p.name)) for p in record.affected]
+        held_sboms = self._held_sboms(repository_ref_id)
         candidates = [
             (
                 package,
@@ -643,6 +644,11 @@ class ExposureService:
             for package, found in kept
         ]
         coverage = self.unresolved_manifests(repository_ref_id)
+        if self._held_sboms(repository_ref_id) != held_sboms:
+            # the walks above read one package each; a scan landing between them mixes snapshots
+            raise ConflictError(
+                f"ref {repository_ref_id}: its SBOMs changed while it was prepared; prepare again"
+            )
         unread = None if coverage is None else {m.ecosystem for m in coverage}
         held = [
             (package, rows)
@@ -678,6 +684,17 @@ class ExposureService:
             digest=sha256_hex(json.dumps(snapshot, sort_keys=True).encode()), members=members
         )
         return tuple(item.model_copy(update={"preparation_scope": scope}) for item in prepared)
+
+    def _held_sboms(self, repository_ref_id: UUID) -> tuple[object, ...]:
+        """The commit's manifest SBOM and scan, and the SBOMs of the images built from it."""
+        with self._uow as uow:
+            ref = self._inventory.get_ref(repository_ref_id)
+            images = uow.images.list_built_from(repository_ref_id)
+        return (
+            ref.manifest_sbom_id,
+            ref.manifest_sbom_assessment_id,
+            sorted((str(i.id), str(i.sbom_id)) for i in images),
+        )
 
     def _prepare(
         self,
@@ -1405,7 +1422,7 @@ class ExposureService:
             canonical = uow.advisories.get(known.alias_of_id) if known.alias_of_id else known
         assert canonical.id is not None
         rows = sorted(
-            _latest(self._recorded(ImpactFilter(advisory_id=canonical.id)), None),
+            _latest(_scoped(self._recorded(ImpactFilter(advisory_id=canonical.id))), None),
             key=lambda row: row.at,
             reverse=True,
         )
@@ -1448,7 +1465,8 @@ class ExposureService:
         """The latest complete preparation of each commit for each advisory (as of `as_of`),
         counted per group at its worst verdict, largest first. A commit counts in each product
         that ships it."""
-        latest = [r for r in _latest(self._advisory_rows(filter), filter.as_of) if _of(r, filter)]
+        every = _scoped(self._advisory_rows(filter))
+        latest = [r for r in _latest(every, filter.as_of) if _of(r, filter)]
         groups: defaultdict[str | None, list[_Recorded]] = defaultdict(list)
         for row in _worst(latest) if group_by == ExposureDimension.CLASSIFICATION else latest:
             for key in self._exposure_keys(row, group_by):
@@ -1471,9 +1489,10 @@ class ExposureService:
         end = filter.as_of or max(r.at[0] for r in every)
         points = []
         window = bucket.window_of(min(r.at[0] for r in rows))
+        parsed = _scoped(every)  # once: each bucket re-reads which run stands, not the scopes
         while window.start <= end:
             standing = _worst(
-                [r for r in _latest(every, min(window.end - _TICK, end)) if _of(r, filter)]
+                [r for r in _latest(parsed, min(window.end - _TICK, end)) if _of(r, filter)]
             )
             points.append(
                 ExposureSeriesPoint.of(
@@ -1709,56 +1728,79 @@ def _of(row: _Recorded, filter: ExposureFilter) -> bool:
     return filter.ecosystem in (None, row.doc.metadata.ecosystem)
 
 
-def _latest(rows: Sequence[_Recorded], until: datetime | None) -> list[_Recorded]:
-    """What stands for each commit and advisory by `until`: its latest-prepared complete
-    preparation (every package and version it declared), so a run finishing late or a newer
-    partial run never displaces a newer complete one; else its latest-prepared partial run, so
-    recorded verdicts (and the findings they filed) still show; else, for documents recorded
-    before scopes, the latest of each package and version. A document whose scope disagrees
-    with the members first recorded under its digest is left out, with a warning, rather than
-    failing every read of the advisory or displacing the scope it claims."""
-    Member = tuple[str, str, str | None]
-    scoped: dict[tuple[UUID, UUID, str], dict[Member, _Recorded]] = {}
-    declared: dict[tuple[UUID, UUID, str], frozenset[Member]] = {}
-    prepared: dict[tuple[UUID, UUID, str], str] = {}
-    legacy: dict[tuple[UUID, UUID], dict[Member, _Recorded]] = {}
+_Member = tuple[str, str, str | None]
+
+
+@dataclass(frozen=True)
+class _Scoped:
+    """A recorded row with its package member and, for a scoped document, its run's digest,
+    declared members and preparation time, read once per read."""
+
+    row: _Recorded
+    member: _Member
+    digest: str | None = None
+    declared: frozenset[_Member] = frozenset()
+    prepared: str = ""
+
+
+def _scoped(rows: Sequence[_Recorded]) -> list[_Scoped]:
+    """Each row with its scope, oldest first. A document whose scope disagrees with the
+    members first recorded under its digest is left out, with one warning, rather than failing
+    every read of the advisory or displacing the run it claims."""
+    first: dict[tuple[UUID, UUID, str], frozenset[_Member]] = {}
+    kept = []
     for row in sorted(rows, key=lambda r: r.at):
-        if not _by(row, until):
-            continue
         metadata = row.doc.metadata
-        commit = (row.analysis.repository_ref_id, row.analysis.advisory_id)
         ecosystem = metadata.ecosystem or Ecosystem.GO.value
         member = (ecosystem, metadata.module, row.doc.repos[0].version)
         raw_scope = getattr(metadata, "preparation_scope", None)
         if raw_scope is None:
-            members = legacy.setdefault(commit, {})
+            kept.append(_Scoped(row, member))
+            continue
+        scope = ImpactPreparationScope.model_validate(raw_scope, from_attributes=True)
+        stated = frozenset((m.ecosystem.value, m.module, m.version) for m in scope.members)
+        key = (row.analysis.repository_ref_id, row.analysis.advisory_id, scope.digest)
+        if first.setdefault(key, stated) != stated or member not in stated:
+            log.warning(
+                "impact analysis %s of ref %s: scope %s disagrees with its first members",
+                row.analysis.assessment_id,
+                key[0],
+                scope.digest,
+            )
+            continue
+        kept.append(_Scoped(row, member, scope.digest, stated, str(metadata.generated_at)))
+    return kept
+
+
+def _latest(rows: Sequence[_Scoped], until: datetime | None) -> list[_Recorded]:
+    """What stands for each commit and advisory by `until`: its latest-prepared complete run
+    (every package and version it declared), so a run finishing late or a newer partial run
+    never displaces a newer complete one; else its latest-prepared partial run, so recorded
+    verdicts (and the findings they filed) still show; else, for documents recorded before
+    scopes, the latest of each package and version."""
+    runs: dict[tuple[UUID, UUID, str], dict[_Member, _Scoped]] = {}
+    legacy: dict[tuple[UUID, UUID], dict[_Member, _Recorded]] = {}
+    for item in rows:
+        row = item.row
+        if not _by(row, until):
+            continue
+        commit = (row.analysis.repository_ref_id, row.analysis.advisory_id)
+        if item.digest is None:
+            legacy.setdefault(commit, {})[item.member] = row
         else:
-            scope = ImpactPreparationScope.model_validate(raw_scope, from_attributes=True)
-            key = (*commit, scope.digest)
-            stated = frozenset((m.ecosystem.value, m.module, m.version) for m in scope.members)
-            if declared.setdefault(key, stated) != stated or member not in stated:
-                log.warning(
-                    "impact analysis %s of ref %s: scope %s disagrees with its first members",
-                    row.analysis.assessment_id,
-                    commit[0],
-                    scope.digest,
-                )
-                continue
-            prepared[key] = max(prepared.get(key, ""), str(metadata.generated_at))
-            members = scoped.setdefault(key, {})
-        if member not in members or members[member].at < row.at:
-            members[member] = row
+            runs.setdefault((*commit, item.digest), {})[item.member] = item
     Rank = tuple[bool, str, tuple[datetime, UUID]]
     standing: dict[tuple[UUID, UUID], tuple[Rank, list[_Recorded]]] = {}
-    for key, members in scoped.items():
+    for key, members in runs.items():
+        some = next(iter(members.values()))
         rank = (
-            frozenset(members) == declared[key],
-            prepared[key],
-            max(r.at for r in members.values()),
+            frozenset(members) == some.declared,
+            max(m.prepared for m in members.values()),
+            max(m.row.at for m in members.values()),
         )
         commit = (key[0], key[1])
         if commit not in standing or standing[commit][0] < rank:
-            standing[commit] = (rank, list(members.values()))
+            standing[commit] = (rank, [m.row for m in members.values()])
     chosen = [r for _, found in standing.values() for r in found]
     return chosen + [
         r for commit, members in legacy.items() if commit not in standing for r in members.values()
