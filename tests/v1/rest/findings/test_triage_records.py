@@ -415,7 +415,7 @@ def test_triage_authority_and_provenance_refusals_precede_all_report_mutations(
         world.context.config = world.context.config.model_copy(
             update={
                 "recording": world.context.config.recording.model_copy(
-                    update={"triage": ("triage", "triage_again", "remediation")}
+                    update={"triage": ("triage", "triage_again", "remediate_finding")}
                 )
             }
         )
@@ -423,7 +423,7 @@ def test_triage_authority_and_provenance_refusals_precede_all_report_mutations(
             source = uow.assessments.get(world.assessment_id)
             repository_id = uow.repository_refs.get(source.repository_ref_id).repository_id
         order = ops.start(
-            OrderRequest(asset="remediation", priority=1, repository_id=repository_id),
+            OrderRequest(asset="remediate_finding", priority=1, repository_id=repository_id),
             world.principal,
             WorkerId(world.principal.ref),
             timedelta(minutes=10),

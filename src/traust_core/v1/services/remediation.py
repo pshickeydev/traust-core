@@ -143,7 +143,6 @@ ASSESSOR = "skill:remediate-finding"
 FLEET_FIX = AssessmentKind.FLEET_FIX
 FLEET_FIX_ASSESSOR = "skill:fleet-fix"
 FLEET_FIX_ORDER = AssetName("fleet-fix")
-REMEDIATION_RECORD = AssetName("remediation")
 _FLEET_FIX_CONFIG = "fleet-fix:"
 _FINAL = frozenset({"merged", "abandoned"})
 _READY = frozenset({"checks_passed", "revalidated_fixed", "pr_opened"})
@@ -541,10 +540,10 @@ class RemediationService:
         run_order_id: UUID,
         principal: Principal,
     ) -> WorkItem:
-        """A runner's remediation report under its leased order's authorization: the lease is
-        a remediation order's, and every finding the report covers is on the repository that
-        lease names — the work item is chosen from the findings, so either mismatch would
-        write another lane's resolutions under this order."""
+        """Record a leased remediation run, bound to its repository and any named work item."""
+        # Local import avoids the scheduling -> remediation dependency cycle.
+        from traust_core.v1.services.remediation_scheduling import REMEDIATE_FINDING
+
         if self._recording is None:
             raise ConfigError("remediation recording requires operations authorization")
         repository = self._inventory.find_repository(doc.metadata.repository)
@@ -560,10 +559,10 @@ class RemediationService:
             # NEED(contracts: remediation recording section): the door shares the triage
             # allowlist until contracts lands a remediation section, so the allowlist alone
             # would admit a triage order's lease here; only a remediation order records.
-            if order.asset != REMEDIATION_RECORD:
+            if order.asset != REMEDIATE_FINDING:
                 raise ForbiddenError(
                     f"order {run_order_id}: remediation recording requires a"
-                    f" {REMEDIATION_RECORD} order, not {order.asset}"
+                    f" {REMEDIATE_FINDING} order, not {order.asset}"
                 )
             wanted = tuple(
                 sorted({_finding_id(s.finding_ref) for s in doc.source_findings}, key=str)
@@ -576,7 +575,7 @@ class RemediationService:
                     f"order {run_order_id}: remediation report covers findings of another"
                     " repository"
                 )
-            return self.record(doc, provenance)
+            return self.record(doc, provenance, work_item_id=order.work_item_id)
 
     @overload
     def record(

@@ -389,22 +389,18 @@ class FindingDecisions:
         principal: Principal,
         checkout: Path | None = None,
     ) -> TriageRecordResult:
-        """A triage report under its leased order's authorization: the lease is a triage
-        order's — the remediation door shares the triage allowlist until contracts lands
-        a remediation recording section, so the allowlist alone would admit a remediation
-        order's lease here too."""
+        """Record triage under a live triage lease, never a remediation run's lease."""
         if self._recording is None:
             raise ConfigError("triage recording requires operations authorization")
-        # Local import: remediation imports this package's service, so a module-level
-        # import would cycle.
-        from traust_core.v1.services.remediation import REMEDIATION_RECORD
+        # Local import avoids remediation's findings-service dependency cycle.
+        from traust_core.v1.services.remediation_scheduling import REMEDIATE_FINDING
 
         triaged = self._log.get(assessment_id)
         repository_id = self._inventory.get_ref(triaged.repository_ref_id).repository_id
         with self._recording.recording(
             run_order_id, principal, "triage", repository_id, provenance
         ) as order:
-            if order.asset == REMEDIATION_RECORD:
+            if order.asset == REMEDIATE_FINDING:
                 raise ForbiddenError(
                     f"order {run_order_id}: triage recording requires a triage order,"
                     f" not {order.asset}"

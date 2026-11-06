@@ -28,8 +28,8 @@ def context(engine: Engine, tmp_path: Path) -> Context:
         tmp_path,
         identity=IdentityConfig(trust_local=True),
         # The remediation door authorizes under the triage allowlist (NEED: contracts has
-        # no recording.remediation section yet); its orders run the "remediation" asset.
-        recording=RecordingConfig(verification=("verify",), triage=("remediation",)),
+        # no recording.remediation section yet); its orders run the native scheduler asset.
+        recording=RecordingConfig(verification=("verify",), triage=("remediate_finding",)),
     )
     context.__dict__["local_issuer"] = LocalIssuer(context.config.home, SystemClock())
     return context

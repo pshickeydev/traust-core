@@ -14,6 +14,7 @@ from sqlalchemy.engine import Engine
 from tests.v1.repositories.tables.conftest import Seed
 from tests.v1.rest.conftest import bearer, same_as_in_process
 from tests.v1.rest.ops.conftest import runner
+from tests.v1.rest.remediation.test_remediations import schedule
 from tests.v1.services.test_remediation import REPORT, WHEN, decisions
 from traust_core.v1.context import Context
 from traust_core.v1.errors import ForbiddenError
@@ -37,7 +38,7 @@ from traust_core.v1.repositories.contract import CONTRACT_TABLES, SqlTraustUnitO
 from traust_core.v1.services.artifact_publishing import PublishSpec, PublishSpecs
 
 URL = "/v1/remediation-records"
-ASSET = "remediation"
+ASSET = "remediate_finding"
 
 
 def snapshot(context: Context) -> dict[str, object]:
@@ -62,12 +63,20 @@ def machine(context: Context, identity: str = "runner-7") -> Principal:
     return context.identity.authenticate(Credential(token=grant.token))
 
 
-def leased(context: Context, world: World, *, asset: str = ASSET) -> RunOrder:
+def leased(
+    context: Context, world: World, *, asset: str = ASSET, work_item_id: UUID | None = None
+) -> RunOrder:
     principal = machine(context)
     ops = context.services().ops
     assert world.repo.id is not None
     queued = ops.submit(
-        OrderRequest(asset=AssetName(asset), priority=1, repository_id=world.repo.id), principal
+        OrderRequest(
+            asset=AssetName(asset),
+            priority=1,
+            repository_id=world.repo.id,
+            work_item_id=work_item_id,
+        ),
+        principal,
     )
     order = ops.claim(WorkerId(principal.ref), timedelta(hours=2), (AssetName(asset),))
     assert order is not None and order.id == queued.id
@@ -106,7 +115,7 @@ class World:
             self.repo: Repository = seed.repository(
                 url=f"https://github.com/example-org/svc-{uuid4().hex[:8]}"
             )
-            self.ref: RepositoryRef = seed.repository_ref(self.repo)
+            self.ref: RepositoryRef = seed.repository_ref(self.repo, is_default=True)
             self.found = seed.finding(self.repo)
             seed.decision(
                 self.found,
@@ -369,6 +378,7 @@ def test_only_the_live_lease_owner_can_close_and_replay(
         ("wrong repository", 403),
         ("wrong asset", 403),
         ("triage lease", 403),
+        ("obsolete remediation asset", 403),
         ("findings of another repository", 403),
         ("repositoryless order", 403),
         ("expired lease", 409),
@@ -388,17 +398,14 @@ def test_order_authorization_refusals_leave_rows_and_objects_unchanged(
         order = leased(context, World(engine))
     elif case == "wrong asset":
         order = leased(context, world, asset="verify")
-    elif case == "triage lease":
-        # The door shares the triage allowlist (NEED: contracts has no recording.remediation
-        # section yet), so a triage asset passes that list; it must still be refused here.
+    elif case in {"triage lease", "obsolete remediation asset"}:
+        asset = "triage" if case == "triage lease" else "remediation"
         context.config = context.config.model_copy(
             update={
-                "recording": context.config.recording.model_copy(
-                    update={"triage": (ASSET, "triage")}
-                )
+                "recording": context.config.recording.model_copy(update={"triage": (ASSET, asset)})
             }
         )
-        order = leased(context, world, asset="triage")
+        order = leased(context, world, asset=asset)
     elif case in {"repositoryless order", "queued order"}:
         repository_id = None if case == "repositoryless order" else world.repo.id
         ops = context.services().ops
@@ -504,5 +511,101 @@ def test_explicit_worker_start_records_exact_report_bytes_under_its_native_order
     assert publisher.get(result.report.id).payload == payload
     before = snapshot(context)
     replay = client.post(URL, json=body(doc, order), headers=runner(context))
+    assert replay.status_code == 200 and replay.json() == recorded.json()
+    assert snapshot(context) == before
+
+
+def test_scheduled_runner_records_its_report_through_the_native_doors(
+    context: Context, client: TestClient, engine: Engine
+) -> None:
+    world = World(engine)
+    created = client.post(
+        "/v1/remediations",
+        json=schedule(engine, str(world.repo.id), [str(world.id)]),
+        headers=bearer(context),
+    )
+    assert created.status_code == 200, created.text
+    effort = created.json()
+    owner = machine(context)
+    order = context.services().ops.claim(
+        WorkerId(owner.ref), timedelta(hours=2), (AssetName("remediate_finding"),)
+    )
+    assert order is not None and order.work_item_id == UUID(effort["assessment_id"])
+    doc = report(
+        world,
+        (
+            "fork",
+            {
+                **REPORT["fork"],
+                "url": effort["fork_url"],
+                "fix_branch": effort["fork_branch"],
+            },
+        ),
+    )
+    response = client.post(URL, json=body(doc, order), headers=runner(context))
+    assert response.status_code == 200, response.text
+    item = WorkItem.model_validate(response.json())
+    assert item.work_item_id == order.work_item_id
+    assert item.report is not None and item.report.digest == sha256_hex(doc.payload)
+    assert context.services().remediation_scheduling.get(UUID(effort["id"])).remediation.status == (
+        RemediationStatus.CHECKS_PASSED
+    )
+
+
+@pytest.mark.parametrize("target", ["another finding", "newer attempt"])
+def test_named_order_cannot_record_another_work_item(
+    context: Context, client: TestClient, engine: Engine, target: str
+) -> None:
+    world = World(engine)
+    service = context.services().remediation
+    first = opened(context, world)
+    order = leased(context, world, work_item_id=first.work_item_id)
+    if target == "newer attempt":
+        service.record_progress(first.work_item_id, RemediationStatus.ABANDONED)
+        other = opened(context, world)
+        doc = report(world)
+    else:
+        with SqlTraustUnitOfWork(engine) as uow:
+            seed = Seed(uow)
+            found = seed.finding(world.repo)
+            seed.decision(found, validity="confirmed", severity="high", actor="human:analyst")
+            uow.commit()
+        assert found.id is not None and world.ref.id is not None
+        other = service.open([found.id], world.ref.id)
+        raw = json.loads(report(world).payload)
+        raw["source_findings"][0]["finding_ref"] = str(found.id)
+        doc = RemediationArtifact.parse(json.dumps(raw).encode())
+    before = snapshot(context)
+    response = client.post(URL, json=body(doc, order), headers=runner(context))
+    assert_problem(response, 422, "")
+    assert snapshot(context) == before
+    assert service.get(other.work_item_id).report is None
+
+
+def test_named_retry_records_identical_report_bytes_on_its_own_attempt(
+    context: Context, client: TestClient, engine: Engine
+) -> None:
+    world = World(engine)
+    first = opened(context, world)
+    first_order = leased(context, world, work_item_id=first.work_item_id)
+    doc = report(world, ("summary", {**REPORT["summary"], "status": "checks_failed"}))
+    recorded = client.post(URL, json=body(doc, first_order), headers=runner(context))
+    assert recorded.status_code == 200, recorded.text
+    original = WorkItem.model_validate(recorded.json())
+    assert first_order.id is not None
+    context.services().ops.complete(
+        first_order.id, WorkerId(machine(context).ref), JobResult.succeeded()
+    )
+    retry = opened(context, world)
+    assert retry.work_item_id != original.work_item_id
+    retry_order = leased(context, world, work_item_id=retry.work_item_id)
+    recorded = client.post(URL, json=body(doc, retry_order), headers=runner(context))
+    assert recorded.status_code == 200, recorded.text
+    result = WorkItem.model_validate(recorded.json())
+    assert result.work_item_id == retry.work_item_id
+    assert result.report is not None and result.report.digest == sha256_hex(doc.payload)
+    assert context.services().remediation.get(original.work_item_id) == original
+    before = snapshot(context)
+    replay = client.post(URL, json=body(doc, retry_order), headers=runner(context))
     assert replay.status_code == 200 and replay.json() == recorded.json()
     assert snapshot(context) == before
