@@ -105,6 +105,18 @@ def test_a_fork_brings_its_upstream_into_the_inventory_once(observed: Observed) 
     assert [o["fork_of"] for o in observed.observations()] == [str(upstream.url)] * 2
 
 
+def test_a_fork_links_an_upstream_registered_in_another_case(
+    observed: Observed, seed: Seed
+) -> None:
+    # GitHub's owner/repo is case-insensitive: the observation's lowercased parent finds the
+    # row registered as the forge spells it, never a second one
+    registered = seed.repository(url="https://github.com/Org/Upstream", public=True)
+    observed.uow.commit()
+    observed.observe(fork=True, parent="Org/Upstream")
+    assert observed.row().upstream_id == registered.id
+    assert observed.uow.repositories.find_by_url("https://github.com/org/upstream") is None
+
+
 def test_a_repository_no_longer_a_fork_loses_its_upstream(observed: Observed) -> None:
     observed.observe(fork=True, parent="org/upstream")
     observed.observe(fork=False, parent=None, pushed_at="2026-10-02T00:00:00Z")

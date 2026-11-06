@@ -145,3 +145,12 @@ def test_a_repositorys_private_mirror(engine: sa.Engine, explained: Profile) -> 
     (statement,) = explained(lambda uow: uow.repositories.find_private_mirror(upstream))
     # Scans the small repository table until contracts indexes upstream_id (NEED in the query).
     assert statement.execution_ms < 10, statement.plan
+
+
+def test_casefold_url_lookup_is_a_bounded_scan(engine: sa.Engine, explained: Profile) -> None:
+    """A fork's GitHub parent found in another case (core#368). NEED(contracts): an index on
+    repository(lower(url)); until then the lookup scans the repository table."""
+    (statement,) = explained(
+        lambda uow: uow.repositories.find_by_url_casefold(TYPICAL_REPOSITORY.upper())
+    )
+    assert statement.execution_ms < 25, statement.plan

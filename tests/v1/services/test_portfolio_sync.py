@@ -14,11 +14,13 @@ from sqlalchemy.engine import Engine
 from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import T0
 from traust_core.v1.errors import ConflictError, NotFoundError, RepositoryError, ValidationError
+from traust_core.v1.models.common import PageRequest
 from traust_core.v1.models.inventory import (
     OrgName,
     OwnerAssignment,
     OwnershipSource,
     RefName,
+    RepositoryFilter,
     SyncReport,
     TeamName,
 )
@@ -47,8 +49,11 @@ class Forge:
         visibility: str | None = "public",
         heads: dict[str, str] | None = None,
         error: SourceError | None = None,
+        described: RepoInfo | None = None,
+        info_error: SourceError | ValidationError | None = None,
     ) -> None:
         self.listing, self.visibility, self.heads, self.error = listing, visibility, heads, error
+        self.described, self.info_error = described, info_error
         self.calls: list[str] = []
 
     def _result(self, data):
@@ -62,7 +67,9 @@ class Forge:
 
     def info(self, repo: HttpsRepoUrl) -> Result[RepoInfo]:
         self.calls.append(f"info {repo}")
-        return self._result(RepoInfo(repo=repo, visibility=self.visibility))
+        if self.info_error:
+            raise self.info_error
+        return self._result(self.described or RepoInfo(repo=repo, visibility=self.visibility))
 
     def head(self, repo: HttpsRepoUrl, branch: str) -> Result[GitSha]:
         assert self.heads is not None
@@ -80,6 +87,10 @@ def listed(*paths: str, visibility: str = "public") -> list[RepoInfo]:
     return [RepoInfo(repo=url(p), visibility=visibility) for p in paths]
 
 
+def describing(repo: str, parent: str | None, *, fork: bool = True) -> RepoInfo:
+    return RepoInfo(repo=url(repo), visibility="public", fork=fork, parent=parent)
+
+
 @pytest.fixture(params=SQL_BACKENDS)
 def engine(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[Engine]:
     with contract_db(request.param, tmp_path) as eng:
@@ -89,6 +100,11 @@ def engine(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[Engine]:
 @pytest.fixture
 def portfolio(engine: Engine) -> PortfolioService:
     return PortfolioService(SqlTraustUnitOfWork(engine), PortfolioPolicy())
+
+
+def repository_count(portfolio: PortfolioService) -> int:
+    page = portfolio.list_repositories(RepositoryFilter(), PageRequest(limit=100))
+    return len(page.items)
 
 
 def sync(portfolio: PortfolioService, forge: Forge, at: datetime = T0) -> PortfolioSync:
@@ -147,15 +163,75 @@ def test_a_forge_failure_imports_nothing(portfolio: PortfolioService) -> None:
 
 
 @pytest.mark.parametrize(("visibility", "public"), [("public", True), (None, False)])
-def test_import_repository_asks_the_forge_only_for_a_new_repository(
+def test_import_repository_asks_the_forge_for_a_new_repository_and_an_unlinked_one(
     portfolio: PortfolioService, visibility: str | None, public: bool
 ) -> None:
     forge = Forge(visibility=visibility)
     repo = url("example-group/sub/api", "gitlab.com")
     added = sync(portfolio, forge).import_repository(repo)
     assert portfolio.get_repository(added.added[0]).public is public
+    # a known repository without an upstream is asked once more: the forge may name its parent
     assert sync(portfolio, forge).import_repository(repo) == SyncReport(unchanged=added.added)
-    assert forge.calls == [f"info {repo}"]
+    assert forge.calls == [f"info {repo}", f"info {repo}"]
+
+
+def test_import_repository_registers_a_fork_with_its_upstream(
+    portfolio: PortfolioService,
+) -> None:
+    forge = Forge(described=describing("example-org/fork", "example-org/api"))
+    report = sync(portfolio, forge).import_repository(url("example-org/fork"))
+    fork = portfolio.get_repository(report.added[0])
+    parent = portfolio.find_repository(url("example-org/api"))
+    assert parent is not None and parent.id is not None
+    assert fork.upstream_id == parent.id
+    # the parent is brought in private, until its own import says otherwise
+    assert parent.public is False
+
+
+@pytest.mark.parametrize("fork", [False, None])
+def test_import_repository_leaves_a_non_fork_without_an_upstream(
+    portfolio: PortfolioService, fork: bool | None
+) -> None:
+    # fork=None is the forge not saying: no lineage is recorded either way
+    forge = Forge(described=describing("example-org/plain", None, fork=fork))
+    report = sync(portfolio, forge).import_repository(url("example-org/plain"))
+    assert portfolio.get_repository(report.added[0]).upstream_id is None
+
+
+def test_import_repository_backfills_a_known_forks_missing_upstream(
+    portfolio: PortfolioService,
+) -> None:
+    registered = portfolio.register_repository(url("example-org/fork"), public=True)
+    assert registered.id is not None
+    forge = Forge(described=describing("example-org/fork", "example-org/api"))
+    report = sync(portfolio, forge).import_repository(url("example-org/fork"))
+    assert report == SyncReport(unchanged=(registered.id,))
+    parent = portfolio.find_repository(url("example-org/api"))
+    assert parent is not None and parent.id is not None
+    assert portfolio.get_repository(registered.id).upstream_id == parent.id
+
+
+def test_import_repository_leaves_a_linked_fork_unchanged(portfolio: PortfolioService) -> None:
+    forge = Forge(described=describing("example-org/fork", "example-org/api"))
+    first = sync(portfolio, forge).import_repository(url("example-org/fork"))
+    linked = portfolio.get_repository(first.added[0])
+    assert linked.id is not None and linked.upstream_id is not None
+    again = sync(portfolio, forge).import_repository(url("example-org/fork"))
+    assert again == SyncReport(unchanged=(linked.id,))
+    assert portfolio.get_repository(linked.id).upstream_id == linked.upstream_id
+    # the link settles the question: the forge is not asked again
+    assert forge.calls == [f"info {url('example-org/fork')}"]
+
+
+def test_import_repository_matches_the_forks_parent_by_normalized_url(
+    portfolio: PortfolioService,
+) -> None:
+    parent = portfolio.register_repository(url("example-org/api"), public=True)
+    assert parent.id is not None
+    forge = Forge(described=describing("example-org/fork", "Example-Org/API"))
+    report = sync(portfolio, forge).import_repository(url("example-org/fork"))
+    assert portfolio.get_repository(report.added[0]).upstream_id == parent.id
+    assert repository_count(portfolio) == 2  # the fork and its one parent row
 
 
 def test_import_branch_registers_the_commit_the_branch_points_at(
@@ -302,3 +378,83 @@ def test_set_owners_never_closes_ownership_at_or_before_it_opened(
     with pytest.raises(ConflictError):
         portfolio.set_owners(repository.id, [], T0)
     assert ownerships(engine, repo) == [("Current", T0, None)]
+
+
+def test_a_parents_own_import_corrects_its_placeholder_visibility(
+    portfolio: PortfolioService,
+) -> None:
+    fork_forge = Forge(described=describing("example-org/fork", "example-org/api"))
+    sync(portfolio, fork_forge).import_repository(url("example-org/fork"))
+    parent = portfolio.find_repository(url("example-org/api"))
+    assert parent is not None and parent.id is not None and parent.public is False
+
+    parent_forge = Forge(described=describing("example-org/api", None, fork=False))
+    report = sync(portfolio, parent_forge).import_repository(url("example-org/api"))
+    assert report == SyncReport(unchanged=(parent.id,))
+    assert portfolio.get_repository(parent.id).public is True
+
+
+def test_a_fork_links_a_parent_registered_in_another_case(portfolio: PortfolioService) -> None:
+    parent = portfolio.register_repository(url("Example-Org/API"), public=True)
+    assert parent.id is not None
+    forge = Forge(described=describing("example-org/fork", "Example-Org/API"))
+    report = sync(portfolio, forge).import_repository(url("example-org/fork"))
+    assert portfolio.get_repository(report.added[0]).upstream_id == parent.id
+    assert repository_count(portfolio) == 2  # the fork and its one parent row
+
+
+def test_a_forge_outage_still_returns_a_known_repository(portfolio: PortfolioService) -> None:
+    known = portfolio.register_repository(url("example-org/api"), public=True)
+    assert known.id is not None
+    forge = Forge(info_error=SourceError("forge down", ComparisonStatus.UNREACHABLE))
+    report = sync(portfolio, forge).import_repository(url("example-org/api"))
+    assert report.unchanged == (known.id,)
+    assert report.skipped == (f"{url('example-org/api')}: forge facts not refreshed: unreachable",)
+    assert portfolio.get_repository(known.id) == known  # nothing changed without the forge
+
+
+def test_a_parent_imported_in_another_case_is_the_forks_placeholder(
+    portfolio: PortfolioService,
+) -> None:
+    fork_forge = Forge(described=describing("example-org/fork", "Example-Org/API"))
+    fork = sync(portfolio, fork_forge).import_repository(url("example-org/fork")).added[0]
+    placeholder = portfolio.get_repository(fork).upstream_id
+    assert placeholder is not None
+
+    parent_forge = Forge(described=describing("Example-Org/API", None, fork=False))
+    report = sync(portfolio, parent_forge).import_repository(url("Example-Org/API"))
+    assert report == SyncReport(unchanged=(placeholder,))  # no second row
+    assert portfolio.get_repository(placeholder).public is True
+
+
+def test_a_host_the_forge_cannot_ask_still_returns_a_known_repository(
+    portfolio: PortfolioService,
+) -> None:
+    known = portfolio.register_repository(url("example-org/api"), public=True)
+    assert known.id is not None
+    forge = Forge(info_error=ValidationError("unsupported forge kind: example"))
+    report = sync(portfolio, forge).import_repository(url("example-org/api"))
+    assert report.unchanged == (known.id,)
+    assert report.skipped == (
+        f"{url('example-org/api')}: forge facts not refreshed: unsupported forge kind: example",
+    )
+
+
+def test_every_lookup_and_registration_finds_a_github_repository_in_any_case(
+    portfolio: PortfolioService,
+) -> None:
+    # GitHub's owner/repo is case-insensitive: planning, filtered reads and registration all
+    # resolve the row a fork's lowercase placeholder (or anyone) registered
+    first = portfolio.register_repository(url("example-org/api"), public=False)
+    again = portfolio.register_repository(url("Example-Org/API"), public=True)
+    assert again.id == first.id and repository_count(portfolio) == 1
+    found = portfolio.find_repository(url("EXAMPLE-ORG/api"))
+    assert found is not None and found.id == first.id
+    listed = portfolio.list_repositories(
+        RepositoryFilter(url=str(url("Example-Org/Api"))), PageRequest(limit=10)
+    )
+    assert [r.id for r in listed.items] == [first.id]
+    # GitLab keeps exact matching
+    lab = portfolio.register_repository(url("group/app", "gitlab.com"), public=False)
+    assert portfolio.find_repository(url("Group/App", "gitlab.com")) is None
+    assert lab.id is not None

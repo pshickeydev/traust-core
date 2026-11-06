@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Protocol
+from contextlib import AbstractContextManager
+from typing import Protocol, Self
 
 from traust_core.v1.repositories.traust.inventory.component import (
     COMPONENT,
@@ -52,6 +53,8 @@ class InventoryUnitOfWork(UnitOfWork, Protocol):
     repository_refs: RepositoryRefRepository
     teams: TeamRepository
     ownerships: OwnershipRepository
+
+    def write(self) -> AbstractContextManager[Self]: ...
 
 
 __all__ = [

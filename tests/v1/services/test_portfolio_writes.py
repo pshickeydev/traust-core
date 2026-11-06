@@ -435,7 +435,8 @@ def test_failed_assignment_preserves_existing_team_and_can_be_retried(engine: sa
     "operation,target",
     [
         ("register_product", "product"),
-        ("register_repository", "repository"),
+        # register_repository is serialised by its URL lock, so two calls never meet at the
+        # INSERT; test_a_second_spelling_waits_for_the_first_writer_and_reuses_its_row covers it
         ("register_ref", "repository_ref"),
         ("bare_ref", "repository_ref"),
         ("record_release", "release"),
