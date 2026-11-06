@@ -245,6 +245,7 @@ class RemediationService:
         validation: ValidationService,
         applier: FleetFixApplier | None = None,
         goldens: GoldenRunner | None = None,
+        recording: OpsService | None = None,
     ) -> None:
         self._uow = uow
         self._inventory = Inventory(uow, forks.hosts)
@@ -261,6 +262,7 @@ class RemediationService:
         self._validation = validation
         self._applier = applier
         self._goldens = goldens
+        self._recording = recording
 
     def open(self, finding_ids: Sequence[UUID], repository_ref_id: UUID) -> WorkItem:
         """A work item for confirmed, open findings of the commit's repository (legacy manifest
@@ -530,6 +532,50 @@ class RemediationService:
             "NEED(remediation-evidence): no contracts schema holds evidence before the report; "
             f"record {evidence.kind} evidence in work item {work_item_id}'s remediation report"
         )
+
+    def record_order(
+        self,
+        doc: RemediationArtifact,
+        provenance: Provenance,
+        run_order_id: UUID,
+        principal: Principal,
+    ) -> WorkItem:
+        """Record a leased remediation run, bound to its repository and any named work item."""
+        # Local import avoids the scheduling -> remediation dependency cycle.
+        from traust_core.v1.services.remediation_scheduling import REMEDIATE_FINDING
+
+        if self._recording is None:
+            raise ConfigError("remediation recording requires operations authorization")
+        repository = self._inventory.find_repository(doc.metadata.repository)
+        if repository is None or repository.id is None:
+            raise NotFoundError(f"repository {doc.metadata.repository}")
+        with self._recording.recording(
+            order_id=run_order_id,
+            principal=principal,
+            kind="remediation",
+            repository_id=repository.id,
+            provenance=provenance,
+        ) as order:
+            # NEED(contracts: remediation recording section): the door shares the triage
+            # allowlist until contracts lands a remediation section, so the allowlist alone
+            # would admit a triage order's lease here; only a remediation order records.
+            if order.asset != REMEDIATE_FINDING:
+                raise ForbiddenError(
+                    f"order {run_order_id}: remediation recording requires a"
+                    f" {REMEDIATE_FINDING} order, not {order.asset}"
+                )
+            wanted = tuple(
+                sorted({_finding_id(s.finding_ref) for s in doc.source_findings}, key=str)
+            )
+            covered = {view.finding.repository_id for view in self._findings.list_by_ids(wanted)}
+            # A report over several repositories is record()'s payload refusal; one repository
+            # other than the lease's is this order trying to write outside its scope.
+            if len(covered) == 1 and repository.id not in covered:
+                raise ForbiddenError(
+                    f"order {run_order_id}: remediation report covers findings of another"
+                    " repository"
+                )
+            return self.record(doc, provenance, work_item_id=order.work_item_id)
 
     @overload
     def record(

@@ -28,6 +28,7 @@ All modules live under `traust_core.v1` (see [Versioning](#versioning)).
 | **Assessment intake bindings** | `rest.assessments`, `services.assessment`, `services.findings.decisions` | Authenticated `GET /v1/assessments/{assessment_id}/intake` → mapping-only `AssessmentIntakeBindings`; digest-verified secure-code report labels or triage row labels resolve only through their owner and assessment/baseline occurrence scope | receipt-trusted UUIDs, manufactured creation history, source-title matching |
 | **Artifact reads** | `rest.artifacts`, `services.artifact_publishing` | Authenticated `GET /v1/artifacts/{artifact_id}` → native `Artifact` metadata; `GET /v1/artifacts/{artifact_id}/content` → digest-verified original bytes through `ArtifactPublisher.metadata` / `payload` | consumer report reserialization, obsolete SDK schema revalidation, direct object/database access |
 | **Verification records** | `rest.remediation` | `POST /v1/verification-records`: exact UTF-8 report text, native `Provenance`, and `run_order_id` → `VerificationService.record_order` → native `Verification`; a verified machine must own a live lease for the report repository and a server-allowed verification asset | event envelopes, caller-supplied actor/signer, human countersigns |
+| **Remediation records** | `rest.remediation`, `services.remediation` | `POST /v1/remediation-records`: exact report bytes, provenance and a live `remediate_finding` lease; the order's named work item scopes recording and replay | accepting a different attempt or a triage lease as remediation authority |
 | **Validation report REST** | `rest.validation` | `POST /v1/validation-records` → `services.validation.record_order`; live leased `run_order_id`, exact report text, `Provenance`, native `ValidationRecordInput` bindings → `ValidationRecordResult` | source-label lookups, route-owned authorization or verdict rules, human decision commands |
 | **Reporting** | `services.reporting`, `providers.report_files` | `ctx.reporting` (the same instance as `ctx.services().reporting`; it never opens the record store, so file-only callers use it) over a report document the caller holds, nothing stored: `validate(payload, XArtifact)` → contract `Issue`s; `validate_reports(path, strict=, schema=)` → a `ReportValidation` (errors, warnings) per report file at `path` (a directory sweeps its .json files; the schema comes from each file name unless a contract schema is named): the contract schema, then the family's content checks (`services.reporting.checks`: counts against findings, canonical ids, `metadata.repository`, dispositions, review surfaces, OWASP threat ratings) and, with `strict`, the audit-report warnings; `lint(doc, files=None)` runs every core `Lint` registered for the type; `render(doc, RenderFormat.MARKDOWN \| HTML)` (triage in both; security reports and threat models as Markdown: `services.reporting.report_markdown`, `services.reporting.threat_model`); `lint_threat_models(paths, strict=)` lints THREAT_MODEL.md prose (`threat_model.lint_threat_model`, OWASP cells via `services.reporting.threat_rating`; ATT&CK and ATLAS ids against the registered catalogs, which the pack always pins; without them the door raises naming the register doors); `lost_sections(existing, rendered)` (the render guard); `sarif_reports(root)` is the SARIF sweep's report selection; `sarif(doc)` for report and cloud-config audits (`SarifExport.report`, `locations.sarif_tool_uri` as `informationUri`). `ctx.services().redaction.redact(payload)` scrubs secrets (`RedactionPolicy`; `scan(text)` finds them without redacting) | `traust_engine.reporting` (`validate`, `lint`, `render`, `sarif`), `_util/redact.py` |
 | **Rendering** | `rendering` | `Report` → `MarkdownRenderer` → `publish()`; `markdown_table()`; `markdown_text()` escapes a structured cell as plain text (no HTML, links or inline formatting) | 18 copies of `render_md` |
@@ -411,6 +412,19 @@ New report assessments store `run_order_id` at creation. A replay cannot relink 
 append-only assessment from another or an unbound run. Independent validation
 executions still use their existing provenance-based run identity. Recording does
 not heartbeat, complete, or extend the lease; the runner lifecycle remains separate.
+
+`POST /v1/remediation-records` returns the native `WorkItem` after
+`RemediationService.record_order` authorizes the lease and records the exact report bytes.
+Its asset is the scheduler's `remediate_finding`, also used for explicit worker starts;
+the unmerged `remediation` asset is not accepted. Until contracts provides a separate
+remediation recording section and source type, authorize it in `recording.triage` and
+use `TRIAGE_REPORT` provenance. This does not authorize remediation leases to record triage.
+The report's metadata and findings must match the leased repository.
+
+A named `RunOrder.work_item_id` constrains both work-item selection and digest replay.
+A stale order cannot record against a newer attempt or another finding set. Orders
+without a named item retain finding-set selection and digest replay; explicitly started
+orders should name the work item when they must distinguish remediation attempts.
 
 Existing native verification inputs are available through
 `GET /v1/findings/{finding_id}`, `GET /v1/repositories/{repository_id}/refs` and
