@@ -180,8 +180,12 @@ def test_a_configured_database_missing_the_scheduling_tables_is_refused_with_its
 
 def _without_run_order_work_item(home: Path) -> None:
     with Context(Config(home=home)).database.begin() as conn:
-        for trigger in ("", "_update"):
-            conn.exec_driver_sql(f"DROP TRIGGER ops_run_order_work_item_of_repository{trigger}")
+        for trigger in (
+            "ops_run_order_work_item_of_repository",
+            "ops_run_order_work_item_of_repository_update",
+            "ops_ref_of_ordered_work_item_stays",
+        ):
+            conn.exec_driver_sql(f"DROP TRIGGER {trigger}")
         conn.exec_driver_sql("DROP INDEX idx_ops_run_order_work_item")
         conn.exec_driver_sql("ALTER TABLE ops_run_order DROP COLUMN work_item_id")
 

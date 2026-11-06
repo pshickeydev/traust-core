@@ -24,7 +24,7 @@ from traust_core.v1.context.config import ProcessConfig
 from traust_core.v1.errors import ConflictError, ForbiddenError, NotFoundError, ValidationError
 from traust_core.v1.models.common import PageRequest
 from traust_core.v1.models.identity import IdentitySource, Principal
-from traust_core.v1.models.operations import OrderState, RecordingStartScope
+from traust_core.v1.models.operations import OrderRequest, OrderState, RecordingStartScope
 from traust_core.v1.models.remediation_scheduling import Remediation, RemediationFindingRequest
 from traust_core.v1.models.vocabulary import ActorKind, RemediationStatus
 from traust_core.v1.repositories import create_database_engine
@@ -750,3 +750,47 @@ def test_a_verification_that_fails_part_way_leaves_nothing_behind(
     verification.record(doc, verification_provenance())  # the retry records it whole
     assert recorded()[0] == before[0] + 1
     assert row(engine, scheduled.id).status == "revalidated_fixed"
+
+
+def test_a_direct_order_names_only_a_work_item_of_its_own_repository(
+    service: RemediationSchedulingService, context: Context, engine: Engine
+) -> None:
+    repository_id, finding_ids, repository_ids = seeded(engine)
+    other_repository, _, _ = seeded(engine)
+    request = pairs(finding_ids, repository_ids)
+    scheduled = service.create(fork_of(engine, request), BRANCH, request, PERSON)
+    assert scheduled.assessment_id is not None
+    ops = context.services().ops
+    with SqlTraustUnitOfWork(engine) as uow:
+        not_a_work_item = Seed(uow).assessment(
+            repository_ref_id=default_ref(engine, repository_id)
+        )  # an audit, not a work item
+        uow.commit()
+    for repository, work_item in (
+        (other_repository, scheduled.assessment_id),  # another repository's work item
+        (repository_id, uuid4()),  # no such work item
+        (repository_id, not_a_work_item.id),  # an assessment, not a remediation work item
+        (None, scheduled.assessment_id),  # an order on no repository
+    ):
+        with pytest.raises(ValidationError, match="is not a remediation work item"):
+            ops.submit(
+                OrderRequest(
+                    asset=REMEDIATE_FINDING,
+                    priority=0,
+                    repository_id=repository,
+                    work_item_id=work_item,
+                ),
+                PERSON,
+            )
+    assert len(queued_orders(engine, repository_id)) == 1  # only the scheduled one
+    assert queued_orders(engine, other_repository) == []
+    named = ops.submit(
+        OrderRequest(
+            asset=REMEDIATE_FINDING,
+            priority=0,
+            repository_id=repository_id,
+            work_item_id=scheduled.assessment_id,
+        ),
+        PERSON,
+    )
+    assert named.work_item_id == scheduled.assessment_id

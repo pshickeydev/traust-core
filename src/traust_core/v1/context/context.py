@@ -776,6 +776,7 @@ class Context:
             recording_assets=self.config.recording.model_dump(exclude={"start"}),
             recording_starts=self.config.recording.start,
             inventory=Inventory(uow),
+            assessments=AssessmentLog(uow),
         )
         validation_records = ValidationRecords(uow, self.object_store, findings=FindingRecords(uow))
         precedents = FindingPrecedents(uow, validation=validation_records)
