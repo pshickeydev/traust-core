@@ -300,6 +300,7 @@ class OpsService:
         """A run its runner has already begun (by hand, or a cron job beside the engine), leased to
         `worker`: the subject's planned or queued order is taken over, else a new one is stored."""
         _classifiers(lane=request.lane, event_source=request.event_source)
+        self._check_work_item(request)
         now = self._clock.now()
         lease = {
             "state": OrderState.LEASED,
@@ -318,6 +319,11 @@ class OpsService:
                 if current.state not in (OrderState.PLANNED, OrderState.QUEUED):
                     raise ConflictError(
                         f"order {current.id}: {current.asset} is already {current.state}"
+                    )
+                if request.work_item_id not in (None, current.work_item_id):
+                    raise ConflictError(
+                        f"order {current.id} runs work item {current.work_item_id}, not "
+                        f"{request.work_item_id}"
                     )
                 saved = uow.run_orders.update(current.model_copy(update=lease))
             assert saved.id is not None

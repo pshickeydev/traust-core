@@ -6,6 +6,7 @@ from __future__ import annotations
 import threading
 import time
 from collections.abc import Iterator
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
@@ -24,7 +25,7 @@ from traust_core.v1.context.config import ProcessConfig
 from traust_core.v1.errors import ConflictError, ForbiddenError, NotFoundError, ValidationError
 from traust_core.v1.models.common import PageRequest
 from traust_core.v1.models.identity import IdentitySource, Principal
-from traust_core.v1.models.operations import OrderRequest, OrderState, RecordingStartScope
+from traust_core.v1.models.operations import OrderRequest, OrderState, RecordingStartScope, WorkerId
 from traust_core.v1.models.remediation_scheduling import Remediation, RemediationFindingRequest
 from traust_core.v1.models.vocabulary import ActorKind, RemediationStatus
 from traust_core.v1.repositories import create_database_engine
@@ -794,3 +795,123 @@ def test_a_direct_order_names_only_a_work_item_of_its_own_repository(
         PERSON,
     )
     assert named.work_item_id == scheduled.assessment_id
+
+
+def test_a_retry_after_a_failed_attempt_is_a_new_work_item(
+    service: RemediationSchedulingService, context: Context, engine: Engine
+) -> None:
+    _, finding_ids, repository_ids = seeded(engine)
+    request = pairs(finding_ids, repository_ids)
+    first = service.create(fork_of(engine, request), BRANCH, request, PERSON)
+    assert first.assessment_id is not None
+    remediation = context.services().remediation
+    remediation.record_progress(first.assessment_id, RemediationStatus("checks_failed"))
+    retry = service.create(fork_of(engine, request), BRANCH, request, PERSON)
+    assert retry.id != first.id and retry.assessment_id not in (None, first.assessment_id)
+    assert retry.assessment_id is not None
+    # each effort names its own work item, so lookups and syncs stay unambiguous
+    assert remediation.prepare(retry.assessment_id).fix_branch == BRANCH
+    remediation.record_progress(retry.assessment_id, RemediationStatus("forked"))
+    assert (row(engine, first.id).status, row(engine, retry.id).status) == (
+        "checks_failed",
+        "forked",
+    )
+    # a report on these findings now belongs to the retry
+    done = remediation.record(pushed(retry, finding_ids), provenance())
+    assert done.work_item_id == retry.assessment_id
+    assert remediation.get(first.assessment_id).report is None
+
+
+def test_a_started_order_names_only_a_work_item_of_its_own_repository(
+    service: RemediationSchedulingService, context: Context, engine: Engine
+) -> None:
+    repository_id, finding_ids, repository_ids = seeded(engine, findings=2)
+    other_repository, _, _ = seeded(engine)
+    one, two = (pairs(finding_ids[i : i + 1], repository_ids[i : i + 1]) for i in (0, 1))
+    first = service.create(fork_of(engine, one), BRANCH, one, PERSON)
+    second = service.create(fork_of(engine, two), "fix/second", two, PERSON)
+    ops = context.services().ops
+
+    def start(repository: UUID | None, work_item: UUID | None) -> Any:
+        return ops.start(
+            OrderRequest(
+                asset=REMEDIATE_FINDING,
+                priority=0,
+                repository_id=repository,
+                work_item_id=work_item,
+            ),
+            MACHINE,
+            WorkerId("runner"),
+            timedelta(minutes=5),
+        )
+
+    for repository, work_item in (
+        (other_repository, first.assessment_id),
+        (repository_id, uuid4()),
+    ):
+        with pytest.raises(ValidationError, match="is not a remediation work item"):
+            start(repository, work_item)
+    # the open order taken over runs the first effort's work item, never another's
+    with pytest.raises(ConflictError, match="runs work item"):
+        start(repository_id, second.assessment_id)
+    taken = start(repository_id, first.assessment_id)
+    assert (taken.state, taken.work_item_id) == (OrderState.LEASED, first.assessment_id)
+
+
+def test_split_verification_reports_together_revalidate_the_effort(
+    service: RemediationSchedulingService, context: Context, engine: Engine
+) -> None:
+    world = World(engine, findings=2, patched_name="main")
+    audited(engine, world, world.base)
+    request = pairs(world.ids, [world.repo.id] * len(world.ids))
+    scheduled = service.create(fork_of(engine, request), world.patched.name, request, PERSON)
+    context.services().remediation.record(
+        pushed(scheduled, world.ids, fork__fix_commit=world.patched.sha), provenance()
+    )
+    verification = context.services().verification
+    a, b = world.ids
+    verification.record(verification_report(world, {a: "resolved"}), verification_provenance())
+    assert row(engine, scheduled.id).status == "checks_passed"  # b not verified yet
+    verification.record(verification_report(world, {b: "resolved"}), verification_provenance())
+    assert row(engine, scheduled.id).status == "revalidated_fixed"  # a's earlier verdict counts
+
+
+def test_an_effort_that_is_over_stays_over_once_a_newer_one_covers_its_findings(
+    service: RemediationSchedulingService, context: Context, engine: Engine
+) -> None:
+    world = World(engine, findings=2, patched_name="main")
+    audited(engine, world, world.base)
+    request = pairs(world.ids, [world.repo.id] * len(world.ids))
+    first = service.create(fork_of(engine, request), world.patched.name, request, PERSON)
+    context.services().remediation.record(
+        pushed(first, world.ids, fork__fix_commit=world.patched.sha), provenance()
+    )
+    verification = context.services().verification
+    unfixed = verification_report(world, dict.fromkeys(world.ids, "unresolved"))
+    verification.record(unfixed, verification_provenance())
+    assert row(engine, first.id).status == "revalidated_still_vulnerable"
+    newer = service.create(fork_of(engine, request), world.patched.name, request, PERSON)
+    assert newer.id != first.id
+    again = service.create(fork_of(engine, request), world.patched.name, request, PERSON)
+    assert again.id == newer.id  # the newer effort is the live one
+    verification.record(verification_report(world), verification_provenance())  # late, fixed
+    assert row(engine, first.id).status == "revalidated_still_vulnerable"
+    assert row(engine, newer.id).status == "candidate"  # its own fix isn't reported yet
+
+
+def test_opening_a_work_item_that_fails_part_way_leaves_no_assessment(
+    context: Context, engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository_id, finding_ids, _ = seeded(engine)
+    remediation = context.services().remediation
+    ref_id = default_ref(engine, repository_id)
+
+    def broken(*_: Any, **__: Any) -> None:
+        raise RuntimeError("decisions failed")
+
+    decisions = context.services().findings.decisions
+    monkeypatch.setattr(type(decisions), "record_resolution", broken)
+    with pytest.raises(RuntimeError, match="decisions failed"):
+        remediation.open(finding_ids, ref_id)
+    with SqlTraustUnitOfWork(engine) as uow:
+        assert [a for a in uow.assessments.list_for_ref(ref_id) if a.kind == "remediation"] == []

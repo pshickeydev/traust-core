@@ -269,6 +269,9 @@ _STEP = {
     "abandoned": 7,
 }
 _FINAL = frozenset({"merged", "abandoned"})
+# An attempt here is over: the same findings may be tried again, as a new work item (a failed
+# attempt is one).
+OVER = frozenset({*_FINAL, "checks_failed", "revalidated_still_vulnerable"})
 # Remediation progress never establishes that a finding is fixed.
 _RESOLUTION: dict[str, str | None] = {
     "candidate": None,

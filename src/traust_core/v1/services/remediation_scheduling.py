@@ -16,6 +16,7 @@ from traust_core.v1.models.common import Page, PageRequest
 from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.inventory import RepositoryRef
 from traust_core.v1.models.operations import AssetName, OrderRequest
+from traust_core.v1.models.remediation import OVER
 from traust_core.v1.models.remediation_scheduling import (
     Remediation,
     RemediationDetail,
@@ -35,9 +36,6 @@ log = logging.getLogger(__name__)
 REMEDIATE_FINDING = AssetName("remediate_finding")
 # A scheduled fix is asked for now, like onboarding's baseline orders.
 _ASKED_NOW = 0
-# An effort here is over: the same findings may be scheduled again. A failed attempt is one
-# ("a retry after a failed attempt is a new work item", models.remediation).
-_OVER = frozenset({"merged", "abandoned", "checks_failed", "revalidated_still_vulnerable"})
 # The remediation report's `fork.fix_branch` (traust-contracts remediation schema): a branch
 # scheduled here becomes that field, so it must pass it as well as git's rules.
 _FIX_BRANCH = re.compile(r"[A-Za-z0-9._/-]{1,200}")
@@ -163,7 +161,7 @@ class RemediationSchedulingService:
         """The live effort covering exactly these findings for this target (a retry, a report
         recorded since); the same findings for another target, or an overlap, conflict."""
         for effort, covers in self._findings.scheduled.efforts_covering(finding_ids):
-            if effort.status in _OVER:
+            if effort.status in OVER:
                 continue
             if covers != finding_ids:
                 listed = ", ".join(sorted(map(str, covers & finding_ids)))
