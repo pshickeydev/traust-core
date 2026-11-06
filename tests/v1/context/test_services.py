@@ -37,7 +37,12 @@ from traust_core.v1.services import operations
 from traust_core.v1.services.identity import IdentityConfig, LoginConfig
 from traust_core.v1.services.ledger import LedgerConfig
 
-OPERATOR = Principal(identity="operator@example.com", kind=ActorKind("human"), display="operator")
+OPERATOR = Principal(
+    identity="operator@example.com",
+    kind=ActorKind("human"),
+    display="operator",
+    verified_by=IdentitySource.OIDC,
+)
 REVIEWER = Principal(
     identity="reviewer@example.com",
     kind=ActorKind.HUMAN,

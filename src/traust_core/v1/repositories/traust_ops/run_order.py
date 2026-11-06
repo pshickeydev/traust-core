@@ -77,6 +77,15 @@ class RunOrderRepository(MutableRecordRepository[RunOrder], Protocol):
         """Repositories (None = fleet-wide) with an order of `asset` in `states`."""
         ...
 
+    def subject_has_order(
+        self,
+        assets: Collection[str],
+        repository_id: UUID,
+        states: Collection[OrderState],
+    ) -> bool:
+        """Whether one subject has any order of these assets in these states (bounded read)."""
+        ...
+
     def search(
         self,
         *,
@@ -255,6 +264,25 @@ class SqlRunOrderRepository(SqlMutableRepository[RunOrder]):
             where.append(c.reason == reason)
         stmt = sa.select(c.repository_id).where(*where).distinct()
         return set(self._execute(f"subjects of {asset}", stmt).scalars())
+
+    def subject_has_order(
+        self,
+        assets: Collection[str],
+        repository_id: UUID,
+        states: Collection[OrderState],
+    ) -> bool:
+        c = self.table.c
+        stmt = (
+            self._select()
+            .where(
+                c.asset.in_(list(assets)),
+                c.state.in_(list(states)),
+                c.repository_id == repository_id,
+            )
+            .limit(1)
+        )
+        row = self._execute(f"order of {sorted(assets)} for {repository_id}", stmt).first()
+        return row is not None
 
     def feed_after(
         self, after: tuple[datetime, UUID] | None, states: Collection[OrderState], limit: int
