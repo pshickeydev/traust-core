@@ -452,6 +452,14 @@ class BudgetStatus(StrEnum):
     NO_BUDGET = "no_budget"
 
 
+# The enforcement levels under which admission may withhold a lane's orders: shared by
+# BudgetVerdict.binding and the ops policy gates so the two cannot drift.
+WITHHOLDING_ENFORCEMENT: tuple[BudgetEnforcement, ...] = (
+    BudgetEnforcement.ADVISORY,
+    BudgetEnforcement.ENFORCED,
+)
+
+
 class BudgetVerdict(Model):
     """One lane's month-to-date spend plus an estimate, judged against its budget."""
 
@@ -467,7 +475,7 @@ class BudgetVerdict(Model):
         """Admission may withhold: over, enforcing, and the cost is known."""
         return (
             self.status is BudgetStatus.OVER
-            and self.enforcement in (BudgetEnforcement.ADVISORY, BudgetEnforcement.ENFORCED)
+            and self.enforcement in WITHHOLDING_ENFORCEMENT
             and self.estimate_usd is not None
         )
 

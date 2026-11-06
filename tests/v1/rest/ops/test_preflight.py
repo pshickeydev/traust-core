@@ -10,6 +10,7 @@ from tests.v1.repositories.tables.conftest import Seed
 from tests.v1.rest.conftest import bearer, same_as_in_process
 from tests.v1.rest.ops.conftest import runner
 from traust_core.v1.context import Context
+from traust_core.v1.context.config import RecordingConfig
 from traust_core.v1.models.identity import Credential
 from traust_core.v1.models.operations import PreflightRequest
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
@@ -25,9 +26,17 @@ def seeded_repository(context: Context, *, with_scan: bool = False) -> UUID:
     return repo.id
 
 
+def staged(context: Context) -> None:
+    """Declare the deployment's stage assets so the ordering gate applies."""
+    context.config = context.config.model_copy(
+        update={"recording": RecordingConfig(assessment=("assessment",), triage=("triage",))}
+    )
+
+
 def test_an_allowed_stage_matches_the_in_process_answer(
     context: Context, client: TestClient
 ) -> None:
+    staged(context)
     repo = seeded_repository(context, with_scan=True)
     grant = context.local_issuer.mint("alice@example.com")
     body = {"asset": "triage", "repository_id": str(repo), "config_generation": "g7"}
@@ -73,6 +82,7 @@ def test_a_machine_caller_is_denied_the_role(context: Context, client: TestClien
 
 
 def test_a_stage_without_its_prior_record_is_denied(context: Context, client: TestClient) -> None:
+    staged(context)
     repo = seeded_repository(context)
     response = client.post(
         "/v1/preflight",

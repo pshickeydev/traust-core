@@ -404,6 +404,12 @@ def test_order_authorization_refusals_leave_rows_and_objects_unchanged(
     if case == "wrong repository":
         order = leased(context, World(engine))
     elif case == "wrong asset":
+        # the deployment gates verify behind a completed remediate_finding order; give it one
+        with SqlTraustUnitOfWork(context.database) as uow:
+            Seed(uow).run_order(
+                asset="remediate_finding", repository_id=world.repo.id, state="succeeded"
+            )
+            uow.commit()
         order = leased(context, world, asset="verify")
     elif case in {"triage lease", "obsolete remediation asset"}:
         asset = "triage" if case == "triage lease" else "remediation"
@@ -412,11 +418,6 @@ def test_order_authorization_refusals_leave_rows_and_objects_unchanged(
                 "recording": context.config.recording.model_copy(update={"triage": (ASSET, asset)})
             }
         )
-        # submit's ordering gate needs the prior stage completed for the subject first
-        prior = "assessment" if asset == "triage" else "triage"
-        with SqlTraustUnitOfWork(context.database) as uow:
-            Seed(uow).run_order(asset=prior, repository_id=world.repo.id, state="succeeded")
-            uow.commit()
         order = leased(context, world, asset=asset)
     elif case in {"repositoryless order", "queued order"}:
         repository_id = None if case == "repositoryless order" else world.repo.id

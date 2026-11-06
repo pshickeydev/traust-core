@@ -89,6 +89,26 @@ def orders(context: Context) -> Page[RunOrder]:
     )
 
 
+def test_a_start_cannot_skip_the_stage_ordering_the_doors_enforce(
+    context: Context, client: TestClient, engine: Engine
+) -> None:
+    """A recording start is a run: it meets the same ordering gate as preflight and submit."""
+    context.config = context.config.model_copy(
+        update={"recording": context.config.recording.model_copy(update={"triage": ("triage",)})}
+    )
+    body = request(context)
+    refused = client.post(URL, json=body.model_dump(mode="json"), headers=runner(context))
+    assert refused.status_code == 403, refused.text
+    assert refused.headers["content-type"].startswith("application/problem+json")
+    assert refused.json()["code"] == "ordering_violated"
+    repository_id = body.order.repository_id
+    with SqlTraustUnitOfWork(engine) as uow:
+        Seed(uow).run_order(asset="triage", repository_id=repository_id, state="succeeded")
+        uow.commit()
+    started = client.post(URL, json=body.model_dump(mode="json"), headers=runner(context))
+    assert started.status_code == 200, started.text
+
+
 def test_verified_machine_starts_its_scoped_run_and_can_record(
     context: Context, client: TestClient
 ) -> None:

@@ -25,6 +25,7 @@ from traust_core.v1.models.operations import (
     FEED_ORDER_STATES,
     FINISHED_ORDER_STATES,
     SPEND_UNPRICED,
+    WITHHOLDING_ENFORCEMENT,
     AssetName,
     AssetRequest,
     Budget,
@@ -74,7 +75,6 @@ from traust_core.v1.models.operations import (
 from traust_core.v1.models.vocabulary import (
     ActorKind,
     AssessmentKind,
-    BudgetEnforcement,
     SourceType,
 )
 from traust_core.v1.providers.clock import Clock
@@ -99,18 +99,27 @@ _RECORDING_SOURCES = {
     "remediation": SourceType.TRIAGE_REPORT,
 }
 
-# A stage may run only after its predecessor left a finished order for the subject; stages not
-# listed (fleet assets, scans) have no ordering precondition. Remediation's plan-level gate is a
-# disposition, which lives on the findings service behind OpsService (a wiring cycle), so the
-# finished triage order is its record until that door is reachable.
-PRIOR_ORDER_STAGE: Final[Mapping[AssetName, AssetName]] = {
-    AssetName("triage"): AssetName("assessment"),
-    AssetName("remediation"): AssetName("triage"),
-    AssetName("validation"): AssetName("triage"),
-    AssetName("verification"): AssetName("remediation"),
+# A stage may run only after its predecessor left a completed order for the subject. Stages
+# are record kinds and the deployment's recording config names each kind's assets, so the gate
+# follows the configured names (one deployment's assessments run as "audit", another's as
+# "assessment"; remediation reports ride the triage allowlist until contracts grows a
+# recording.remediation section). A predecessor the deployment does not wire is not required:
+# the gate enforces what the config declares. Remediation's plan-level gate is a disposition,
+# which lives on the findings service behind OpsService (a wiring cycle), so a finished triage
+# order is its record until that door is reachable.
+_PRIOR_RECORD_KIND: Final[Mapping[str, str]] = {
+    "triage": "assessment",
+    "validation": "triage",
+    "verification": "triage",
 }
 
-_WITHHOLDING = (BudgetEnforcement.ADVISORY, BudgetEnforcement.ENFORCED)
+# Ordering counts a predecessor that actually ran. FINISHED_ORDER_STATES also covers refused,
+# withheld and failed orders (they finished as orders, not as work); a failed assessment must
+# not unlock triage.
+_COMPLETED_ORDER_STATES: Final[tuple[OrderState, ...]] = (
+    OrderState.SUCCEEDED,
+    OrderState.DEGRADED,
+)
 
 S = TypeVar("S", contravariant=True)
 E = TypeVar("E", contravariant=True)
@@ -266,16 +275,7 @@ class OpsService:
     ) -> tuple[DenyIssue, ...]:
         """The gates preflight reports and submit enforces: one code path, called from both."""
         issues: list[DenyIssue] = []
-        if not (
-            principal.is_verified_human()
-            or (
-                principal.kind == ActorKind.MACHINE
-                and principal.verified_by is not None
-                and repository_id is not None
-                and self._in_start_scope(principal, asset, repository_id)
-            )
-        ):
-            # Who may ask for a run: authorize_request's rule, as a typed issue.
+        if not self._may_request(asset, repository_id, principal):
             issues.append(
                 DenyIssue(
                     code=DenyCode.ROLE_DENIED,
@@ -294,21 +294,15 @@ class OpsService:
                         code=DenyCode.SUBJECT_UNKNOWN, detail=f"no repository {repository_id}"
                     )
                 )
-            else:
-                prior = PRIOR_ORDER_STAGE.get(asset)
-                if prior is not None and repository_id not in self.subjects(
-                    prior, FINISHED_ORDER_STATES
-                ):
-                    issues.append(
-                        DenyIssue(
-                            code=DenyCode.ORDERING_VIOLATED,
-                            detail=f"{asset} needs a completed {prior} order for the subject first",
-                        )
-                    )
+        issues.extend(self._ordering_issues(asset, repository_id))
         if lane is not None:
             verdict = self._spend.check_budget(lane, None)
-            if verdict.status is BudgetStatus.OVER and verdict.enforcement in _WITHHOLDING:
-                # No estimate exists before the run, so the gate is measured spend alone.
+            if (
+                verdict.status is BudgetStatus.OVER
+                and verdict.enforcement in WITHHOLDING_ENFORCEMENT
+            ):
+                # No estimate exists before the run, so the gate is measured spend alone
+                # (BudgetVerdict.binding also needs the estimate; a preflight cannot have one).
                 issues.append(
                     DenyIssue(
                         code=DenyCode.BUDGET_EXHAUSTED,
@@ -316,6 +310,48 @@ class OpsService:
                     )
                 )
         return tuple(issues)
+
+    def _may_request(
+        self, asset: AssetName, repository_id: UUID | None, principal: Principal
+    ) -> bool:
+        """Who may ask for a run: a verified person, or a verified machine within a
+        `recording.start` grant for this asset and repository. `authorize_request` enforces this
+        rule; the policy gates report it as a typed issue — one rule, two doors."""
+        return principal.is_verified_human() or (
+            principal.kind == ActorKind.MACHINE
+            and principal.verified_by is not None
+            and repository_id is not None
+            and self._in_start_scope(principal, asset, repository_id)
+        )
+
+    def _ordering_issues(self, asset: AssetName, repository_id: UUID | None) -> Iterator[DenyIssue]:
+        """The stage-ordering gate, from the deployment's recording config: a gated asset needs
+        its predecessor's completed order on the very subject. A subjectless order cannot show
+        one, so it is refused rather than queued unverified."""
+        for kind, assets in self._recording_assets.items():
+            if asset not in assets:
+                continue
+            prior = _PRIOR_RECORD_KIND.get(kind)
+            if prior is None:
+                continue
+            prior_assets = self._recording_assets.get(prior, frozenset())
+            if not prior_assets:
+                continue  # the deployment wires no such stage: nothing to require
+            if repository_id is None:
+                yield DenyIssue(
+                    code=DenyCode.ORDERING_VIOLATED,
+                    detail=f"{asset} needs a repository: its {prior} prerequisite is per-subject",
+                )
+                continue
+            with self._uow as uow:
+                completed = uow.run_orders.subject_has_order(
+                    tuple(prior_assets), repository_id, _COMPLETED_ORDER_STATES
+                )
+            if not completed:
+                yield DenyIssue(
+                    code=DenyCode.ORDERING_VIOLATED,
+                    detail=f"{asset} needs a completed {prior} order for the subject first",
+                )
 
     def plan(
         self, request: OrderRequest, principal: Principal, config: Sequence[ConfigDigest] = ()
@@ -485,6 +521,9 @@ class OpsService:
         if self._inventory is None:
             raise ConfigError("recording start requires inventory reads (Context wires them)")
         self._inventory.get_repository(request.repository_id)
+        if issues := tuple(self._ordering_issues(request.asset, request.repository_id)):
+            # The same stage ordering submit and preflight enforce; a recording start is a run.
+            raise PolicyDenied(issues)
         return self.start(request, principal, WorkerId(principal.ref), lease_for)
 
     def authorize_request(
@@ -493,13 +532,7 @@ class OpsService:
         """Who may ask for a run outside routing: a verified person (as for a direct order), or a
         verified machine within a `recording.start` grant for this asset and repository (the
         deployment's explicit machine scope; default deny)."""
-        if principal.is_verified_human():
-            return
-        if not (
-            principal.kind == ActorKind.MACHINE
-            and principal.verified_by is not None
-            and self._in_start_scope(principal, asset, repository_id)
-        ):
+        if not self._may_request(asset, repository_id, principal):
             raise ForbiddenError(
                 f"not allowed to ask for {asset} on repository {repository_id}: a verified "
                 "person, or a machine granted it in recording.start, may"
