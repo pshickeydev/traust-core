@@ -3,6 +3,7 @@ SQLite and Postgres."""
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -15,6 +16,7 @@ from tests.v1.services.test_portfolio_sync import Forge, listed, url
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.inventory import OrgName, ProductSlug, RefName, TeamName
+from traust_core.v1.models.observation import ComparisonStatus
 from traust_core.v1.models.onboarding import (
     Gap,
     OnboardingRequest,
@@ -24,6 +26,7 @@ from traust_core.v1.models.onboarding import (
 from traust_core.v1.models.operations import AssetName, OrderState
 from traust_core.v1.models.vocabulary import ActorKind
 from traust_core.v1.providers.clock import FixedClock
+from traust_core.v1.providers.sources import SourceError
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.repositories.objects.store import InMemoryObjectStore
 from traust_core.v1.services.artifact_publishing import ArtifactPublisher, PublishSpecs
@@ -142,3 +145,19 @@ def test_a_registered_product_onboards_without_a_label(
     product = portfolio.register_product(ProductSlug.parse("example"), "Example")
     result = onboarding.onboard(request(), OPERATOR)
     assert (result.product_id, result.repository_ids, result.order_ids) == (product.id, (), ())
+
+
+def test_onboarding_a_known_repository_shows_a_forge_refresh_it_couldnt_make(
+    onboarding: OnboardingService,
+    portfolio: PortfolioService,
+    forge: Forge,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    known = portfolio.register_repository(API, public=True)  # no upstream linked yet
+    forge.info_error = SourceError("forge down", ComparisonStatus.UNREACHABLE)
+    with caplog.at_level(logging.WARNING, logger="traust_core.v1.services.onboarding"):
+        result = onboarding.onboard(request(label="Example", repositories=[{"url": API}]), OPERATOR)
+    assert result.repository_ids == (known.id,)  # still onboarded
+    assert len(result.skipped) == 1 and "forge facts not refreshed" in result.skipped[0]
+    assert f"onboarding repository {known.id}: forge facts not refreshed" in caplog.text
+    assert str(API) not in caplog.text  # the log names the id, not the URL

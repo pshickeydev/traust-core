@@ -75,3 +75,96 @@ def test_a_second_spelling_waits_for_the_first_writer_and_reuses_its_row(engine:
         a.commit()
     writer.join(timeout=30)
     assert done == [first.id]
+
+
+def test_a_mixed_case_configured_host_finds_a_repository_in_any_case(tmp_path: Path) -> None:
+    hosts = {"github.com": "github", "GitHub.Example.com": "github"}
+    config = Config(home=tmp_path, forge_hosts=hosts)
+    assert config.forge_hosts == {"github.com": "github", "github.example.com": "github"}
+    services = Context(config).services()
+    registered = services.portfolio.register_repository(
+        HttpsRepoUrl.parse("https://github.example.com/Org/Repo", config.forge_hosts), public=False
+    )
+    other_case = HttpsRepoUrl.parse("https://github.example.com/org/REPO", config.forge_hosts)
+    found = services.portfolio.find_repository(other_case)
+    assert found is not None and found.id == registered.id
+
+
+@pytest.mark.parametrize(
+    "spelling", ["https://github.com/example-org/api", "https://github.com/Example-Org/API"]
+)
+def test_a_waiting_writer_keeps_the_first_writers_repository_as_it_was(
+    engine: Engine, spelling: str
+) -> None:
+    # A registers private and holds the write lock; B asks for public in the same or another
+    # spelling: B waits, then gets A's row unchanged
+    with SqlTraustUnitOfWork(engine).write() as a:
+        a.repositories.lock_url("https://github.com/example-org/api")
+        first = a.repositories.get_or_add(
+            Repository(url="https://github.com/example-org/api", public=False)
+        )
+        done: list[Repository] = []
+
+        def second() -> None:
+            own = create_database_engine(engine.url.render_as_string(hide_password=False))
+            try:
+                portfolio = PortfolioService(SqlTraustUnitOfWork(own), PortfolioPolicy())
+                url = HttpsRepoUrl.parse(spelling, ["github.com"])
+                done.append(portfolio.register_repository(url, public=True))
+            finally:
+                own.dispose()
+
+        writer = threading.Thread(target=second)
+        writer.start()
+        writer.join(timeout=1)
+        assert writer.is_alive() and done == []
+        a.commit()
+    writer.join(timeout=30)
+    assert done == [first]  # every field as the first writer stored it, public included
+    with SqlTraustUnitOfWork(engine) as uow:
+        assert uow.repositories.get(first.id) == first  # type: ignore[arg-type]
+
+
+def test_a_metadata_write_waits_for_a_visibility_change_and_keeps_it(engine: Engine) -> None:
+    # Postgres: B waits on A's row lock; SQLite: on A's write lock. Either way B reads after A
+    portfolio = PortfolioService(SqlTraustUnitOfWork(engine), PortfolioPolicy())
+    fork = portfolio.register_repository(
+        HttpsRepoUrl.parse("https://github.com/mirror-org/api", ["github.com"]), public=False
+    )
+    parent = HttpsRepoUrl.parse("https://github.com/example-org/api", ["github.com"])
+    assert fork.id is not None
+    with SqlTraustUnitOfWork(engine).write() as a:  # another import, changing visibility
+        held = a.repositories.get_for_update(fork.id)
+        a.repositories.update(held.model_copy(update={"public": True}))
+        done: list[Repository] = []
+
+        def link() -> None:  # this import's forge said nothing of visibility
+            own = create_database_engine(engine.url.render_as_string(hide_password=False))
+            try:
+                other = PortfolioService(SqlTraustUnitOfWork(own), PortfolioPolicy())
+                done.append(other.record_repo_info(fork.id, None, parent))  # type: ignore[arg-type]
+            finally:
+                own.dispose()
+
+        writer = threading.Thread(target=link)
+        writer.start()
+        writer.join(timeout=1)
+        assert writer.is_alive() and done == []  # it waits for the row
+        a.commit()
+    writer.join(timeout=30)
+    assert done and done[0].public is True and done[0].upstream_id is not None
+    assert portfolio.get_repository(fork.id).public is True  # the change stands
+
+
+def test_a_mixed_case_configured_private_host_keeps_its_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("EXAMPLE_FORGE_TOKEN", "token-for-tests")
+    config = Config(
+        home=tmp_path,
+        forge_hosts={"github.com": "github", "GitHub.Example.com": "github"},
+        forge_tokens={"GitHub.Example.com": "EXAMPLE_FORGE_TOKEN"},
+    )
+    assert config.forge_tokens == {"github.example.com": "EXAMPLE_FORGE_TOKEN"}
+    api = Context(config).forge_api
+    assert api.headers("github.example.com") == {"Authorization": "Bearer token-for-tests"}

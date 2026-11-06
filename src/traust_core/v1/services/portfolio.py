@@ -350,14 +350,13 @@ class PortfolioService:
         assert facts.repo is not None and facts.head is not None and self._assessment is not None
         fork_of = _fork_parent_url(facts.repo.host, facts.fork, facts.parent, self._hosts)
         observed = facts.status in (*OBSERVED, ComparisonStatus.NO_PINNED_SHA)
-        with self._uow as uow:
-            repository = uow.repositories.get(facts.repository_id)
+        with self._uow.write() as uow:
+            repository = uow.repositories.get_for_update(facts.repository_id)
             upstream = self._upstream(uow, fork_of) if fork_of else None
+            seen_public = _is_public(facts.visibility)
             current = repository.model_copy(
                 update=dict(
-                    public=repository.public
-                    if facts.visibility is None
-                    else facts.visibility.lower() == "public",
+                    public=repository.public if seen_public is None else seen_public,
                     archived=repository.archived if facts.archived is None else facts.archived,
                     # fork=None means the forge did not say — keep the recorded lineage;
                     # a reported fork repoints it, a reported non-fork clears it
@@ -636,7 +635,7 @@ class PortfolioService:
         if parent_url is not None and not isinstance(parent_url, HttpsRepoUrl):
             raise ValidationError("repository.parent_url must be an HttpsRepoUrl")
         with self._uow.write() as uow:
-            repository = uow.repositories.get(repository_id)
+            repository = uow.repositories.get_for_update(repository_id)
             update: dict[str, object] = {}
             if public is not None and public != repository.public:
                 update["public"] = public
@@ -1173,6 +1172,11 @@ def _release_version(label: str) -> tuple[int, int, int] | None:
     return None if found is None else (int(found[1]), int(found[2]), int(found[3] or 0))
 
 
+def _is_public(visibility: str | None) -> bool | None:
+    """The forge's visibility word as the inventory's flag; None when the forge didn't say."""
+    return None if visibility is None else visibility.lower() == "public"
+
+
 def _fork_parent_url(
     host: str, fork: bool | None, parent: str | None, hosts: Mapping[str, str]
 ) -> HttpsRepoUrl | None:
@@ -1232,7 +1236,9 @@ class PortfolioSync:
         self._portfolio = portfolio
         self._sources = sources
         self._clock = clock or SystemClock()
-        self._hosts = dict(hosts or DEFAULT_FORGE_HOSTS)
+        # the portfolio's hosts unless told otherwise: a fork on a custom host needs them to
+        # resolve its parent
+        self._hosts = dict(hosts or portfolio.inventory.hosts)
 
     def list_org(self, org: OrgName, host: str) -> list[RepoInfo]:
         return self._sources.list_org(org, host).data
@@ -1246,11 +1252,14 @@ class PortfolioSync:
 
     def import_repository(self, url: HttpsRepoUrl) -> SyncReport:
         """Register one repository with the visibility its forge reports and its fork's
-        upstream linked; a known repository's missing upstream is back-filled."""
+        upstream linked. A known repository with no upstream is asked again on every import:
+        nothing stored says the forge already called it a non-fork."""
         known = self._portfolio.find_repository(url)
         if known is not None and known.id is not None:
+            # NEED(contracts: repo-state records the forge's fork answer, a non-fork included):
+            # until then a non-fork costs one forge call per import
             if known.upstream_id is None:
-                # lineage not linked yet: the forge may name a parent, or correct a parent
+                # lineage not known yet: the forge may name a parent, or correct a parent
                 # placeholder's visibility. A forge outage, or a host the forge provider
                 # can't ask, still returns the known id.
                 try:
@@ -1270,7 +1279,7 @@ class PortfolioSync:
 
     def _record_info(self, repository_id: UUID, info: RepoInfo) -> None:
         """The forge's visibility and a fork's parent, normalized as an observation URL."""
-        public = None if info.visibility is None else info.visibility.lower() == "public"
+        public = _is_public(info.visibility)
         parent = _fork_parent_url(info.repo.host, info.fork, info.parent, self._hosts)
         self._portfolio.record_repo_info(repository_id, public, parent)
 
@@ -1312,7 +1321,7 @@ class PortfolioSync:
 
     def _register(self, url: HttpsRepoUrl, visibility: str | None) -> SyncReport:
         known = self._portfolio.find_repository(url)
-        repository = known or self._portfolio.register_repository(url, visibility == "public")
+        repository = known or self._portfolio.register_repository(url, bool(_is_public(visibility)))
         assert repository.id is not None
         return SyncReport(**{"unchanged" if known else "added": (repository.id,)})
 

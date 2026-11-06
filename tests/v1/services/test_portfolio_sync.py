@@ -12,7 +12,8 @@ import pytest
 from sqlalchemy.engine import Engine
 
 from tests.v1.conftest import SQL_BACKENDS, contract_db
-from tests.v1.repositories.tables.conftest import T0
+from tests.v1.repositories.tables.conftest import T0, Seed
+from traust_core.v1.context import Config, Context
 from traust_core.v1.errors import ConflictError, NotFoundError, RepositoryError, ValidationError
 from traust_core.v1.models.common import PageRequest
 from traust_core.v1.models.inventory import (
@@ -417,14 +418,14 @@ def test_a_parent_imported_in_another_case_is_the_forks_placeholder(
     portfolio: PortfolioService,
 ) -> None:
     fork_forge = Forge(described=describing("example-org/fork", "Example-Org/API"))
-    fork = sync(portfolio, fork_forge).import_repository(url("example-org/fork")).added[0]
-    placeholder = portfolio.get_repository(fork).upstream_id
-    assert placeholder is not None
+    fork_id = sync(portfolio, fork_forge).import_repository(url("example-org/fork")).added[0]
+    placeholder_id = portfolio.get_repository(fork_id).upstream_id
+    assert placeholder_id is not None
 
     parent_forge = Forge(described=describing("Example-Org/API", None, fork=False))
     report = sync(portfolio, parent_forge).import_repository(url("Example-Org/API"))
-    assert report == SyncReport(unchanged=(placeholder,))  # no second row
-    assert portfolio.get_repository(placeholder).public is True
+    assert report == SyncReport(unchanged=(placeholder_id,))  # no second row
+    assert portfolio.get_repository(placeholder_id).public is True
 
 
 def test_a_host_the_forge_cannot_ask_still_returns_a_known_repository(
@@ -458,3 +459,42 @@ def test_every_lookup_and_registration_finds_a_github_repository_in_any_case(
     lab = portfolio.register_repository(url("group/app", "gitlab.com"), public=False)
     assert portfolio.find_repository(url("Group/App", "gitlab.com")) is None
     assert lab.id is not None
+
+
+def test_sync_resolves_a_custom_hosts_fork_with_the_portfolios_hosts(engine: Engine) -> None:
+    hosts = {"github.com": "github", "github.example.com": "github"}
+    portfolio = PortfolioService(SqlTraustUnitOfWork(engine), PortfolioPolicy(), hosts=hosts)
+    fork_url = HttpsRepoUrl.parse("https://github.example.com/mirror-org/api", hosts)
+    described = RepoInfo(repo=fork_url, visibility="private", fork=True, parent="example-org/api")
+    # no hosts given: the sync resolves the parent with the portfolio's
+    report = PortfolioSync(portfolio, Forge(described=described)).import_repository(fork_url)  # type: ignore[arg-type]
+    fork_id = report.added[0]
+    upstream_id = portfolio.get_repository(fork_id).upstream_id
+    assert upstream_id is not None
+    assert portfolio.get_repository(upstream_id).url == "https://github.example.com/example-org/api"
+
+
+@pytest.mark.parametrize("visibility", ["public", "Public", "PUBLIC"])
+def test_a_new_repository_is_registered_with_its_final_visibility(
+    portfolio: PortfolioService, engine: Engine, visibility: str
+) -> None:
+    repo = url(f"example-org/api-{visibility}")
+    report = sync(portfolio, Forge(visibility=visibility)).import_repository(repo)
+    registered = portfolio.get_repository(report.added[0])
+    assert registered.public is True
+    assert registered.updated_at == registered.created_at  # written once, not flipped after
+
+
+def test_an_observation_without_a_fork_answer_never_stops_a_later_link(tmp_path: Path) -> None:
+    context = Context(Config(home=tmp_path))
+    portfolio = context.services().portfolio
+    fork = portfolio.register_repository(url("example-org/fork"), public=False)
+    with SqlTraustUnitOfWork(context.database) as uow:  # observed, the forge silent on forks
+        ref = Seed(uow).repository_ref(Seed(uow).repository(), is_default=True)
+        ref = uow.repository_refs.update(ref.model_copy(update={"repository_id": fork.id}))
+        Seed(uow).assessment(ref, kind="repo_state")
+        uow.commit()
+    forge = Forge(described=describing("example-org/fork", "example-org/api"))
+    sync(portfolio, forge).import_repository(url("example-org/fork"))
+    assert forge.calls == [f"info {url('example-org/fork')}"]  # still asked
+    assert portfolio.get_repository(fork.id).upstream_id is not None  # type: ignore[arg-type]
