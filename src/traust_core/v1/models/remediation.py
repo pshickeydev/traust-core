@@ -268,10 +268,12 @@ _STEP = {
     "merged": 6,
     "abandoned": 7,
 }
-_FINAL = frozenset({"merged", "abandoned"})
+_FINAL = frozenset({RemediationStatus.MERGED, RemediationStatus.ABANDONED})
 # An attempt here is over: the same findings may be tried again, as a new work item (a failed
 # attempt is one).
-OVER = frozenset({*_FINAL, "checks_failed", "revalidated_still_vulnerable"})
+OVER = frozenset(
+    {*_FINAL, RemediationStatus.CHECKS_FAILED, RemediationStatus.REVALIDATED_STILL_VULNERABLE}
+)
 # Remediation progress never establishes that a finding is fixed.
 _RESOLUTION: dict[str, str | None] = {
     "candidate": None,

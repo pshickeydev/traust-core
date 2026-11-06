@@ -6,7 +6,7 @@ from __future__ import annotations
 import threading
 import time
 from collections.abc import Iterator
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
@@ -37,6 +37,7 @@ from traust_core.v1.services.remediation_scheduling import (
 )
 
 FORK = "https://github.com/example-mirrors/example-service"
+VERIFIED_AT = datetime(2026, 10, 24, 9, tzinfo=UTC)
 BRANCH = "fix/1f0e8dad-e8d3-4c1e-9a1a-8b2f6b0d1b7c/title"
 GIT = ProcessConfig(allowed_binaries=("git",))
 PRIVATE = RemediationConfig(fork_org="mirror-org")
@@ -816,10 +817,23 @@ def test_a_retry_after_a_failed_attempt_is_a_new_work_item(
         "checks_failed",
         "forked",
     )
-    # a report on these findings now belongs to the retry
-    done = remediation.record(pushed(retry, finding_ids), provenance())
+    # both attempts await a report: the run names its own work item, never a guess
+    with pytest.raises(ValidationError, match="name the work item"):
+        remediation.record(pushed(retry, finding_ids), provenance())
+    late = remediation.record(  # the failed attempt's worker reports after the retry opened
+        pushed(first, finding_ids, summary__status="checks_failed"),
+        provenance(),
+        work_item_id=first.assessment_id,
+    )
+    assert late.work_item_id == first.assessment_id
+    assert remediation.get(retry.assessment_id).report is None
+    assert row(engine, retry.id).status == "forked"  # the retry didn't run that report
+    done = remediation.record(
+        pushed(retry, finding_ids), provenance(), work_item_id=retry.assessment_id
+    )
     assert done.work_item_id == retry.assessment_id
-    assert remediation.get(first.assessment_id).report is None
+    with pytest.raises(ValidationError, match="not for exactly these findings"):
+        remediation.record(pushed(retry, finding_ids), provenance(), work_item_id=uuid4())
 
 
 def test_a_started_order_names_only_a_work_item_of_its_own_repository(
@@ -915,3 +929,24 @@ def test_opening_a_work_item_that_fails_part_way_leaves_no_assessment(
         remediation.open(finding_ids, ref_id)
     with SqlTraustUnitOfWork(engine) as uow:
         assert [a for a in uow.assessments.list_for_ref(ref_id) if a.kind == "remediation"] == []
+
+
+def test_a_verification_delivered_late_never_overrides_a_newer_one(
+    service: RemediationSchedulingService, context: Context, engine: Engine
+) -> None:
+    world = World(engine, findings=2, patched_name="main")
+    audited(engine, world, world.base)
+    request = pairs(world.ids, [world.repo.id] * len(world.ids))
+    scheduled = service.create(fork_of(engine, request), world.patched.name, request, PERSON)
+    context.services().remediation.record(
+        pushed(scheduled, world.ids, fork__fix_commit=world.patched.sha), provenance()
+    )
+    verification = context.services().verification
+    a, b = world.ids
+    earlier, later = VERIFIED_AT, VERIFIED_AT + timedelta(hours=1)
+    newer = verification_report(world, {a: "resolved"})
+    verification.record(newer, verification_provenance(at=later))
+    older = verification_report(world, {a: "unresolved", b: "resolved"})
+    verification.record(older, verification_provenance(at=earlier))  # delivered late
+    # a's newer fixed verdict stands, and b's (older, but its only one) completes the effort
+    assert row(engine, scheduled.id).status == "revalidated_fixed"

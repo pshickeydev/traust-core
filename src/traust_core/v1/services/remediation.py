@@ -5,7 +5,7 @@ import logging
 import re
 from collections import Counter, defaultdict
 from collections.abc import Collection, Mapping, Sequence
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, overload
 from urllib.parse import urlsplit
@@ -532,13 +532,20 @@ class RemediationService:
         )
 
     @overload
-    def record(self, doc: RemediationArtifact, provenance: Provenance) -> WorkItem: ...
+    def record(
+        self, doc: RemediationArtifact, provenance: Provenance, *, work_item_id: UUID | None = None
+    ) -> WorkItem: ...
     @overload
     def record(self, doc: FleetFixArtifact, provenance: Provenance) -> FleetFix: ...
     def record(
-        self, doc: RemediationArtifact | FleetFixArtifact, provenance: Provenance
+        self,
+        doc: RemediationArtifact | FleetFixArtifact,
+        provenance: Provenance,
+        *,
+        work_item_id: UUID | None = None,
     ) -> WorkItem | FleetFix:
-        """A report on the open work item for exactly its findings (`finding_ref` = finding id):
+        """A report on the open work item for exactly its findings (`finding_ref` = finding id),
+        the one the run prepared when it names it (`work_item_id`; the report itself doesn't):
         attached, its Jira keys linked, the item moved to its status; re-recording is a no-op."""
         if isinstance(doc, FleetFixArtifact):
             return self._record_fleet_fix(doc, provenance)
@@ -549,7 +556,7 @@ class RemediationService:
         wanted = tuple(sorted({_finding_id(s.finding_ref) for s in doc.source_findings}, key=str))
         status = RemediationStatus(doc.summary.status)
         digest = sha256_hex(doc.payload)
-        item = self._reported_item(wanted, digest)
+        item = self._reported_item(wanted, digest, work_item_id)
         pushed_to = str(_url(doc.fork.url))
         self._refuse_public(pushed_to)
         # a scheduled fix is pushed where it was scheduled: its commit is what verification of
@@ -831,20 +838,26 @@ class RemediationService:
     def _active(self, repository_id: UUID) -> list[WorkItem]:
         return [i for i in self._items(repository_id) if i.status not in OVER and not i.is_done()]
 
-    def _reported_item(self, wanted: tuple[UUID, ...], digest: str) -> WorkItem:
+    def _reported_item(
+        self, wanted: tuple[UUID, ...], digest: str, work_item_id: UUID | None
+    ) -> WorkItem:
         views = self._findings.list_by_ids(wanted)
         if len({v.finding.repository_id for v in views}) != 1:
             raise ValidationError("remediation report covers findings of several repositories")
         same = [i for i in self._items(views[0].finding.repository_id) if i.finding_ids == wanted]
+        if work_item_id is not None:
+            same = [i for i in same if i.work_item_id == work_item_id]
+            if not same:
+                raise ValidationError(f"work item {work_item_id} is not for exactly these findings")
         if done := [i for i in same if i.report is not None and i.report.digest == digest]:
             return done[0]
+        # a failed attempt and its retry both await a report: only the run's own work item
+        # tells them apart, never a guess
         open_ = [i for i in same if i.status not in _FINAL and not i.is_done()]
-        # a failed attempt takes its own report, unless a retry has opened since: then the retry
-        if live := [i for i in open_ if i.status not in OVER]:
-            open_ = live
         if len(open_) != 1:
             listed = ", ".join(map(str, wanted))
-            raise ValidationError(f"no single open work item for findings {listed}")
+            name = " (name the work item)" if len(open_) > 1 else ""
+            raise ValidationError(f"no single open work item for findings {listed}{name}")
         return open_[0]
 
     def _items(
@@ -1265,7 +1278,7 @@ class VerificationService:
                 )
             if not replay:
                 verdict_of = {f: v.verdict for f, v in verdicts.items()}
-                self._revalidate(verdict_of, meta.patched_commit, ref)
+                self._revalidate(verdict_of, assessment.occurred_at, meta.patched_commit, ref)
             uow.commit()
         if not found:
             self._uow.after_commit(
@@ -1279,14 +1292,19 @@ class VerificationService:
         return verification
 
     def _revalidate(
-        self, verdicts: Mapping[UUID, str], patched_commit: str, patched: RepositoryRef
+        self,
+        verdicts: Mapping[UUID, str],
+        occurred_at: datetime,
+        patched_commit: str,
+        patched: RepositoryRef,
     ) -> None:
         """The scheduled efforts this report verified move to their revalidated status, on the
         verdicts' own transaction. An effort is this report's when the ref verified is its fix
         branch and the commit verified is its work item's recorded fix commit (a report on the
         same findings at another commit or branch, on the upstream or another fork, says nothing
-        about this fix). Each finding it covers counts at its latest verdict on that commit, this
-        report's or an earlier one's: fixed only when all are fixed; still vulnerable when any
+        about this fix). Each finding it covers counts at its latest verdict on that commit by when
+        the verification happened, this report's or another's (one delivered late never
+        overrides a newer one): fixed only when all are fixed; still vulnerable when any
         verified one isn't; left as is while some are unverified and the rest fixed. Merged or
         abandoned efforts are past revalidation, and an effort that is over stays over once a
         newer one covers any of its findings."""
@@ -1306,10 +1324,11 @@ class VerificationService:
                 for other, _ in self._findings.scheduled.efforts_covering(covers)
             ):
                 continue
-            latest = {f: verdicts[f] for f in covers if f in verdicts}
-            if unsaid := covers - latest.keys():
-                latest |= self._verified_on(patched, unsaid)
-            said = [v in FIXED_VERDICTS for v in latest.values()]
+            latest = self._verified_on(patched, covers)
+            for f in covers & verdicts.keys():
+                if f not in latest or latest[f][0] <= occurred_at:
+                    latest[f] = (occurred_at, verdicts[f])
+            said = [verdict in FIXED_VERDICTS for _, verdict in latest.values()]
             if not all(said):
                 status = RemediationStatus("revalidated_still_vulnerable")
             elif len(said) == len(covers):
@@ -1320,11 +1339,11 @@ class VerificationService:
 
     def _verified_on(
         self, patched: RepositoryRef, finding_ids: Collection[UUID]
-    ) -> dict[UUID, str]:
-        """Each finding's latest verdict from an earlier verification of this commit."""
+    ) -> dict[UUID, tuple[datetime, str]]:
+        """Each finding's latest verdict on this commit, by when its verification happened."""
         history = {f: self._findings.history(f) for f in finding_ids}
         runs = {
-            a.id
+            a.id: a.occurred_at
             for a in self._log.list_by_ids(
                 {d.assessment_id for ds in history.values() for d in ds if d.assessment_id}
             )
@@ -1332,8 +1351,13 @@ class VerificationService:
         }
         latest = {}
         for finding_id, decisions in history.items():
-            if said := [d for d in decisions if d.assessment_id in runs and d.reason]:
-                latest[finding_id] = str(max(said, key=lambda d: d.occurred_at).reason)
+            said = [
+                (runs[d.assessment_id], str(d.reason))
+                for d in decisions
+                if d.assessment_id in runs and d.reason
+            ]
+            if said:
+                latest[finding_id] = max(said)
         return latest
 
     def _audit_of(
