@@ -44,7 +44,7 @@ from traust_core.v1.models.dependencies import (
     malicious_id,
     package_name,
 )
-from traust_core.v1.models.detection_quality import MissReason
+from traust_core.v1.models.detection_quality import COMPLIANCE_PRECISION_GATE, MissReason
 from traust_core.v1.models.findings import (
     FindingClock,
     FindingDimension,
@@ -66,6 +66,7 @@ from traust_core.v1.models.insight import (
     CensusLayer,
     CensusProduct,
     ComplianceDashboard,
+    CompliancePrecision,
     ContainerFinding,
     ContainerFindings,
     ContainerReport,
@@ -288,6 +289,10 @@ class InsightService:
                     n == ViewName.PQC_WORKLIST
                     or (filter.repository_ref_ids is None and not filter.pqc_chokepoints)
                 )
+                and (
+                    n == ViewName.COMPLIANCE_PRECISION
+                    or (filter.framework is None and filter.precision_gate is None)
+                )
                 and ((supports := getattr(v, "supports_filter", None)) is None or supports(filter))
             ]
             if views is None
@@ -327,9 +332,107 @@ class InsightService:
             raise ValidationError(
                 "repository_ref_ids and pqc_chokepoints are supported only by pqc-worklist"
             )
+        if (
+            filter is not None
+            and name != ViewName.COMPLIANCE_PRECISION
+            and (filter.framework is not None or filter.precision_gate is not None)
+        ):
+            raise ValidationError(
+                "framework and precision_gate are supported only by compliance-precision"
+            )
         if filter is not None and filter.window is not None and not _accepts_window(found):
             raise ValidationError(f"{name.value} does not support a window")
         return found
+
+
+class CompliancePrecisionView:
+    name = ViewName.COMPLIANCE_PRECISION
+
+    def __init__(self, detection_quality: DetectionQualityService) -> None:
+        self._detection_quality = detection_quality
+
+    @staticmethod
+    def supports_filter(filter: ViewFilter) -> bool:
+        return filter.framework is not None and not filter.model_dump(
+            exclude={"framework", "precision_gate"}, exclude_defaults=True
+        )
+
+    def build(self, filter: ViewFilter) -> CompliancePrecision:
+        if filter.framework is None:
+            raise ValidationError("compliance-precision requires a framework")
+        if not self.supports_filter(filter):
+            unsupported = filter.model_dump(
+                exclude={"framework", "precision_gate"}, exclude_defaults=True
+            )
+            raise ValidationError(
+                "compliance-precision supports only framework and precision_gate; "
+                "unsupported filters: " + ", ".join(sorted(unsupported))
+            )
+        calibration = self._detection_quality.calibrate_compliance(
+            filter.framework,
+            gate=(
+                COMPLIANCE_PRECISION_GATE
+                if filter.precision_gate is None
+                else filter.precision_gate
+            ),
+        )
+        model = CompliancePrecision(calibration=calibration)
+        document: dict[str, contracts.JsonValue] = model.model_dump(mode="json")
+        contracts.validate_view(self.name, document)
+        return model
+
+    def report(self, model: CompliancePrecision, generated_at: datetime) -> Report:
+        calibration = model.calibration
+        population = Section(
+            heading="Population",
+            body="Distinct recorded compliance documents for the selected framework, counted "
+            "once per digest. A firing is an automatic not-satisfied check or an attributed "
+            "human override reversing that verdict; the latter is a dismissal. This is "
+            "field precision, not evaluator idempotence, seeded efficacy or clean coverage.",
+            table=Table(
+                columns=("Framework", "Distinct assessments", "Precision gate (inclusive)"),
+                rows=(
+                    (
+                        calibration.framework.value,
+                        str(calibration.assessments),
+                        str(calibration.gate),
+                    ),
+                ),
+            ),
+        )
+        if not calibration.assessments:
+            results = Section(
+                heading="Results",
+                body="No assessments recorded for this framework; field precision is unmeasured.",
+            )
+        elif not calibration.checks:
+            results = Section(
+                heading="Results",
+                body="No eligible automatic check firings; field precision is unmeasured.",
+            )
+        else:
+            results = Section(
+                heading="Check precision",
+                body="Flagged checks require human demotion review, not automatic changes.",
+                table=Table(
+                    columns=("Check", "Fired", "Dismissed", "Precision", "Demotion review"),
+                    rows=tuple(
+                        (
+                            check.check_id,
+                            str(check.fired),
+                            str(check.dismissed),
+                            "—" if check.precision is None else str(check.precision),
+                            "flagged" if check.flagged else "not flagged",
+                        )
+                        for check in calibration.checks
+                    ),
+                ),
+            )
+        return Report(
+            title="Compliance field precision",
+            generated_at=generated_at,
+            sections=(population, results),
+        )
 
 
 class PqcWorklistView:

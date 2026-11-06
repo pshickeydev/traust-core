@@ -9,6 +9,7 @@ from pydantic import SerializeAsAny
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.common import TimeBucket, TimeWindow
 from traust_core.v1.models.insight import ViewFilter, ViewModel, ViewName
+from traust_core.v1.models.vocabulary import ComplianceFramework
 from traust_core.v1.rest.common.aware_datetime import UtcDatetime
 from traust_core.v1.rest.common.deps import Caller
 from traust_core.v1.rest.common.problems import PROBLEMS
@@ -36,6 +37,8 @@ def get_insight(
     window_end: UtcDatetime | None = None,
     repository_ref_id: Ids = None,
     chokepoint: Labels = None,
+    framework: ComplianceFramework | None = None,
+    precision_gate: Annotated[float | None, Query(ge=0, le=1, allow_inf_nan=False)] = None,
 ) -> SerializeAsAny[ViewModel]:
     """One insight (a dashboard, rollup or export such as SARIF) for a scope at `as_of`, built on
     demand; one route for every insight, so a new one needs no route or SDK release."""
@@ -56,5 +59,7 @@ def get_insight(
         repository_id=repository_id,
         repository_ref_ids=None if repository_ref_id is None else tuple(repository_ref_id),
         pqc_chokepoints=tuple(chokepoint or ()),
+        framework=framework,
+        precision_gate=precision_gate,
     )
     return insight.build(name, filter)

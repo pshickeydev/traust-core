@@ -18,9 +18,15 @@ from tests.v1.services.test_pqc_rules import STAMPS, hit, scan
 from traust_core.v1 import contracts
 from traust_core.v1.context import Config, Context
 from traust_core.v1.errors import NotFoundError, ValidationError
-from traust_core.v1.models.common import Page, TimeBucket, TimeWindow
+from traust_core.v1.models.common import PageRequest, TimeBucket, TimeWindow
 from traust_core.v1.models.insight import ExecutivePanel, PqcWorklist, ViewFilter, ViewName
-from traust_core.v1.models.inventory import Liveness, Product, Repository, RepositoryRef
+from traust_core.v1.models.inventory import (
+    Liveness,
+    Product,
+    Repository,
+    RepositoryFilter,
+    RepositoryRef,
+)
 from traust_core.v1.models.pqc import (
     PqcFilter,
     PqcScan,
@@ -33,6 +39,7 @@ from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.repositories.contract import CONTRACT_TABLES, SqlTraustUnitOfWork
 from traust_core.v1.services.insight import InsightService, PqcWorklistView
 from traust_core.v1.services.pqc import facts as pqc_facts
+from traust_core.v1.services.pqc.service import WorklistPriorityPolicy
 
 
 @pytest.fixture(params=SQL_BACKENDS)
@@ -183,9 +190,7 @@ def test_routing_preserves_availability_evidence_without_reinterpreting_policy(
     availability = Liveness(
         repository_id=target.id, url=target.url, unobserved=status, reason="recorded"
     )
-    monkeypatch.setattr(
-        services.portfolio, "liveness", lambda *_: Page(items=(availability,), next=None)
-    )
+    monkeypatch.setattr(services.portfolio, "liveness_in", lambda _: {target.id: availability})
     (entry,) = services.pqc.worklist(PqcFilter(repository_ref_ids=(fleet.refs["alpha"].id,)))
     assert (entry.route, entry.reason, entry.access.unobserved) == (expected, status.value, status)
 
@@ -321,3 +326,59 @@ def test_hostile_priority_fragments_remain_data_in_the_model_and_human_reports(
     assert "<img" not in published.markdown and "<img" not in published.html
     assert "[docs](javascript:" not in published.markdown
     assert "\n## forged" not in published.markdown
+
+
+def test_one_ref_worklist_does_not_enumerate_unrelated_inventory(
+    context: Context, fleet: Fleet, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    services = context.services()
+    target = fleet.repositories["alpha"]
+    ref = fleet.refs["alpha"]
+    assert target.id is not None and ref.id is not None
+    expected = next(
+        row
+        for row in services.portfolio.liveness(RepositoryFilter(), PageRequest()).items
+        if row.repository_id == target.id
+    )
+
+    def no_fleet_enumeration(*args: object, **kwargs: object) -> None:
+        raise AssertionError("a one-ref request enumerated the whole repository inventory")
+
+    monkeypatch.setattr(services.portfolio, "list_repositories", no_fleet_enumeration)
+    before = snapshot(context)
+    (entry,) = services.pqc.worklist(PqcFilter(repository_ref_ids=(ref.id,)))
+    assert (entry.repository_id, entry.repository_ref_id, entry.access) == (
+        target.id,
+        ref.id,
+        expected,
+    )
+    assert snapshot(context) == before
+
+
+@pytest.mark.parametrize(
+    ("repository", "chokepoints", "cwes", "expected"),
+    [
+        (
+            "https://github.com/example/oauth",
+            (" OAUTH ",),
+            ("CWE-327",),
+            PqcWorklistTier.CHOKEPOINT,
+        ),
+        (
+            "https://github.com/example/other",
+            ("oauth",),
+            ("cwe-327: legacy",),
+            PqcWorklistTier.CRYPTO_CWE,
+        ),
+        ("https://github.com/example/other", (), (" CWE-1240 ",), PqcWorklistTier.CRYPTO_CWE),
+        ("https://github.com/example/other", (), ("CWE-79",), PqcWorklistTier.TAIL),
+        ("https://github.com/example/other", (), (), PqcWorklistTier.TAIL),
+    ],
+)
+def test_priority_policy_preserves_precedence_and_legacy_cwe_normalization(
+    repository: str,
+    chokepoints: tuple[str, ...],
+    cwes: tuple[str, ...],
+    expected: PqcWorklistTier,
+) -> None:
+    assert WorklistPriorityPolicy(chokepoints).tier(repository, cwes) == expected

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 from collections import Counter, defaultdict
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime
 from typing import TypeVar, overload
 from urllib.parse import urlsplit
@@ -68,44 +68,59 @@ READINESS_LINT = Lint({PqcReadinessArtifact: [pqc_readiness.ReadinessWriteRules(
 _KIND = AssessmentKind.PQC_READINESS
 _SCANNER = "pqc-scan"
 _SKILL = "skill:pqc-readiness"
-_CRYPTO_CWES = frozenset(
-    {
-        "CWE-256",
-        "CWE-259",
-        "CWE-261",
-        "CWE-295",
-        "CWE-296",
-        "CWE-297",
-        "CWE-310",
-        "CWE-311",
-        "CWE-312",
-        "CWE-319",
-        "CWE-321",
-        "CWE-322",
-        "CWE-323",
-        "CWE-324",
-        "CWE-325",
-        "CWE-326",
-        "CWE-327",
-        "CWE-328",
-        "CWE-329",
-        "CWE-330",
-        "CWE-331",
-        "CWE-335",
-        "CWE-338",
-        "CWE-347",
-        "CWE-522",
-        "CWE-540",
-        "CWE-547",
-        "CWE-757",
-        "CWE-798",
-        "CWE-916",
-        "CWE-1240",
-    }
-)
-_WORKLIST_TIERS = tuple(PqcWorklistTier)
+_WORKLIST_ORDER = {tier: index for index, tier in enumerate(PqcWorklistTier)}
 
 D = TypeVar("D", bound=ArtifactDocument)
+
+
+class WorklistPriorityPolicy:
+    _CRYPTO_CWES = frozenset(
+        {
+            "CWE-256",
+            "CWE-259",
+            "CWE-261",
+            "CWE-295",
+            "CWE-296",
+            "CWE-297",
+            "CWE-310",
+            "CWE-311",
+            "CWE-312",
+            "CWE-319",
+            "CWE-321",
+            "CWE-322",
+            "CWE-323",
+            "CWE-324",
+            "CWE-325",
+            "CWE-326",
+            "CWE-327",
+            "CWE-328",
+            "CWE-329",
+            "CWE-330",
+            "CWE-331",
+            "CWE-335",
+            "CWE-338",
+            "CWE-347",
+            "CWE-522",
+            "CWE-540",
+            "CWE-547",
+            "CWE-757",
+            "CWE-798",
+            "CWE-916",
+            "CWE-1240",
+        }
+    )
+
+    def __init__(self, chokepoints: tuple[str, ...] = ()) -> None:
+        if any(not fragment.strip() for fragment in chokepoints):
+            raise ValidationError("a PQC chokepoint is a nonblank URL fragment")
+        self._chokepoints = tuple(fragment.strip().lower() for fragment in chokepoints)
+
+    def tier(self, repository: str, cwes: Iterable[str]) -> PqcWorklistTier:
+        if any(fragment in repository.lower() for fragment in self._chokepoints):
+            return PqcWorklistTier.CHOKEPOINT
+        if any(cwe.upper().split(":")[0].strip() in self._CRYPTO_CWES for cwe in cwes):
+            return PqcWorklistTier.CRYPTO_CWE
+        return PqcWorklistTier.TAIL
 
 
 class PqcService:
@@ -326,9 +341,7 @@ class PqcService:
         """One ranked entry per in-scope repository, including unassessed inventory; no scans."""
         if filter.buckets or filter.categories or filter.patchable is not None:
             raise ValidationError("PQC worklist supports only product and repository-ref scope")
-        if any(not fragment.strip() for fragment in chokepoints):
-            raise ValidationError("a PQC chokepoint is a nonblank URL fragment")
-        priority = tuple(fragment.strip().lower() for fragment in chokepoints)
+        priority = WorklistPriorityPolicy(chokepoints)
         ref_ids = self._refs(filter)
         if ref_ids is None:
             repositories = list(
@@ -353,13 +366,9 @@ class PqcService:
                 PqcFilter(repository_ref_ids=tuple(ref.id for ref in selected if ref.id))
             )
         }
-        availability = {
-            live.repository_id: live
-            for live in every_item(lambda page: self._portfolio.liveness(RepositoryFilter(), page))
-        }
-        findings = self._findings.all_in(
-            [repository.id for repository in repositories if repository.id]
-        )
+        repository_ids = [repository.id for repository in repositories if repository.id]
+        availability = self._portfolio.liveness_in(repository_ids)
+        findings = self._findings.all_in(repository_ids)
         entries = []
         for repository in repositories:
             assert repository.id is not None
@@ -372,17 +381,9 @@ class PqcService:
                 ),
                 default=None,
             )
-            crypto = any(
-                cwe.upper().split(":")[0].strip() in _CRYPTO_CWES
-                for finding in findings.get(repository.id, ())
-                for cwe in finding.cwes
-            )
-            tier = (
-                0
-                if any(part in repository.url.lower() for part in priority)
-                else 1
-                if crypto
-                else 2
+            tier = priority.tier(
+                repository.url,
+                (cwe for finding in findings.get(repository.id, ()) for cwe in finding.cwes),
             )
             access = availability[repository.id]
             route, reason = PqcWorklistRoute.SOURCE, access.reason
@@ -398,12 +399,12 @@ class PqcService:
                     repository=repository.url,
                     repository_ref_id=ref.id if ref else None,
                     sha=ref.sha if ref else None,
-                    priority_tier=_WORKLIST_TIERS[tier],
+                    priority_tier=tier,
                     route=route,
                     access=access,
                     reason=reason,
                     scan=states.get(ref.id) if ref else None,
-                    cursor=f"{tier}|{repository.url}",
+                    cursor=f"{_WORKLIST_ORDER[tier]}|{repository.url}",
                 )
             )
         return tuple(sorted(entries, key=lambda entry: entry.cursor))

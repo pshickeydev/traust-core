@@ -21,7 +21,7 @@ from traust_core.v1.models.code_facts import LanguageCount
 from traust_core.v1.models.common import TimeBucket, TimeWindow
 from traust_core.v1.models.compliance import ComplianceRollup, DocVariance
 from traust_core.v1.models.dependencies import ExposureRollup
-from traust_core.v1.models.detection_quality import CriticalMiss
+from traust_core.v1.models.detection_quality import ComplianceCalibration, CriticalMiss
 from traust_core.v1.models.findings import (
     Decision,
     FindingRollup,
@@ -41,6 +41,7 @@ from traust_core.v1.models.pqc import (
 )
 from traust_core.v1.models.validation import ValidationRollup
 from traust_core.v1.models.vocabulary import (
+    ComplianceFramework,
     IsolationDimension,
     OwnershipClass,
     RemediationStatus,
@@ -68,6 +69,7 @@ class ViewName(StrEnum):
     PQC_VENDORS = "pqc-vendors"
     PQC_WORKLIST = "pqc-worklist"
     COMPLIANCE = "compliance"
+    COMPLIANCE_PRECISION = "compliance-precision"
     PROGRAM = "program"
     EXECUTIVE_SUMMARY = "executive-summary"
     REVIEW_CARD = "review-card"
@@ -100,6 +102,10 @@ class PqcWorklist(ViewModel):
     entries: tuple[PqcWorklistEntry, ...]
 
 
+class CompliancePrecision(ViewModel):
+    calibration: ComplianceCalibration
+
+
 class ExecutivePanel(StrEnum):
     ATTACK = "attack"
     PQC = "pqc"
@@ -128,6 +134,8 @@ class ViewFilter(Model):
     first_party_divisor: Decimal | None = Field(default=None, gt=0, allow_inf_nan=False)
     repository_ref_ids: tuple[UUID, ...] | None = None
     pqc_chokepoints: tuple[str, ...] = ()
+    framework: ComplianceFramework | None = None
+    precision_gate: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
 
 
 class SeverityCounts(Model):
