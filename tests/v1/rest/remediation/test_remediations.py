@@ -3,7 +3,7 @@ reads list and detail it, and a verification recorded through the record door re
 
 from __future__ import annotations
 
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from fastapi.testclient import TestClient
 from sqlalchemy.engine import Engine
@@ -15,6 +15,7 @@ from tests.v1.rest.remediation.test_verification_records import body as record_b
 from tests.v1.rest.remediation.test_verification_records import leased
 from tests.v1.services.test_verification import World, audited, report
 from traust_core.v1.context import Context
+from traust_core.v1.models.operations import RecordingStartScope
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 
 URL = "/v1/remediations"
@@ -37,10 +38,10 @@ def seeded(engine: Engine, *, findings: int = 1) -> tuple[str, list[str]]:
         return str(repo.id), [str(f.id) for f in made]
 
 
-def schedule(repository_id: str, finding_ids: list[str]) -> dict[str, object]:
+def schedule(repository_id: str, finding_ids: list[str], branch: str = BRANCH) -> dict[str, object]:
     return {
         "fork_url": FORK,
-        "fork_branch": BRANCH,
+        "fork_branch": branch,
         "findings": [{"finding_id": f, "repository_id": repository_id} for f in finding_ids],
     }
 
@@ -96,8 +97,19 @@ def test_the_door_needs_a_token_and_a_body_it_can_schedule(
 def test_a_machine_identity_may_schedule(
     context: Context, client: TestClient, engine: Engine
 ) -> None:
-    repository_id, finding_ids = seeded(engine)
-    made = client.post(URL, json=schedule(repository_id, finding_ids), headers=runner(context))
+    repository_id, finding_ids = seeded(engine, findings=2)
+    first = schedule(repository_id, finding_ids[:1])
+    refused = client.post(URL, json=first, headers=runner(context))
+    assert refused.status_code == 403, refused.text  # no recording.start grant: no scheduling
+    grant = RecordingStartScope(
+        principal="machine:runner-7",
+        assets=("remediate_finding",),
+        repository_ids=(UUID(repository_id),),
+    )
+    context.config = context.config.model_copy(
+        update={"recording": context.config.recording.model_copy(update={"start": (grant,)})}
+    )
+    made = client.post(URL, json=schedule(repository_id, finding_ids[1:]), headers=runner(context))
     assert made.status_code == 200, made.text
     assert made.json()["status"] == "candidate"
 
@@ -110,7 +122,7 @@ def test_a_verification_recorded_through_the_door_revalidates_the_effort(
     assert world.repo.id is not None
     made = client.post(
         URL,
-        json=schedule(str(world.repo.id), [str(f) for f in world.ids]),
+        json=schedule(str(world.repo.id), [str(f) for f in world.ids], branch=world.patched.name),
         headers=bearer(context),
     )
     assert made.status_code == 200, made.text

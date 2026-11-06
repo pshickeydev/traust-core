@@ -304,6 +304,16 @@ class RemediationService:
         item = self.get(work_item_id)
         subject = self._inventory.subject(item.repository_ref_id, work_item_id)
         views = self._findings.list_by_ids(item.finding_ids)
+        with self._uow as uow:
+            scheduled = uow.remediations.find_by_assessment(work_item_id)
+        # a scheduled effort names where its fix lives (SCI's chosen target, the console's);
+        # its host is a configured forge (checked at scheduling) and `record` still refuses a
+        # public fork
+        fork = (
+            self._forks.of(_url(scheduled.fork_url), ForkVisibility.PRIVATE)
+            if scheduled is not None
+            else item.fork or self.resolve_fork(subject.repository_id)
+        )
         return RemediationInput(
             subject=subject,
             findings=FindingContext(),
@@ -319,8 +329,10 @@ class RemediationService:
                 )
                 for v in views
             ),
-            fork=item.fork or self.resolve_fork(subject.repository_id),
-            fix_branch=self._forks.fix_branch(views[0].finding.id, views[0].finding.title),  # type: ignore[arg-type]
+            fork=fork,
+            fix_branch=scheduled.fork_branch
+            if scheduled is not None
+            else self._forks.fix_branch(views[0].finding.id, views[0].finding.title),  # type: ignore[arg-type]
         )
 
     def _hint(self, view: FindingView, repository_url: str) -> str | None:
@@ -485,7 +497,7 @@ class RemediationService:
         item = self.get(work_item_id)
         if item.advance(status) is item:
             return item
-        with self._uow as uow:
+        with self._uow.write() as uow:
             self._findings.decisions.record_resolution(
                 work_item_id, item.finding_ids, resolution_for(status), status
             )
@@ -528,7 +540,7 @@ class RemediationService:
         item = self._reported_item(wanted, digest)
         if item.report is not None:  # recorded before; finish a run that stopped part-way
             if item.status != status:
-                with self._uow as uow:
+                with self._uow.write() as uow:
                     self._findings.decisions.record_resolution(
                         item.work_item_id, wanted, resolution_for(status), status, item.report.id
                     )
@@ -543,7 +555,7 @@ class RemediationService:
                 for finding_id in wanted:
                     self._findings.records.link_external(finding_id, JIRA, key)
             uow.commit()
-        with self._uow as uow:
+        with self._uow.write() as uow:
             self._findings.decisions.record_resolution(
                 item.work_item_id, wanted, resolution_for(status), status, report.id
             )
@@ -941,7 +953,7 @@ def _finding_id(ref: str) -> UUID:
 def _sync_scheduled(uow: TraustUnitOfWork, assessment_id: UUID, status: RemediationStatus) -> None:
     """The remediation row linked to a work item follows it, never stepping back; on the
     caller's transaction, so the row and the decision land or roll back together."""
-    linked = uow.remediations.find_by_assessment(assessment_id)
+    linked = uow.remediations.find_by_assessment_for_update(assessment_id)
     if linked is not None and (moved := linked.moved_on(status)) is not None:
         uow.remediations.update(moved)
 
@@ -1198,7 +1210,7 @@ class VerificationService:
         rationales = {
             i: " ".join(f.evidence.explanation.split())[:RATIONALE_CAP] for i, f in verdicts.items()
         }
-        with self._uow as uow:
+        with self._uow.write() as uow:
             for (validity, resolution, verdict), finding_ids in said.items():
                 self._findings.decisions.record_resolution(
                     assessment.id,
@@ -1211,7 +1223,7 @@ class VerificationService:
                     rationales=rationales,
                     evidence_grade=VERIFIED_GRADE,
                 )
-            self._revalidate(uow, verdicts)
+            self._revalidate(uow, verdicts, meta.patched_ref)
             uow.commit()
         if not recorded:
             self._uow.after_commit(
@@ -1224,20 +1236,31 @@ class VerificationService:
         )
         return verification
 
-    def _revalidate(self, uow: TraustUnitOfWork, verdicts: Mapping[UUID, Any]) -> None:
-        """The remediation rows covering the verified findings move to their revalidated
-        status — fixed when every verified finding of the effort is fixed, else still
-        vulnerable — never stepping back, on the verdicts' own transaction."""
-        covered: defaultdict[UUID, set[UUID]] = defaultdict(set)
-        for row in uow.remediation_findings.list_for_findings(verdicts):
-            covered[row.remediation_id].add(row.finding_id)
-        for remediation_id, finding_ids in covered.items():
-            fixed = all(verdicts[f].verdict in FIXED_VERDICTS for f in finding_ids)
-            status = RemediationStatus(
-                "revalidated_fixed" if fixed else "revalidated_still_vulnerable"
-            )
-            linked = uow.remediations.get(remediation_id)
-            if (moved := linked.moved_on(status)) is not None:
+    def _revalidate(
+        self, uow: TraustUnitOfWork, verdicts: Mapping[UUID, Any], patched_ref: str | None
+    ) -> None:
+        """The scheduled efforts this report verified move to their revalidated status, on the
+        verdicts' own transaction. An effort is this report's when its fix branch is the ref
+        verified (a report on the same finding elsewhere says nothing about this fix). It is
+        fixed only when every finding it covers is verified fixed; still vulnerable when any
+        verified one isn't; left as is while some it covers are unverified and the rest fixed."""
+        if patched_ref is None:
+            return
+        linked = {r.remediation_id for r in uow.remediation_findings.list_for_findings(verdicts)}
+        for remediation_id in sorted(linked, key=str):
+            effort = uow.remediations.get_for_update(remediation_id)
+            if effort.fork_branch != patched_ref:
+                continue
+            rows = uow.remediation_findings.list_for_remediation(remediation_id)
+            covered = [r.finding_id for r in rows]
+            said = [verdicts[f].verdict in FIXED_VERDICTS for f in covered if f in verdicts]
+            if not all(said):
+                status = RemediationStatus("revalidated_still_vulnerable")
+            elif len(said) == len(covered):
+                status = RemediationStatus("revalidated_fixed")
+            else:
+                continue
+            if (moved := effort.moved_on(status)) is not None:
                 uow.remediations.update(moved)
 
     def _audit_of(

@@ -321,17 +321,40 @@ class OpsService:
             if kind in _RECORDING_SOURCES
         ):
             raise ForbiddenError("recording start asset is not authorized for report recording")
-        if request.repository_id is None or not any(
-            scope.principal == principal.ref
-            and request.asset in scope.assets
-            and request.repository_id in scope.repository_ids
-            for scope in self._recording_starts
+        if request.repository_id is None or not self._in_start_scope(
+            principal, request.asset, request.repository_id
         ):
             raise ForbiddenError("recording start is outside the machine's asset/repository scope")
         if self._inventory is None:
             raise ConfigError("recording start requires inventory reads (Context wires them)")
         self._inventory.get_repository(request.repository_id)
         return self.start(request, principal, WorkerId(principal.ref), lease_for)
+
+    def authorize_request(
+        self, asset: AssetName, repository_id: UUID, principal: Principal
+    ) -> None:
+        """Who may ask for a run outside routing: a verified person (as for a direct order), or a
+        verified machine within a `recording.start` grant for this asset and repository (the
+        deployment's explicit machine scope; default deny)."""
+        if principal.is_verified_human():
+            return
+        if not (
+            principal.kind == ActorKind.MACHINE
+            and principal.verified_by is not None
+            and self._in_start_scope(principal, asset, repository_id)
+        ):
+            raise ForbiddenError(
+                f"{principal.ref} may not ask for {asset} on repository {repository_id}: a "
+                "verified person, or a machine granted it in recording.start, may"
+            )
+
+    def _in_start_scope(self, principal: Principal, asset: AssetName, repository_id: UUID) -> bool:
+        return any(
+            scope.principal == principal.ref
+            and asset in scope.assets
+            and repository_id in scope.repository_ids
+            for scope in self._recording_starts
+        )
 
     def heartbeat(self, order_id: UUID, worker: WorkerId, lease_for: timedelta) -> RunOrder:
         now = self._clock.now()

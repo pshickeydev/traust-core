@@ -6,14 +6,13 @@ from __future__ import annotations
 
 import contextlib
 import logging
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING
-from urllib.parse import urlsplit
 from uuid import UUID
 
-from traust_core.v1.errors import NotFoundError, ValidationError
+from traust_core.v1.errors import ConflictError, NotFoundError, ValidationError
 from traust_core.v1.models.identity import Principal
-from traust_core.v1.models.inventory import RepositoryRef
+from traust_core.v1.models.inventory import DEFAULT_FORGE_HOSTS, RepositoryRef
 from traust_core.v1.models.operations import AssetName, OrderRequest
 from traust_core.v1.models.remediation_scheduling import (
     Remediation,
@@ -36,6 +35,8 @@ log = logging.getLogger(__name__)
 REMEDIATE_FINDING = AssetName("remediate_finding")
 # A scheduled fix is asked for now, like onboarding's baseline orders.
 _ASKED_NOW = 0
+# An effort past these is over: the same findings may be scheduled again.
+_OVER = frozenset({"merged", "abandoned"})
 
 
 class RemediationSchedulingService:
@@ -45,9 +46,11 @@ class RemediationSchedulingService:
         findings: FindingService,
         remediation: RemediationService,
         ops: OpsService,
+        hosts: Mapping[str, str] | None = None,
     ) -> None:
         self._uow = uow
         self._inventory = Inventory(uow)
+        self._hosts = dict(hosts or DEFAULT_FORGE_HOSTS)
         self._findings = findings
         self._remediation = remediation
         self._ops = ops
@@ -66,9 +69,13 @@ class RemediationSchedulingService:
         wanted = tuple(dict.fromkeys((f.finding_id, f.repository_id) for f in findings))
         if not wanted:
             raise ValidationError("a remediation needs at least one finding")
-        url = _https(fork_url)
+        url = _https(fork_url, self._hosts)
         _branch(fork_branch)
-        with self._uow as uow:
+        with self._uow.write() as uow:
+            # the findings' rows, locked in one order: a second request for any of them waits
+            # here and then finds this effort, never opening a second one alongside it
+            for finding_id in sorted({f for f, _ in wanted}, key=str):
+                uow.findings.get_for_update(finding_id)
             views = {v.finding.id: v for v in self._findings.list_by_ids([f for f, _ in wanted])}
             for finding_id, repository_id in wanted:
                 view = views[finding_id]
@@ -86,11 +93,12 @@ class RemediationSchedulingService:
                     f"a remediation schedules one repository's findings, not {listed}"
                 )
             (repository_id,) = repositories
+            self._ops.authorize_request(REMEDIATE_FINDING, repository_id, principal)
+            if (existing := self._scheduled({f for f, _ in wanted}, uow)) is not None:
+                return existing
             patch = self._patch_ref(repository_id)
             assert patch.id is not None
             item = self._remediation.open([f for f, _ in wanted], patch.id)
-            if (existing := uow.remediations.find_by_assessment(item.work_item_id)) is not None:
-                return existing
             scheduled = uow.remediations.add(
                 Remediation(
                     fork_url=str(url),
@@ -108,6 +116,9 @@ class RemediationSchedulingService:
                         repository_id=repository,
                     )
                 )
+            # NEED(contracts: run_order names the work item it runs): the order carries only its
+            # asset and repository, so the runner takes the repository's oldest pending work
+            # item (`RemediationService.next_pending`, the skill's `remediation next`)
             order = self._ops.submit(
                 OrderRequest(
                     asset=REMEDIATE_FINDING, priority=_ASKED_NOW, repository_id=repository_id
@@ -146,17 +157,38 @@ class RemediationSchedulingService:
         """Scheduled remediations, oldest first: one status', one repository's or one
         finding's."""
         with self._uow as uow:
+            linked: set[UUID] | None = None
             if repository_id is not None:
-                linked = uow.remediation_findings.list_for_repository(repository_id)
-                found = uow.remediations.list_by_ids({r.remediation_id for r in linked})
-            elif finding_id is not None:
-                linked = uow.remediation_findings.list_for_finding(finding_id)
-                found = uow.remediations.list_by_ids({r.remediation_id for r in linked})
+                rows = uow.remediation_findings.list_for_repository(repository_id)
+                linked = {r.remediation_id for r in rows}
+            if finding_id is not None:
+                rows = uow.remediation_findings.list_for_finding(finding_id)
+                ids = {r.remediation_id for r in rows}
+                linked = ids if linked is None else linked & ids  # every filter given applies
+            if linked is not None:
+                found = uow.remediations.list_by_ids(linked)
             elif status is not None:
                 found = uow.remediations.list_by_status(status)
             else:
                 found = uow.remediations.list_all()
             return [r for r in found if status is None or r.status == status]
+
+    def _scheduled(self, finding_ids: set[UUID], uow: TraustUnitOfWork) -> Remediation | None:
+        """The live effort already covering exactly these findings (a retry, a report recorded
+        since); one covering some of them is a conflict. Merged or abandoned efforts are over."""
+        rows = uow.remediation_findings.list_for_findings(finding_ids)
+        efforts = {r.remediation_id for r in rows}
+        live = [r for r in uow.remediations.list_by_ids(efforts) if r.status not in _OVER]
+        for remediation in live:
+            assert remediation.id is not None
+            covers = {
+                r.finding_id for r in uow.remediation_findings.list_for_remediation(remediation.id)
+            }
+            if covers == finding_ids:
+                return remediation
+            listed = ", ".join(sorted(map(str, covers & finding_ids)))
+            raise ConflictError(f"remediation {remediation.id} already covers {listed}")
+        return None
 
     def _patch_ref(self, repository_id: UUID) -> RepositoryRef:
         """The commit the work item patches: the repository's default line."""
@@ -169,24 +201,26 @@ class RemediationSchedulingService:
         return refs[0]
 
 
-def _https(raw: str) -> HttpsRepoUrl:
-    return HttpsRepoUrl.parse(raw.rstrip("/"), [urlsplit(raw).hostname or ""])
+def _https(raw: str, hosts: Mapping[str, str]) -> HttpsRepoUrl:
+    """The fork as an https URL on one of the deployment's configured forges."""
+    return HttpsRepoUrl.parse(raw.rstrip("/"), hosts)
 
 
 def _branch(name: str) -> None:
-    """Reject what git's check-ref-format rejects (the parts a caller could trip on)."""
+    """Reject what `git check-ref-format --branch` rejects."""
+    parts = name.split("/")
     bad = (
         not name
         or name == "@"
         or "@{" in name
         or name.startswith("-")
-        or name.endswith(".lock")
         or ".." in name
-        or "//" in name
-        or name.startswith("/")
-        or name.endswith("/")
+        or name.endswith(".")
         or any(c in name for c in " ~^:?*[\\")
         or any(ord(c) < 32 or ord(c) == 127 for c in name)
+        # per component: not empty (no leading, trailing or doubled /), no leading dot,
+        # no .lock ending
+        or any(not p or p.startswith(".") or p.endswith(".lock") for p in parts)
     )
     if bad:
         raise ValidationError(f"fork_branch is not a branch name: {name!r}")

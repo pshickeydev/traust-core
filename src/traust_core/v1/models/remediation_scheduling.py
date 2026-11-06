@@ -9,6 +9,8 @@ from traust_core.v1.models.remediation import WorkItem, furthest
 from traust_core.v1.models.values import HttpsRepoUrl
 from traust_core.v1.models.vocabulary import RemediationStatus
 
+_REVALIDATED = frozenset({"revalidated_fixed", "revalidated_still_vulnerable"})
+
 
 class Remediation(Entity):
     """The current state of one remediation effort: where the fix lives (the fork and its
@@ -22,7 +24,10 @@ class Remediation(Entity):
 
     def moved_on(self, status: RemediationStatus) -> Remediation | None:
         """The effort at `status` when that stands at or beyond where it is; None when it
-        would step back (the row never rewinds a status sync)."""
+        would step back (the row never rewinds a status sync). Between the two revalidated
+        verdicts, which rank alike, the latest verification wins (a re-patch, a regression)."""
+        if status != self.status and {status, self.status} <= _REVALIDATED:
+            return self.model_copy(update={"status": status})
         reached = furthest((self.status, status))
         return None if reached == self.status else self.model_copy(update={"status": reached})
 
