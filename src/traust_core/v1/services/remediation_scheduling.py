@@ -17,7 +17,7 @@ from traust_core.v1.errors import ConflictError, NotFoundError, ValidationError
 from traust_core.v1.models.common import Page, PageRequest
 from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.inventory import RepositoryRef
-from traust_core.v1.models.operations import REMEDIATE_FINDING, OrderRequest
+from traust_core.v1.models.operations import REMEDIATE_FINDING, OrderRequest, RunOrder
 from traust_core.v1.models.remediation import OVER, WorkItem, furthest
 from traust_core.v1.models.remediation_scheduling import (
     RemediationFindingRequest,
@@ -36,6 +36,8 @@ log = logging.getLogger(__name__)
 
 # The two revalidated verdicts rank alike: between them, the latest verification wins.
 _REVALIDATED = frozenset({"revalidated_fixed", "revalidated_still_vulnerable"})
+# Orders read per listing round: a page folds batches until it is full, never all history.
+_BATCH = 200
 # A scheduled fix is asked for now, like onboarding's baseline orders.
 _ASKED_NOW = 0
 # The remediation report's `fork.fix_branch` (traust-contracts remediation schema): a branch
@@ -112,16 +114,16 @@ class RemediationSchedulingService:
             # the order names the work item it runs and carries the fork facts: the runner
             # prepares that one, never the repository's oldest pending item, and reads where
             # the fix lives off the order it claims
-            order = self._ops.submit(
+            order = self._ops.schedule_fix(
                 OrderRequest(
                     asset=REMEDIATE_FINDING,
                     priority=_ASKED_NOW,
                     repository_id=repository_id,
                     work_item_id=item.work_item_id,
-                    fork_url=str(fork.url),
-                    fork_branch=fork_branch,
                 ),
                 principal,
+                str(fork.url),
+                fork_branch,
             )
             self._uow.commit()
         self._uow.after_commit(
@@ -139,6 +141,7 @@ class RemediationSchedulingService:
             fork_branch=fork_branch,
             status=item.status,
             order_id=order.id,
+            scheduled_at=order.created_at,
         )
 
     def get(self, work_item_id: UUID) -> ScheduledEffort:
@@ -158,6 +161,7 @@ class RemediationSchedulingService:
             fork_branch=order.fork_branch,
             status=item.status,
             order_id=order.id,
+            scheduled_at=order.created_at,
         )
         return effort.model_copy(update={"status": self._status(effort, order.repository_id)})
 
@@ -169,91 +173,69 @@ class RemediationSchedulingService:
         repository_id: UUID | None = None,
         finding_id: UUID | None = None,
     ) -> Page[ScheduledEffort]:
-        """Scheduled efforts, oldest first, a page at a time: at a status (its effective one —
-        the work item's, or its revalidation verdict), on a repository, on a finding (every
-        filter given applies)."""
+        """Scheduled efforts in the order they were scheduled, a page at a time: at a status (its
+        effective one — the work item's, or its revalidation verdict), on a repository, on a
+        finding (every filter given applies). Orders are read and folded in bounded batches
+        until the page is full, never the whole history."""
         after = page.position()
-        efforts = [
-            e
-            for e, _ in self._efforts(repository_id)
-            if (status is None or e.status == status)
-            and (finding_id is None or finding_id in e.work_item.finding_ids)
-            and (
-                after is None
-                or (e.work_item.opened_at, str(e.work_item.work_item_id))
-                > (after[0], str(after[1]))
-            )
-        ]
+        found: list[ScheduledEffort] = []
+        while len(found) <= page.limit:
+            orders = self._ops.orders_after(REMEDIATE_FINDING, repository_id, after, _BATCH)
+            found += [
+                e
+                for e in self._efforts(orders)
+                if (status is None or e.status == status)
+                and (finding_id is None or finding_id in e.work_item.finding_ids)
+            ]
+            if len(orders) < _BATCH:
+                break
+            after = (orders[-1].created_at, orders[-1].id)  # type: ignore[assignment]
         return Page.of(
-            efforts[: page.limit + 1],
+            found[: page.limit + 1],
             page.limit,
-            lambda e: (e.work_item.opened_at, e.work_item.work_item_id),
+            lambda e: (e.scheduled_at, e.order_id),
         )
 
-    def _efforts(self, repository_id: UUID | None) -> list[tuple[ScheduledEffort, UUID | None]]:
-        """Every scheduled effort, oldest first: the orders that run one, each with its work
-        item and its effective status folded (an item whose findings were never recorded — a
-        run that stopped between open()'s commits — is nothing to work on, not an error). One
-        order per work item — the oldest's, the one that scheduled it: a second order for the
-        same work item is not a second effort."""
-        orders = sorted(
-            self._ops.work_item_orders(REMEDIATE_FINDING, repository_id),
-            key=lambda o: (o.created_at, o.id),
-        )
+    def _efforts(self, orders: Sequence[RunOrder]) -> list[ScheduledEffort]:
+        """The efforts a batch of orders schedules, in their order: an order carrying fork facts
+        and naming a work item whose findings were recorded (an order naming no fork runs no
+        scheduled fix), each with its effective status folded — one covering fold per
+        repository, shared by its efforts."""
         items = {
             i.work_item_id: i
             for i in self._remediation.items_for({o.work_item_id for o in orders if o.work_item_id})
         }
-        made: list[tuple[ScheduledEffort, UUID | None]] = []
-        seen: set[UUID] = set()
+        made: list[ScheduledEffort] = []
         for order in orders:
-            if order.work_item_id is None or order.work_item_id in seen:
+            item = None if order.work_item_id is None else items.get(order.work_item_id)
+            if item is None or order.fork_url is None or order.fork_branch is None:
                 continue
-            if (item := items.get(order.work_item_id)) is None:
-                continue
-            if order.fork_url is None or order.fork_branch is None:
-                continue  # an order that names no fork runs no scheduled fix
-            seen.add(order.work_item_id)
-            # A work-item order's repository is never null (the pairing trigger); the
-            # effort carries it so consumers that did not ask by repository read no ref.
+            # A work-item order's repository is never null (contracts#117's pairing trigger).
             assert order.repository_id is not None
             made.append(
-                (
-                    ScheduledEffort(
-                        work_item=item,
-                        repository_id=order.repository_id,
-                        fork_url=order.fork_url,
-                        fork_branch=order.fork_branch,
-                        status=item.status,
-                        order_id=order.id,
-                    ),
-                    order.repository_id,
+                ScheduledEffort(
+                    work_item=item,
+                    repository_id=order.repository_id,
+                    fork_url=order.fork_url,
+                    fork_branch=order.fork_branch,
+                    status=item.status,
+                    order_id=order.id,
+                    scheduled_at=order.created_at,
                 )
             )
-        # one covering fold per repository, shared by its efforts (their newer-effort check)
-        covering: dict[UUID, list[WorkItem]] = {}
-        for repository in {repo for _, repo in made if repo is not None}:
-            wanted = {
-                f
-                for effort, repo in made
-                if repo == repository
-                for f in effort.work_item.finding_ids
-            }
-            covering[repository] = self._remediation.covering(repository, wanted)
-        efforts = [
-            (
-                effort.model_copy(
-                    update={"status": self._status(effort, repository, covering[repository])}
-                ),
+        covering = {
+            repository: self._remediation.covering(
                 repository,
+                {f for e in made if e.repository_id == repository for f in e.work_item.finding_ids},
             )
-            if repository is not None
-            else (effort, repository)
-            for effort, repository in made
+            for repository in {e.repository_id for e in made}
+        }
+        return [
+            e.model_copy(
+                update={"status": self._status(e, e.repository_id, covering[e.repository_id])}
+            )
+            for e in made
         ]
-        return sorted(
-            efforts, key=lambda e: (e[0].work_item.opened_at, e[0].work_item.work_item_id)
-        )
 
     def _status(
         self,
@@ -297,6 +279,8 @@ class RemediationSchedulingService:
             repository_id, {f for item in covering for f in item.finding_ids}
         )
         for item in covering:
+            if item.status in OVER:  # a failed or finished attempt: a retry is a new work item
+                continue
             order = self._ops.order_for_work_item(item.work_item_id)
             if (
                 order is None or order.fork_url is None or order.fork_branch is None
@@ -309,6 +293,7 @@ class RemediationSchedulingService:
                 fork_branch=order.fork_branch,
                 status=item.status,
                 order_id=order.id,
+                scheduled_at=order.created_at,
             )
             effective = self._status(effort, repository_id, candidates)
             if effective in OVER:

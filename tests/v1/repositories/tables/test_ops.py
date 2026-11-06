@@ -351,3 +351,21 @@ def test_find_by_work_item_is_the_oldest_order_or_none(seed: Seed) -> None:
     assert found is not None and (found.created_at, found.id) < (latest.created_at, latest.id)
     other = saved_id(seed.assessment(ref, kind="remediation"))
     assert orders.find_by_work_item(other) is None
+
+
+def test_find_by_work_item_prefers_the_order_carrying_fork_facts(seed: Seed) -> None:
+    orders = seed.uow.run_orders
+    repository = seed.repository()
+    item = saved_id(seed.assessment(seed.repository_ref(repository), kind="remediation"))
+    seed.run_order(state="queued", repository_id=repository.id, work_item_id=item)  # bare, older
+    apart()
+    scheduled = seed.run_order(
+        asset="remediate_finding",
+        state="queued",
+        repository_id=repository.id,
+        work_item_id=item,
+        fork_url="https://github.com/mirror-org/svc",
+        fork_branch="fix/one",
+    )
+    found = orders.find_by_work_item(item)
+    assert found is not None and found.id == scheduled.id  # a bare order never displaces it

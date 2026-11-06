@@ -318,12 +318,14 @@ def test_get_and_list_filter_the_scheduled_efforts(
         pairs(finding_ids[:1], repository_ids[:1]),
         PERSON,
     )
+    apart()  # listed by when each was scheduled: the store stamps milliseconds
     second = service.create(
         fork_of(engine, pairs(finding_ids[1:], repository_ids[1:])),
         BRANCH,
         pairs(finding_ids[1:], repository_ids[1:]),
         PERSON,
     )
+    apart()
     third = service.create(
         fork_of(engine, pairs(other_findings, other_repos)),
         BRANCH,
@@ -1056,8 +1058,16 @@ def test_the_orders_door_refuses_fork_facts_it_cannot_vouch_for(
             "work_item_id": item.id,
             "fork_branch": BRANCH,
         },
+        # a whole pair too: only the scheduling door, after its checks, sets fork facts
+        {
+            "asset": REMEDIATE_FINDING,
+            "priority": 0,
+            "work_item_id": item.id,
+            "fork_url": "https://github.com/attacker/fork",
+            "fork_branch": "fix/anything",
+        },
     ):
-        with pytest.raises(pydantic.ValidationError, match="together"):
+        with pytest.raises(pydantic.ValidationError, match="Extra inputs are not permitted"):
             ops.submit(OrderRequest(**values), PERSON)  # type: ignore[arg-type]
 
 
@@ -1069,3 +1079,98 @@ def test_get_answers_not_found_for_what_was_never_scheduled(
     item = remediation.open(finding_ids, default_ref(engine, repository_id))
     with pytest.raises(NotFoundError, match="schedules no remediation"):
         service.get(item.work_item_id)
+
+
+def test_the_listing_follows_its_cursor_page_after_page(
+    service: RemediationSchedulingService, engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from traust_core.v1.services import remediation_scheduling
+
+    monkeypatch.setattr(remediation_scheduling, "_BATCH", 2)  # several rounds per page
+    _, finding_ids, repository_ids = seeded(engine, findings=5)
+    made = []
+    for finding_id, repository_id in zip(finding_ids, repository_ids, strict=True):
+        request = pairs([finding_id], [repository_id])
+        made.append(service.create(fork_of(engine, request), BRANCH, request, PERSON))
+        apart()
+    seen, cursor = [], None
+    while True:
+        page = service.list(PageRequest(limit=2, cursor=cursor))
+        seen += [e.work_item.work_item_id for e in page.items]
+        if page.next is None:
+            break
+        cursor = page.next
+    assert seen == [e.work_item.work_item_id for e in made]  # every effort once, in order
+
+
+def test_an_attempt_that_is_over_never_comes_back_as_the_live_effort(
+    service: RemediationSchedulingService,
+    context: Context,
+    engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, finding_ids, repository_ids = seeded(engine)
+    request = pairs(finding_ids, repository_ids)
+    failed = service.create(fork_of(engine, request), BRANCH, request, PERSON)
+    context.services().remediation.record_progress(
+        failed.work_item.work_item_id, RemediationStatus("checks_failed")
+    )
+    # a later verification of its fix reads as fixed, yet the failed attempt is still over
+    monkeypatch.setattr(
+        RemediationSchedulingService,
+        "_status",
+        lambda self, effort, repository_id, candidates=None: RemediationStatus("revalidated_fixed"),
+    )
+    retry = service.create(fork_of(engine, request), BRANCH, request, PERSON)
+    assert retry.work_item.work_item_id != failed.work_item.work_item_id
+
+
+def test_schedule_fix_sets_fork_facts_only_on_a_work_items_remediation_order(
+    context: Context,
+) -> None:
+    with pytest.raises(ValidationError, match="fork facts ride only a remediate_finding order"):
+        context.services().ops.schedule_fix(
+            OrderRequest(asset=REMEDIATE_FINDING, priority=0), PERSON, "https://x.test/a", "fix/a"
+        )
+
+
+def test_a_verification_recorded_before_the_fix_was_reported_never_revalidates_it(
+    service: RemediationSchedulingService, context: Context, engine: Engine
+) -> None:
+    world = World(engine, patched_name="main")
+    audited(engine, world, world.base)
+    request = pairs(world.ids, [world.repo.id] * len(world.ids))
+    scheduled = service.create(fork_of(engine, request), world.patched.name, request, PERSON)
+    context.services().verification.record(
+        verification_report(world, dict.fromkeys(world.ids, "unresolved")),
+        verification_provenance(),
+    )  # an older check of the same branch and commit
+    apart()
+    context.services().remediation.record(
+        pushed(scheduled, world.ids, fork__fix_commit=world.patched.sha), provenance()
+    )
+    assert folded(service, scheduled) == "checks_passed"  # not that earlier check's verdict
+
+
+def test_tied_verifications_go_by_their_record_never_their_verdict() -> None:
+    from datetime import UTC, datetime
+
+    from traust_core.v1.models.assessment import Assessment
+    from traust_core.v1.services.remediation import _verdict_order
+
+    at = datetime(2026, 11, 6, tzinfo=UTC)
+    a, b = (
+        Assessment(
+            id=uuid4(),
+            created_at=at,
+            repository_ref_id=uuid4(),
+            kind="verification",
+            status="completed",
+            assessor="skill:verify",
+            assessor_version="1",
+            occurred_at=at,
+        )
+        for _ in range(2)
+    )
+    assert _verdict_order(a) != _verdict_order(b)  # same times: the id breaks the tie
+    assert (_verdict_order(a) < _verdict_order(b)) == (a.id < b.id)  # type: ignore[operator]

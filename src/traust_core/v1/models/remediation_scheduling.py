@@ -4,6 +4,7 @@ the fork facts; there is no scheduling table (contracts#117)."""
 
 from __future__ import annotations
 
+from datetime import datetime
 from uuid import UUID
 
 from traust_core.v1.models.base import Model
@@ -43,3 +44,4 @@ class ScheduledEffort(Model):
     fork_branch: str
     status: RemediationStatus
     order_id: UUID | None = None
+    scheduled_at: datetime | None = None  # when its order was queued: the listing's order

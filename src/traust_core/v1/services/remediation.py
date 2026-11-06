@@ -1060,11 +1060,11 @@ def _source_finding(item: RemediationItem) -> dict[str, Any]:
     }
 
 
-def _verdict_order(verification: Assessment) -> tuple[datetime, datetime]:
-    """When a verification happened, then when it was recorded: an equal-time tie goes to the
-    later recorded, never to the verdict's text."""
-    assert verification.created_at is not None
-    return verification.occurred_at, verification.created_at
+def _verdict_order(verification: Assessment) -> tuple[datetime, datetime, UUID]:
+    """When a verification happened, then when it was recorded, then its id: a tie goes by the
+    record, never by the verdict's text."""
+    assert verification.created_at is not None and verification.id is not None
+    return verification.occurred_at, verification.created_at, verification.id
 
 
 def _finding_id(ref: str) -> UUID:
@@ -1600,8 +1600,17 @@ class VerificationService:
         or another's: fixed only when every covered finding verified fixed, still vulnerable
         when any verified one isn't, nothing while some are unverified and the rest fixed.
         Merged or abandoned efforts are past revalidation."""
-        if fork_branch is None or item.fix_commit is None or item.status in _PAST_REVALIDATION:
+        if (
+            fork_branch is None
+            or item.fix_commit is None
+            or item.report is None
+            or item.status in _PAST_REVALIDATION
+        ):
             return []
+        # only verifications recorded once the fix was reported can revalidate it: an earlier
+        # check of the same commit was never about this effort
+        reported_at = self._log.get_artifact(item.report.id).created_at
+        assert reported_at is not None
         refs = self._inventory.list_refs_by_ids({item.repository_ref_id})
         if not refs:
             return []
@@ -1611,7 +1620,10 @@ class VerificationService:
             for a in self._log.list_by_ids(
                 {d.assessment_id for ds in history.values() for d in ds if d.assessment_id}
             )
-            if a.kind == VERIFICATION and a.repository_ref_id is not None
+            if a.kind == VERIFICATION
+            and a.repository_ref_id is not None
+            and a.created_at is not None
+            and a.created_at >= reported_at
         ]
         patched = {
             r.id: r
@@ -1636,12 +1648,12 @@ class VerificationService:
         }
 
         def latest_so_far(
-            pairs: list[tuple[tuple[datetime, datetime], str]],
-            moment: tuple[datetime, datetime],
+            pairs: list[tuple[tuple[datetime, datetime, UUID], str]],
+            moment: tuple[datetime, datetime, UUID],
         ) -> str | None:
             # the first verdict at the greatest order not past the moment: an equal-time tie
             # never turns on the verdict text (the max() _verified_on used)
-            best: tuple[tuple[datetime, datetime], str] | None = None
+            best: tuple[tuple[datetime, datetime, UUID], str] | None = None
             for order, verdict in pairs:
                 if order <= moment and (best is None or order > best[0]):
                     best = (order, verdict)

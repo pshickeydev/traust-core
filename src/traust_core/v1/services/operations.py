@@ -202,6 +202,24 @@ class OpsService:
         self, request: OrderRequest, principal: Principal, config: Sequence[ConfigDigest] = ()
     ) -> RunOrder:
         """Queue an order directly, with the config it must run under in its run manifest."""
+        return self._queue(request, principal, config)
+
+    def schedule_fix(
+        self, request: OrderRequest, principal: Principal, fork_url: str, fork_branch: str
+    ) -> RunOrder:
+        """Queue a scheduled fix's order with its fork facts (RemediationSchedulingService only:
+        it checked them against ForkPolicy and git's branch rules)."""
+        if request.asset != "remediate_finding" or request.work_item_id is None:
+            raise ValidationError("fork facts ride only a remediate_finding order naming its item")
+        return self._queue(request, principal, (), fork_url=fork_url, fork_branch=fork_branch)
+
+    def _queue(
+        self,
+        request: OrderRequest,
+        principal: Principal,
+        config: Sequence[ConfigDigest],
+        **fork: str,
+    ) -> RunOrder:
         issues = self._policy_issues(
             asset=request.asset,
             repository_id=request.repository_id,
@@ -215,6 +233,7 @@ class OpsService:
         order = RunOrder(
             **request.model_dump(),
             **self._config_manifest(tuple(config)),
+            **fork,
             state=OrderState.QUEUED,
             requested_by=principal.ref,
         )
@@ -888,26 +907,24 @@ class OpsService:
         with self._uow as uow:
             return uow.run_orders.find_by_work_item(work_item_id)
 
-    def work_item_orders(
-        self, asset: AssetName, repository_id: UUID | None = None
+    def orders_after(
+        self,
+        asset: AssetName,
+        repository_id: UUID | None,
+        after: tuple[datetime, UUID] | None,
+        limit: int,
     ) -> list[RunOrder]:
-        """Every order of `asset` that names a work item (an asset that runs one named item —
-        remediate_finding's scheduled efforts), optionally one repository's; oldest first."""
-        orders: list[RunOrder] = []
-        after = None
+        """One bounded batch of `asset`'s orders, optionally one repository's, oldest first after
+        a (created_at, id) position."""
         with self._uow as uow:
-            while True:
-                batch = uow.run_orders.search(
-                    asset=str(asset),
-                    repository_id=repository_id,
-                    work_item=True,
-                    limit=500,
-                    after=after,
-                )
-                orders.extend(batch)
-                if len(batch) < 500:
-                    return orders
-                after = (batch[-1].created_at, batch[-1].id)  # type: ignore[assignment]
+            return uow.run_orders.search(
+                asset=str(asset),
+                repository_id=repository_id,
+                work_item=True,
+                limit=limit,
+                after=after,
+                oldest_first=True,
+            )
 
     def manifest(self, order_id: UUID) -> OrderManifest:
         """The config an order was planned with and its approval, from its run manifest."""
