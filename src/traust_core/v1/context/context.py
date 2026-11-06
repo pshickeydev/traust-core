@@ -208,6 +208,7 @@ from traust_core.v1.services.insight import (
     PqcPortfolioView,
     PqcVendorsView,
     PqcView,
+    PqcWorklistView,
     PrivilegesView,
     ProgramView,
     RemediationIndexView,
@@ -945,6 +946,7 @@ class Context:
             ),
             scanner=self.pqc_scanner,
             clock=self.clock,
+            findings=findings,
         )
         validation = ValidationService(
             uow,
@@ -1102,6 +1104,7 @@ class Context:
                     ExposureView(exposure),
                     DependencyReachView(exposure, portfolio),
                     PqcView(pqc),
+                    PqcWorklistView(pqc),
                     pqc_portfolio,
                     PqcVendorsView(pqc, exposure, portfolio),
                     ComplianceDashboardView(compliance),

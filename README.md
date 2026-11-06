@@ -35,6 +35,7 @@ All modules live under `traust_core.v1` (see [Versioning](#versioning)).
 | **Detection-quality and compliance renderers** | `rendering.benchmark`, `rendering.compliance_precision`, `rendering.compliance` | `benchmark_markdown(run)` / `scorecards_markdown(cards)` and `compliance_precision_markdown(calibration)` render typed results with untrusted cells escaped; `rendering.compliance.assessment_report(document)` → `ComplianceService.render_assessment(document)` Markdown bytes | consumer-owned report renderers |
 | **Secret detection** | `models.redaction` | `SecretDetector.publication_rules()` / `evidence_rules()` yield ordered `SecretRule`s whose `spans(text)` return exact `SecretSpan(tag, start, end)` offsets; `RedactionPolicy` publishes through the same catalog, so it is the one owner of secret patterns | a consumer-owned credential regex table |
 | **Verification worklists** | `services.remediation`, `models.remediation`, `services.findings` | `verification.sweep(repository_ids, include_branches=False)` keeps repository/ref identity, branch head source and line-specific counts; `sweep_markdown(sweep)` renders the same queue; `findings.on_ref(repository_ref_id)` folds resolution on that ref's line | a second worklist store |
+| **PQC worklist** | `services.pqc`, `models.pqc`, `services.insight` | `pqc.worklist(PqcFilter(...), chokepoints=(...))` owns the existing per-repository selection, ordering and routes; `insight.publish(ViewName.PQC_WORKLIST, ViewFilter(...))` adds the contracts-owned model and shared human rendering | client-side sweep ranking or consumer-owned report formatting |
 | **Historical report signatures** | `services.reporting`, `services.ledger`, `models.ledger` | `validate_reports(..., signing_pubkey=Path(...))` requires a historical layer document's Merkle tree and public-key signature through `LedgerService.verify_document`; `ReportValidation.integrity` holds the typed `DocumentVerification` | trusting an unsigned layer |
 | **Jobs** | `models.operations`, `services.operations` | `Materializer.materialize(AssetRequest) -> JobResult` (succeeded · degraded · refused · failed): the seam traust-engine calls; `Router` for continuous-ops `route()` | each CLI inventing its own exit codes |
 | **Providers** | `providers` | the outside world: `base` (`Provider`, `Readiness`, `Provenance`, registry), `tools`, `sources`, `feeds` (`FeedProvider`, `HttpFileFeed` for single-file feeds, `validate_payload`), `http` (`HttpFetcher` + `RetryPolicy`, the outbound HTTP path), `correlation` (`correlation_scope`: scoped request/order/run IDs passed to HTTP and subprocesses), `depsdev` (`DepsDevResolver`: deps.dev graphs and default versions through the feeds registry's `deps_dev` source, answers cached a day in the object store; `ctx.deps_dev`), `process` (`ProcessRunner`, the only subprocess path), `report_files` (`ReportFiles`: the report files a caller names on disk), `clock`, `model_catalog` (`ctx.model_catalog`: list prices and cost, plus roles: `list_roles()`, `resolve_role(role, tier)` (never below the floor), `validate()`, `stamp(role, model)` for a report's `model_routing`), `transcripts` (`ctx.session_transcripts.source(workspace, skills)`: Claude Code transcripts as a `SpendSource` for `SpendService.collect` and `usage_summary`, each request's skill inferred from the session's signals) | ad hoc `subprocess`/`git`/fetch code, 22 private `run` wrappers |
@@ -488,6 +489,32 @@ flowchart LR
 | Try an unreleased contracts change | `uv add --editable ../traust-contracts` locally (don't commit) |
 | Add a named artifact | one line in `models/artifacts.py`: `class XArtifact(ArtifactDocument, name=…, schema=…, kind=…)` |
 | See an artifact's fields | `TriageArtifact.describe()` (field tree with types, required/optional); `TriageArtifact.schema_path()` |
+
+### PQC worklist Insight
+
+`ctx.services().pqc.worklist(PqcFilter(...), chokepoints=(...))` is the one owner of
+the former Traust sweep worklist. Selection and ordering are unchanged: one repository,
+the representative registered ref ranked by default flag then registration time/ID,
+caller chokepoint fragments first, crypto-CWE associations next, then the tail.
+Cursors retain `<tier-index>|<repository-url>`. Global inventory includes repositories
+with no registered commit; explicit empty ref scope stays empty rather than widening.
+Product and explicit ref scopes intersect.
+
+`ViewName.PQC_WORKLIST` builds an ephemeral `PqcWorklist` through that service. Its
+packaged view schema retains scope, entries, full liveness, scan provenance and nullable
+currency. Use at most one `ViewFilter.product_ids` value, optional `repository_ref_ids`
+(`None`: all, `()`: none), and `pqc_chokepoints` (nonblank caller URL fragments).
+Historical/time-window, team/category, single-repository and unrelated filters are
+refused, and other views cannot silently ignore the new worklist parameters. The
+existing REST registry accepts repeated `product_id`, `repository_ref_id` and
+`chokepoint` query parameters with the same constraints.
+
+Publishing renders structured Markdown/HTML without storing rows or object bytes,
+scanning, checking out repositories or ingesting dependencies. Unknown scan currency
+stays null in the model and renders as `—`, not stale/false or a readiness claim.
+Availability is the existing liveness service's recorded evidence, not an access grant;
+this migration does not change when its routing statuses are produced.
+Chokepoints remain per-run adopter inputs; no persistence/configuration home is invented.
 
 ### PQC source scanner
 

@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import json
 import logging
-from collections import Counter
+from collections import Counter, defaultdict
 from collections.abc import Sequence
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import TypeVar, overload
 from urllib.parse import urlsplit
 from uuid import UUID
@@ -31,7 +31,7 @@ from traust_core.v1.models.code_facts import CryptoProbeId
 from traust_core.v1.models.common import Provenance, ToolRequest, every_item
 from traust_core.v1.models.findings import FindingContext, SubjectRef
 from traust_core.v1.models.integrity import sha256_hex
-from traust_core.v1.models.inventory import RepositoryFilter
+from traust_core.v1.models.inventory import RepositoryFilter, RepositoryRef
 from traust_core.v1.models.pqc import (
     PqcBlocker,
     PqcDimension,
@@ -44,14 +44,19 @@ from traust_core.v1.models.pqc import (
     PqcScanState,
     PqcSite,
     PqcVendorClaims,
+    PqcWorklistEntry,
+    PqcWorklistRoute,
+    PqcWorklistTier,
 )
 from traust_core.v1.models.values import HttpsRepoUrl
+from traust_core.v1.models.vocabulary import ComparisonStatus
 from traust_core.v1.providers.clock import Clock, SystemClock
 from traust_core.v1.providers.crypto import long_validity
 from traust_core.v1.providers.pqc import PqcScanner
 from traust_core.v1.repositories.traust.assessments import AssessmentsUnitOfWork
 from traust_core.v1.services.artifact_publishing import ArtifactPublisher, AssessmentLog
 from traust_core.v1.services.code_facts import CodeFactsService
+from traust_core.v1.services.findings import FindingService
 from traust_core.v1.services.lint import Lint, LintContext, LintReport
 from traust_core.v1.services.portfolio import PortfolioService
 from traust_core.v1.services.pqc import facts as pqc_facts
@@ -63,6 +68,42 @@ READINESS_LINT = Lint({PqcReadinessArtifact: [pqc_readiness.ReadinessWriteRules(
 _KIND = AssessmentKind.PQC_READINESS
 _SCANNER = "pqc-scan"
 _SKILL = "skill:pqc-readiness"
+_CRYPTO_CWES = frozenset(
+    {
+        "CWE-256",
+        "CWE-259",
+        "CWE-261",
+        "CWE-295",
+        "CWE-296",
+        "CWE-297",
+        "CWE-310",
+        "CWE-311",
+        "CWE-312",
+        "CWE-319",
+        "CWE-321",
+        "CWE-322",
+        "CWE-323",
+        "CWE-324",
+        "CWE-325",
+        "CWE-326",
+        "CWE-327",
+        "CWE-328",
+        "CWE-329",
+        "CWE-330",
+        "CWE-331",
+        "CWE-335",
+        "CWE-338",
+        "CWE-347",
+        "CWE-522",
+        "CWE-540",
+        "CWE-547",
+        "CWE-757",
+        "CWE-798",
+        "CWE-916",
+        "CWE-1240",
+    }
+)
+_WORKLIST_TIERS = tuple(PqcWorklistTier)
 
 D = TypeVar("D", bound=ArtifactDocument)
 
@@ -76,6 +117,8 @@ class PqcService:
         publisher: ArtifactPublisher,
         scanner: PqcScanner | None = None,
         clock: Clock | None = None,
+        *,
+        findings: FindingService,
     ) -> None:
         self._uow = uow
         self._log = AssessmentLog(uow)
@@ -84,6 +127,7 @@ class PqcService:
         self._publisher = publisher
         self._scanner = scanner
         self._clock = clock or SystemClock()
+        self._findings = findings
 
     def prescan(self, repository_ref_id: UUID, request: ToolRequest | None) -> PqcPrescan:
         """Layer 1 for the commit: the pinned scan plus the crypto census over its checkout, or
@@ -275,6 +319,94 @@ class PqcService:
                 )
             )
         return states
+
+    def worklist(
+        self, filter: PqcFilter, *, chokepoints: tuple[str, ...] = ()
+    ) -> tuple[PqcWorklistEntry, ...]:
+        """One ranked entry per in-scope repository, including unassessed inventory; no scans."""
+        if filter.buckets or filter.categories or filter.patchable is not None:
+            raise ValidationError("PQC worklist supports only product and repository-ref scope")
+        if any(not fragment.strip() for fragment in chokepoints):
+            raise ValidationError("a PQC chokepoint is a nonblank URL fragment")
+        priority = tuple(fragment.strip().lower() for fragment in chokepoints)
+        ref_ids = self._refs(filter)
+        if ref_ids is None:
+            repositories = list(
+                every_item(lambda page: self._portfolio.list_repositories(RepositoryFilter(), page))
+            )
+            selected = self._portfolio.inventory.list_refs_of(
+                [repository.id for repository in repositories if repository.id]
+            )
+        else:
+            selected = self._portfolio.inventory.list_refs_by_ids(ref_ids)
+            repositories = self._portfolio.inventory.list_repositories(
+                sorted({ref.repository_id for ref in selected}, key=str)
+            )
+        if not repositories:
+            return ()
+        refs: defaultdict[UUID, list[RepositoryRef]] = defaultdict(list)
+        for ref in selected:
+            refs[ref.repository_id].append(ref)
+        states = {
+            state.repository_ref_id: state
+            for state in self.scan_states(
+                PqcFilter(repository_ref_ids=tuple(ref.id for ref in selected if ref.id))
+            )
+        }
+        availability = {
+            live.repository_id: live
+            for live in every_item(lambda page: self._portfolio.liveness(RepositoryFilter(), page))
+        }
+        findings = self._findings.all_in(
+            [repository.id for repository in repositories if repository.id]
+        )
+        entries = []
+        for repository in repositories:
+            assert repository.id is not None
+            ref = max(
+                refs[repository.id],
+                key=lambda row: (
+                    row.is_default,
+                    row.created_at or datetime.min.replace(tzinfo=UTC),
+                    str(row.id),
+                ),
+                default=None,
+            )
+            crypto = any(
+                cwe.upper().split(":")[0].strip() in _CRYPTO_CWES
+                for finding in findings.get(repository.id, ())
+                for cwe in finding.cwes
+            )
+            tier = (
+                0
+                if any(part in repository.url.lower() for part in priority)
+                else 1
+                if crypto
+                else 2
+            )
+            access = availability[repository.id]
+            route, reason = PqcWorklistRoute.SOURCE, access.reason
+            if ref is None:
+                route, reason = PqcWorklistRoute.ACCESS_REQUEST, "no-registered-commit"
+            elif access.unobserved == ComparisonStatus.NO_CREDENTIALS:
+                route, reason = PqcWorklistRoute.ACCESS_REQUEST, access.unobserved.value
+            elif access.unobserved == ComparisonStatus.UNREACHABLE:
+                route, reason = PqcWorklistRoute.SBOM_ONLY, access.unobserved.value
+            entries.append(
+                PqcWorklistEntry(
+                    repository_id=repository.id,
+                    repository=repository.url,
+                    repository_ref_id=ref.id if ref else None,
+                    sha=ref.sha if ref else None,
+                    priority_tier=_WORKLIST_TIERS[tier],
+                    route=route,
+                    access=access,
+                    reason=reason,
+                    scan=states.get(ref.id) if ref else None,
+                    cursor=f"{tier}|{repository.url}",
+                )
+            )
+        return tuple(sorted(entries, key=lambda entry: entry.cursor))
 
     def sites(self, filter: PqcFilter) -> list[PqcSite]:
         """The group pins and below-default Go toolchains in each in-scope commit's latest facts."""

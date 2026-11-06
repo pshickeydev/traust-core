@@ -34,6 +34,8 @@ def get_insight(
     category: Labels = None,
     window_start: UtcDatetime | None = None,
     window_end: UtcDatetime | None = None,
+    repository_ref_id: Ids = None,
+    chokepoint: Labels = None,
 ) -> SerializeAsAny[ViewModel]:
     """One insight (a dashboard, rollup or export such as SARIF) for a scope at `as_of`, built on
     demand; one route for every insight, so a new one needs no route or SDK release."""
@@ -52,5 +54,7 @@ def get_insight(
         ),
         artifact_id=artifact_id,
         repository_id=repository_id,
+        repository_ref_ids=None if repository_ref_id is None else tuple(repository_ref_id),
+        pqc_chokepoints=tuple(chokepoint or ()),
     )
     return insight.build(name, filter)
