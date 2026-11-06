@@ -5,7 +5,7 @@ import logging
 import re
 from collections import Counter, defaultdict
 from collections.abc import Collection, Mapping, Sequence
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, overload
 from urllib.parse import urlsplit
@@ -66,6 +66,7 @@ from traust_core.v1.models.operations import (
 )
 from traust_core.v1.models.remediation import (
     FIXED_VERDICTS,
+    OVER,
     Check,
     CheckOutcome,
     EvidenceItem,
@@ -284,20 +285,24 @@ class RemediationService:
             if overlap := set(item.finding_ids) & set(wanted):
                 listed = ", ".join(sorted(map(str, overlap)))
                 raise ConflictError(f"work item {item.work_item_id} already covers {listed}")
-        assessment = self._log.open(
-            Assessment(
-                repository_ref_id=repository_ref_id,
-                kind=REMEDIATION,
-                status=ASSESSMENT_COMPLETED,
-                assessor=ASSESSOR,
-                assessor_version="",
-                occurred_at=self._clock.now(),
+        # the assessment and its candidate decisions land together: never a work item without
+        # findings
+        with self._uow.write() as uow:
+            assessment = self._log.open(
+                Assessment(
+                    repository_ref_id=repository_ref_id,
+                    kind=REMEDIATION,
+                    status=ASSESSMENT_COMPLETED,
+                    assessor=ASSESSOR,
+                    assessor_version="",
+                    occurred_at=self._clock.now(),
+                )
             )
-        )
-        assert assessment.id is not None
-        self._findings.decisions.record_resolution(
-            assessment.id, wanted, resolution_for(RemediationStatus("candidate")), "candidate"
-        )
+            assert assessment.id is not None
+            self._findings.decisions.record_resolution(
+                assessment.id, wanted, resolution_for(RemediationStatus("candidate")), "candidate"
+            )
+            uow.commit()
         self._uow.after_commit(
             lambda: log.info("work item %s opened for %d findings", assessment.id, len(wanted))
         )
@@ -309,6 +314,9 @@ class RemediationService:
         item = self.get(work_item_id)
         subject = self._inventory.subject(item.repository_ref_id, work_item_id)
         views = self._findings.list_by_ids(item.finding_ids)
+        # a scheduled effort's fork is the policy's (checked at scheduling); its branch is the
+        # one the scheduler named
+        scheduled = self._findings.scheduled.find_by_work_item(work_item_id)
         return RemediationInput(
             subject=subject,
             findings=FindingContext(),
@@ -325,7 +333,9 @@ class RemediationService:
                 for v in views
             ),
             fork=item.fork or self.resolve_fork(subject.repository_id),
-            fix_branch=self._forks.fix_branch(views[0].finding.id, views[0].finding.title),  # type: ignore[arg-type]
+            fix_branch=scheduled.fork_branch
+            if scheduled is not None
+            else self._forks.fix_branch(views[0].finding.id, views[0].finding.title),  # type: ignore[arg-type]
         )
 
     def _hint(self, view: FindingView, repository_url: str) -> str | None:
@@ -482,16 +492,29 @@ class RemediationService:
     def resolve_fork(self, repository_id: UUID) -> Fork:
         repository = self._inventory.get_repository(repository_id)
         mirror = self._inventory.private_mirror(repository_id)
-        return self._forks.resolve(repository.url, None if mirror is None else mirror.url)
+        fork = self._forks.resolve(repository.url, None if mirror is None else mirror.url)
+        self._refuse_public(str(fork.url))
+        return fork
+
+    def _refuse_public(self, fork_url: str) -> None:
+        """The policy names where a fix goes; the forge's word on visibility, as the inventory
+        records it, overrides that label: a public repository never takes an unpublished fix."""
+        known = self._inventory.find_repository(fork_url)
+        if known is not None and known.public:
+            raise ValidationError(f"{fork_url} is a public repository: a fix never goes there")
 
     def record_progress(self, work_item_id: UUID, status: RemediationStatus) -> WorkItem:
-        """Move the work item to `status` (forward only); the same status again is a no-op."""
+        """Move the work item to `status` (forward only); the same status again is a no-op.
+        A remediation scheduled on the item follows it, in the same transaction."""
         item = self.get(work_item_id)
         if item.advance(status) is item:
             return item
-        self._findings.decisions.record_resolution(
-            work_item_id, item.finding_ids, resolution_for(status), status
-        )
+        with self._uow.write() as uow:
+            self._findings.decisions.record_resolution(
+                work_item_id, item.finding_ids, resolution_for(status), status
+            )
+            self._findings.scheduled.follow(work_item_id, status)
+            uow.commit()
         self._uow.after_commit(
             lambda: log.info("work item %s: %s -> %s", work_item_id, item.status, status)
         )
@@ -509,13 +532,20 @@ class RemediationService:
         )
 
     @overload
-    def record(self, doc: RemediationArtifact, provenance: Provenance) -> WorkItem: ...
+    def record(
+        self, doc: RemediationArtifact, provenance: Provenance, *, work_item_id: UUID | None = None
+    ) -> WorkItem: ...
     @overload
     def record(self, doc: FleetFixArtifact, provenance: Provenance) -> FleetFix: ...
     def record(
-        self, doc: RemediationArtifact | FleetFixArtifact, provenance: Provenance
+        self,
+        doc: RemediationArtifact | FleetFixArtifact,
+        provenance: Provenance,
+        *,
+        work_item_id: UUID | None = None,
     ) -> WorkItem | FleetFix:
-        """A report on the open work item for exactly its findings (`finding_ref` = finding id):
+        """A report on the open work item for exactly its findings (`finding_ref` = finding id),
+        the one the run prepared when it names it (`work_item_id`; the report itself doesn't):
         attached, its Jira keys linked, the item moved to its status; re-recording is a no-op."""
         if isinstance(doc, FleetFixArtifact):
             return self._record_fleet_fix(doc, provenance)
@@ -526,12 +556,28 @@ class RemediationService:
         wanted = tuple(sorted({_finding_id(s.finding_ref) for s in doc.source_findings}, key=str))
         status = RemediationStatus(doc.summary.status)
         digest = sha256_hex(doc.payload)
-        item = self._reported_item(wanted, digest)
+        item = self._reported_item(wanted, digest, work_item_id)
+        pushed_to = str(_url(doc.fork.url))
+        self._refuse_public(pushed_to)
+        # a scheduled fix is pushed where it was scheduled: its commit is what verification of
+        # that branch later revalidates
+        scheduled = self._findings.scheduled.find_by_work_item(item.work_item_id)
+        if scheduled is not None and (pushed_to, doc.fork.fix_branch) != (
+            scheduled.fork_url,
+            scheduled.fork_branch,
+        ):
+            raise ValidationError(
+                f"remediation report pushes to {pushed_to} {doc.fork.fix_branch}, not the "
+                f"scheduled {scheduled.fork_url} {scheduled.fork_branch}"
+            )
         if item.report is not None:  # recorded before; finish a run that stopped part-way
             if item.status != status:
-                self._findings.decisions.record_resolution(
-                    item.work_item_id, wanted, resolution_for(status), status, item.report.id
-                )
+                with self._uow.write() as uow:
+                    self._findings.decisions.record_resolution(
+                        item.work_item_id, wanted, resolution_for(status), status, item.report.id
+                    )
+                    self._findings.scheduled.follow(item.work_item_id, status)
+                    uow.commit()
             return self.get(item.work_item_id)
         item.advance(status)
         published = (provenance.artifact or self._publisher.publish_ref(doc)).id
@@ -541,9 +587,12 @@ class RemediationService:
                 for finding_id in wanted:
                     self._findings.records.link_external(finding_id, JIRA, key)
             uow.commit()
-        self._findings.decisions.record_resolution(
-            item.work_item_id, wanted, resolution_for(status), status, report.id
-        )
+        with self._uow.write() as uow:
+            self._findings.decisions.record_resolution(
+                item.work_item_id, wanted, resolution_for(status), status, report.id
+            )
+            self._findings.scheduled.follow(item.work_item_id, status)
+            uow.commit()
         self._uow.after_commit(
             lambda: log.info("work item %s: report %s, %s", item.work_item_id, report.id, status)
         )
@@ -787,19 +836,28 @@ class RemediationService:
         return Page.of(items[: page.limit + 1], page.limit, lambda i: (i.opened_at, i.work_item_id))
 
     def _active(self, repository_id: UUID) -> list[WorkItem]:
-        return [i for i in self._items(repository_id) if i.status not in _FINAL and not i.is_done()]
+        return [i for i in self._items(repository_id) if i.status not in OVER and not i.is_done()]
 
-    def _reported_item(self, wanted: tuple[UUID, ...], digest: str) -> WorkItem:
+    def _reported_item(
+        self, wanted: tuple[UUID, ...], digest: str, work_item_id: UUID | None
+    ) -> WorkItem:
         views = self._findings.list_by_ids(wanted)
         if len({v.finding.repository_id for v in views}) != 1:
             raise ValidationError("remediation report covers findings of several repositories")
         same = [i for i in self._items(views[0].finding.repository_id) if i.finding_ids == wanted]
+        if work_item_id is not None:
+            same = [i for i in same if i.work_item_id == work_item_id]
+            if not same:
+                raise ValidationError(f"work item {work_item_id} is not for exactly these findings")
         if done := [i for i in same if i.report is not None and i.report.digest == digest]:
             return done[0]
+        # a failed attempt and its retry both await a report: only the run's own work item
+        # tells them apart, never a guess
         open_ = [i for i in same if i.status not in _FINAL and not i.is_done()]
         if len(open_) != 1:
             listed = ", ".join(map(str, wanted))
-            raise ValidationError(f"no single open work item for findings {listed}")
+            name = " (name the work item)" if len(open_) > 1 else ""
+            raise ValidationError(f"no single open work item for findings {listed}{name}")
         return open_[0]
 
     def _items(
@@ -872,6 +930,7 @@ class RemediationService:
                 ),
                 "report": ArtifactRef(id=report.id, name=doc.name, digest=report.digest),
                 "fix_branch": doc.fork.fix_branch,
+                "fix_commit": doc.fork.fix_commit,
             }
         )
 
@@ -926,6 +985,13 @@ def _source_finding(item: RemediationItem) -> dict[str, Any]:
     }
 
 
+def _verdict_order(verification: Assessment) -> tuple[datetime, datetime]:
+    """When a verification happened, then when it was recorded: an equal-time tie goes to the
+    later recorded, never to the verdict's text."""
+    assert verification.created_at is not None
+    return verification.occurred_at, verification.created_at
+
+
 def _finding_id(ref: str) -> UUID:
     try:
         return UUID(ref)
@@ -934,6 +1000,7 @@ def _finding_id(ref: str) -> UUID:
 
 
 VERIFICATION = AssessmentKind.VERIFICATION
+_PAST_REVALIDATION = frozenset({"merged", "abandoned"})
 VERIFY_ASSESSOR = "skill:verify-remediation"
 # Classifier plan import table: execution-proven evidence without a grade is E1, so a
 # verdict outranks ungraded progress and tracker statements, as legacy's source tiers did.
@@ -1124,7 +1191,9 @@ class VerificationService:
     ) -> Verification:
         """A verification report (`original_id` = finding id from prepare) as a `verification`
         assessment of the patched commit: its verdicts as decisions, its regressions as findings.
-        Re-recording finishes a run that stopped part-way and otherwise changes nothing."""
+        The assessment, its report, the regressions, the verdicts and the revalidation of the
+        remediations scheduled on them are one transaction; only the published bytes precede it.
+        Re-recording a finished run changes nothing."""
         if warnings := check_verification(doc):
             log.warning("verification report has %d warnings", len(warnings))
         meta = doc.metadata
@@ -1144,39 +1213,19 @@ class VerificationService:
             if named is None or named.id != repository_id:
                 raise ValidationError(f"{meta.repository} is not the findings' repository")
             ref = self._inventory.find_ref(repository_id, meta.patched_commit, meta.patched_ref)
-        recorded = self._log.find_recorded(
-            [ref.id],  # type: ignore[list-item]
-            VERIFICATION,
-            VerificationArtifact.schema,
-            digest,
-        )
-        if recorded:
-            assessment, report = recorded[0]
-            if run_order_id is not None and assessment.run_order_id != run_order_id:
-                raise ConflictError(
-                    f"verification assessment {assessment.id} belongs to order "
-                    f"{assessment.run_order_id}, not {run_order_id}"
-                )
-        else:
-            baseline = self._audit_of(list(verdicts), meta.original_commit, ref)
-            published = (provenance.artifact or self._publisher.publish_ref(doc)).id
-            assessment, report = self._log.add(
-                Assessment(
-                    repository_ref_id=ref.id,  # type: ignore[arg-type]
-                    run_order_id=run_order_id,
-                    kind=VERIFICATION,
-                    status=ASSESSMENT_COMPLETED,
-                    assessor=VERIFY_ASSESSOR,
-                    assessor_version=meta.harness_version,
-                    baseline_assessment_id=baseline,
-                    occurred_at=provenance.occurred_at,
-                ),
-                published,
+
+        def recorded() -> list[tuple[Assessment, Artifact]]:
+            return self._log.find_recorded(
+                [ref.id],  # type: ignore[list-item]
+                VERIFICATION,
+                VerificationArtifact.schema,
                 digest,
             )
-        assert assessment.id is not None and report.id is not None
-        if doc.regressions:
-            self._findings.intake.accept(assessment.id, regression_candidates(doc, repository_id))
+
+        # the bytes go first, outside the transaction: content-addressed, a copy is harmless
+        published = None
+        if not recorded():
+            published = (provenance.artifact or self._publisher.publish_ref(doc)).id
         said: defaultdict[tuple[Any, ...], list[UUID]] = defaultdict(list)
         for finding_id, f in verdicts.items():
             propagation = f.cross_repo.propagation if f.cross_repo else None
@@ -1184,19 +1233,61 @@ class VerificationService:
         rationales = {
             i: " ".join(f.evidence.explanation.split())[:RATIONALE_CAP] for i, f in verdicts.items()
         }
-        for (validity, resolution, verdict), finding_ids in said.items():
-            self._findings.decisions.record_resolution(
-                assessment.id,
-                finding_ids,
-                resolution,
-                verdict,
-                report.id,
-                validity=validity,
-                fixed_repository_ref_id=ref.id if verdict in FIXED_VERDICTS else None,
-                rationales=rationales,
-                evidence_grade=VERIFIED_GRADE,
+        with self._uow.write() as uow:
+            # under the write lock: a delivery of the same report may have landed meanwhile
+            if found := recorded():
+                assessment, report = found[0]
+                if run_order_id is not None and assessment.run_order_id != run_order_id:
+                    raise ConflictError(
+                        f"verification assessment {assessment.id} belongs to order "
+                        f"{assessment.run_order_id}, not {run_order_id}"
+                    )
+            else:
+                assert published is not None  # a recorded assessment is never removed
+                assessment, report = self._log.add(
+                    Assessment(
+                        repository_ref_id=ref.id,  # type: ignore[arg-type]
+                        run_order_id=run_order_id,
+                        kind=VERIFICATION,
+                        status=ASSESSMENT_COMPLETED,
+                        assessor=VERIFY_ASSESSOR,
+                        assessor_version=meta.harness_version,
+                        baseline_assessment_id=self._audit_of(
+                            list(verdicts), meta.original_commit, ref
+                        ),
+                        occurred_at=provenance.occurred_at,
+                    ),
+                    published,
+                    digest,
+                )
+            assert assessment.id is not None and report.id is not None
+            # a report delivered again after its run finished has already revalidated: replaying
+            # an older one must not move a scheduled effort back past a newer verdict
+            replay = bool(found) and all(
+                any(d.assessment_id == assessment.id for d in self._findings.history(f))
+                for f in verdicts
             )
-        if not recorded:
+            if doc.regressions:
+                self._findings.intake.accept(
+                    assessment.id, regression_candidates(doc, repository_id)
+                )
+            for (validity, resolution, verdict), finding_ids in said.items():
+                self._findings.decisions.record_resolution(
+                    assessment.id,
+                    finding_ids,
+                    resolution,
+                    verdict,
+                    report.id,
+                    validity=validity,
+                    fixed_repository_ref_id=ref.id if verdict in FIXED_VERDICTS else None,
+                    rationales=rationales,
+                    evidence_grade=VERIFIED_GRADE,
+                )
+            if not replay:
+                verdict_of = {f: v.verdict for f, v in verdicts.items()}
+                self._revalidate(verdict_of, assessment, meta.patched_commit, ref)
+            uow.commit()
+        if not found:
             self._uow.after_commit(
                 lambda: log.info(
                     "verification %s: %d verdicts on ref %s", assessment.id, len(verdicts), ref.id
@@ -1206,6 +1297,77 @@ class VerificationService:
             v for v in self._verifications(repository_id) if v.verification_id == assessment.id
         )
         return verification
+
+    def _revalidate(
+        self,
+        verdicts: Mapping[UUID, str],
+        verification: Assessment,
+        patched_commit: str,
+        patched: RepositoryRef,
+    ) -> None:
+        """The scheduled efforts this report verified move to their revalidated status, on the
+        verdicts' own transaction. An effort is this report's when the ref verified is its fix
+        branch and the commit verified is its work item's recorded fix commit (a report on the
+        same findings at another commit or branch, on the upstream or another fork, says nothing
+        about this fix). Each finding it covers counts at its latest verdict on that commit, this
+        report's or another's, by when the verification happened, then when it was recorded
+        (`_verdict_order`: one delivered late never overrides a newer one, a tie never turns on
+        the verdict): fixed only when all are fixed; still vulnerable when any
+        verified one isn't; left as is while some are unverified and the rest fixed. Merged or
+        abandoned efforts are past revalidation, and an effort that is over stays over once a
+        newer one covers any of its findings."""
+        for effort, covers in self._findings.scheduled.efforts_covering(verdicts):
+            assert effort.id is not None
+            if (
+                effort.assessment_id is None
+                or effort.status in _PAST_REVALIDATION
+                or effort.fork_branch != patched.name
+            ):
+                continue
+            fixed_at = self._remediation.get(effort.assessment_id).fix_commit
+            if fixed_at is None or not patched_commit.startswith(fixed_at):
+                continue
+            if effort.status in OVER and any(
+                other.created_at > effort.created_at  # type: ignore[operator]
+                for other, _ in self._findings.scheduled.efforts_covering(covers)
+            ):
+                continue
+            latest = self._verified_on(patched, covers)
+            this = _verdict_order(verification)
+            for finding_id in covers & verdicts.keys():
+                if finding_id not in latest or latest[finding_id][0] <= this:
+                    latest[finding_id] = (this, verdicts[finding_id])
+            said = [verdict in FIXED_VERDICTS for _, verdict in latest.values()]
+            if not all(said):
+                status = RemediationStatus("revalidated_still_vulnerable")
+            elif len(said) == len(covers):
+                status = RemediationStatus("revalidated_fixed")
+            else:
+                continue
+            self._findings.scheduled.move(effort.id, status)
+
+    def _verified_on(
+        self, patched: RepositoryRef, finding_ids: Collection[UUID]
+    ) -> dict[UUID, tuple[tuple[datetime, datetime], str]]:
+        """Each finding's latest verdict on this commit (`_verdict_order`)."""
+        history = {f: self._findings.history(f) for f in finding_ids}
+        runs = {
+            a.id: _verdict_order(a)
+            for a in self._log.list_by_ids(
+                {d.assessment_id for ds in history.values() for d in ds if d.assessment_id}
+            )
+            if a.kind == VERIFICATION and a.repository_ref_id == patched.id
+        }
+        latest = {}
+        for finding_id, decisions in history.items():
+            said = [
+                (runs[d.assessment_id], str(d.reason))
+                for d in decisions
+                if d.assessment_id in runs and d.reason
+            ]
+            if said:
+                latest[finding_id] = max(said, key=lambda s: s[0])
+        return latest
 
     def _audit_of(
         self, finding_ids: Sequence[UUID], original_commit: str, patched: RepositoryRef

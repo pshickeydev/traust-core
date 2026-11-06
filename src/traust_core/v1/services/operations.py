@@ -67,13 +67,13 @@ from traust_core.v1.models.operations import (
     WorkerId,
     WorkLane,
 )
-from traust_core.v1.models.vocabulary import ActorKind, SourceType
+from traust_core.v1.models.vocabulary import ActorKind, AssessmentKind, SourceType
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.feeds import FeedStatus
 from traust_core.v1.providers.model_catalog import ModelCatalog, ModelSpec
 from traust_core.v1.providers.tools import DatabaseStatus
 from traust_core.v1.repositories.traust_ops import OpsUnitOfWork
-from traust_core.v1.services.artifact_publishing import ArtifactPublisher
+from traust_core.v1.services.artifact_publishing import ArtifactPublisher, AssessmentLog
 from traust_core.v1.services.assessment import AssessmentService
 from traust_core.v1.services.portfolio import Inventory, PortfolioService
 from traust_core.v1.services.provider_catalog import ProviderBinding, ProviderCatalog
@@ -130,6 +130,7 @@ class OpsService:
         recording_assets: Mapping[str, Collection[str]] | None = None,
         recording_starts: Sequence[RecordingStartScope] = (),
         inventory: Inventory | None = None,
+        assessments: AssessmentLog | None = None,
     ) -> None:
         self._uow = uow
         self._clock = clock
@@ -142,12 +143,14 @@ class OpsService:
         }
         self._recording_starts = tuple(recording_starts)
         self._inventory = inventory
+        self._assessments = assessments
 
     def submit(
         self, request: OrderRequest, principal: Principal, config: Sequence[ConfigDigest] = ()
     ) -> RunOrder:
         """Queue an order directly, with the config it must run under in its run manifest."""
         _classifiers(lane=request.lane, event_source=request.event_source)
+        self._check_work_item(request)
         order = RunOrder(
             **request.model_dump(),
             **self._config_manifest(tuple(config)),
@@ -167,6 +170,29 @@ class OpsService:
         )
         return saved
 
+    def _check_work_item(self, request: OrderRequest) -> None:
+        """An order names a remediation work item on its own repository, or none: the runner
+        prepares the item the order names."""
+        if request.work_item_id is None:
+            return
+        if self._inventory is None or self._assessments is None:
+            raise ConfigError(
+                "an order naming a work item requires inventory reads (Context wires them)"
+            )
+        found = self._assessments.list_by_ids({request.work_item_id})
+        if (
+            not found
+            or found[0].kind != AssessmentKind.REMEDIATION
+            or (
+                self._inventory.get_ref(found[0].repository_ref_id).repository_id
+                != request.repository_id
+            )
+        ):
+            raise ValidationError(
+                f"work item {request.work_item_id} is not a remediation work item of "
+                f"repository {request.repository_id}"
+            )
+
     def plan(
         self, request: OrderRequest, principal: Principal, config: Sequence[ConfigDigest] = ()
     ) -> RunOrder:
@@ -174,6 +200,7 @@ class OpsService:
         run manifest; an open order for the same subject is re-ranked while still planned,
         otherwise returned unchanged."""
         _classifiers(lane=request.lane, event_source=request.event_source)
+        self._check_work_item(request)
         manifest = self._config_manifest(tuple(config))
         with self._uow as uow:
             current = uow.run_orders.find_open(request.asset, request.repository_id)
@@ -273,6 +300,7 @@ class OpsService:
         """A run its runner has already begun (by hand, or a cron job beside the engine), leased to
         `worker`: the subject's planned or queued order is taken over, else a new one is stored."""
         _classifiers(lane=request.lane, event_source=request.event_source)
+        self._check_work_item(request)
         now = self._clock.now()
         lease = {
             "state": OrderState.LEASED,
@@ -291,6 +319,11 @@ class OpsService:
                 if current.state not in (OrderState.PLANNED, OrderState.QUEUED):
                     raise ConflictError(
                         f"order {current.id}: {current.asset} is already {current.state}"
+                    )
+                if request.work_item_id not in (None, current.work_item_id):
+                    raise ConflictError(
+                        f"order {current.id} runs work item {current.work_item_id}, not "
+                        f"{request.work_item_id}"
                     )
                 saved = uow.run_orders.update(current.model_copy(update=lease))
             assert saved.id is not None
@@ -321,17 +354,40 @@ class OpsService:
             if kind in _RECORDING_SOURCES
         ):
             raise ForbiddenError("recording start asset is not authorized for report recording")
-        if request.repository_id is None or not any(
-            scope.principal == principal.ref
-            and request.asset in scope.assets
-            and request.repository_id in scope.repository_ids
-            for scope in self._recording_starts
+        if request.repository_id is None or not self._in_start_scope(
+            principal, request.asset, request.repository_id
         ):
             raise ForbiddenError("recording start is outside the machine's asset/repository scope")
         if self._inventory is None:
             raise ConfigError("recording start requires inventory reads (Context wires them)")
         self._inventory.get_repository(request.repository_id)
         return self.start(request, principal, WorkerId(principal.ref), lease_for)
+
+    def authorize_request(
+        self, asset: AssetName, repository_id: UUID, principal: Principal
+    ) -> None:
+        """Who may ask for a run outside routing: a verified person (as for a direct order), or a
+        verified machine within a `recording.start` grant for this asset and repository (the
+        deployment's explicit machine scope; default deny)."""
+        if principal.is_verified_human():
+            return
+        if not (
+            principal.kind == ActorKind.MACHINE
+            and principal.verified_by is not None
+            and self._in_start_scope(principal, asset, repository_id)
+        ):
+            raise ForbiddenError(
+                f"not allowed to ask for {asset} on repository {repository_id}: a verified "
+                "person, or a machine granted it in recording.start, may"
+            )
+
+    def _in_start_scope(self, principal: Principal, asset: AssetName, repository_id: UUID) -> bool:
+        return any(
+            scope.principal == principal.ref
+            and asset in scope.assets
+            and repository_id in scope.repository_ids
+            for scope in self._recording_starts
+        )
 
     def heartbeat(self, order_id: UUID, worker: WorkerId, lease_for: timedelta) -> RunOrder:
         now = self._clock.now()

@@ -38,6 +38,7 @@ RUN_ORDER = TableSpec(
         timestamp_column("lease_expires_at", nullable=True),
         timestamp_column("started_at", nullable=True),
         timestamp_column("finished_at", nullable=True),
+        uuid_column("work_item_id", nullable=True),
     ),
 )
 

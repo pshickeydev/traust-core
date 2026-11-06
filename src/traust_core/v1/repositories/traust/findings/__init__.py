@@ -41,6 +41,16 @@ from traust_core.v1.repositories.traust.findings.location_hash import (
     LocationHashRepository,
     SqlLocationHashRepository,
 )
+from traust_core.v1.repositories.traust.findings.remediation import (
+    REMEDIATION,
+    RemediationRepository,
+    SqlRemediationRepository,
+)
+from traust_core.v1.repositories.traust.findings.remediation_finding import (
+    REMEDIATION_FINDING,
+    RemediationFindingRepository,
+    SqlRemediationFindingRepository,
+)
 from traust_core.v1.repositories.traust.findings.review_item import (
     REVIEW_ITEM,
     ReviewItemRepository,
@@ -58,6 +68,8 @@ TABLES = (
     DECISION_APPROVER,
     REVIEW_ITEM,
     LOCATION_HASH,
+    REMEDIATION,
+    REMEDIATION_FINDING,
 )
 
 
@@ -73,6 +85,8 @@ class FindingsUnitOfWork(UnitOfWork, Protocol):
     decision_approvers: DecisionApproverRepository
     review_items: ReviewItemRepository
     location_hashes: LocationHashRepository
+    remediations: RemediationRepository
+    remediation_findings: RemediationFindingRepository
 
 
 __all__ = [
@@ -86,6 +100,8 @@ __all__ = [
     "FindingRepository",
     "FindingsUnitOfWork",
     "LocationHashRepository",
+    "RemediationFindingRepository",
+    "RemediationRepository",
     "ReviewItemRepository",
     "SqlCweRepository",
     "SqlDecisionApproverRepository",
@@ -95,5 +111,7 @@ __all__ = [
     "SqlFindingLabelRepository",
     "SqlFindingRepository",
     "SqlLocationHashRepository",
+    "SqlRemediationFindingRepository",
+    "SqlRemediationRepository",
     "SqlReviewItemRepository",
 ]

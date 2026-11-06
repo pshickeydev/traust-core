@@ -268,7 +268,12 @@ _STEP = {
     "merged": 6,
     "abandoned": 7,
 }
-_FINAL = frozenset({"merged", "abandoned"})
+_FINAL = frozenset({RemediationStatus.MERGED, RemediationStatus.ABANDONED})
+# An attempt here is over: the same findings may be tried again, as a new work item (a failed
+# attempt is one).
+OVER = frozenset(
+    {*_FINAL, RemediationStatus.CHECKS_FAILED, RemediationStatus.REVALIDATED_STILL_VULNERABLE}
+)
 # Remediation progress never establishes that a finding is fixed.
 _RESOLUTION: dict[str, str | None] = {
     "candidate": None,
@@ -309,12 +314,18 @@ class WorkItem(Model):
     evidence: tuple[EvidenceItem, ...] = ()
     report: ArtifactRef | None = None
     fix_branch: str | None = None
+    fix_commit: str | None = None  # the remediation report's fork.fix_commit
 
     def advance(self, status: RemediationStatus) -> WorkItem:
-        """The item at `status`: forward only, nothing after merged or abandoned."""
+        """The item at `status`: forward only, nothing after merged or abandoned, and an attempt
+        that is over (its retry is a new work item) stays over."""
         if status == self.status:
             return self
-        if self.status in _FINAL or (status != "abandoned" and _STEP[status] <= _STEP[self.status]):
+        if (
+            self.status in _FINAL
+            or (self.status in OVER and status not in OVER)
+            or (status != RemediationStatus.ABANDONED and _STEP[status] <= _STEP[self.status])
+        ):
             raise ConflictError(
                 f"work item {self.work_item_id}: {self.status} can't move to {status}"
             )

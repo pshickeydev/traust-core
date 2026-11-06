@@ -169,6 +169,7 @@ class OrderRequest(Model):
     lane: LaneName | None = None
     rule: str | None = None
     event_source: str | None = None
+    work_item_id: UUID | None = None  # the remediation work item the order runs, if any
 
 
 class StartRecordingRequest(Model):
@@ -488,6 +489,7 @@ class RunOrder(Entity):
     lease_expires_at: datetime | None = None
     started_at: datetime | None = None
     finished_at: datetime | None = None
+    work_item_id: UUID | None = None  # the remediation work item the order runs, if any
 
 
 FEED_ORDER_STATES = (*FINISHED_ORDER_STATES, OrderState.AWAITING_APPROVAL)

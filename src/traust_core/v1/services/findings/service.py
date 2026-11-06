@@ -86,6 +86,7 @@ from traust_core.v1.services.findings.precedents import FindingPrecedents
 from traust_core.v1.services.findings.rating import RatingPolicy
 from traust_core.v1.services.findings.records import FindingRecords
 from traust_core.v1.services.findings.review import FindingReview, request
+from traust_core.v1.services.findings.scheduled import ScheduledRemediations
 from traust_core.v1.services.findings.views import FindingViewQuery
 from traust_core.v1.services.portfolio import Inventory
 
@@ -111,6 +112,7 @@ class FindingService:
         self._inventory = Inventory(uow)
         self._log = AssessmentLog(uow)
         self.records = FindingRecords(uow)
+        self.scheduled = ScheduledRemediations(uow)
         self._rating = rating
         self._views = FindingViewQuery(rating)
         self._objects = objects
