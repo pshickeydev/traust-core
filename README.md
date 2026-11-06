@@ -71,6 +71,31 @@ The remaining correctness changes are:
 - `services.artifacts` resolves every named document through the shared artifact catalog,
   including PQC facts published by the native prescan. Role aliases retain their common
   schema type; integrity checks and domain-scoped publication permissions remain unchanged.
+- `ViewName.CRITICAL_MISSES` is a global, on-demand view of
+  `DetectionQualityService.critical_misses(window)`. Use `ctx.services().insight.build`,
+  `report` or `publish` with `ViewFilter(window=TimeWindow(start=…, end=…))`;
+  boundaries must be timezone-aware and increasing, with an inclusive start and exclusive end,
+  and the window cannot exceed 31 days. Scope filters and `as_of` are refused because
+  dispositions are current, not historical.
+  The model retains the existing `CriticalMiss` rows under `window` / `misses`, validated by
+  `contracts.validate_view("critical-misses", document)` against the separately packaged
+  `contracts.view_schema("critical-misses")`, not an artifact schema or stored projection.
+  Shared Markdown/HTML renderers retain IDs, assessment provenance, reason and unknown validity;
+  `area_reported` requires adjudication and is not a confirmed miss or hit. Empty results do not
+  establish coverage or a miss rate. Publishing writes neither database rows nor object bytes.
+  Implicit all-view refreshes omit this global-only view when the requested scope is
+  incompatible; explicit requests still fail rather than dropping filters. Refresh without
+  a window retains the current-month fallback. Explicit windows are accepted only by views
+  that consume them, including optional-window trends.
+  Critical-misses publication uses a cumulative 10,000-input-record budget across window
+  assessments and related history/finding reads, enforced with bounded SQL fetches. Overflow
+  fails with no partial report and asks callers to narrow the window; direct legacy producer
+  calls remain unchanged unless `max_records` is supplied. This bounds materialized rows,
+  not database scan/sort work or individual row byte size.
+  The same registry is available at
+  `GET /v1/insights/critical-misses?window_start=…&window_end=…`; both boundaries are required
+  together. View-schema validation exposes a recursive JSON type without a model-layer
+  dependency in the contracts facade.
 
 
 ## Repository checkouts

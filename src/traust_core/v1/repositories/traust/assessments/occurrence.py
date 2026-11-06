@@ -6,6 +6,7 @@ from uuid import UUID
 
 import sqlalchemy as sa
 
+from traust_core.v1.models.common import RecordBudget
 from traust_core.v1.models.findings import Occurrence
 from traust_core.v1.repositories.tables import (
     TRAUST,
@@ -33,9 +34,13 @@ OCCURRENCE = TableSpec(
 
 class OccurrenceRepository(RecordRepository[Occurrence], Protocol):
     def find(self, finding_id: UUID, assessment_id: UUID) -> Occurrence | None: ...
-    def list_for_assessment(self, assessment_id: UUID) -> list[Occurrence]: ...
+    def list_for_assessment(
+        self, assessment_id: UUID, *, read_budget: RecordBudget | None = None
+    ) -> list[Occurrence]: ...
     def list_for_finding(self, finding_id: UUID) -> list[Occurrence]: ...
-    def list_for_findings(self, finding_ids: Collection[UUID]) -> list[Occurrence]: ...
+    def list_for_findings(
+        self, finding_ids: Collection[UUID], *, read_budget: RecordBudget | None = None
+    ) -> list[Occurrence]: ...
     def list_by_ids(self, occurrence_ids: Collection[UUID]) -> list[Occurrence]: ...
     def list_with_rule(self) -> list[Occurrence]:
         """Every occurrence a detector rule matched (per-rule precision)."""
@@ -54,14 +59,24 @@ class SqlOccurrenceRepository(SqlAppendOnlyRepository[Occurrence]):
             c.assessment_id == assessment_id,
         )
 
-    def list_for_assessment(self, assessment_id: UUID) -> list[Occurrence]:
-        return self._many(f"list for {assessment_id}", self.table.c.assessment_id == assessment_id)
+    def list_for_assessment(
+        self, assessment_id: UUID, *, read_budget: RecordBudget | None = None
+    ) -> list[Occurrence]:
+        return self._many(
+            f"list for {assessment_id}",
+            self.table.c.assessment_id == assessment_id,
+            read_budget=read_budget,
+        )
 
     def list_for_finding(self, finding_id: UUID) -> list[Occurrence]:
         return self._many(f"list for finding {finding_id}", self.table.c.finding_id == finding_id)
 
-    def list_for_findings(self, finding_ids: Collection[UUID]) -> list[Occurrence]:
-        return self._many_in("list for findings", self.table.c.finding_id, finding_ids)
+    def list_for_findings(
+        self, finding_ids: Collection[UUID], *, read_budget: RecordBudget | None = None
+    ) -> list[Occurrence]:
+        return self._many_in(
+            "list for findings", self.table.c.finding_id, finding_ids, read_budget=read_budget
+        )
 
     def list_by_ids(self, occurrence_ids: Collection[UUID]) -> list[Occurrence]:
         return self._many_in("list by id", self.table.c.id, occurrence_ids)

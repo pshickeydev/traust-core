@@ -435,6 +435,19 @@ def context(engine: Engine, tmp_path: Path) -> Context:
     return ctx
 
 
+@pytest.mark.parametrize("door", ["build", "report", "publish"])
+def test_a_view_without_window_support_refuses_a_range_on_every_door(
+    context: Context, door: str
+) -> None:
+    service = context.services().insight
+    filter = ViewFilter(window=TimeWindow(start=T0, end=T0 + timedelta(days=7)))
+    with pytest.raises(ValidationError):
+        getattr(service, door)(ViewName.FINDINGS_ROLLUP, filter)
+    result = service.refresh([ViewName.FINDINGS_ROLLUP], filter)
+    assert ViewName.FINDINGS_ROLLUP not in result.rendered
+    assert ViewName.FINDINGS_ROLLUP in result.failed
+
+
 def test_rollup_over_stored_findings(context: Context, engine: Engine) -> None:
     with SqlTraustUnitOfWork(engine) as uow:
         seed = Seed(uow)

@@ -7,6 +7,7 @@ from datetime import datetime
 from uuid import UUID
 
 from traust_core.v1.models.assessment import Assessment
+from traust_core.v1.models.common import RecordBudget
 from traust_core.v1.models.findings import (
     Decision,
     Disposition,
@@ -40,28 +41,34 @@ class FindingFacts:
         findings: Sequence[Finding],
         until: datetime | None,
         repository_ref_id: UUID | None = None,
+        *,
+        read_budget: RecordBudget | None = None,
     ) -> FindingFacts:
         """Decisions made after `until` are left out; every occurrence is kept."""
         ids = [f.id for f in findings if f.id is not None]
         decisions: defaultdict[UUID, list[Decision]] = defaultdict(list)
-        for d in uow.decisions.list_for_findings(ids, until=until):
+        for d in uow.decisions.list_for_findings(ids, until=until, read_budget=read_budget):
             decisions[d.finding_id].append(d)
-        occurrences = uow.occurrences.list_for_findings(ids)
+        occurrences = uow.occurrences.list_for_findings(ids, read_budget=read_budget)
         assessments = AssessmentLog(uow).list_by_ids(
             {o.assessment_id for o in occurrences}
-            | {d.assessment_id for ds in decisions.values() for d in ds if d.assessment_id}
+            | {d.assessment_id for ds in decisions.values() for d in ds if d.assessment_id},
+            read_budget=read_budget,
         )
         at = {a.id: a.occurred_at for a in assessments if a.id}
         reported: defaultdict[UUID, list[Occurrence]] = defaultdict(list)
         for o in sorted(occurrences, key=lambda o: at[o.assessment_id]):
             reported[o.finding_id].append(o)
-        links = uow.finding_cwes.list_for_findings(ids) if ids else []
-        names = {c.id: c.identifier for c in uow.cwes.list_by_ids({fc.cwe_id for fc in links})}
+        links = uow.finding_cwes.list_for_findings(ids, read_budget=read_budget) if ids else []
+        names = {
+            c.id: c.identifier
+            for c in uow.cwes.list_by_ids({fc.cwe_id for fc in links}, read_budget=read_budget)
+        }
         cwes: defaultdict[UUID, list[str]] = defaultdict(list)
         for fc in links:
             cwes[fc.finding_id].append(names[fc.cwe_id])
         labels: defaultdict[UUID, list[FindingLabel]] = defaultdict(list)
-        for fl in uow.finding_labels.list_for_findings(ids) if ids else ():
+        for fl in uow.finding_labels.list_for_findings(ids, read_budget=read_budget) if ids else ():
             labels[fl.finding_id].append(fl)
         return cls(
             lines=_lines(
@@ -70,10 +77,13 @@ class FindingFacts:
                 {
                     b.id: b
                     for b in AssessmentLog(uow).list_by_ids(
-                        {a.baseline_assessment_id for a in assessments if a.baseline_assessment_id}
+                        {a.baseline_assessment_id for a in assessments if a.baseline_assessment_id},
+                        read_budget=read_budget,
                     )
                 },
-                Inventory(uow).list_refs_of({f.repository_id for f in findings}),
+                Inventory(uow).list_refs_of(
+                    {f.repository_id for f in findings}, read_budget=read_budget
+                ),
                 repository_ref_id,
             ),
             decisions=decisions,

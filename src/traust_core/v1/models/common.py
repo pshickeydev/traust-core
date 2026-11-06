@@ -22,6 +22,23 @@ RepoPath = NewType("RepoPath", str)
 Cursor = NewType("Cursor", str)
 
 
+class RecordBudget:
+    """A cumulative bound on materialized input rows, including repeated related reads."""
+
+    def __init__(self, max_records: int, workload: str) -> None:
+        if max_records < 1:
+            raise ValidationError(f"{workload}: max_records must be positive")
+        self.remaining = max_records
+        self._workload = workload
+
+    def consume(self, count: int) -> None:
+        if count > self.remaining:
+            raise ValidationError(
+                f"{self._workload} workload exceeds its record budget; narrow the window"
+            )
+        self.remaining -= count
+
+
 class TimeBucket(StrEnum):
     DAY = "day"
     WEEK = "week"

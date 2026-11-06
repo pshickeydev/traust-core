@@ -11,6 +11,7 @@ from sqlalchemy.dialects.postgresql import insert as postgres_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from traust_core.v1.errors import RepositoryError
+from traust_core.v1.models.common import RecordBudget
 from traust_core.v1.models.findings import Decision, validity_spellings
 from traust_core.v1.models.vocabulary import ActorKind, Severity, Validity
 from traust_core.v1.repositories.tables import (
@@ -61,7 +62,11 @@ class DecisionRepository(RecordRepository[Decision], Protocol):
 
     def list_for_finding(self, finding_id: UUID) -> list[Decision]: ...
     def list_for_findings(
-        self, finding_ids: Collection[UUID], until: datetime | None = None
+        self,
+        finding_ids: Collection[UUID],
+        until: datetime | None = None,
+        *,
+        read_budget: RecordBudget | None = None,
     ) -> list[Decision]:
         """Decisions on these findings, those made after `until` left out."""
         ...
@@ -119,14 +124,21 @@ class SqlDecisionRepository(SqlAppendOnlyRepository[Decision]):
         )
 
     def list_for_findings(
-        self, finding_ids: Collection[UUID], until: datetime | None = None
+        self,
+        finding_ids: Collection[UUID],
+        until: datetime | None = None,
+        *,
+        read_budget: RecordBudget | None = None,
     ) -> list[Decision]:
         c = self.table.c
         where = [c.finding_id.in_(finding_ids)]
         if until is not None:
             where.append(c.occurred_at <= until)
         return self._many(
-            f"list for {len(finding_ids)} findings", *where, order_by=(c.occurred_at,)
+            f"list for {len(finding_ids)} findings",
+            *where,
+            order_by=(c.occurred_at,),
+            read_budget=read_budget,
         )
 
     def list_since(self, since: datetime, limit: int) -> list[Decision]:
