@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from uuid import UUID
 
 from traust_core.v1.errors import ValidationError
@@ -16,6 +17,8 @@ from traust_core.v1.models.operations import OrderRequest
 from traust_core.v1.providers.clock import Clock, SystemClock
 from traust_core.v1.services.operations import OpsService
 from traust_core.v1.services.portfolio import PortfolioService, PortfolioSync
+
+log = logging.getLogger(__name__)
 
 
 class OnboardingService:
@@ -57,7 +60,8 @@ class OnboardingService:
         if product is None:
             assert request.label is not None
             product = self._portfolio.register_product(request.product, request.label)
-        repository_ids = [self._onboard_repository(spec) for spec in self._specs(request)]
+        onboarded = [self._onboard_repository(spec) for spec in self._specs(request)]
+        repository_ids = [repository_id for repository_id, _ in onboarded]
         orders = [
             self._ops.plan(
                 OrderRequest(asset=asset, priority=0, repository_id=repository_id), principal
@@ -70,16 +74,24 @@ class OnboardingService:
             product_id=product.id,
             repository_ids=tuple(repository_ids),
             order_ids=tuple(o.id for o in orders if o.id),
+            skipped=tuple(why for _, skipped in onboarded for why in skipped),
         )
 
-    def _onboard_repository(self, spec: RepositorySpec) -> UUID:
+    def _onboard_repository(self, spec: RepositorySpec) -> tuple[UUID, tuple[str, ...]]:
+        """The repository's id, and what its import couldn't refresh."""
         report = self._sync.import_repository(spec.url)
         repository_id = (*report.added, *report.unchanged)[0]
+        if report.skipped:
+            log.warning(
+                "onboarding repository %s: forge facts not refreshed (%d)",
+                repository_id,
+                len(report.skipped),
+            )
         for ref in spec.refs:
             self._sync.import_branch(repository_id, spec.url, ref)
         if spec.team is not None:
             self._portfolio.assign_owner(repository_id, spec.team, self._clock.now())
-        return repository_id
+        return repository_id, report.skipped
 
     def _specs(self, request: OnboardingRequest) -> list[RepositorySpec]:
         """The repositories named, then the organisation's others; one spec per URL."""

@@ -7,6 +7,7 @@ from uuid import UUID
 
 import sqlalchemy as sa
 
+from traust_core.v1.errors import NotFoundError
 from traust_core.v1.models.inventory import Repository
 from traust_core.v1.repositories.tables import (
     TRAUST,
@@ -33,6 +34,7 @@ class RepositoryRepository(MutableRecordRepository[Repository], Protocol):
     def get_or_add(self, record: Repository) -> Repository: ...
     def get_or_add_with_status(self, record: Repository) -> tuple[Repository, bool]: ...
     def find_by_url(self, url: str) -> Repository | None: ...
+    def get_for_update(self, repository_id: UUID) -> Repository: ...
     def find_by_url_casefold(self, url: str) -> Repository | None: ...
     def lock_url(self, url: str) -> None: ...
     def find_private_mirror(self, upstream_id: UUID) -> Repository | None: ...
@@ -56,6 +58,15 @@ class SqlRepositoryRepository(SqlMutableRepository[Repository]):
 
     def find_by_url(self, url: str) -> Repository | None:
         return self._one(f"find {url}", self.table.c.url == url)
+
+    def get_for_update(self, repository_id: UUID) -> Repository:
+        """The row a metadata write reads, locked until the transaction ends (Postgres; SQLite's
+        caller holds its write lock), so two writers can't put back a stale value."""
+        stmt = self._select().where(self.table.c.id == repository_id).with_for_update()
+        row = self._execute(f"lock repository {repository_id}", stmt).mappings().one_or_none()
+        if row is None:
+            raise NotFoundError(f"repository {repository_id}")
+        return self._to_record(row)
 
     def find_by_url_casefold(self, url: str) -> Repository | None:
         """The oldest repository whose URL matches ignoring case (GitHub's owner/repo)."""
