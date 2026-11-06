@@ -408,7 +408,7 @@ class CompliancePrecisionView:
                             check.check_id,
                             str(check.fired),
                             str(check.dismissed),
-                            "Unmeasured" if check.precision is None else str(check.precision),
+                            "—" if check.precision is None else str(check.precision),
                             "flagged" if check.flagged else "not flagged",
                         )
                         for check in calibration.checks
