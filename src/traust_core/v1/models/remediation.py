@@ -317,10 +317,15 @@ class WorkItem(Model):
     fix_commit: str | None = None  # the remediation report's fork.fix_commit
 
     def advance(self, status: RemediationStatus) -> WorkItem:
-        """The item at `status`: forward only, nothing after merged or abandoned."""
+        """The item at `status`: forward only, nothing after merged or abandoned, and an attempt
+        that is over (its retry is a new work item) stays over."""
         if status == self.status:
             return self
-        if self.status in _FINAL or (status != "abandoned" and _STEP[status] <= _STEP[self.status]):
+        if (
+            self.status in _FINAL
+            or (self.status in OVER and status not in OVER)
+            or (status != RemediationStatus.ABANDONED and _STEP[status] <= _STEP[self.status])
+        ):
             raise ConflictError(
                 f"work item {self.work_item_id}: {self.status} can't move to {status}"
             )

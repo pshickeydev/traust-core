@@ -985,6 +985,13 @@ def _source_finding(item: RemediationItem) -> dict[str, Any]:
     }
 
 
+def _verdict_order(verification: Assessment) -> tuple[datetime, datetime]:
+    """When a verification happened, then when it was recorded: an equal-time tie goes to the
+    later recorded, never to the verdict's text."""
+    assert verification.created_at is not None
+    return verification.occurred_at, verification.created_at
+
+
 def _finding_id(ref: str) -> UUID:
     try:
         return UUID(ref)
@@ -1278,7 +1285,7 @@ class VerificationService:
                 )
             if not replay:
                 verdict_of = {f: v.verdict for f, v in verdicts.items()}
-                self._revalidate(verdict_of, assessment.occurred_at, meta.patched_commit, ref)
+                self._revalidate(verdict_of, assessment, meta.patched_commit, ref)
             uow.commit()
         if not found:
             self._uow.after_commit(
@@ -1294,7 +1301,7 @@ class VerificationService:
     def _revalidate(
         self,
         verdicts: Mapping[UUID, str],
-        occurred_at: datetime,
+        verification: Assessment,
         patched_commit: str,
         patched: RepositoryRef,
     ) -> None:
@@ -1302,9 +1309,10 @@ class VerificationService:
         verdicts' own transaction. An effort is this report's when the ref verified is its fix
         branch and the commit verified is its work item's recorded fix commit (a report on the
         same findings at another commit or branch, on the upstream or another fork, says nothing
-        about this fix). Each finding it covers counts at its latest verdict on that commit by when
-        the verification happened, this report's or another's (one delivered late never
-        overrides a newer one): fixed only when all are fixed; still vulnerable when any
+        about this fix). Each finding it covers counts at its latest verdict on that commit, this
+        report's or another's, by when the verification happened, then when it was recorded
+        (`_verdict_order`: one delivered late never overrides a newer one, a tie never turns on
+        the verdict): fixed only when all are fixed; still vulnerable when any
         verified one isn't; left as is while some are unverified and the rest fixed. Merged or
         abandoned efforts are past revalidation, and an effort that is over stays over once a
         newer one covers any of its findings."""
@@ -1325,9 +1333,10 @@ class VerificationService:
             ):
                 continue
             latest = self._verified_on(patched, covers)
-            for f in covers & verdicts.keys():
-                if f not in latest or latest[f][0] <= occurred_at:
-                    latest[f] = (occurred_at, verdicts[f])
+            this = _verdict_order(verification)
+            for finding_id in covers & verdicts.keys():
+                if finding_id not in latest or latest[finding_id][0] <= this:
+                    latest[finding_id] = (this, verdicts[finding_id])
             said = [verdict in FIXED_VERDICTS for _, verdict in latest.values()]
             if not all(said):
                 status = RemediationStatus("revalidated_still_vulnerable")
@@ -1339,11 +1348,11 @@ class VerificationService:
 
     def _verified_on(
         self, patched: RepositoryRef, finding_ids: Collection[UUID]
-    ) -> dict[UUID, tuple[datetime, str]]:
-        """Each finding's latest verdict on this commit, by when its verification happened."""
+    ) -> dict[UUID, tuple[tuple[datetime, datetime], str]]:
+        """Each finding's latest verdict on this commit (`_verdict_order`)."""
         history = {f: self._findings.history(f) for f in finding_ids}
         runs = {
-            a.id: a.occurred_at
+            a.id: _verdict_order(a)
             for a in self._log.list_by_ids(
                 {d.assessment_id for ds in history.values() for d in ds if d.assessment_id}
             )
@@ -1357,7 +1366,7 @@ class VerificationService:
                 if d.assessment_id in runs and d.reason
             ]
             if said:
-                latest[finding_id] = max(said)
+                latest[finding_id] = max(said, key=lambda s: s[0])
         return latest
 
     def _audit_of(

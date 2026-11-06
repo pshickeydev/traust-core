@@ -15,7 +15,7 @@ import pytest
 from sqlalchemy.engine import Engine
 
 from tests.v1.conftest import SQL_BACKENDS, contract_db
-from tests.v1.repositories.tables.conftest import Seed
+from tests.v1.repositories.tables.conftest import Seed, apart
 from tests.v1.services.test_remediation import provenance, report
 from tests.v1.services.test_verification import World, audited
 from tests.v1.services.test_verification import provenance as verification_provenance
@@ -949,4 +949,47 @@ def test_a_verification_delivered_late_never_overrides_a_newer_one(
     older = verification_report(world, {a: "unresolved", b: "resolved"})
     verification.record(older, verification_provenance(at=earlier))  # delivered late
     # a's newer fixed verdict stands, and b's (older, but its only one) completes the effort
+    assert row(engine, scheduled.id).status == "revalidated_fixed"
+
+
+def test_a_failed_attempt_never_advances_once_over(
+    service: RemediationSchedulingService, context: Context, engine: Engine
+) -> None:
+    _, finding_ids, repository_ids = seeded(engine)
+    request = pairs(finding_ids, repository_ids)
+    first = service.create(fork_of(engine, request), BRANCH, request, PERSON)
+    assert first.assessment_id is not None
+    remediation = context.services().remediation
+    remediation.record_progress(first.assessment_id, RemediationStatus("checks_failed"))
+    retry = service.create(fork_of(engine, request), BRANCH, request, PERSON)
+    for later in ("checks_passed", "pr_opened", "revalidated_fixed"):
+        with pytest.raises(ConflictError, match="can't move"):
+            remediation.record_progress(first.assessment_id, RemediationStatus(later))
+    again = remediation.record_progress(first.assessment_id, RemediationStatus("checks_failed"))
+    assert again.status == "checks_failed"  # the same status again is a no-op
+    assert (row(engine, first.id).status, row(engine, retry.id).status) == (
+        "checks_failed",
+        "candidate",
+    )
+    closed = remediation.record_progress(first.assessment_id, RemediationStatus("abandoned"))
+    assert closed.status == "abandoned"  # an over attempt can still be closed
+
+
+def test_equal_time_verdicts_go_to_the_later_recorded_never_the_verdict_text(
+    service: RemediationSchedulingService, context: Context, engine: Engine
+) -> None:
+    world = World(engine, findings=2, patched_name="main")
+    audited(engine, world, world.base)
+    request = pairs(world.ids, [world.repo.id] * len(world.ids))
+    scheduled = service.create(fork_of(engine, request), world.patched.name, request, PERSON)
+    context.services().remediation.record(
+        pushed(scheduled, world.ids, fork__fix_commit=world.patched.sha), provenance()
+    )
+    verification = context.services().verification
+    a, b = world.ids
+    same = verification_provenance(at=VERIFIED_AT)
+    for verdicts in ({a: "unresolved"}, {a: "resolved"}, {b: "resolved"}):
+        apart()
+        verification.record(verification_report(world, verdicts), same.model_copy())
+    # a's tie goes to the later recorded "resolved", so b's report completes the effort
     assert row(engine, scheduled.id).status == "revalidated_fixed"
