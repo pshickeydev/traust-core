@@ -15,7 +15,7 @@ from traust_core.v1.errors import ConflictError, NotFoundError, ValidationError
 from traust_core.v1.models.common import Page, PageRequest
 from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.inventory import RepositoryRef
-from traust_core.v1.models.operations import AssetName, OrderRequest
+from traust_core.v1.models.operations import REMEDIATE_FINDING, OrderRequest
 from traust_core.v1.models.remediation import OVER
 from traust_core.v1.models.remediation_scheduling import (
     Remediation,
@@ -33,7 +33,6 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-REMEDIATE_FINDING = AssetName("remediate_finding")
 # A scheduled fix is asked for now, like onboarding's baseline orders.
 _ASKED_NOW = 0
 # The remediation report's `fork.fix_branch` (traust-contracts remediation schema): a branch

@@ -29,6 +29,10 @@ ProviderName = NewType("ProviderName", str)
 ModelName = NewType("ModelName", str)
 SkillName = NewType("SkillName", str)
 
+# The native remediation-scheduling asset: contracts' recording config has no remediation
+# section yet, so its orders ride the triage allowlist and only this name tells them apart.
+REMEDIATE_FINDING = AssetName("remediate_finding")
+
 
 class Outcome(StrEnum):
     SUCCEEDED = "succeeded"

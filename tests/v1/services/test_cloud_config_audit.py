@@ -228,7 +228,9 @@ def context(engine: Engine, tmp_path: Path) -> Context:
 
 def a_ref(engine: Engine) -> UUID:
     with SqlTraustUnitOfWork(engine) as uow:
-        ref = Seed(uow).repository_ref()
+        seed = Seed(uow)
+        # Onboarded (a default line), so the subject gate admits orders for the repository.
+        ref = seed.repository_ref(seed.repository(), is_default=True)
         uow.commit()
     assert ref.id is not None
     return ref.id

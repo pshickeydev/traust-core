@@ -94,7 +94,11 @@ def test_a_start_cannot_skip_the_stage_ordering_the_doors_enforce(
 ) -> None:
     """A recording start is a run: it meets the same ordering gate as preflight and submit."""
     context.config = context.config.model_copy(
-        update={"recording": context.config.recording.model_copy(update={"triage": ("triage",)})}
+        update={
+            "recording": context.config.recording.model_copy(
+                update={"triage": ("triage", "remediate_finding")}
+            )
+        }
     )
     body = request(context)
     refused = client.post(URL, json=body.model_dump(mode="json"), headers=runner(context))
@@ -103,7 +107,15 @@ def test_a_start_cannot_skip_the_stage_ordering_the_doors_enforce(
     assert refused.json()["code"] == "ordering_violated"
     repository_id = body.order.repository_id
     with SqlTraustUnitOfWork(engine) as uow:
+        # Verification follows remediation, not ordinary triage.
         Seed(uow).run_order(asset="triage", repository_id=repository_id, state="succeeded")
+        uow.commit()
+    refused = client.post(URL, json=body.model_dump(mode="json"), headers=runner(context))
+    assert refused.status_code == 403, refused.text
+    with SqlTraustUnitOfWork(engine) as uow:
+        Seed(uow).run_order(
+            asset="remediate_finding", repository_id=repository_id, state="succeeded"
+        )
         uow.commit()
     started = client.post(URL, json=body.model_dump(mode="json"), headers=runner(context))
     assert started.status_code == 200, started.text

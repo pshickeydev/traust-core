@@ -160,6 +160,12 @@ class Inventory:
         with self._uow as uow:
             return uow.repository_refs.get(repository_ref_id)
 
+    def has_default_ref(self, repository_id: UUID) -> bool:
+        """Whether the repository has an imported default line — the onboarding step that
+        gives a run something to work on; a registered row alone has none."""
+        with self._uow as uow:
+            return uow.repository_refs.default(repository_id) is not None
+
     def lock_ref(self, repository_ref_id: UUID) -> RepositoryRef:
         """The commit, locked for the caller's transaction."""
         with self._uow as uow:

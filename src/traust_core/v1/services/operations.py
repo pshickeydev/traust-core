@@ -24,6 +24,7 @@ from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.operations import (
     FEED_ORDER_STATES,
     FINISHED_ORDER_STATES,
+    REMEDIATE_FINDING,
     SPEND_UNPRICED,
     WITHHOLDING_ENFORCEMENT,
     AssetName,
@@ -102,15 +103,18 @@ _RECORDING_SOURCES = {
 # A stage may run only after its predecessor left a completed order for the subject. Stages
 # are record kinds and the deployment's recording config names each kind's assets, so the gate
 # follows the configured names (one deployment's assessments run as "audit", another's as
-# "assessment"; remediation reports ride the triage allowlist until contracts grows a
-# recording.remediation section). A predecessor the deployment does not wire is not required:
-# the gate enforces what the config declares. Remediation's plan-level gate is a disposition,
-# which lives on the findings service behind OpsService (a wiring cycle), so a finished triage
-# order is its record until that door is reachable.
+# "assessment"). Remediation orders ride the triage allowlist until contracts grows a
+# recording.remediation section; its predecessor is the triage stage minus the remediation asset
+# itself, and verification needs remediation completed — only REMEDIATE_FINDING satisfies it,
+# not the allowlist's ordinary triage names. A predecessor the deployment does not wire is not
+# required: the gate enforces what the config declares. Remediation's plan-level gate is a
+# disposition, which lives on the findings service behind OpsService (a wiring cycle), so a
+# finished triage order is its record until that door is reachable.
 _PRIOR_RECORD_KIND: Final[Mapping[str, str]] = {
     "triage": "assessment",
+    "remediation": "triage",
     "validation": "triage",
-    "verification": "triage",
+    "verification": "remediation",
 }
 
 # Ordering counts a predecessor that actually ran. FINISHED_ORDER_STATES also covers refused,
@@ -274,20 +278,31 @@ class OpsService:
         principal: Principal,
     ) -> tuple[DenyIssue, ...]:
         """The gates preflight reports and submit enforces: one code path, called from both."""
-        issues: list[DenyIssue] = []
         if not self._may_request(asset, repository_id, principal):
-            issues.append(
+            # A caller who may not ask learns nothing else about the subject, its stages or
+            # the lane's spend: the role denial is the whole answer.
+            return (
                 DenyIssue(
                     code=DenyCode.ROLE_DENIED,
-                    detail=f"asking for a run is a person's; {principal.ref} is not one, "
-                    "nor a machine granted it in recording.start",
-                )
+                    detail="asking for a run is a person's, or a machine granted it in "
+                    "recording.start",
+                ),
             )
+        issues: list[DenyIssue] = []
         if repository_id is not None:
             if self._inventory is None:
                 raise ConfigError("subject checks need the inventory door")
             try:
                 self._inventory.get_repository(repository_id)
+                if not self._inventory.has_default_ref(repository_id):
+                    # Registered (a row) is not onboarded (a default line imported): a
+                    # subject with no commits has nothing for a run to work on.
+                    issues.append(
+                        DenyIssue(
+                            code=DenyCode.SUBJECT_UNKNOWN,
+                            detail=f"repository {repository_id} has no imported default line",
+                        )
+                    )
             except NotFoundError:
                 issues.append(
                     DenyIssue(
@@ -303,10 +318,11 @@ class OpsService:
             ):
                 # No estimate exists before the run, so the gate is measured spend alone
                 # (BudgetVerdict.binding also needs the estimate; a preflight cannot have one).
+                # The figures stay server-side: a denial names the lane, never the amounts.
                 issues.append(
                     DenyIssue(
                         code=DenyCode.BUDGET_EXHAUSTED,
-                        detail=f"lane {lane} spent ${verdict.spent_usd} of ${verdict.budget_usd}",
+                        detail=f"lane {lane} is over its monthly budget",
                     )
                 )
         return tuple(issues)
@@ -328,30 +344,51 @@ class OpsService:
         """The stage-ordering gate, from the deployment's recording config: a gated asset needs
         its predecessor's completed order on the very subject. A subjectless order cannot show
         one, so it is refused rather than queued unverified."""
-        for kind, assets in self._recording_assets.items():
-            if asset not in assets:
-                continue
-            prior = _PRIOR_RECORD_KIND.get(kind)
-            if prior is None:
-                continue
-            prior_assets = self._recording_assets.get(prior, frozenset())
-            if not prior_assets:
-                continue  # the deployment wires no such stage: nothing to require
-            if repository_id is None:
-                yield DenyIssue(
-                    code=DenyCode.ORDERING_VIOLATED,
-                    detail=f"{asset} needs a repository: its {prior} prerequisite is per-subject",
-                )
-                continue
-            with self._uow as uow:
-                completed = uow.run_orders.subject_has_order(
-                    tuple(prior_assets), repository_id, _COMPLETED_ORDER_STATES
-                )
-            if not completed:
-                yield DenyIssue(
-                    code=DenyCode.ORDERING_VIOLATED,
-                    detail=f"{asset} needs a completed {prior} order for the subject first",
-                )
+        kind = self._stage_of(asset)
+        prior = _PRIOR_RECORD_KIND.get(kind)
+        if prior is None:
+            return
+        prior_assets = self._recording_assets.get(prior, frozenset())
+        if prior == "remediation":
+            # Verification follows remediation specifically: only the native scheduling
+            # asset unlocks it, never the triage allowlist's ordinary names.
+            prior_assets = prior_assets & {REMEDIATE_FINDING}
+        elif kind == "remediation":
+            # Remediation rides the triage allowlist; its predecessor is triage's work,
+            # not another remediation order.
+            prior_assets = prior_assets - {REMEDIATE_FINDING}
+        if not prior_assets:
+            return  # the deployment wires no such stage: nothing to require
+        if repository_id is None:
+            yield DenyIssue(
+                code=DenyCode.ORDERING_VIOLATED,
+                detail=f"{asset} needs a repository: its {prior} prerequisite is per-subject",
+            )
+            return
+        with self._uow as uow:
+            completed = uow.run_orders.subject_has_order(
+                tuple(prior_assets), repository_id, _COMPLETED_ORDER_STATES
+            )
+        if not completed:
+            yield DenyIssue(
+                code=DenyCode.ORDERING_VIOLATED,
+                detail=f"{asset} needs a completed {prior} order for the subject first",
+            )
+
+    def _stage_of(self, asset: AssetName) -> str | None:
+        """The one record kind an asset runs as, or None when ungated. The context copies the
+        triage allowlist into a remediation key (contracts has no recording.remediation
+        section yet), so that alias cannot disambiguate a name: REMEDIATE_FINDING is the only
+        remediation asset, every other name resolves among the primary kinds, and an asset on
+        several of those is ambiguous — the config validator refuses such bindings."""
+        if asset == REMEDIATE_FINDING:
+            return "remediation"
+        kinds = [
+            k
+            for k, assets in self._recording_assets.items()
+            if k != "remediation" and asset in assets
+        ]
+        return kinds[0] if len(kinds) == 1 else None
 
     def plan(
         self, request: OrderRequest, principal: Principal, config: Sequence[ConfigDigest] = ()

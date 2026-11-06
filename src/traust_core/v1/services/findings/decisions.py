@@ -53,6 +53,7 @@ from traust_core.v1.models.findings import (
 from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.models.inventory import DEFAULT_FORGE_HOSTS
+from traust_core.v1.models.operations import REMEDIATE_FINDING
 from traust_core.v1.models.validation import (
     ValidationAttempt,
     ValidationFilter,
@@ -392,8 +393,6 @@ class FindingDecisions:
         """Record triage under a live triage lease, never a remediation run's lease."""
         if self._recording is None:
             raise ConfigError("triage recording requires operations authorization")
-        # Local import avoids remediation's findings-service dependency cycle.
-        from traust_core.v1.services.remediation_scheduling import REMEDIATE_FINDING
 
         triaged = self._log.get(assessment_id)
         repository_id = self._inventory.get_ref(triaged.repository_ref_id).repository_id

@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
+import pydantic
 import pytest
 import sqlalchemy as sa
 from sqlalchemy.engine import Engine
@@ -188,3 +189,15 @@ def test_unknown_order_does_not_authorize_recording(engine: Engine, tmp_path: Pa
         ),
     ):
         ops.save_progress(order.id, OrderProgress(step=1))
+
+
+def test_an_asset_on_two_report_kinds_allowlists_is_refused() -> None:
+    """Stage gates resolve a report kind from the asset name alone, so an asset bound to two
+    kinds is ambiguous — the config refuses it rather than deny its first orders. The
+    remediation alias (remediate_finding riding the triage allowlist) stays legal: it runs
+    as its own stage."""
+    with pytest.raises(pydantic.ValidationError, match="one report kind"):
+        RecordingConfig(assessment=("audit",), triage=("audit",))
+    with pytest.raises(pydantic.ValidationError, match="one report kind"):
+        RecordingConfig(triage=("triage",), validation=("triage",))
+    RecordingConfig(triage=("triage", "remediate_finding"), verification=("verify",))

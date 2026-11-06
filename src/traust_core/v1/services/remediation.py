@@ -54,6 +54,7 @@ from traust_core.v1.models.integrity import FingerprintInput, sha256_hex
 from traust_core.v1.models.inventory import OrgName, RepositoryRef, default_line, ref_line
 from traust_core.v1.models.operations import (
     OPEN_ORDER_STATES,
+    REMEDIATE_FINDING,
     AssetName,
     ConfigDigest,
     JobResult,
@@ -541,8 +542,6 @@ class RemediationService:
         principal: Principal,
     ) -> WorkItem:
         """Record a leased remediation run, bound to its repository and any named work item."""
-        # Local import avoids the scheduling -> remediation dependency cycle.
-        from traust_core.v1.services.remediation_scheduling import REMEDIATE_FINDING
 
         if self._recording is None:
             raise ConfigError("remediation recording requires operations authorization")
