@@ -39,6 +39,11 @@ def test_an_unknown_config_schema_is_a_config_error() -> None:
         contracts.validate_config("no-such-config", {})
 
 
+def test_an_unknown_view_schema_is_a_config_error() -> None:
+    with pytest.raises(ConfigError):
+        contracts.validate_view("no-such-view", {})
+
+
 def test_database_ddl_applies_every_namespace_on_sqlite(tmp_path: Path) -> None:
     engine = create_database_engine(f"sqlite:///{tmp_path}/c.db")
     apply_contract_db(engine)

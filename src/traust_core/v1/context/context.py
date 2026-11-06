@@ -195,6 +195,7 @@ from traust_core.v1.services.insight import (
     ComplianceDashboardView,
     ContainerFindingsView,
     CoverageView,
+    CriticalMissesView,
     DependencyReachView,
     ExecutiveSummaryView,
     ExposureView,
@@ -968,6 +969,28 @@ class Context:
             applier=self.fleet_fix_applier,
             goldens=self.fleet_fix_goldens,
         )
+        detection_quality = DetectionQualityService(
+            uow,
+            findings,
+            ArtifactPublisher(
+                PublishSpecs(
+                    PublishSpec(BenchmarkTargetArtifact),
+                    PublishSpec(ReportArtifact),
+                    PublishSpec(ComplianceAssessmentArtifact),
+                ),
+                self.object_store,
+                uow,
+            ),
+            clock=self.clock,
+            rule_packs=self.rule_packs,
+            canaries=self.canaries,
+            code_facts=code_facts,
+            objects=self.object_store,
+            rule_drafts=self.rule_drafts,
+            sweeper=self.rule_sweeper,
+            git=self.git,
+            checkouts=self.checkouts,
+        )
         freshness = FreshnessQuery(catalog, exposure, self.clock)
         trend = FindingsTrendView(findings, portfolio, self.clock)
         threats = ThreatRegisterView(assessment, compliance, portfolio, rating, self.clock)
@@ -1038,28 +1061,7 @@ class Context:
             code_facts=code_facts,
             sync=sync,
             onboarding=OnboardingService(portfolio, sync, ops, clock=self.clock),
-            detection_quality=DetectionQualityService(
-                uow,
-                findings,
-                ArtifactPublisher(
-                    PublishSpecs(
-                        PublishSpec(BenchmarkTargetArtifact),
-                        PublishSpec(ReportArtifact),
-                        PublishSpec(ComplianceAssessmentArtifact),
-                    ),
-                    self.object_store,
-                    uow,
-                ),
-                clock=self.clock,
-                rule_packs=self.rule_packs,
-                canaries=self.canaries,
-                code_facts=code_facts,
-                objects=self.object_store,
-                rule_drafts=self.rule_drafts,
-                sweeper=self.rule_sweeper,
-                git=self.git,
-                checkouts=self.checkouts,
-            ),
+            detection_quality=detection_quality,
             pqc=pqc,
             remediation=remediation,
             verification=VerificationService(
@@ -1080,6 +1082,7 @@ class Context:
                     FindingsRollupView(findings, portfolio, assessment),
                     ContainerFindingsView(findings, portfolio, assessment, rating),
                     InsecurePatternsView(findings, portfolio),
+                    CriticalMissesView(detection_quality),
                     trend,
                     ProgramView(spend, ops, self.assets.names),
                     CoverageView(assessment, portfolio, self.clock),

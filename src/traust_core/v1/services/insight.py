@@ -44,6 +44,7 @@ from traust_core.v1.models.dependencies import (
     malicious_id,
     package_name,
 )
+from traust_core.v1.models.detection_quality import MissReason
 from traust_core.v1.models.findings import (
     FindingClock,
     FindingDimension,
@@ -69,6 +70,7 @@ from traust_core.v1.models.insight import (
     ContainerFindings,
     ContainerReport,
     CoverageDashboard,
+    CriticalMisses,
     DeclaredIac,
     DeclaredIacTarget,
     DependencyReach,
@@ -195,6 +197,7 @@ if TYPE_CHECKING:
     from traust_core.v1.services.assessment import AssessmentService
     from traust_core.v1.services.code_facts import CodeFactsService
     from traust_core.v1.services.compliance import ComplianceService
+    from traust_core.v1.services.detection_quality import DetectionQualityService
     from traust_core.v1.services.exposure import ExposureService
     from traust_core.v1.services.findings import FindingService
     from traust_core.v1.services.operations import OpsService, SpendService
@@ -301,6 +304,110 @@ class InsightService:
             raise ValidationError(
                 f"view {name.value!r} is not built; built views: {known}"
             ) from None
+
+
+class CriticalMissesView:
+    name = ViewName.CRITICAL_MISSES
+    windowed = True
+
+    def __init__(self, detection_quality: DetectionQualityService) -> None:
+        self._detection_quality = detection_quality
+
+    def build(self, filter: ViewFilter) -> CriticalMisses:
+        unsupported = filter.model_dump(exclude={"window"}, exclude_defaults=True)
+        if unsupported:
+            raise ValidationError(
+                "critical-misses supports only a global window; unsupported filters: "
+                + ", ".join(sorted(unsupported))
+            )
+        window = filter.window
+        if window is None:
+            raise ValidationError("critical-misses requires an explicit window")
+        if window.start.utcoffset() is None or window.end.utcoffset() is None:
+            raise ValidationError("critical-misses requires timezone-aware window boundaries")
+        if window.start >= window.end:
+            raise ValidationError("critical-misses requires window start before end")
+        model = CriticalMisses(
+            window=window,
+            misses=tuple(self._detection_quality.critical_misses(window)),
+        )
+        contracts.validate_view(self.name, model.model_dump(mode="json"))
+        return model
+
+    def report(self, model: CriticalMisses, generated_at: datetime) -> Report:
+        sections = [
+            Section(
+                heading="Population",
+                body="Critical findings first reported in the window after an earlier audit "
+                "of their repository. Dispositions are the currently recorded dispositions, "
+                "not a historical snapshot. This list does not measure coverage or a miss rate.",
+                table=Table(
+                    columns=("Window start (inclusive)", "Window end (exclusive)"),
+                    rows=((model.window.start.isoformat(), model.window.end.isoformat()),),
+                ),
+            )
+        ]
+        if not model.misses:
+            sections.append(
+                Section(
+                    heading="Results",
+                    body="No critical-miss entries were returned for this window. "
+                    "This does not establish that audits covered all critical findings.",
+                )
+            )
+        else:
+            for reason, heading, explanation in (
+                (
+                    MissReason.MISSED,
+                    "Missed",
+                    "The earlier audit reported nothing at the finding's paths.",
+                ),
+                (
+                    MissReason.AREA_REPORTED,
+                    "Area reported — adjudication required",
+                    "The earlier audit reported something at a finding path. "
+                    "These entries require adjudication; they are not established misses or hits.",
+                ),
+            ):
+                rows = tuple(
+                    (
+                        str(miss.finding_id),
+                        str(miss.repository_id),
+                        miss.title,
+                        str(miss.found_by),
+                        miss.found_at.isoformat(),
+                        str(miss.missed_by),
+                        miss.reason.value,
+                        "Unknown" if miss.validity is None else miss.validity,
+                    )
+                    for miss in model.misses
+                    if miss.reason == reason
+                )
+                sections.append(
+                    Section(
+                        heading=heading,
+                        body=explanation,
+                        table=Table(
+                            columns=(
+                                "Finding ID",
+                                "Repository ID",
+                                "Title",
+                                "Found by assessment",
+                                "Found at",
+                                "Missed by audit",
+                                "Reason",
+                                "Validity",
+                            ),
+                            rows=rows,
+                        ),
+                    )
+                )
+        return Report(
+            title="Critical misses",
+            generated_at=generated_at,
+            sections=tuple(sections),
+            sources=("DetectionQualityService.critical_misses",),
+        )
 
 
 class ContainerFindingsView:

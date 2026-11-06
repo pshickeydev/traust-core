@@ -71,6 +71,20 @@ The remaining correctness changes are:
 - `services.artifacts` resolves every named document through the shared artifact catalog,
   including PQC facts published by the native prescan. Role aliases retain their common
   schema type; integrity checks and domain-scoped publication permissions remain unchanged.
+- `ViewName.CRITICAL_MISSES` is a global, on-demand view of
+  `DetectionQualityService.critical_misses(window)`. Use `ctx.services().insight.build`,
+  `report` or `publish` with `ViewFilter(window=TimeWindow(start=…, end=…))`;
+  boundaries must be timezone-aware and increasing, with an inclusive start and exclusive end.
+  Scope filters and `as_of` are refused because dispositions are current, not historical.
+  The model retains the existing `CriticalMiss` rows under `window` / `misses`, validated by
+  `contracts.validate_view("critical-misses", document)` against the separately packaged
+  `contracts.view_schema("critical-misses")`, not an artifact schema or stored projection.
+  Shared Markdown/HTML renderers retain IDs, assessment provenance, reason and unknown validity;
+  `area_reported` requires adjudication and is not a confirmed miss or hit. Empty results do not
+  establish coverage or a miss rate. Publishing writes neither database rows nor object bytes.
+  Refresh without a window uses its existing current-month fallback. The same registry is
+  available at `GET /v1/insights/critical-misses?window_start=…&window_end=…`; both boundaries
+  are required together.
 
 
 ## Repository checkouts

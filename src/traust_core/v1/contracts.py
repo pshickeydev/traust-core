@@ -204,6 +204,20 @@ def validate_config(name: str, document: Any) -> None:
     _check(name, _config_validator(name), document)
 
 
+def view_schema(name: str) -> dict[str, Any]:
+    """A `views_schema/v1` contract for an on-demand, non-persisted view."""
+    return _read_json(_root() / "views_schema/v1" / f"{name}.schema.json")
+
+
+@cache
+def _view_validator(name: str) -> Draft202012Validator:
+    return Draft202012Validator(view_schema(name), format_checker=FormatChecker())
+
+
+def validate_view(name: str, document: Any) -> None:
+    _check(name, _view_validator(name), document)
+
+
 def _violations(validator: Draft202012Validator, document: Any) -> list[SchemaViolation]:
     return sorted(validator.iter_errors(document), key=lambda e: list(e.absolute_path))
 

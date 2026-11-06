@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import pytest
 from fastapi.testclient import TestClient
 
 from tests.v1.repositories.tables.conftest import Seed
 from tests.v1.rest.conftest import bearer, same_as_in_process
+from tests.v1.services.test_detection_quality_doors import WINDOW, Campaign, World
+from traust_core.v1 import contracts
 from traust_core.v1.context import Context
 from traust_core.v1.models.insight import ViewFilter, ViewName
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
@@ -66,3 +69,62 @@ def test_a_category_query_scopes_the_insight(context: Context, client: TestClien
     params = {"repository_id": str(ref.repository_id), "category": ["crypto"]}
     body = client.get(url, params=params, headers=bearer(context)).json()
     assert [r["message"]["text"] for r in body["runs"][0]["results"]] == ["crypto finding"]
+
+
+@pytest.fixture
+def campaign(context: Context) -> Campaign:
+    uow = SqlTraustUnitOfWork(context.database)
+    return Campaign(World(context.database, uow, context.services().artifacts)).build()
+
+
+def test_critical_misses_uses_the_existing_insight_registry_and_native_population(
+    context: Context, client: TestClient, campaign: Campaign
+) -> None:
+    params = {"window_start": WINDOW.start.isoformat(), "window_end": WINDOW.end.isoformat()}
+    response = client.get("/v1/insights/critical-misses", params=params, headers=bearer(context))
+    assert response.status_code == 200
+    expected = context.services().insight.build(ViewName.CRITICAL_MISSES, ViewFilter(window=WINDOW))
+    body = response.json()
+    same_as_in_process(body, expected)
+    contracts.validate_view("critical-misses", body)
+    assert {row["finding_id"] for row in body["misses"]} == {
+        str(campaign.ids[name]) for name in ("area", "missed", "benchmark-first")
+    }
+    assert body["window"] == WINDOW.model_dump(mode="json")
+    assert client.get("/v1/insights/critical-misses", params=params).status_code == 401
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {},
+        {"window_start": WINDOW.start.isoformat()},
+        {"window_end": WINDOW.end.isoformat()},
+        {"window_start": WINDOW.end.isoformat(), "window_end": WINDOW.start.isoformat()},
+        {"window_start": WINDOW.start.isoformat(), "window_end": WINDOW.start.isoformat()},
+        {
+            "window_start": WINDOW.start.replace(tzinfo=None).isoformat(),
+            "window_end": WINDOW.end.isoformat(),
+        },
+        {
+            "window_start": WINDOW.start.isoformat(),
+            "window_end": WINDOW.end.replace(tzinfo=None).isoformat(),
+        },
+        {
+            "window_start": WINDOW.start.isoformat(),
+            "window_end": WINDOW.end.isoformat(),
+            "as_of": WINDOW.end.isoformat(),
+        },
+        {
+            "window_start": WINDOW.start.isoformat(),
+            "window_end": WINDOW.end.isoformat(),
+            "category": "crypto",
+        },
+    ],
+)
+def test_critical_misses_http_refuses_incomplete_invalid_or_unsupported_filters(
+    context: Context, client: TestClient, params: dict[str, str]
+) -> None:
+    response = client.get("/v1/insights/critical-misses", params=params, headers=bearer(context))
+    assert response.status_code == 422
+    assert response.headers["content-type"] == "application/problem+json"
