@@ -8,7 +8,6 @@ a verification's verdicts fold back at read (VerificationService.revalidated_ver
 from __future__ import annotations
 
 import logging
-import re
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 from uuid import UUID
@@ -18,7 +17,7 @@ from traust_core.v1.models.common import Page, PageRequest
 from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.inventory import RepositoryRef
 from traust_core.v1.models.operations import REMEDIATE_FINDING, OrderRequest, RunOrder
-from traust_core.v1.models.remediation import OVER, WorkItem, furthest
+from traust_core.v1.models.remediation import OVER, Fork, WorkItem, furthest
 from traust_core.v1.models.remediation_scheduling import (
     RemediationFindingRequest,
     ScheduledEffort,
@@ -27,7 +26,11 @@ from traust_core.v1.models.vocabulary import RemediationStatus
 from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.services.findings.service import FindingService
 from traust_core.v1.services.portfolio import Inventory
-from traust_core.v1.services.remediation import RemediationService, VerificationService
+from traust_core.v1.services.remediation import (
+    RemediationService,
+    VerificationService,
+    check_fix_branch,
+)
 
 if TYPE_CHECKING:
     from traust_core.v1.services.operations import OpsService
@@ -40,9 +43,6 @@ _REVALIDATED = frozenset({"revalidated_fixed", "revalidated_still_vulnerable"})
 _BATCH = 200
 # A scheduled fix is asked for now, like onboarding's baseline orders.
 _ASKED_NOW = 0
-# The remediation report's `fork.fix_branch` (traust-contracts remediation schema): a branch
-# scheduled here becomes that field, so it must pass it as well as git's rules.
-_FIX_BRANCH = re.compile(r"[A-Za-z0-9._/-]{1,200}")
 
 
 class RemediationSchedulingService:
@@ -76,7 +76,7 @@ class RemediationSchedulingService:
         wanted = tuple(dict.fromkeys((f.finding_id, f.repository_id) for f in findings))
         if not wanted:
             raise ValidationError("a remediation needs at least one finding")
-        _branch(fork_branch)
+        check_fix_branch(fork_branch)
         finding_ids = {f for f, _ in wanted}
         with self._uow.write():
             # a second request for any of these findings waits here, then finds this effort
@@ -148,8 +148,8 @@ class RemediationSchedulingService:
         """One scheduled effort: its work item (the effort itself) and the fork facts of the
         order that runs it."""
         item = self._remediation.get(work_item_id)
-        order = self._ops.order_for_work_item(work_item_id)
-        if order is None or order.fork_url is None or order.fork_branch is None:
+        order = self._remediation.scheduled_order(work_item_id)
+        if order is None:
             raise NotFoundError(f"work item {work_item_id} schedules no remediation")
         # A work-item order's repository is never null: the pairing trigger holds it to the
         # work item's commit's repository (contracts#117's run_order_work_item_of_repository).
@@ -180,11 +180,12 @@ class RemediationSchedulingService:
         after = page.position()
         found: list[ScheduledEffort] = []
         history: dict[UUID, list[WorkItem]] = {}  # each repository folded once per listing
+        forks: dict[UUID, Fork] = {}
         while len(found) <= page.limit:
             orders = self._ops.orders_after(REMEDIATE_FINDING, repository_id, after, _BATCH)
             found += [
                 e
-                for e in self._efforts(orders, history)
+                for e in self._efforts(orders, history, forks)
                 if (status is None or e.status == status)
                 and (finding_id is None or finding_id in e.work_item.finding_ids)
             ]
@@ -198,7 +199,10 @@ class RemediationSchedulingService:
         )
 
     def _efforts(
-        self, orders: Sequence[RunOrder], history: dict[UUID, list[WorkItem]]
+        self,
+        orders: Sequence[RunOrder],
+        history: dict[UUID, list[WorkItem]],
+        forks: dict[UUID, Fork],
     ) -> list[ScheduledEffort]:
         """The efforts a batch of orders schedules, in their order: each work item once, at the
         order `get` reads for it (the oldest carrying both fork facts — an order naming no fork
@@ -213,9 +217,13 @@ class RemediationSchedulingService:
             chosen = None if item is None else scheduling.get(item.work_item_id)
             if item is None or chosen is None or chosen.id != order.id:
                 continue
-            assert order.fork_url is not None and order.fork_branch is not None
             # A work-item order's repository is never null (contracts#117's pairing trigger).
             assert order.repository_id is not None
+            if order.repository_id not in forks:
+                forks[order.repository_id] = self._remediation.resolve_fork(order.repository_id)
+            if not self._remediation.vouches(order, forks[order.repository_id]):
+                continue
+            assert order.fork_url is not None and order.fork_branch is not None
             made.append(
                 ScheduledEffort(
                     work_item=item,
@@ -280,11 +288,10 @@ class RemediationSchedulingService:
             repository_id, {f for item in covering for f in item.finding_ids}
         )
         for item in covering:
-            order = self._ops.order_for_work_item(item.work_item_id)
-            if (
-                order is None or order.fork_url is None or order.fork_branch is None
-            ):  # a manually opened work item, or one no order ever ran: not a scheduled effort
+            order = self._remediation.scheduled_order(item.work_item_id)
+            if order is None:  # opened by hand, or by no order scheduling vouches for
                 continue
+            assert order.fork_url is not None and order.fork_branch is not None
             effort = ScheduledEffort(
                 work_item=item,
                 repository_id=repository_id,
@@ -317,21 +324,3 @@ class RemediationSchedulingService:
                 "commit to patch"
             )
         return ref
-
-
-def _branch(name: str) -> None:
-    """Reject what `git check-ref-format --branch` rejects, and what the remediation report's
-    `fork.fix_branch` pattern does."""
-    parts = name.split("/")
-    bad = (
-        not _FIX_BRANCH.fullmatch(name)
-        or name == "@"
-        or name.startswith("-")
-        or ".." in name
-        or name.endswith(".")
-        # per component: not empty (no leading, trailing or doubled /), no leading dot,
-        # no .lock ending
-        or any(not p or p.startswith(".") or p.endswith(".lock") for p in parts)
-    )
-    if bad:
-        raise ValidationError(f"fork_branch is not a branch name: {name!r}")

@@ -1081,6 +1081,39 @@ def test_get_answers_not_found_for_what_was_never_scheduled(
         service.get(item.work_item_id)
 
 
+@pytest.mark.parametrize(
+    "fork",
+    [
+        {"fork_url": "https://github.com/attacker/fork", "fork_branch": "fix/anything"},
+        {"fork_branch": "../../etc"},  # the policy's fork, a branch git refuses
+    ],
+)
+def test_fork_facts_scheduling_never_checked_steer_nothing(
+    service: RemediationSchedulingService,
+    context: Context,
+    engine: Engine,
+    fork: dict[str, str],
+) -> None:
+    """Orders from the generic door before it lost its fork fields carry unchecked facts."""
+    repository_id, finding_ids, _ = seeded(engine)
+    remediation = context.services().remediation
+    item = remediation.open(finding_ids, default_ref(engine, repository_id))
+    policy = str(remediation.resolve_fork(repository_id).url)
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        at = {"asset": "remediate_finding", "state": "queued", "repository_id": repository_id}
+        seed.run_order(**at, work_item_id=item.work_item_id)  # bare, older
+        apart()
+        seed.run_order(**at, work_item_id=item.work_item_id, **{"fork_url": policy, **fork})
+        uow.commit()
+    with pytest.raises(NotFoundError, match="schedules no remediation"):
+        service.get(item.work_item_id)
+    assert service.list(PageRequest()).items == ()
+    assert remediation.scheduled_order(item.work_item_id) is None
+    prepared = remediation.prepare(item.work_item_id)
+    assert prepared.fix_branch != fork["fork_branch"]  # the policy's branch, not the order's
+
+
 def test_the_listing_follows_its_cursor_page_after_page(
     service: RemediationSchedulingService, engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:

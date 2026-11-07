@@ -141,6 +141,9 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 REMEDIATION = AssessmentKind.REMEDIATION
+# The remediation report's `fork.fix_branch` (traust-contracts remediation schema): a branch
+# scheduled here becomes that field, so it must pass it as well as git's rules.
+_FIX_BRANCH = re.compile(r"[A-Za-z0-9._/-]{1,200}")
 ASSESSOR = "skill:remediate-finding"
 FLEET_FIX = AssessmentKind.FLEET_FIX
 FLEET_FIX_ASSESSOR = "skill:fleet-fix"
@@ -320,7 +323,7 @@ class RemediationService:
         views = self._findings.list_by_ids(item.finding_ids)
         # a scheduled effort's fork is the policy's (checked at scheduling); its branch is the
         # one the scheduler named, on the order that runs the work item
-        order = self._ops.order_for_work_item(work_item_id)
+        order = self.scheduled_order(work_item_id)
         return RemediationInput(
             subject=subject,
             findings=FindingContext(),
@@ -493,6 +496,26 @@ class RemediationService:
             key=lambda c: (_rank(c.findings[0]), -len(c.findings), c.url),
         )
 
+    def scheduled_order(self, work_item_id: UUID) -> RunOrder | None:
+        """The order that scheduled the work item's effort, when scheduling vouches for its
+        fork facts; None for an item opened by hand or by an order it doesn't."""
+        order = self._ops.order_for_work_item(work_item_id)
+        if order is None or order.repository_id is None:
+            return None
+        return order if self.vouches(order, self.resolve_fork(order.repository_id)) else None
+
+    @staticmethod
+    def vouches(order: RunOrder, fork: Fork) -> bool:
+        """Whether an order's fork facts are what scheduling sets: the repository's remediation
+        fork and a fix branch. The generic orders door once took unchecked ones."""
+        if order.fork_url is None or order.fork_branch is None or order.fork_url != str(fork.url):
+            return False
+        try:
+            check_fix_branch(order.fork_branch)
+        except ValidationError:
+            return False
+        return True
+
     def resolve_fork(self, repository_id: UUID) -> Fork:
         repository = self._inventory.get_repository(repository_id)
         mirror = self._inventory.private_mirror(repository_id)
@@ -606,12 +629,10 @@ class RemediationService:
         self._refuse_public(pushed_to)
         # a scheduled fix is pushed where it was scheduled: its commit is what verification of
         # that branch later revalidates
-        order = self._ops.order_for_work_item(item.work_item_id)
-        if (
-            order is not None
-            and order.fork_url is not None
-            and order.fork_branch is not None
-            and (pushed_to, doc.fork.fix_branch) != (order.fork_url, order.fork_branch)
+        order = self.scheduled_order(item.work_item_id)
+        if order is not None and (pushed_to, doc.fork.fix_branch) != (
+            order.fork_url,
+            order.fork_branch,
         ):
             raise ValidationError(
                 f"remediation report pushes to {pushed_to} {doc.fork.fix_branch}, not the "
@@ -1745,3 +1766,21 @@ class VerificationService:
 
 def _scanned(assessment: Assessment) -> bool:
     return assessment.kind == AssessmentKind.SCANNER and assessment.status == ASSESSMENT_COMPLETED
+
+
+def check_fix_branch(name: str) -> None:
+    """Reject what `git check-ref-format --branch` rejects, and what the remediation report's
+    `fork.fix_branch` pattern does."""
+    parts = name.split("/")
+    bad = (
+        not _FIX_BRANCH.fullmatch(name)
+        or name == "@"
+        or name.startswith("-")
+        or ".." in name
+        or name.endswith(".")
+        # per component: not empty (no leading, trailing or doubled /), no leading dot,
+        # no .lock ending
+        or any(not p or p.startswith(".") or p.endswith(".lock") for p in parts)
+    )
+    if bad:
+        raise ValidationError(f"fork_branch is not a branch name: {name!r}")

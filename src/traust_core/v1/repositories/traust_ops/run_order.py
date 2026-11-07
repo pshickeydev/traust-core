@@ -228,16 +228,26 @@ class SqlRunOrderRepository(SqlMutableRepository[RunOrder]):
 
     def scheduling_orders(self, work_item_ids: Collection[UUID]) -> dict[UUID, RunOrder]:
         c = self.table.c
-        forked = [
-            o
-            for o in self._many_in(
-                f"orders of {len(work_item_ids)} work items", c.work_item_id, work_item_ids
-            )
-            if o.fork_url is not None and o.fork_branch is not None
-        ]
         first: dict[UUID, RunOrder] = {}
-        for o in sorted(forked, key=lambda o: (o.created_at, o.id)):  # type: ignore[arg-type,return-value]
-            first.setdefault(o.work_item_id, o)  # type: ignore[arg-type]
+        for batch in self._batches(work_item_ids):
+            rank = (
+                sa.func.row_number()
+                .over(partition_by=c.work_item_id, order_by=(c.created_at, c.id))
+                .label("rank")
+            )
+            ranked = (
+                sa.select(self.table, rank)
+                .where(
+                    c.work_item_id.in_(batch), c.fork_url.is_not(None), c.fork_branch.is_not(None)
+                )
+                .subquery()
+            )
+            stmt = sa.select(*(ranked.c[col.name] for col in c)).where(ranked.c.rank == 1)
+            rows = self._execute(f"scheduling orders of {len(batch)} work items", stmt)
+            first.update(
+                (o.work_item_id, o)  # type: ignore[misc]
+                for o in map(self._to_record, rows.mappings())
+            )
         return first
 
     def search(
