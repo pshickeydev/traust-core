@@ -46,7 +46,6 @@ from traust_core.v1.models.validation import (
     ValidationRollup,
     ValidationScope,
     ValidationTarget,
-    hostname,
     origin,
 )
 from traust_core.v1.models.vocabulary import (
@@ -207,11 +206,25 @@ def _authorize_http_step(step: SchemaView, scope: ValidationScope, now: datetime
             )
             if name is None:
                 checks.append(("services", None, "list"))
+        direct_origin = getattr(probe, "url", None) if mode == "direct" and ns is None else None
+        if mode == "direct" and ns is None and not isinstance(direct_origin, str):
+            raise ForbiddenError("direct HTTP requires an exact URL")
         for checked_resource, checked_name, checked_verb in checks:
             decision = scope.decide(
-                ValidationAction(kind=ValidationActionKind.K8S, verb=checked_verb),
+                ValidationAction(
+                    kind=(
+                        ValidationActionKind.HTTP
+                        if mode == "direct" and ns is None
+                        else ValidationActionKind.K8S
+                    ),
+                    verb=checked_verb,
+                ),
                 ValidationTarget(
-                    context=context, namespace=ns, resource=checked_resource, name=checked_name
+                    context=context,
+                    namespace=ns,
+                    resource=checked_resource,
+                    name=checked_name,
+                    url=direct_origin,
                 ),
                 as_of=now,
             )
@@ -290,8 +303,15 @@ def _authorize_http_step(step: SchemaView, scope: ValidationScope, now: datetime
             try:
                 if not isinstance(url, str):
                     raise ValueError("missing URL")
-                origin(url)
-                host = hostname(url)
+                scheme, host, port = origin(url)
+                if ns is None and (
+                    (getattr(probe, "scheme", None) or "auto") not in ("auto", scheme)
+                    or (
+                        getattr(probe, "port", None) is not None
+                        and getattr(probe, "port", None) != port
+                    )
+                ):
+                    raise ValueError("direct URL does not match its scheme or port")
             except ValueError as e:
                 raise ForbiddenError("direct HTTP requires an exact URL") from e
             exact = [

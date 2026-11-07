@@ -126,6 +126,9 @@ and nonempty names restrict it to those nodes. Node address types and networks r
 runtime checks. Scope binding rejects conflicting HTTP policies for the same context.
 When a Route probe names a literal origin, approval requires that host to match its exact Route
 target or an applicable discovery domain; execution must also verify the resolved Route origin.
+Namespace-less direct HTTP uses a distinct HTTP action, not cluster-wide Kubernetes
+permission. It requires an explicit exact-host grant, a named context with a pinned
+API, and the permitted action; expiry, off-limits and denied verbs still apply.
 
 `ValidationScope.expires` is valid through its date; timezone-aware `expires_at` expires at the
 specified instant. Bindings intersect both constraints. `decide`/`permits` accept a date or an

@@ -154,6 +154,7 @@ class ValidationActionKind(StrEnum):
     """Scope operations, including operations outside the execution-adapter registry."""
 
     K8S = "k8s"
+    HTTP = "http"
     CONTAINER = "container"
     WASM = "wasm"
     BROWSER = "browser"
@@ -219,6 +220,30 @@ def origin(value: str) -> tuple[str, str, int]:
     if scheme not in {"http", "https"} or not parsed.netloc:
         raise ValueError("expected an HTTP(S) origin")
     return scheme, host, parsed.port or (443 if scheme == "https" else 80)
+
+
+def _http_origin(value: str) -> tuple[str, str, int]:
+    parsed = urlsplit(value)
+    result = origin(value)
+    if parsed.path not in {"", "/"} or parsed.query or parsed.fragment or "#" in value:
+        raise ValueError("expected an HTTP(S) origin without a path, query, or fragment")
+    authority = parsed.netloc
+    if authority.startswith("["):
+        closing = authority.find("]")
+        if closing < 0 or not isinstance(
+            ipaddress.ip_address(parsed.hostname), ipaddress.IPv6Address
+        ):
+            raise ValueError("invalid IPv6 authority")
+        if "%" in authority:
+            raise ValueError("scoped IPv6 addresses are not valid HTTP origins")
+        suffix = authority[closing + 1 :]
+        if suffix and (not suffix.startswith(":") or not suffix[1:].isdigit()):
+            raise ValueError("invalid HTTP port")
+    elif "[" in authority or "]" in authority or (
+        ":" in authority and not authority.rsplit(":", 1)[1].isdigit()
+    ):
+        raise ValueError("invalid HTTP authority")
+    return result
 
 
 class HttpTarget(Model):
@@ -723,6 +748,8 @@ class ValidationScope(Model):
             return f"off_limits: {rule!r}"
         if action.kind == ValidationActionKind.K8S:
             return self._k8s_denial(action, target)
+        if action.kind == ValidationActionKind.HTTP:
+            return self._http_denial(action, target)
         if action.kind == ValidationActionKind.CONTAINER:
             if not self.containers:
                 return "no containers in scope"
@@ -780,6 +807,45 @@ class ValidationScope(Model):
                 )
             return None
         return f"unknown inventory resource '{target.resource}'"
+
+    def _http_denial(self, action: ValidationAction, target: ValidationTarget) -> str | None:
+        if ScopeBindingMode.EXPLICIT not in self.modes:
+            return "direct HTTP requires an explicit scope"
+        if (
+            not target.context
+            or target.context == "__current__"
+            or any(ord(c) <= 32 or ord(c) == 127 for c in target.context)
+            or target.namespace is not None
+            or target.resource != "http_targets"
+            or (target.name is not None and not re.fullmatch(r"[a-z0-9][a-z0-9.-]*", target.name))
+            or target.image is not None
+            or target.artifact_id is not None
+        ):
+            return "invalid namespace-less direct HTTP target"
+        if action.verb not in {"port-forward+http", "get", "create", "update", "patch", "delete"}:
+            return f"unsupported direct HTTP verb '{action.verb}'"
+        cluster = next((c for c in self.clusters if c.context == target.context), None)
+        if cluster is None or not cluster.api:
+            return "direct HTTP requires an explicitly pinned cluster API for its context"
+        if action.verb in cluster.verbs_denied:
+            return f"verb '{action.verb}' denied for context '{cluster.context}'"
+        try:
+            _http_origin(cluster.api)
+            if target.url is None:
+                raise ValueError("missing direct HTTP origin")
+            _, host, _ = _http_origin(target.url)
+        except (TypeError, ValueError):
+            return "direct HTTP requires valid target and cluster API origins"
+        if not any(
+            grant.host == host
+            and grant.context == target.context
+            and grant.namespace is None
+            and grant.resource in (None, "http_targets")
+            and (grant.name is None or grant.name == target.name)
+            for grant in self.http_targets
+        ):
+            return "direct HTTP requires a matching explicit target grant"
+        return None
 
     def _k8s_denial(self, action: ValidationAction, target: ValidationTarget) -> str | None:
         cluster = next((c for c in self.clusters if c.context == target.context), None)
