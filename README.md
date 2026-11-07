@@ -121,9 +121,11 @@ The remaining correctness changes are:
   are omitted; held-out targets remain available only through release scoring. An empty view
   means no eligible scorecards, not necessarily no recorded audits. The view takes no filters
   and is excluded from implicit refresh; explicit publication remains available.
-  Reads share a 10,000-record workload budget across the answer key, audit history, report
-  metadata, findings and target matching/scoring. Overflow raises `ValidationError` (HTTP 422),
-  never a partial scorecard. Matching and scoring reuse the same loaded reports.
+  Reads share a 10,000-materialized-input-record budget across the answer key, audit
+  history, artifact metadata reads and report findings. Matching, rerun comparisons and
+  per-version scoring reuse those inputs without charging them again. Each actual related
+  metadata read still counts; this is not a byte-size or scoring-iteration limit. Overflow
+  raises `ValidationError` (HTTP 422), never a partial scorecard.
   The model is validated by `contracts.validate_view("benchmark-scorecards", …)`. The report
   renders strict recall, near misses (adjudication items, never detections), injection and
   stability; unmeasured cells show `—`, never 0. No recorded answer key is `NotFoundError`.

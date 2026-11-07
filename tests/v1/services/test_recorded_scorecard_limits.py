@@ -49,24 +49,21 @@ def test_only_eligible_versions_are_published_without_losing_skipped_targets(wor
     assert {card.auditor_versions for card in release} == {("eligible",), ("held-only",)}
 
 
+@pytest.mark.parametrize("excluded", [{"held_out": True}, {"admitted": False}])
 def test_a_commit_less_audit_of_a_shared_repository_does_not_fall_to_the_eligible_target(
-    world: World,
+    world: World, excluded: dict[str, bool]
 ) -> None:
-    """Qodo 393: eligibility is applied after resolution, not before."""
     shared = "https://github.com/org/shared"
     world.key(
         target(repo_url=shared),
-        target(id="bt-held-shared", repo_url=shared, held_out=True),
+        target(id="bt-excluded-shared", repo_url=shared, **excluded),
     )
     world.attach(
         audited(finding(fingerprint=FP), repository=shared),
         AssessmentKind.BENCHMARK_AUDIT,
         "h-1",
     )
-    # The audit is ambiguous between the two targets and matches neither: it must not
-    # fall to the eligible one just because the held-out one was excluded up front.
     assert world.service().scorecards(BenchmarkFilter()) == []
-    # Release scoring sees both candidates, so the same ambiguity holds there.
     assert world.service().scorecards(BenchmarkFilter(include_held_out=True)) == []
 
 
@@ -116,6 +113,28 @@ def test_audit_findings_share_the_cumulative_budget(world: World) -> None:
         world.service().scorecards(BenchmarkFilter(), max_records=12)
     (card,) = world.service().scorecards(BenchmarkFilter(), max_records=1000)
     assert (card.targets_scored, card.overall.expected, card.overall.detected) == (1, 1, 1)
+
+
+def test_exact_materialized_budget_survives_reruns_and_multiple_versions(world: World) -> None:
+    world.key(target())
+    for index, version in enumerate(("first", "first", "second")):
+        world.attach(
+            audited(finding(fingerprint=FP)),
+            AssessmentKind.BENCHMARK_AUDIT,
+            version,
+            occurred_at=T0 + timedelta(seconds=index),
+        )
+    # Key metadata/target/expected plus three audit/link/metadata/finding sets: 3 + 3*4.
+    cards = world.service().scorecards(BenchmarkFilter(), max_records=15)
+    assert [
+        (card.auditor_versions, card.overall.detected, card.overall.expected, card.mean_stability)
+        for card in cards
+    ] == [
+        (("first",), 1, 1, 1.0),
+        (("second",), 1, 1, None),
+    ]
+    with pytest.raises(ValidationError):
+        world.service().scorecards(BenchmarkFilter(), max_records=14)
 
 
 def test_bounded_complete_results_reuse_reports_read_for_matching(
