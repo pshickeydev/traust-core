@@ -96,6 +96,7 @@ from traust_core.v1.models.insight import (
     InsecurePattern,
     InsecurePatternCut,
     InsecurePatterns,
+    InventoryExport,
     IsolationReviewRow,
     IsolationSummary,
     LanguageSeverity,
@@ -152,7 +153,13 @@ from traust_core.v1.models.insight import (
     ViewModel,
     ViewName,
 )
-from traust_core.v1.models.inventory import Product, Repository, RepositoryFilter, default_line
+from traust_core.v1.models.inventory import (
+    INVENTORY_COLUMNS,
+    Product,
+    Repository,
+    RepositoryFilter,
+    default_line,
+)
 from traust_core.v1.models.operations import (
     FINISHED_ORDER_STATES,
     AssetName,
@@ -283,9 +290,8 @@ class InsightService:
         return result
 
     def refresh(self, views: Sequence[ViewName] | None, filter: ViewFilter) -> RefreshResult:
-        """Render each view (all registered, bar single-item renders, when None); a view that
-        fails doesn't stop the rest; a windowed view with no window covers the month of `as_of`.
-        A ConfigError is the deployment's, not one view's, so it stops the refresh."""
+        """Render selected views; implicit refresh excludes per-item and on-demand views.
+        Configuration errors stop refresh; individual view errors are reported."""
         names = (
             [
                 n
@@ -351,6 +357,63 @@ class InsightService:
         if filter is not None and filter.window is not None and not _accepts_window(found):
             raise ValidationError(f"{name.value} does not support a window")
         return found
+
+
+class InventoryExportView:
+    name = ViewName.INVENTORY_EXPORT
+    on_demand = True
+
+    def __init__(self, portfolio: PortfolioService, *, max_records: int = 10_000) -> None:
+        self._portfolio = portfolio
+        self._max_records = max_records
+
+    @staticmethod
+    def supports_filter(filter: ViewFilter) -> bool:
+        return not filter.model_dump(exclude_defaults=True)
+
+    def build(self, filter: ViewFilter) -> InventoryExport:
+        if not self.supports_filter(filter):
+            unsupported = filter.model_dump(exclude_defaults=True)
+            raise ValidationError(
+                "inventory-export takes no filters; unsupported: " + ", ".join(sorted(unsupported))
+            )
+        model = InventoryExport(
+            rows=self._portfolio.inventory_export(max_records=self._max_records)
+        )
+        contracts.validate_view(self.name, model.model_dump(mode="json"))
+        return model
+
+    def report(self, model: InventoryExport, generated_at: datetime) -> Report:
+        return Report(
+            title="Inventory export",
+            generated_at=generated_at,
+            sections=(
+                Section(
+                    heading="Repositories",
+                    body="" if model.rows else "No repositories registered.",
+                    table=self.export(model),
+                ),
+            ),
+            sources=("PortfolioService.inventory_export",),
+        )
+
+    def export(self, model: InventoryExport) -> Table:
+        return Table(
+            columns=INVENTORY_COLUMNS,
+            rows=tuple(
+                (
+                    row.repository,
+                    row.url,
+                    row.host,
+                    row.organization,
+                    row.repo_name,
+                    "; ".join(row.owner_teams),
+                    "; ".join(row.products),
+                    "; ".join(row.accountable_contacts),
+                )
+                for row in model.rows
+            ),
+        )
 
 
 class CompliancePrecisionView:

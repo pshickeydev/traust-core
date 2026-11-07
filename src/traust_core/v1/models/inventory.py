@@ -13,7 +13,7 @@ from enum import StrEnum
 from typing import NewType
 from uuid import UUID
 
-from pydantic import AwareDatetime, Field, field_serializer
+from pydantic import AwareDatetime, ConfigDict, Field, field_serializer
 
 from traust_core.v1.models.base import Entity, Model
 from traust_core.v1.models.values import GitSha, HttpsRepoUrl
@@ -46,6 +46,26 @@ class Repository(Entity):
     url: str
     public: bool
     archived: bool | None = None
+
+
+class InventoryExportRow(Model):
+    model_config = ConfigDict(
+        frozen=True, extra="forbid", populate_by_name=True, serialize_by_alias=True
+    )
+
+    repository: str = Field(alias="Repository")
+    url: str = Field(alias="URL")
+    host: str = Field(alias="Host")
+    organization: str = Field(alias="Organization/Group")
+    repo_name: str = Field(alias="Repo Name")
+    owner_teams: tuple[str, ...] = Field(alias="Owner Team")
+    products: tuple[str, ...] = Field(alias="Products")
+    accountable_contacts: tuple[str, ...] = Field(alias="Accountable Contacts")
+
+
+INVENTORY_COLUMNS = tuple(
+    field.alias or name for name, field in InventoryExportRow.model_fields.items()
+)
 
 
 class RepositoryRef(Entity):

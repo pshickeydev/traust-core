@@ -8,7 +8,7 @@ lifecycle. Tracker keys, CPEs, errata tags, legacy teams and free text are never
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from datetime import date
 from enum import StrEnum
 from typing import Any
@@ -16,6 +16,7 @@ from typing import Any
 from pydantic import Field
 
 from traust_core.v1.models.base import Dto
+from traust_core.v1.models.common import RecordBudget
 
 DEFINITION_KEYS = ("ps_products", "ps_modules", "ps_update_streams")
 # These values may be passed to an employee verification tool.
@@ -153,21 +154,33 @@ def _slug(text: str | None) -> str:
 class ProductDefinitions:
     """The registry document indexed for lookups by product id, package name and repo URL."""
 
-    def __init__(self, document: Mapping[str, Any], today: date) -> None:
+    def __init__(
+        self,
+        document: Mapping[str, Any],
+        today: date,
+        *,
+        read_budget: RecordBudget | None = None,
+    ) -> None:
         self._products: dict[str, Any] = document.get("ps_products") or {}
         self._modules: dict[str, Any] = document.get("ps_modules") or {}
         self._today = today
+        self._read_budget = read_budget
+        streams = document.get("ps_update_streams") or {}
+        self._consume(1 + len(self._products) + len(self._modules) + len(streams))
         self._module_products: dict[str, list[str]] = {}
         for pid, product in self._products.items():
+            self._consume(len(product.get("ps_modules") or []))
             for mid in product.get("ps_modules") or []:
                 self._module_products.setdefault(mid, []).append(pid)
         self._stream_modules: dict[str, list[str]] = {}
         for mid, module in self._modules.items():
+            self._consume(len(module.get("ps_update_streams") or []))
             for sid in module.get("ps_update_streams") or []:
                 self._stream_modules.setdefault(sid, []).append(mid)
         self._repo_streams: dict[str, list[str]] = {}
         self._repo_components: dict[str, set[str]] = {}
-        for sid, stream in (document.get("ps_update_streams") or {}).items():
+        for sid, stream in streams.items():
+            self._consume(len(stream.get("managed_service_components") or []))
             for component in stream.get("managed_service_components") or []:
                 if url := component.get("git_repo_url"):
                     key = norm_repo_url(url)
@@ -179,6 +192,10 @@ class ProductDefinitions:
                 if s := _slug(candidate):
                     self._slugs.setdefault(s, pid)
 
+    def _consume(self, count: int) -> None:
+        if self._read_budget is not None:
+            self._read_budget.consume(count)
+
     def resolve(
         self,
         mappings: ProductMappings,
@@ -187,13 +204,16 @@ class ProductDefinitions:
         product_ids: Iterable[str] = (),
     ) -> tuple[ProductMatch, ...]:
         """Each query's match, in query order: packages, then repo URLs, then product ids."""
-        results = [
-            self._package(name, mappings).model_copy(
-                update={"query": ProductQuery(kind=ProductQueryKind.PACKAGE, value=name)}
+        results = []
+        for name in packages:
+            self._consume(1)
+            results.append(
+                self._package(name, mappings).model_copy(
+                    update={"query": ProductQuery(kind=ProductQueryKind.PACKAGE, value=name)}
+                )
             )
-            for name in packages
-        ]
         for url in repo_urls:
+            self._consume(1)
             mapped = mappings.repos.get(url) or mappings.repos.get(norm_repo_url(url))
             match = (
                 (self.product(mapped) if mapped else None)
@@ -203,6 +223,7 @@ class ProductDefinitions:
             query = ProductQuery(kind=ProductQueryKind.REPO_URL, value=url)
             results.append(match.model_copy(update={"query": query}))
         for pid in product_ids:
+            self._consume(1)
             match = self.product(pid) or self._none(
                 ProductEvidence(error=f"{pid!r} not in registry")
             )
@@ -222,8 +243,16 @@ class ProductDefinitions:
         key = norm_repo_url(url)
         if not (streams := self._repo_streams.get(key)):
             return None
-        modules = [mid for sid in streams for mid in self._stream_modules.get(sid, [])]
-        products = [pid for mid in modules for pid in self._module_products.get(mid, [])]
+        modules = []
+        for sid in streams:
+            mids = self._stream_modules.get(sid, [])
+            self._consume(len(mids))
+            modules.extend(mids)
+        products = []
+        for mid in modules:
+            pids = self._module_products.get(mid, [])
+            self._consume(len(pids))
+            products.extend(pids)
         evidence = ProductEvidence(
             repo_url=url,
             ps_update_streams=tuple(sorted(set(streams))),
@@ -254,10 +283,12 @@ class ProductDefinitions:
         evidence: ProductEvidence,
     ) -> ProductMatch:
         modules = sorted(set(module_ids))
+        products = sorted(set(product_ids))
+        self._consume(len(products) + len(modules))
         contacts, dropped = self._contacts(modules)
         return ProductMatch(
             match_tier=tier,
-            ps_products=tuple(sorted(set(product_ids))),
+            ps_products=tuple(products),
             ps_modules=tuple(modules),
             lifecycle=self._lifecycle(modules),
             contacts=contacts,
@@ -279,7 +310,11 @@ class ProductDefinitions:
         for mid in module_ids:
             module = self._modules.get(mid) or {}
             for field, tier, embargo in CONTACT_FIELDS:
-                for value, component in _values(module.get(field)):
+                values = module.get(field)
+                if isinstance(values, dict):
+                    self._consume(len(values))
+                for value, component in _values(values):
+                    self._consume(1)
                     if not isinstance(value, str):
                         continue
                     ident = value.split("@")[0].strip()
@@ -343,13 +378,15 @@ def drop_rate_warning(results: Iterable[ProductMatch]) -> str | None:
     )
 
 
-def _values(value: object) -> list[tuple[object, str | None]]:
+def _values(value: object) -> Iterator[tuple[object, str | None]]:
     """One contact field as (value, component) pairs: a list, or a component -> members map."""
     if isinstance(value, list):
-        return [(v, None) for v in value]
-    if isinstance(value, dict):
-        return [(v, component) for component, members in value.items() for v in members or []]
-    return []
+        for member in value:
+            yield member, None
+    elif isinstance(value, dict):
+        for component, members in value.items():
+            for member in members or []:
+                yield member, component
 
 
 def _with_evidence(match: ProductMatch, **evidence: str) -> ProductMatch:

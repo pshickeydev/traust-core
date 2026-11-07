@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import Protocol
 from uuid import UUID
 
+from traust_core.v1.models.common import RecordBudget
 from traust_core.v1.models.inventory import Component
 from traust_core.v1.repositories.tables import (
     TRAUST,
@@ -25,7 +26,9 @@ class ComponentRepository(MutableRecordRepository[Component], Protocol):
     def find(self, release_id: UUID, repository_ref_id: UUID) -> Component | None: ...
     def list_for_release(self, release_id: UUID) -> list[Component]: ...
     def list_for_ref(self, repository_ref_id: UUID) -> list[Component]: ...
-    def list_for_refs(self, repository_ref_ids: Collection[UUID]) -> list[Component]: ...
+    def list_for_refs(
+        self, repository_ref_ids: Collection[UUID], *, read_budget: RecordBudget | None = None
+    ) -> list[Component]: ...
 
 
 class SqlComponentRepository(SqlMutableRepository[Component]):
@@ -58,10 +61,13 @@ class SqlComponentRepository(SqlMutableRepository[Component]):
             f"list for ref {repository_ref_id}", self.table.c.repository_ref_id == repository_ref_id
         )
 
-    def list_for_refs(self, repository_ref_ids: Collection[UUID]) -> list[Component]:
+    def list_for_refs(
+        self, repository_ref_ids: Collection[UUID], *, read_budget: RecordBudget | None = None
+    ) -> list[Component]:
         """The components of any of these commits, read in bounded batches."""
         return self._many_in(
             f"list for {len(repository_ref_ids)} refs",
             self.table.c.repository_ref_id,
             repository_ref_ids,
+            read_budget=read_budget,
         )
