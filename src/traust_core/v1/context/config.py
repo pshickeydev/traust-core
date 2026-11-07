@@ -15,7 +15,12 @@ from traust_core.v1 import contracts
 from traust_core.v1.errors import ConfigError, DocumentError
 from traust_core.v1.models.compliance import DocsTarget
 from traust_core.v1.models.inventory import DEFAULT_FORGE_HOSTS
-from traust_core.v1.models.operations import Budget, RecordingStartScope
+from traust_core.v1.models.operations import (
+    REMEDIATE_FINDING,
+    Budget,
+    RecordingStartScope,
+    RecordKind,
+)
 from traust_core.v1.services.findings.rating import RatingConfig
 from traust_core.v1.services.findings.review import ReviewConfig
 from traust_core.v1.services.identity import IdentityConfig
@@ -286,6 +291,37 @@ class RecordingConfig(_Model):
     validation: tuple[str, ...] = ()
     verification: tuple[str, ...] = ()
     start: tuple[RecordingStartScope, ...] = ()
+
+    @pydantic.model_validator(mode="after")
+    def _one_stage_per_asset(self) -> RecordingConfig:
+        """An asset on two report kinds' allowlists is ambiguous: submit and preflight
+        resolve a stage from the asset alone, so the config refuses such a binding rather
+        than let the service guess (a service wired outside RecordingConfig gets a
+        ConfigError at the gate for the same reason). REMEDIATE_FINDING is the one
+        deliberate alias (remediation rides the triage allowlist until contracts grows a
+        recording.remediation section) and is legal on triage only — anywhere else it is
+        a misbinding whose remediation prerequisite nothing wires."""
+        names: dict[str, RecordKind] = {}
+        for kind in (
+            RecordKind.TRIAGE,
+            RecordKind.ASSESSMENT,
+            RecordKind.VALIDATION,
+            RecordKind.VERIFICATION,
+        ):
+            for asset in getattr(self, kind.value):
+                if asset == REMEDIATE_FINDING:
+                    if kind is not RecordKind.TRIAGE:
+                        raise ValueError(
+                            f"recording.{kind.value} lists asset {asset}: the remediation "
+                            "alias belongs to the triage allowlist"
+                        )
+                    continue
+                if (first := names.setdefault(asset, kind)) is not kind:
+                    raise ValueError(
+                        f"recording.{first.value} and recording.{kind.value} both list asset "
+                        f"{asset}: a recording asset belongs to one report kind"
+                    )
+        return self
 
 
 _PATH_FIELDS = (

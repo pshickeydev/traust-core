@@ -12,7 +12,7 @@ import pytest
 from sqlalchemy.engine import Engine
 
 from tests.v1.conftest import SQL_BACKENDS, contract_db
-from tests.v1.repositories.tables.conftest import T0, Seed
+from tests.v1.repositories.tables.conftest import T0, Seed, apart
 from traust_core.v1.context import Config, Context
 from traust_core.v1.errors import ConflictError, NotFoundError, RepositoryError, ValidationError
 from traust_core.v1.models.common import PageRequest
@@ -52,9 +52,10 @@ class Forge:
         error: SourceError | None = None,
         described: RepoInfo | None = None,
         info_error: SourceError | ValidationError | None = None,
+        head_error: SourceError | None = None,
     ) -> None:
         self.listing, self.visibility, self.heads, self.error = listing, visibility, heads, error
-        self.described, self.info_error = described, info_error
+        self.described, self.info_error, self.head_error = described, info_error, head_error
         self.calls: list[str] = []
 
     def _result(self, data):
@@ -73,6 +74,8 @@ class Forge:
         return self._result(self.described or RepoInfo(repo=repo, visibility=self.visibility))
 
     def head(self, repo: HttpsRepoUrl, branch: str) -> Result[GitSha]:
+        if self.head_error:
+            raise self.head_error
         assert self.heads is not None
         return self._result(GitSha.parse(self.heads[branch]))
 
@@ -249,6 +252,58 @@ def test_import_branch_registers_the_commit_the_branch_points_at(
         repository.id, url("example-org/api"), RefName("main")
     )
     assert again == ref
+
+
+def test_a_forks_default_line_the_forge_couldnt_give_is_skipped_and_asked_again(
+    portfolio: PortfolioService,
+) -> None:
+    """A failed head lookup holds back the parent link, so the next import asks again
+    (Qodo 392: a linked fork was never asked for its default line)."""
+    fork = url("example-org/fork")
+    forge = Forge(
+        described=RepoInfo(
+            repo=fork,
+            visibility="public",
+            fork=True,
+            parent="example-org/api",
+            default_branch="main",
+        ),
+        heads={"main": "c" * 40},
+        head_error=SourceError("forge down", ComparisonStatus.UNREACHABLE),
+    )
+    report = sync(portfolio, forge).import_repository(fork)
+    (repository_id,) = report.added
+    assert portfolio.get_repository(repository_id).upstream_id is None
+    assert len(report.skipped) == 1 and "default line not imported" in report.skipped[0]
+    assert portfolio.inventory.default_line(repository_id) is None
+    forge.head_error = None
+    again = sync(portfolio, forge).import_repository(fork)
+    assert (again.unchanged, again.skipped) == ((repository_id,), ())
+    line = portfolio.inventory.default_line(repository_id)
+    assert line is not None and (line.name, line.sha) == ("main", "c" * 40)
+    assert portfolio.get_repository(repository_id).upstream_id is not None
+    assert sync(portfolio, forge).import_repository(fork) == again
+    assert forge.calls.count(f"info {fork}") == 2  # a linked fork with its line isn't asked
+
+
+def test_import_branch_on_the_default_line_returns_its_latest_flagged_head(
+    portfolio: PortfolioService,
+) -> None:
+    """The recorded default line names the branch, so no forge metadata call can fail it, and
+    the ref returned is the flagged row (Qodo 392)."""
+    api = url("example-org/api")
+    forge = Forge(described=RepoInfo(repo=api, visibility="public", default_branch="main"))
+    forge.heads = {"main": "c" * 40, "dev": "e" * 40}
+    (repository_id,) = sync(portfolio, forge).import_repository(api).added
+    apart()
+    forge.heads["main"] = "d" * 40
+    forge.info_error = SourceError("forge down", ComparisonStatus.UNREACHABLE)
+    ref = sync(portfolio, forge).import_branch(repository_id, api, RefName("main"))
+    assert (ref.sha, ref.is_default) == ("d" * 40, True)
+    assert portfolio.inventory.default_line(repository_id) == ref
+    other = sync(portfolio, forge).import_branch(repository_id, api, RefName("dev"))
+    assert (other.sha, other.is_default) == ("e" * 40, False)
+    assert portfolio.inventory.default_line(repository_id) == ref
 
 
 def test_owner_hints_are_the_forge_answer(portfolio: PortfolioService) -> None:

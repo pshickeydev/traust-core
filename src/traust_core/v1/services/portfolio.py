@@ -160,6 +160,15 @@ class Inventory:
         with self._uow as uow:
             return uow.repository_refs.get(repository_ref_id)
 
+    def default_line(self, repository_id: UUID) -> RepositoryRef | None:
+        """The latest ref recorded as the repository's default line (import or observation) —
+        the onboarding step that gives a run something to work on; None for a registered row
+        alone. Earlier flags stay: each was the forge's answer when it was recorded."""
+        # NEED(contracts: when the forge last named a ref the default head): a branch moved
+        # A -> B -> A re-flags A's existing row, so the latest created flag still answers B
+        with self._uow as uow:
+            return uow.repository_refs.default(repository_id)
+
     def lock_ref(self, repository_ref_id: UUID) -> RepositoryRef:
         """The commit, locked for the caller's transaction."""
         with self._uow as uow:
@@ -688,6 +697,28 @@ class PortfolioService:
             ref = uow.repository_refs.get_or_add(
                 RepositoryRef(repository_id=repository_id, sha=str(sha), name=name, kind=kind)
             )
+            uow.commit()
+            return ref
+
+    def mark_default_branch(
+        self, repository_id: UUID, sha: GitSha, branch: RefName
+    ) -> RepositoryRef:
+        """The default branch's commit, recorded as the repository's default line — the
+        subject a run works on, before any observation runs. The line is added when absent
+        and flagged when already imported: a named line is immutable once recorded, so the
+        default flag is what a new answer moves."""
+        with self._uow as uow:
+            ref = uow.repository_refs.get_or_add(
+                RepositoryRef(
+                    repository_id=repository_id,
+                    name=branch,
+                    kind=RefKind.BRANCH,
+                    is_default=True,
+                    sha=str(sha),
+                )
+            )
+            if not ref.is_default:
+                ref = uow.repository_refs.update(ref.model_copy(update={"is_default": True}))
             uow.commit()
             return ref
 
@@ -1237,6 +1268,10 @@ def _registered(doc: CorpusRegistryArtifact, product: Product) -> CorpusSubject:
     return subject
 
 
+def _why(e: SourceError | ValidationError) -> object:
+    return e.observation_status if isinstance(e, SourceError) else e
+
+
 class PortfolioSync:
     """Brings forge listings and the declared ownership source into the portfolio."""
 
@@ -1280,29 +1315,50 @@ class PortfolioSync:
                 try:
                     info = self._sources.info(url).data
                 except (SourceError, ValidationError) as e:
-                    why = e.observation_status if isinstance(e, SourceError) else e
                     return SyncReport(
                         unchanged=(known.id,),
-                        skipped=(f"{url}: forge facts not refreshed: {why}",),
+                        skipped=(f"{url}: forge facts not refreshed: {_why(e)}",),
                     )
-                self._record_info(known.id, info)
+                return SyncReport(unchanged=(known.id,), skipped=self._record_info(known.id, info))
             return SyncReport(unchanged=(known.id,))
         info = self._sources.info(url).data
         report = self._register(url, info.visibility)
-        self._record_info((*report.added, *report.unchanged)[0], info)
-        return report
+        skipped = self._record_info((*report.added, *report.unchanged)[0], info)
+        return report + SyncReport(skipped=skipped)
 
-    def _record_info(self, repository_id: UUID, info: RepoInfo) -> None:
-        """The forge's visibility and a fork's parent, normalized as an observation URL."""
-        public = _is_public(info.visibility)
-        parent = _fork_parent_url(info.repo.host, info.fork, info.parent, self._hosts)
-        self._portfolio.record_repo_info(repository_id, public, parent)
+    def _record_info(self, repository_id: UUID, info: RepoInfo) -> tuple[str, ...]:
+        """What an import learned from the forge: the visibility it reports (None: it didn't
+        say), a fork's parent, and the default branch's line — the observation's default ref
+        without needing a run, so an imported repository is a subject from the start. A head
+        the forge couldn't give is skipped, and holds back the parent link that would settle
+        a fork's import, so the next import asks again."""
+        head, skipped = None, ()
+        if info.default_branch is not None:
+            try:
+                head = self._sources.head(info.repo, info.default_branch).data
+            except (SourceError, ValidationError) as e:
+                skipped = (f"{info.repo}: default line not imported: {_why(e)}",)
+        parent = (
+            None
+            if skipped
+            else _fork_parent_url(info.repo.host, info.fork, info.parent, self._hosts)
+        )
+        self._portfolio.record_repo_info(repository_id, _is_public(info.visibility), parent)
+        if head is not None:
+            assert info.default_branch is not None
+            self._portfolio.mark_default_branch(repository_id, head, RefName(info.default_branch))
+        return skipped
 
     def import_branch(
         self, repository_id: UUID, url: HttpsRepoUrl, branch: RefName
     ) -> RepositoryRef:
-        """Register the commit a branch points at now."""
+        """Register the commit a branch points at now; on the branch the recorded default line
+        names (the forge's answer at import or observation) the head just imported is the
+        default line's latest commit."""
         head = self._sources.head(url, branch).data
+        line = self._portfolio.inventory.default_line(repository_id)
+        if line is not None and line.name == branch:
+            return self._portfolio.mark_default_branch(repository_id, head, branch)
         return self._portfolio.register_ref(repository_id, head, branch, RefKind.BRANCH)
 
     def owner_hints(self, url: HttpsRepoUrl) -> list[OwnerHint]:
