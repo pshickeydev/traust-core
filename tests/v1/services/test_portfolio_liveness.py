@@ -159,3 +159,14 @@ def test_an_empty_inventory_lists_nothing(uow: SqlTraustUnitOfWork) -> None:
 def test_liveness_needs_the_assessment_service(uow: SqlTraustUnitOfWork) -> None:
     with pytest.raises(ConfigError, match="AssessmentService"):
         PortfolioService(uow, PortfolioPolicy()).liveness(RepositoryFilter(), PageRequest(limit=10))
+
+
+def test_id_scoped_liveness_preserves_recorded_values_and_empty_scope(
+    uow: SqlTraustUnitOfWork, fleet: dict[str, Liveness]
+) -> None:
+    service = portfolio(uow)
+    selected = [fleet["live"].repository_id, fleet["gone-quiet"].repository_id]
+    found = service.liveness_in(selected)
+    assert found == {fleet[name].repository_id: fleet[name] for name in ("live", "gone-quiet")}
+    assert found[selected[0]].archived is False and found[selected[1]].archived is True
+    assert service.liveness_in(()) == {}

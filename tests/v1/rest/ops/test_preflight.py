@@ -20,6 +20,8 @@ def seeded_repository(context: Context, *, with_scan: bool = False) -> UUID:
     with SqlTraustUnitOfWork(context.database) as uow:
         seed = Seed(uow)
         repo = seed.repository()
+        # Onboarded: a default line, so the subject gate sees an imported repository.
+        seed.repository_ref(repo, is_default=True)
         if with_scan:
             seed.run_order(asset="assessment", repository_id=repo.id, state="succeeded")
         uow.commit()
@@ -78,7 +80,11 @@ def test_a_machine_caller_is_denied_the_role(context: Context, client: TestClien
         headers=runner(context),
     )
     assert response.status_code == 403
-    assert response.json()["code"] == "role_denied"
+    problem = response.json()
+    assert problem["code"] == "role_denied"
+    # The denial is the whole answer: no other gate's codes, no spend figures in any detail.
+    assert [issue["code"] for issue in problem["issues"]] == ["role_denied"]
+    assert all("$" not in issue["detail"] for issue in problem["issues"])
 
 
 def test_a_stage_without_its_prior_record_is_denied(context: Context, client: TestClient) -> None:

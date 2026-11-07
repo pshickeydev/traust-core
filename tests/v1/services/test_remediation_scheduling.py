@@ -274,6 +274,30 @@ def test_create_needs_the_repositorys_default_line_to_patch(
         )
 
 
+def test_create_patches_the_latest_default_line_once_the_branch_has_moved(
+    service: RemediationSchedulingService, engine: Engine
+) -> None:
+    """An import's default line and a later observation's both stay flagged; the fix patches
+    the latest (Qodo 392: a moved default branch blocked remediation)."""
+    repository_id, finding_ids, repository_ids = seeded(engine)
+    imported = default_ref(engine, repository_id)
+    with SqlTraustUnitOfWork(engine) as uow:
+        first = uow.repository_refs.get(imported)
+        moved = Seed(uow).repository_ref(
+            uow.repositories.get(repository_id),
+            sha="d" * 40,
+            is_default=True,
+            created_at=first.created_at + timedelta(minutes=1),
+        )
+        uow.commit()
+    request = pairs(finding_ids, repository_ids)
+    scheduled = service.create(fork_of(engine, request), BRANCH, request, PERSON)
+    detail = service.get(scheduled.work_item.work_item_id)
+    with SqlTraustUnitOfWork(engine) as uow:
+        patched = uow.assessments.get(detail.work_item.work_item_id).repository_ref_id
+    assert patched == moved.id != imported
+
+
 # get, list
 
 

@@ -124,7 +124,9 @@ def context(engine: Engine, tmp_path: Path) -> Context:
 @pytest.fixture
 def ref(engine: Engine) -> UUID:
     with SqlTraustUnitOfWork(engine) as uow:
-        saved = Seed(uow).repository_ref()
+        seed = Seed(uow)
+        # Onboarded (a default line), so the subject gate admits orders for the repository.
+        saved = seed.repository_ref(seed.repository(), is_default=True)
         uow.commit()
     assert saved.id is not None
     return saved.id
@@ -872,7 +874,9 @@ def test_an_order_that_is_not_running_or_ran_elsewhere_takes_no_assessment(
     services = context.services()
     with SqlTraustUnitOfWork(engine) as uow:
         seed = Seed(uow)
-        other = seed.repository_ref(seed.repository(url="https://github.com/org/elsewhere"))
+        other = seed.repository_ref(
+            seed.repository(url="https://github.com/org/elsewhere"), is_default=True
+        )
         uow.commit()
     assert other.id is not None
     cases = [

@@ -109,6 +109,7 @@ from traust_core.v1.models.insight import (
     PqcSiteRow,
     PqcVendorRoadmap,
     PqcVendorRow,
+    PqcWorklist,
     PrivilegeRow,
     PrivilegesRollup,
     ProductRollup,
@@ -285,6 +286,10 @@ class InsightService:
                 if not getattr(v, "per_item", False)
                 and (filter.window is None or _accepts_window(v))
                 and (
+                    n == ViewName.PQC_WORKLIST
+                    or (filter.repository_ref_ids is None and not filter.pqc_chokepoints)
+                )
+                and (
                     n == ViewName.COMPLIANCE_PRECISION
                     or (filter.framework is None and filter.precision_gate is None)
                 )
@@ -319,6 +324,14 @@ class InsightService:
             raise ValidationError(
                 f"view {name.value!r} is not built; built views: {known}"
             ) from None
+        if (
+            filter is not None
+            and name != ViewName.PQC_WORKLIST
+            and (filter.repository_ref_ids is not None or filter.pqc_chokepoints)
+        ):
+            raise ValidationError(
+                "repository_ref_ids and pqc_chokepoints are supported only by pqc-worklist"
+            )
         if (
             filter is not None
             and name != ViewName.COMPLIANCE_PRECISION
@@ -419,6 +432,110 @@ class CompliancePrecisionView:
             title="Compliance field precision",
             generated_at=generated_at,
             sections=(population, results),
+        )
+
+
+class PqcWorklistView:
+    name = ViewName.PQC_WORKLIST
+
+    def __init__(self, pqc: PqcService) -> None:
+        self._pqc = pqc
+
+    @staticmethod
+    def supports_filter(filter: ViewFilter) -> bool:
+        return len(filter.product_ids) <= 1 and not filter.model_dump(
+            exclude={"product_ids", "repository_ref_ids", "pqc_chokepoints"},
+            exclude_defaults=True,
+        )
+
+    def build(self, filter: ViewFilter) -> PqcWorklist:
+        if not self.supports_filter(filter):
+            raise ValidationError(
+                "pqc-worklist supports only one product, repository_ref_ids and pqc_chokepoints"
+            )
+        product_id = filter.product_ids[0] if filter.product_ids else None
+        entries = self._pqc.worklist(
+            PqcFilter(product_id=product_id, repository_ref_ids=filter.repository_ref_ids),
+            chokepoints=filter.pqc_chokepoints,
+        )
+        model = PqcWorklist(
+            product_id=product_id,
+            repository_ref_ids=filter.repository_ref_ids,
+            chokepoints=tuple(fragment.strip() for fragment in filter.pqc_chokepoints),
+            entries=entries,
+        )
+        document: dict[str, contracts.JsonValue] = model.model_dump(mode="json")
+        contracts.validate_view(self.name, document)
+        return model
+
+    def report(self, model: PqcWorklist, generated_at: datetime) -> Report:
+        population = Section(
+            heading="Population",
+            body="One entry per registered repository in scope, including repositories with "
+            "no registered commit. The representative commit follows the existing sweep's "
+            "default-ref, registration-time and ID ordering. Priority is caller-supplied "
+            "chokepoint fragments, recorded crypto-CWE associations, then the tail. "
+            "Availability and scan currency are recorded evidence, not an access grant or "
+            "a readiness score. Building this worklist does not scan or check out repositories.",
+            table=Table(
+                columns=("Product ID", "Repository-ref scope", "Chokepoint fragments"),
+                rows=(
+                    (
+                        str(model.product_id) if model.product_id is not None else "All inventory",
+                        "All registered commits"
+                        if model.repository_ref_ids is None
+                        else str(len(model.repository_ref_ids)),
+                        ", ".join(model.chokepoints) if model.chokepoints else "—",
+                    ),
+                ),
+            ),
+        )
+        results = Section(
+            heading="Worklist",
+            body="No repositories matched this scope; an empty worklist does not establish "
+            "PQC readiness."
+            if not model.entries
+            else "Order and cursors match the native sweep. The JSON model retains full "
+            "repository/ref IDs, liveness, scan provenance and nullable currency.",
+            table=Table(
+                columns=(
+                    "Priority",
+                    "Repository",
+                    "Commit",
+                    "Route",
+                    "Observation",
+                    "Scan currency",
+                    "Reason",
+                ),
+                rows=tuple(
+                    (
+                        entry.priority_tier.value,
+                        entry.repository,
+                        entry.sha if entry.sha is not None else "—",
+                        entry.route.value,
+                        entry.access.unobserved.value
+                        if entry.access.unobserved is not None
+                        else entry.access.observed_at.isoformat()
+                        if entry.access.observed_at is not None
+                        else "—",
+                        "—"
+                        if entry.scan is None or entry.scan.current is None
+                        else "current"
+                        if entry.scan.current
+                        else "stale",
+                        entry.reason if entry.reason is not None else "—",
+                    )
+                    for entry in model.entries
+                ),
+            ),
+        )
+        return Report(
+            title="PQC worklist",
+            generated_at=generated_at,
+            sections=(population, results),
+            sources=(
+                "PqcService.worklist: registered inventory, recorded findings and scan states",
+            ),
         )
 
 

@@ -17,7 +17,7 @@ from traust_core.v1.errors import ConflictError, NotFoundError, ValidationError
 from traust_core.v1.models.common import Page, PageRequest
 from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.inventory import RepositoryRef
-from traust_core.v1.models.operations import AssetName, OrderRequest
+from traust_core.v1.models.operations import REMEDIATE_FINDING, OrderRequest
 from traust_core.v1.models.remediation import OVER, WorkItem, furthest
 from traust_core.v1.models.remediation_scheduling import (
     RemediationFindingRequest,
@@ -34,7 +34,6 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-REMEDIATE_FINDING = AssetName("remediate_finding")
 # The two revalidated verdicts rank alike: between them, the latest verification wins.
 _REVALIDATED = frozenset({"revalidated_fixed", "revalidated_still_vulnerable"})
 # A scheduled fix is asked for now, like onboarding's baseline orders.
@@ -322,13 +321,13 @@ class RemediationSchedulingService:
 
     def _patch_ref(self, repository_id: UUID) -> RepositoryRef:
         """The commit the work item patches: the repository's default line."""
-        refs = [r for r in self._inventory.list_refs(repository_id) if r.is_default]
-        if len(refs) != 1:
+        ref = self._inventory.default_line(repository_id)
+        if ref is None:
             raise ValidationError(
                 f"repository {repository_id} has no single default ref: a fix needs the "
                 "commit to patch"
             )
-        return refs[0]
+        return ref
 
 
 def _branch(name: str) -> None:
