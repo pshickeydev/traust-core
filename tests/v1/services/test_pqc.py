@@ -16,6 +16,7 @@ from sqlalchemy.engine import Engine
 from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.providers.test_crypto import FIXTURE as CRYPTO
 from tests.v1.repositories.tables.conftest import Seed
+from tests.v1.services.findings.test_reads import service as finding_service
 from tests.v1.services.test_pqc_rules import REPORT, STAMPS, census, hit, scan
 from traust_core.v1.context import Config, Context
 from traust_core.v1.errors import ConfigError, IntegrityError, NotFoundError, ValidationError
@@ -146,7 +147,13 @@ class World:
         )
         self.code_facts, self.scanner = code_facts, scanner
         self.pqc = PqcService(
-            uow, code_facts, self.portfolio, self.publisher, scanner, clock=FixedClock(AT)
+            uow,
+            code_facts,
+            self.portfolio,
+            self.publisher,
+            scanner,
+            clock=FixedClock(AT),
+            findings=finding_service(engine),
         )
 
     def ref(self, url: str = URL, sbom: bytes | None = SBOM) -> UUID:

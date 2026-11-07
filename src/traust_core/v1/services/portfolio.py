@@ -473,21 +473,37 @@ class PortfolioService:
         )
 
     def liveness(self, filter: RepositoryFilter, page: PageRequest) -> Page[Liveness]:
-        """Each listed repository's archived flag and default-branch push as last observed; one
-        never observed comes back `unobserved`, saying why."""
+        """Each listed repository's archived flag and default-branch push as last observed."""
+        listed = self.list_repositories(filter, page)
+        return Page(items=tuple(self._liveness_of(listed.items)), next=listed.next)
+
+    def liveness_in(self, repository_ids: Collection[UUID]) -> dict[UUID, Liveness]:
+        """Liveness for selected repository IDs, without enumerating unrelated inventory."""
+        if not repository_ids:
+            return {}
+        return {
+            row.repository_id: row
+            for row in self._liveness_of(self.inventory.list_repositories(repository_ids))
+        }
+
+    def _liveness_of(self, repositories: Sequence[Repository]) -> list[Liveness]:
         if self._assessment is None:
             raise ConfigError("liveness reads observations through AssessmentService")
-        listed = self.list_repositories(filter, page)
-        ids = [r.id for r in listed.items if r.id]
+        if not repositories:
+            return []
+        ids = [repository.id for repository in repositories if repository.id]
         now = self._clock.now()
         observations = self._assessment.population(
             now, AssessmentFilter(kind=AssessmentKind.REPO_STATE), ids
         ).rows
-        latest = {r.latest.id: r for r in observations if r.latest}
+        latest = {row.latest.id: row for row in observations if row.latest}
         pushes = {
-            latest[a.id].repository_id: (a.occurred_at, json.loads(doc.payload).get("pushed_at"))
-            for a, doc in self._require_publisher().documents(
-                (r.latest for r in latest.values() if r.latest), RepoStateArtifact
+            latest[assessment.id].repository_id: (
+                assessment.occurred_at,
+                json.loads(document.payload).get("pushed_at"),
+            )
+            for assessment, document in self._require_publisher().documents(
+                (row.latest for row in latest.values() if row.latest), RepoStateArtifact
             )
         }
         unaudited = set(
@@ -497,10 +513,9 @@ class PortfolioService:
                 ids,
             ).never_assessed_repository_ids
         )
-        return Page(
-            items=tuple(self._liveness(r, pushes, unaudited, now.date()) for r in listed.items),
-            next=listed.next,
-        )
+        return [
+            self._liveness(repository, pushes, unaudited, now.date()) for repository in repositories
+        ]
 
     def _liveness(
         self,

@@ -8,6 +8,7 @@ from pydantic import Field
 
 from traust_core.v1.models.base import Model
 from traust_core.v1.models.findings import SkillInput
+from traust_core.v1.models.inventory import Liveness
 from traust_core.v1.models.vocabulary import (
     Ecosystem,
     PqcBlastRadius,
@@ -226,6 +227,31 @@ class PqcScanState(Model):
     assessment_id: UUID | None = None
     basis: str | None = None
     current: bool | None = None
+
+
+class PqcWorklistRoute(StrEnum):
+    SOURCE = "source"
+    SBOM_ONLY = "sbom-only"
+    ACCESS_REQUEST = "access-request"
+
+
+class PqcWorklistTier(StrEnum):
+    CHOKEPOINT = "chokepoint"
+    CRYPTO_CWE = "crypto-cwe"
+    TAIL = "tail"
+
+
+class PqcWorklistEntry(Model):
+    repository_id: UUID
+    repository: str
+    repository_ref_id: UUID | None
+    sha: str | None
+    priority_tier: PqcWorklistTier
+    route: PqcWorklistRoute
+    access: Liveness
+    reason: str | None = None
+    scan: PqcScanState | None = None
+    cursor: str
 
 
 class PqcPrescan(Model):

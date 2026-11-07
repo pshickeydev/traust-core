@@ -35,6 +35,8 @@ def get_insight(
     category: Labels = None,
     window_start: UtcDatetime | None = None,
     window_end: UtcDatetime | None = None,
+    repository_ref_id: Ids = None,
+    chokepoint: Labels = None,
     framework: ComplianceFramework | None = None,
     precision_gate: Annotated[float | None, Query(ge=0, le=1, allow_inf_nan=False)] = None,
 ) -> SerializeAsAny[ViewModel]:
@@ -55,6 +57,8 @@ def get_insight(
         ),
         artifact_id=artifact_id,
         repository_id=repository_id,
+        repository_ref_ids=None if repository_ref_id is None else tuple(repository_ref_id),
+        pqc_chokepoints=tuple(chokepoint or ()),
         framework=framework,
         precision_gate=precision_gate,
     )
