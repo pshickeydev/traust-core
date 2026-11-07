@@ -164,6 +164,8 @@ class Inventory:
         """The latest ref recorded as the repository's default line (import or observation) —
         the onboarding step that gives a run something to work on; None for a registered row
         alone. Earlier flags stay: each was the forge's answer when it was recorded."""
+        # NEED(contracts: when the forge last named a ref the default head): a branch moved
+        # A -> B -> A re-flags A's existing row, so the latest created flag still answers B
         with self._uow as uow:
             return uow.repository_refs.default(repository_id)
 
