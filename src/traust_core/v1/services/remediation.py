@@ -643,15 +643,22 @@ class RemediationService:
         self._refuse_public(pushed_to)
         # a scheduled fix is pushed where it was scheduled: its commit is what verification of
         # that branch later revalidates
-        order = self.scheduled_order(item.work_item_id)
-        if order is not None and (pushed_to, doc.fork.fix_branch) != (
-            order.fork_url,
-            order.fork_branch,
-        ):
-            raise ValidationError(
-                f"remediation report pushes to {pushed_to} {doc.fork.fix_branch}, not the "
-                f"scheduled {order.fork_url} {order.fork_branch}"
-            )
+        order = self._ops.order_for_work_item(item.work_item_id)
+        if order is not None and (order.fork_url or order.fork_branch):
+            # an order's fork facts bind its report; ones scheduling can't vouch for bind
+            # nothing, so the report is refused rather than recorded unchecked
+            if order.repository_id is None or not self.vouches(
+                order, self.policy_fork(order.repository_id)
+            ):
+                raise ValidationError(
+                    f"work item {item.work_item_id}'s order names a fork scheduling can't "
+                    "vouch for: reschedule the fix"
+                )
+            if (pushed_to, doc.fork.fix_branch) != (order.fork_url, order.fork_branch):
+                raise ValidationError(
+                    f"remediation report pushes to {pushed_to} {doc.fork.fix_branch}, not the "
+                    f"scheduled {order.fork_url} {order.fork_branch}"
+                )
         if item.report is not None:  # recorded before; finish a run that stopped part-way
             if item.status != status:
                 with self._uow.write() as uow:

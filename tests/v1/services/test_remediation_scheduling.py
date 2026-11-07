@@ -1138,6 +1138,29 @@ def test_a_repository_whose_fork_policy_fails_drops_out_of_the_listing_alone(
         service.get(broken.work_item.work_item_id)
 
 
+def test_a_report_on_an_order_scheduling_no_longer_vouches_for_is_refused(
+    service: RemediationSchedulingService, context: Context, engine: Engine
+) -> None:
+    """Policy changed after the order was leased: its report binds to nothing, so never lands."""
+    world = World(engine, patched_name="main")
+    audited(engine, world, world.base)
+    request = pairs(world.ids, [world.repo.id] * len(world.ids))
+    scheduled = service.create(fork_of(engine, request), world.patched.name, request, PERSON)
+    with SqlTraustUnitOfWork(engine) as uow:
+        Seed(uow).repository(url=str(scheduled.fork_url), public=True)
+        uow.commit()
+    elsewhere = pushed(
+        scheduled,
+        world.ids,
+        fork__url="https://github.com/mirror-org/elsewhere",
+        fork__fix_branch="fix/elsewhere",
+        fork__fix_commit=world.patched.sha,
+    )
+    with pytest.raises(ValidationError, match="can't vouch for"):
+        context.services().remediation.record(elsewhere, provenance())
+    assert context.services().remediation.get(scheduled.work_item.work_item_id).report is None
+
+
 def test_the_listing_follows_its_cursor_page_after_page(
     service: RemediationSchedulingService, engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
