@@ -195,3 +195,19 @@ def test_an_onboarded_repository_is_a_subject_when_the_forge_names_a_default_bra
         OrderRequest(asset=AUDIT, priority=0, repository_id=repository_id), OPERATOR
     )
     assert order.state is OrderState.QUEUED
+
+
+def test_onboarding_shows_a_default_line_it_couldnt_import_and_a_retry_imports_it(
+    onboarding: OnboardingService, uow: SqlTraustUnitOfWork, forge: Forge
+) -> None:
+    forge.described = RepoInfo(repo=API, default_branch="main", visibility="public")
+    forge.head_error = SourceError("forge down", ComparisonStatus.UNREACHABLE)
+    ask = request(label="Example", repositories=[{"url": API}])
+    result = onboarding.onboard(ask, OPERATOR)
+    assert len(result.skipped) == 1 and "default line not imported" in result.skipped[0]
+    with uow:
+        assert uow.repository_refs.default(result.repository_ids[0]) is None
+    forge.head_error = None
+    assert onboarding.onboard(ask, OPERATOR).skipped == ()
+    with uow:
+        assert uow.repository_refs.default(result.repository_ids[0]) is not None

@@ -324,7 +324,7 @@ class OpsService:
             return (
                 DenyIssue(code=DenyCode.SUBJECT_UNKNOWN, detail=f"no repository {repository_id}"),
             )
-        if not self._inventory.has_default_ref(repository_id):
+        if self._inventory.default_line(repository_id) is None:
             return (
                 DenyIssue(
                     code=DenyCode.SUBJECT_UNKNOWN,
