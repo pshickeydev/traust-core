@@ -149,3 +149,13 @@ def test_a_store_another_process_upgraded_first_opens(
     assert "manifest_sbom_assessment_id" in {
         c["name"] for c in sa.inspect(engine).get_columns("repository_ref")
     }
+
+
+def test_a_store_whose_run_order_predates_the_fork_columns_is_refused(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    Context(Config(home=home)).services()  # a local store with the current schema
+    with Context(Config(home=home)).database.begin() as conn:
+        conn.exec_driver_sql("ALTER TABLE ops_run_order DROP COLUMN fork_branch")
+        conn.exec_driver_sql("ALTER TABLE ops_run_order DROP COLUMN fork_url")
+    with pytest.raises(ConfigError, match="apply the additive statements"):
+        Context(Config(home=home)).services()

@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
+import pydantic
 import pytest
 from sqlalchemy.engine import Engine
 
@@ -25,7 +26,12 @@ from traust_core.v1.context.config import ProcessConfig
 from traust_core.v1.errors import ConflictError, ForbiddenError, NotFoundError, ValidationError
 from traust_core.v1.models.common import PageRequest
 from traust_core.v1.models.identity import IdentitySource, Principal
-from traust_core.v1.models.operations import OrderRequest, OrderState, RecordingStartScope, WorkerId
+from traust_core.v1.models.operations import (
+    OrderRequest,
+    OrderState,
+    RecordingStartScope,
+    WorkerId,
+)
 from traust_core.v1.models.remediation_scheduling import (
     RemediationFindingRequest,
     ScheduledEffort,
@@ -1023,3 +1029,43 @@ def test_equal_time_verdicts_go_to_the_later_recorded_never_the_verdict_text(
         verification.record(verification_report(world, verdicts), same.model_copy())
     # a's tie goes to the later recorded "resolved", so b's report completes the effort
     assert folded(service, scheduled) == "revalidated_fixed"
+
+
+def test_the_orders_door_refuses_fork_facts_it_cannot_vouch_for(
+    service: RemediationSchedulingService, context: Context, engine: Engine
+) -> None:
+    # fork facts are the scheduling door's to set (ForkPolicy, branch rules); the generic
+    # orders door neither carries them for another asset nor half of a pair
+    ops = context.services().ops
+    with SqlTraustUnitOfWork(engine) as uow:
+        item = Seed(uow).assessment(kind="remediation")
+        uow.commit()
+        assert item.id is not None
+    for values in (
+        {"asset": "diff_scan", "priority": 0, "fork_url": FORK, "fork_branch": BRANCH},
+        # a branch-less pair would steer prepare without binding record's push guard
+        {
+            "asset": REMEDIATE_FINDING,
+            "priority": 0,
+            "work_item_id": item.id,
+            "fork_url": FORK,
+        },
+        {
+            "asset": REMEDIATE_FINDING,
+            "priority": 0,
+            "work_item_id": item.id,
+            "fork_branch": BRANCH,
+        },
+    ):
+        with pytest.raises(pydantic.ValidationError, match="together"):
+            ops.submit(OrderRequest(**values), PERSON)  # type: ignore[arg-type]
+
+
+def test_get_answers_not_found_for_what_was_never_scheduled(
+    service: RemediationSchedulingService, context: Context, engine: Engine
+) -> None:
+    repository_id, finding_ids, _ = seeded(engine)
+    remediation = context.services().remediation
+    item = remediation.open(finding_ids, default_ref(engine, repository_id))
+    with pytest.raises(NotFoundError, match="schedules no remediation"):
+        service.get(item.work_item_id)

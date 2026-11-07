@@ -734,6 +734,7 @@ class Context:
             apply_schema(engine, contracts.database_ddl(Dialect.of(engine)))
         else:
             _manifest_scan_pointer(engine, upgrade=local)
+            _run_order_fork_columns(engine)
         return engine
 
     @cached_property
@@ -1191,6 +1192,27 @@ def _sla_policy(path: Path) -> SlaPolicy:
         return SlaPolicy.model_validate(document)
     except ValueError as e:
         raise ConfigError(f"SLA policy {path}: {e}") from e
+
+
+def _run_order_fork_columns(engine: Engine) -> None:
+    """contracts added `run_order.fork_url` / `fork_branch`: there is deliberately no upgrade
+    channel (contracts#117 — existing databases alter by hand), so a store whose run_order
+    predates the columns is refused here, with the statements to apply, rather than failing
+    the first remediate_finding order with a raw driver error."""
+    dialect = Dialect.of(engine)
+    schema = "traust_ops" if dialect == Dialect.POSTGRES else None
+    table = "run_order" if dialect == Dialect.POSTGRES else "ops_run_order"
+    inspector = sa.inspect(engine)
+    if not inspector.has_table(table, schema=schema):
+        return
+    columns = {c["name"] for c in inspector.get_columns(table, schema=schema)}
+    if {"fork_url", "fork_branch"} <= columns:
+        return
+    raise ConfigError(
+        f"the database's {table} predates the fork columns: apply the additive statements "
+        "documented in traust-contracts#117 (its 'Upgrading an existing database' section), "
+        "or recreate the store"
+    )
 
 
 def _manifest_scan_pointer(engine: Engine, *, upgrade: bool) -> None:

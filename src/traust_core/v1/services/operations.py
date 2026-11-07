@@ -900,6 +900,7 @@ class OpsService:
                 batch = uow.run_orders.search(
                     asset=str(asset),
                     repository_id=repository_id,
+                    work_item=True,
                     limit=500,
                     after=after,
                 )

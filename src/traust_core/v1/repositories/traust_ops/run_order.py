@@ -227,6 +227,7 @@ class SqlRunOrderRepository(SqlMutableRepository[RunOrder]):
         asset: str | None = None,
         repository_id: UUID | None = None,
         run_batch_id: UUID | None = None,
+        work_item: bool = False,
         limit: int,
         after: tuple[datetime, UUID] | None = None,
     ) -> list[RunOrder]:
@@ -238,6 +239,7 @@ class SqlRunOrderRepository(SqlMutableRepository[RunOrder]):
                 (asset, c.asset == asset),
                 (repository_id, c.repository_id == repository_id),
                 (run_batch_id, c.run_batch_id == run_batch_id),
+                (work_item, c.work_item_id.is_not(None)),
             )
             if value
         ]

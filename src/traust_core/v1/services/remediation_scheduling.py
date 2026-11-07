@@ -291,7 +291,12 @@ class RemediationSchedulingService:
     ) -> ScheduledEffort | None:
         """The live effort covering exactly these findings for this target (a retry, a report
         recorded since); the same findings for another target, or an overlap, conflict."""
-        for item in self._remediation.covering(repository_id, finding_ids):
+        covering = self._remediation.covering(repository_id, finding_ids)
+        # the newer-effort check shares this one repository fold across the candidates
+        candidates = self._remediation.covering(
+            repository_id, {f for item in covering for f in item.finding_ids}
+        )
+        for item in covering:
             order = self._ops.order_for_work_item(item.work_item_id)
             if (
                 order is None or order.fork_url is None or order.fork_branch is None
@@ -305,7 +310,7 @@ class RemediationSchedulingService:
                 status=item.status,
                 order_id=order.id,
             )
-            effective = self._status(effort, repository_id)
+            effective = self._status(effort, repository_id, candidates)
             if effective in OVER:
                 continue
             if set(item.finding_ids) != finding_ids:
