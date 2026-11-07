@@ -180,7 +180,7 @@ class RemediationSchedulingService:
         after = page.position()
         found: list[ScheduledEffort] = []
         history: dict[UUID, list[WorkItem]] = {}  # each repository folded once per listing
-        forks: dict[UUID, Fork] = {}
+        forks: dict[UUID, Fork | None] = {}
         while len(found) <= page.limit:
             orders = self._ops.orders_after(REMEDIATE_FINDING, repository_id, after, _BATCH)
             found += [
@@ -202,7 +202,7 @@ class RemediationSchedulingService:
         self,
         orders: Sequence[RunOrder],
         history: dict[UUID, list[WorkItem]],
-        forks: dict[UUID, Fork],
+        forks: dict[UUID, Fork | None],
     ) -> list[ScheduledEffort]:
         """The efforts a batch of orders schedules, in their order: each work item once, at the
         order `get` reads for it (the oldest carrying both fork facts — an order naming no fork
@@ -220,7 +220,7 @@ class RemediationSchedulingService:
             # A work-item order's repository is never null (contracts#117's pairing trigger).
             assert order.repository_id is not None
             if order.repository_id not in forks:
-                forks[order.repository_id] = self._remediation.resolve_fork(order.repository_id)
+                forks[order.repository_id] = self._remediation.policy_fork(order.repository_id)
             if not self._remediation.vouches(order, forks[order.repository_id]):
                 continue
             assert order.fork_url is not None and order.fork_branch is not None

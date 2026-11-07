@@ -502,13 +502,27 @@ class RemediationService:
         order = self._ops.order_for_work_item(work_item_id)
         if order is None or order.repository_id is None:
             return None
-        return order if self.vouches(order, self.resolve_fork(order.repository_id)) else None
+        return order if self.vouches(order, self.policy_fork(order.repository_id)) else None
+
+    def policy_fork(self, repository_id: UUID) -> Fork | None:
+        """The repository's remediation fork, or None when the policy can no longer name one
+        (a fork org or forge host unset since): its orders are then unvouched, not an error."""
+        try:
+            return self.resolve_fork(repository_id)
+        except (ConfigError, NotFoundError, ValidationError) as e:
+            log.warning("repository %s: remediation fork unresolved: %s", repository_id, e)
+            return None
 
     @staticmethod
-    def vouches(order: RunOrder, fork: Fork) -> bool:
+    def vouches(order: RunOrder, fork: Fork | None) -> bool:
         """Whether an order's fork facts are what scheduling sets: the repository's remediation
         fork and a fix branch. The generic orders door once took unchecked ones."""
-        if order.fork_url is None or order.fork_branch is None or order.fork_url != str(fork.url):
+        # NEED(contracts: run_order records that scheduling set its fork facts): until then
+        # they're checked against today's policy, so a fork policy changed since scheduling
+        # hides the effort
+        if fork is None or order.fork_url is None or order.fork_branch is None:
+            return False
+        if order.fork_url != str(fork.url):
             return False
         try:
             check_fix_branch(order.fork_branch)

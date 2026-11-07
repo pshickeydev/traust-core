@@ -3,6 +3,7 @@ and the status sync that keeps the remediation row beside the decisions that mov
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from collections.abc import Iterator
@@ -1112,6 +1113,29 @@ def test_fork_facts_scheduling_never_checked_steer_nothing(
     assert remediation.scheduled_order(item.work_item_id) is None
     prepared = remediation.prepare(item.work_item_id)
     assert prepared.fix_branch != fork["fork_branch"]  # the policy's branch, not the order's
+
+
+def test_a_repository_whose_fork_policy_fails_drops_out_of_the_listing_alone(
+    service: RemediationSchedulingService,
+    engine: Engine,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    efforts = []
+    for _ in range(2):
+        _, finding_ids, repository_ids = seeded(engine)
+        request = pairs(finding_ids, repository_ids)
+        efforts.append(service.create(fork_of(engine, request), BRANCH, request, PERSON))
+        apart()
+    broken, kept = efforts
+    with SqlTraustUnitOfWork(engine) as uow:  # its mirror turned public: no fork for it now
+        Seed(uow).repository(url=str(broken.fork_url), public=True)
+        uow.commit()
+    with caplog.at_level(logging.WARNING, logger="traust_core.v1.services.remediation"):
+        listed = service.list(PageRequest()).items
+    assert [e.work_item.work_item_id for e in listed] == [kept.work_item.work_item_id]
+    assert f"repository {broken.repository_id}: remediation fork unresolved" in caplog.text
+    with pytest.raises(NotFoundError, match="schedules no remediation"):
+        service.get(broken.work_item.work_item_id)
 
 
 def test_the_listing_follows_its_cursor_page_after_page(
