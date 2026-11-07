@@ -1103,26 +1103,92 @@ def test_the_listing_follows_its_cursor_page_after_page(
     assert seen == [e.work_item.work_item_id for e in made]  # every effort once, in order
 
 
-def test_an_attempt_that_is_over_never_comes_back_as_the_live_effort(
+def test_create_and_the_reads_agree_on_a_failed_attempt_later_verified_fixed(
+    service: RemediationSchedulingService, context: Context, engine: Engine
+) -> None:
+    world = World(engine, patched_name="main")
+    audited(engine, world, world.base)
+    request = pairs(world.ids, [world.repo.id] * len(world.ids))
+    scheduled = service.create(fork_of(engine, request), world.patched.name, request, PERSON)
+    context.services().remediation.record(
+        pushed(
+            scheduled,
+            world.ids,
+            fork__fix_commit=world.patched.sha,
+            summary__status="checks_failed",
+        ),
+        provenance(),
+    )
+    assert folded(service, scheduled) == "checks_failed"
+    context.services().verification.record(verification_report(world), verification_provenance())
+    assert folded(service, scheduled) == "revalidated_fixed"
+    (listed,) = service.list(PageRequest()).items
+    assert listed.status == "revalidated_fixed"
+    with pytest.raises(ValidationError, match="closed"):  # no retry beside a fixed effort
+        service.create(fork_of(engine, request), world.patched.name, request, PERSON)
+    assert [e.work_item.work_item_id for e in service.list(PageRequest()).items] == [
+        scheduled.work_item.work_item_id
+    ]
+
+
+def test_a_listing_reads_each_repositorys_history_once_across_batches(
+    service: RemediationSchedulingService, engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from traust_core.v1.services import remediation_scheduling
+    from traust_core.v1.services.remediation import RemediationService
+
+    monkeypatch.setattr(remediation_scheduling, "_BATCH", 1)
+    _, finding_ids, repository_ids = seeded(engine, findings=3)
+    for finding_id, repository_id in zip(finding_ids, repository_ids, strict=True):
+        request = pairs([finding_id], [repository_id])
+        service.create(fork_of(engine, request), BRANCH, request, PERSON)
+        apart()
+    reads: list[UUID] = []
+    items_of = RemediationService.items_of
+    monkeypatch.setattr(
+        RemediationService,
+        "items_of",
+        lambda self, repository_id: reads.append(repository_id) or items_of(self, repository_id),
+    )
+    # a sparse filter: every batch is read, none matches
+    assert service.list(PageRequest(), status=RemediationStatus("merged")).items == ()
+    assert reads == [repository_ids[0]]
+
+
+def test_the_listing_shows_a_work_item_once_at_the_order_get_reads(
     service: RemediationSchedulingService,
     context: Context,
     engine: Engine,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _, finding_ids, repository_ids = seeded(engine)
+    from traust_core.v1.services import remediation_scheduling
+
+    monkeypatch.setattr(remediation_scheduling, "_BATCH", 1)  # the two orders in two batches
+    repository_id, finding_ids, repository_ids = seeded(engine)
     request = pairs(finding_ids, repository_ids)
-    failed = service.create(fork_of(engine, request), BRANCH, request, PERSON)
-    context.services().remediation.record_progress(
-        failed.work_item.work_item_id, RemediationStatus("checks_failed")
+    scheduled = service.create(fork_of(engine, request), BRANCH, request, PERSON)
+    apart()
+    context.services().ops.schedule_fix(
+        OrderRequest(
+            asset=REMEDIATE_FINDING,
+            priority=0,
+            repository_id=repository_id,
+            work_item_id=scheduled.work_item.work_item_id,
+        ),
+        PERSON,
+        "https://github.com/mirror-org/elsewhere",
+        "fix/elsewhere",
     )
-    # a later verification of its fix reads as fixed, yet the failed attempt is still over
-    monkeypatch.setattr(
-        RemediationSchedulingService,
-        "_status",
-        lambda self, effort, repository_id, candidates=None: RemediationStatus("revalidated_fixed"),
-    )
-    retry = service.create(fork_of(engine, request), BRANCH, request, PERSON)
-    assert retry.work_item.work_item_id != failed.work_item.work_item_id
+    seen = []
+    cursor = None
+    while True:
+        page = service.list(PageRequest(limit=1, cursor=cursor))
+        seen += page.items
+        if page.next is None:
+            break
+        cursor = page.next
+    assert [e.order_id for e in seen] == [service.get(scheduled.work_item.work_item_id).order_id]
+    assert seen[0].fork_url == scheduled.fork_url
 
 
 def test_schedule_fix_sets_fork_facts_only_on_a_work_items_remediation_order(
@@ -1134,25 +1200,41 @@ def test_schedule_fix_sets_fork_facts_only_on_a_work_items_remediation_order(
         )
 
 
-def test_a_verification_recorded_before_the_fix_was_reported_never_revalidates_it(
+def test_a_verification_recorded_before_the_effort_was_scheduled_never_revalidates_it(
     service: RemediationSchedulingService, context: Context, engine: Engine
 ) -> None:
     world = World(engine, patched_name="main")
     audited(engine, world, world.base)
-    request = pairs(world.ids, [world.repo.id] * len(world.ids))
-    scheduled = service.create(fork_of(engine, request), world.patched.name, request, PERSON)
     context.services().verification.record(
         verification_report(world, dict.fromkeys(world.ids, "unresolved")),
         verification_provenance(),
     )  # an older check of the same branch and commit
     apart()
+    request = pairs(world.ids, [world.repo.id] * len(world.ids))
+    scheduled = service.create(fork_of(engine, request), world.patched.name, request, PERSON)
     context.services().remediation.record(
         pushed(scheduled, world.ids, fork__fix_commit=world.patched.sha), provenance()
     )
     assert folded(service, scheduled) == "checks_passed"  # not that earlier check's verdict
 
 
-def test_tied_verifications_go_by_their_record_never_their_verdict() -> None:
+def test_a_verification_recorded_before_a_late_report_still_revalidates_the_fix(
+    service: RemediationSchedulingService, context: Context, engine: Engine
+) -> None:
+    world = World(engine, patched_name="main")
+    audited(engine, world, world.base)
+    request = pairs(world.ids, [world.repo.id] * len(world.ids))
+    scheduled = service.create(fork_of(engine, request), world.patched.name, request, PERSON)
+    apart()
+    context.services().verification.record(verification_report(world), verification_provenance())
+    apart()
+    context.services().remediation.record(
+        pushed(scheduled, world.ids, fork__fix_commit=world.patched.sha), provenance()
+    )
+    assert folded(service, scheduled) == "revalidated_fixed"
+
+
+def test_tied_verifications_break_by_id_never_by_verdict() -> None:
     from datetime import UTC, datetime
 
     from traust_core.v1.models.assessment import Assessment

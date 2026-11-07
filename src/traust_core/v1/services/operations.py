@@ -907,6 +907,11 @@ class OpsService:
         with self._uow as uow:
             return uow.run_orders.find_by_work_item(work_item_id)
 
+    def scheduling_orders(self, work_item_ids: Collection[UUID]) -> dict[UUID, RunOrder]:
+        """Each work item's scheduling order (`order_for_work_item`'s choice), in one read."""
+        with self._uow as uow:
+            return uow.run_orders.scheduling_orders(work_item_ids)
+
     def orders_after(
         self,
         asset: AssetName,

@@ -883,6 +883,11 @@ class RemediationService:
     def _active(self, repository_id: UUID) -> list[WorkItem]:
         return [i for i in self._items(repository_id) if i.status not in OVER and not i.is_done()]
 
+    def items_of(self, repository_id: UUID) -> list[WorkItem]:
+        """Every work item of the repository, oldest first: the fold a scheduling listing
+        reads once per repository."""
+        return self._items(repository_id)
+
     def covering(self, repository_id: UUID, finding_ids: Collection[UUID]) -> list[WorkItem]:
         """The repository's work items that cover any of these findings: scheduling's
         idempotency and overlap checks, and the newer-effort rule of the revalidation fold."""
@@ -1061,8 +1066,9 @@ def _source_finding(item: RemediationItem) -> dict[str, Any]:
 
 
 def _verdict_order(verification: Assessment) -> tuple[datetime, datetime, UUID]:
-    """When a verification happened, then when it was recorded, then its id: a tie goes by the
-    record, never by the verdict's text."""
+    """When a verification happened, then when it was recorded, then its id. Nothing stored
+    orders two verifications recorded in the same tick, so the id is an arbitrary but fixed
+    tie-break: the result never turns on the verdict's text."""
     assert verification.created_at is not None and verification.id is not None
     return verification.occurred_at, verification.created_at, verification.id
 
@@ -1591,7 +1597,7 @@ class VerificationService:
         )
 
     def revalidated_verdicts(
-        self, item: WorkItem, fork_branch: str | None
+        self, item: WorkItem, fork_branch: str | None, scheduled_at: datetime | None
     ) -> list[RemediationStatus]:
         """The effort's revalidation verdicts, folded at read from the verification decisions
         and ordered as their verifications happened — the rules the removed scheduled row's
@@ -1602,15 +1608,15 @@ class VerificationService:
         Merged or abandoned efforts are past revalidation."""
         if (
             fork_branch is None
+            or scheduled_at is None
             or item.fix_commit is None
             or item.report is None
             or item.status in _PAST_REVALIDATION
         ):
             return []
-        # only verifications recorded once the fix was reported can revalidate it: an earlier
-        # check of the same commit was never about this effort
-        reported_at = self._log.get_artifact(item.report.id).created_at
-        assert reported_at is not None
+        # only verifications recorded once the effort was scheduled can revalidate it (both
+        # record times): an earlier check of the same commit was never about this effort, while
+        # one recorded before a late or retried report still checks this effort's fix
         refs = self._inventory.list_refs_by_ids({item.repository_ref_id})
         if not refs:
             return []
@@ -1623,7 +1629,7 @@ class VerificationService:
             if a.kind == VERIFICATION
             and a.repository_ref_id is not None
             and a.created_at is not None
-            and a.created_at >= reported_at
+            and a.created_at >= scheduled_at
         ]
         patched = {
             r.id: r

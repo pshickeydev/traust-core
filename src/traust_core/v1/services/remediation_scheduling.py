@@ -179,11 +179,12 @@ class RemediationSchedulingService:
         until the page is full, never the whole history."""
         after = page.position()
         found: list[ScheduledEffort] = []
+        history: dict[UUID, list[WorkItem]] = {}  # each repository folded once per listing
         while len(found) <= page.limit:
             orders = self._ops.orders_after(REMEDIATE_FINDING, repository_id, after, _BATCH)
             found += [
                 e
-                for e in self._efforts(orders)
+                for e in self._efforts(orders, history)
                 if (status is None or e.status == status)
                 and (finding_id is None or finding_id in e.work_item.finding_ids)
             ]
@@ -196,20 +197,23 @@ class RemediationSchedulingService:
             lambda e: (e.scheduled_at, e.order_id),
         )
 
-    def _efforts(self, orders: Sequence[RunOrder]) -> list[ScheduledEffort]:
-        """The efforts a batch of orders schedules, in their order: an order carrying fork facts
-        and naming a work item whose findings were recorded (an order naming no fork runs no
-        scheduled fix), each with its effective status folded — one covering fold per
-        repository, shared by its efforts."""
-        items = {
-            i.work_item_id: i
-            for i in self._remediation.items_for({o.work_item_id for o in orders if o.work_item_id})
-        }
+    def _efforts(
+        self, orders: Sequence[RunOrder], history: dict[UUID, list[WorkItem]]
+    ) -> list[ScheduledEffort]:
+        """The efforts a batch of orders schedules, in their order: each work item once, at the
+        order `get` reads for it (the oldest carrying both fork facts — an order naming no fork
+        runs no scheduled fix), with its effective status folded over the repository's work
+        items, read once per listing into `history`."""
+        named = {o.work_item_id for o in orders if o.work_item_id}
+        items = {i.work_item_id: i for i in self._remediation.items_for(named)}
+        scheduling = self._ops.scheduling_orders(named)
         made: list[ScheduledEffort] = []
         for order in orders:
             item = None if order.work_item_id is None else items.get(order.work_item_id)
-            if item is None or order.fork_url is None or order.fork_branch is None:
+            chosen = None if item is None else scheduling.get(item.work_item_id)
+            if item is None or chosen is None or chosen.id != order.id:
                 continue
+            assert order.fork_url is not None and order.fork_branch is not None
             # A work-item order's repository is never null (contracts#117's pairing trigger).
             assert order.repository_id is not None
             made.append(
@@ -223,16 +227,11 @@ class RemediationSchedulingService:
                     scheduled_at=order.created_at,
                 )
             )
-        covering = {
-            repository: self._remediation.covering(
-                repository,
-                {f for e in made if e.repository_id == repository for f in e.work_item.finding_ids},
-            )
-            for repository in {e.repository_id for e in made}
-        }
+        for repository in {e.repository_id for e in made} - history.keys():
+            history[repository] = self._remediation.items_of(repository)
         return [
             e.model_copy(
-                update={"status": self._status(e, e.repository_id, covering[e.repository_id])}
+                update={"status": self._status(e, e.repository_id, history[e.repository_id])}
             )
             for e in made
         ]
@@ -260,7 +259,9 @@ class RemediationSchedulingService:
             for other in others
         )
         standing = item.status
-        for verdict in self._verification.revalidated_verdicts(item, effort.fork_branch):
+        for verdict in self._verification.revalidated_verdicts(
+            item, effort.fork_branch, effort.scheduled_at
+        ):
             if standing in OVER and newer:
                 break
             standing = (
@@ -279,8 +280,6 @@ class RemediationSchedulingService:
             repository_id, {f for item in covering for f in item.finding_ids}
         )
         for item in covering:
-            if item.status in OVER:  # a failed or finished attempt: a retry is a new work item
-                continue
             order = self._ops.order_for_work_item(item.work_item_id)
             if (
                 order is None or order.fork_url is None or order.fork_branch is None

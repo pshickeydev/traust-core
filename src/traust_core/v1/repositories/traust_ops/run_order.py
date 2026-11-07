@@ -73,6 +73,10 @@ class RunOrderRepository(MutableRecordRepository[RunOrder], Protocol):
         """The order running a work item, if any (remediate_finding orders name theirs)."""
         ...
 
+    def scheduling_orders(self, work_item_ids: Collection[UUID]) -> dict[UUID, RunOrder]:
+        """Each work item's scheduling order: the oldest carrying both fork facts."""
+        ...
+
     def subjects(
         self,
         asset: str,
@@ -210,17 +214,31 @@ class SqlRunOrderRepository(SqlMutableRepository[RunOrder]):
         return None if row is None else self._to_record(row)
 
     def find_by_work_item(self, work_item_id: UUID) -> RunOrder | None:
-        """The order that scheduled the work item's effort: one carrying fork facts before any
-        bare order naming it, then the oldest."""
+        """The order that scheduled the work item's effort: one carrying both fork facts before
+        any other order naming it, then the oldest."""
         c = self.table.c
         stmt = (
             self._select()
             .where(c.work_item_id == work_item_id)
-            .order_by(c.fork_url.is_(None), c.created_at, c.id)
+            .order_by(c.fork_url.is_(None) | c.fork_branch.is_(None), c.created_at, c.id)
             .limit(1)
         )
         row = self._execute(f"find order for work item {work_item_id}", stmt).mappings().first()
         return None if row is None else self._to_record(row)
+
+    def scheduling_orders(self, work_item_ids: Collection[UUID]) -> dict[UUID, RunOrder]:
+        c = self.table.c
+        forked = [
+            o
+            for o in self._many_in(
+                f"orders of {len(work_item_ids)} work items", c.work_item_id, work_item_ids
+            )
+            if o.fork_url is not None and o.fork_branch is not None
+        ]
+        first: dict[UUID, RunOrder] = {}
+        for o in sorted(forked, key=lambda o: (o.created_at, o.id)):  # type: ignore[arg-type,return-value]
+            first.setdefault(o.work_item_id, o)  # type: ignore[arg-type]
+        return first
 
     def search(
         self,
