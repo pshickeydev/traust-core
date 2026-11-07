@@ -129,6 +129,8 @@ target or an applicable discovery domain; execution must also verify the resolve
 Namespace-less direct HTTP uses a distinct HTTP action, not cluster-wide Kubernetes
 permission. It requires an explicit exact-host grant, a named context with a pinned
 API, and the permitted action; expiry, off-limits and denied verbs still apply.
+Structured POST, PUT, PATCH and DELETE steps require destructive classification:
+the structured HTTP contract has no compensating rollback.
 
 `ValidationScope.expires` is valid through its date; timezone-aware `expires_at` expires at the
 specified instant. Bindings intersect both constraints. `decide`/`permits` accept a date or an

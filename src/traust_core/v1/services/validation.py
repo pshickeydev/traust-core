@@ -128,9 +128,7 @@ def _authorize_http_step(step: SchemaView, scope: ValidationScope, now: datetime
     ):
         raise ForbiddenError("structured HTTP target identity does not match its probe")
     classification = getattr(step, "classification", None)
-    if (method == "DELETE" and classification != "destructive") or (
-        method in {"POST", "PUT", "PATCH"} and classification not in {"mutating", "destructive"}
-    ):
+    if method in {"POST", "PUT", "PATCH", "DELETE"} and classification != "destructive":
         raise ForbiddenError("structured HTTP method does not match its classification")
     for field in ("method", "path", "port"):
         declared = getattr(target, field, None)

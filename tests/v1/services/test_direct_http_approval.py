@@ -39,13 +39,10 @@ def direct_step(
     port: int | None = None,
     authenticate: bool = False,
     csrf: bool = False,
+    classification: str | None = None,
 ) -> SchemaView:
-    if method == "DELETE":
-        classification = "destructive"
-    elif method in {"POST", "PUT", "PATCH"}:
-        classification = "mutating"
-    else:
-        classification = "safe"
+    if classification is None:
+        classification = "destructive" if method in {"POST", "PUT", "PATCH", "DELETE"} else "safe"
     return SchemaView(
         [],
         {
@@ -85,6 +82,15 @@ def test_approval_allows_namespace_less_direct_http(
         scope.model_copy(update={"http_targets": (grant,)}),
         NOW,
     )
+
+
+@pytest.mark.parametrize("method", ["POST", "PUT", "PATCH", "DELETE"])
+@pytest.mark.parametrize("classification", ["safe", "mutating"])
+def test_approval_rejects_underclassified_http_writes(
+    scope: ValidationScope, method: str, classification: str
+) -> None:
+    with pytest.raises(ForbiddenError, match="classification"):
+        _authorize_http_step(direct_step(method=method, classification=classification), scope, NOW)
 
 
 def test_named_grants_do_not_authorize_another_name(scope: ValidationScope) -> None:
