@@ -25,16 +25,17 @@ Cursor = NewType("Cursor", str)
 class RecordBudget:
     """A cumulative bound on materialized input rows, including repeated related reads."""
 
-    def __init__(self, max_records: int, workload: str) -> None:
+    def __init__(self, max_records: int, workload: str, *, hint: str = "narrow the window") -> None:
         if max_records < 1:
             raise ValidationError(f"{workload}: max_records must be positive")
         self.remaining = max_records
         self._workload = workload
+        self._hint = hint
 
     def consume(self, count: int) -> None:
         if count > self.remaining:
             raise ValidationError(
-                f"{self._workload} workload exceeds its record budget; narrow the window"
+                f"{self._workload} workload exceeds its record budget; {self._hint}"
             )
         self.remaining -= count
 

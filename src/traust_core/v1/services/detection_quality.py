@@ -144,6 +144,7 @@ from traust_core.v1.services import rule_proposals
 from traust_core.v1.services.artifact_publishing import (
     ArtifactPublisher,
     AssessmentLog,
+    Imported,
     PublishResult,
 )
 from traust_core.v1.services.code_facts import CodeFactsService
@@ -340,12 +341,12 @@ class DetectionQualityService:
         *,
         include_held_out: bool = False,
     ) -> BenchmarkRun:
-        """Score each target's benchmark audit (and a rerun, for stability) against the answer key.
-
-        Only admitted targets count; held-out ones only when `include_held_out` (release scoring).
-        """
+        """Score admitted targets' recorded audits, including held-out ones only for release."""
         return self._score(
-            runs, lambda t: [self._run_report(a) for a in runs.get(t, ())[:2]], include_held_out
+            runs,
+            lambda target: [self._run_report(a) for a in runs.get(target, ())[:2]],
+            include_held_out,
+            self._benchmark_key(),
         )
 
     def score_reports(
@@ -360,6 +361,7 @@ class DetectionQualityService:
             reports,
             lambda t: [(auditor_version, r) for r in reports.get(t, ())[:2]],
             include_held_out,
+            self._benchmark_key(),
         )
 
     def _score(
@@ -367,11 +369,11 @@ class DetectionQualityService:
         runs: Collection[BenchmarkTargetId],
         load: Callable[[BenchmarkTargetId], Sequence[tuple[str, ReportArtifact] | str]],
         include_held_out: bool,
+        answer_key: Imported[BenchmarkTargetArtifact],
+        *,
+        read_budget: RecordBudget | None = None,
     ) -> BenchmarkRun:
         """The answer key's scored targets, each over its loaded run (and rerun) reports."""
-        answer_key = self._publisher.latest_imported(BenchmarkTargetArtifact)
-        if answer_key is None:
-            raise NotFoundError("no benchmark answer key recorded")
         doc = answer_key.document
         if unknown := sorted(set(runs) - {t.id for t in doc.targets}):
             raise ValidationError(f"runs for targets not in the answer key: {unknown}")
@@ -382,6 +384,8 @@ class DetectionQualityService:
         for target in doc.targets:
             if not target.admitted or (target.held_out and not include_held_out):
                 continue
+            if read_budget is not None:
+                read_budget.consume(1 + len(target.expected))
             target_id = BenchmarkTargetId(target.id)
             reports = load(target_id)
             first = reports[0] if reports else "no run"
@@ -394,6 +398,8 @@ class DetectionQualityService:
                 skipped.append(SkippedTarget(target_id=target_id, reason=f"wrong clone: {got}"))
                 continue
             versions.add(version)
+            if read_budget is not None:
+                read_budget.consume(len(report.findings))
             reported = _reported(report, target.repo_url)
             matches = _match(target, reported)
             scored.append(
@@ -409,8 +415,10 @@ class DetectionQualityService:
             )
             rerun = reports[1] if len(reports) > 1 else None
             if isinstance(rerun, tuple):
+                if read_budget is not None:
+                    read_budget.consume(len(rerun[1].findings))
                 again = {r.fingerprint for r in _reported(rerun[1], target.repo_url)}
-                once = {r.fingerprint for r in reported}
+                once = {row.fingerprint for row in reported}
                 stability.append(
                     Stability(target_id=target_id, jaccard=round(_jaccard(once, again), 3))
                 )
@@ -619,29 +627,66 @@ class DetectionQualityService:
             ),
         )
 
-    def scorecards(self, filter: BenchmarkFilter) -> list[Scorecard]:
-        """A scorecard per auditor version over every recorded benchmark audit, oldest first."""
-        answer_key = self._publisher.latest_imported(BenchmarkTargetArtifact)
-        if answer_key is None:
-            raise NotFoundError("no benchmark answer key recorded")
+    def scorecards(
+        self, filter: BenchmarkFilter, *, max_records: int | None = None
+    ) -> list[Scorecard]:
+        """Complete eligible audit cohorts; exceeding the cumulative budget refuses the read."""
+        read_budget = (
+            RecordBudget(
+                max_records,
+                "benchmark scorecards",
+                hint="reduce the audit population or select an auditor version",
+            )
+            if max_records is not None
+            else None
+        )
+        if read_budget is not None:
+            read_budget.consume(1)
+        answer_key = self._benchmark_key()
         targets = answer_key.document.targets
-        by_version: dict[str, dict[BenchmarkTargetId, list[UUID]]] = {}
-        for audit in sorted(self._log.list_of(AssessmentKind.BENCHMARK_AUDIT), key=_when):
+        if read_budget is not None:
+            read_budget.consume(len(targets) + sum(len(target.expected) for target in targets))
+        eligible = [
+            target
+            for target in targets
+            if target.admitted and (filter.include_held_out or not target.held_out)
+        ]
+        if not eligible:
+            return []
+        by_repo = defaultdict(list)
+        for target in eligible:
+            by_repo[canon_repo(target.repo_url)].append(target)
+        by_version: dict[str, dict[BenchmarkTargetId, list[tuple[str, ReportArtifact]]]] = {}
+        audits = self._log.list_of(AssessmentKind.BENCHMARK_AUDIT, read_budget=read_budget)
+        for audit in sorted(audits, key=_when):
             if filter.auditor_version not in (None, audit.assessor_version):
                 continue
-            assert audit.id is not None
-            run = self._run_report(audit.id)
-            target = None if isinstance(run, str) else _target_of(targets, run[1].metadata)
-            if target is None:
-                log.warning("benchmark audit %s matches no answer-key target: not scored", audit.id)
+            run = self._benchmark_report(audit, read_budget=read_budget)
+            if isinstance(run, str):
                 continue
-            by_version.setdefault(audit.assessor_version, {}).setdefault(target, []).append(
-                audit.id
+            candidates = by_repo.get(canon_repo(run[1].metadata.repository), ())
+            if read_budget is not None:
+                read_budget.consume(len(candidates))
+            target_id = _target_of(candidates, run[1].metadata)
+            if target_id is None:
+                log.warning(
+                    "benchmark audit %s has no eligible answer-key target: not scored", audit.id
+                )
+                continue
+            cohort = by_version.setdefault(audit.assessor_version, {}).setdefault(target_id, [])
+            if len(cohort) < 2:
+                cohort.append(run)
+        cards = []
+        for version, runs in by_version.items():
+            scored = self._score(
+                runs,
+                lambda target, cohort=runs: cohort.get(target, ()),
+                filter.include_held_out,
+                answer_key,
+                read_budget=read_budget,
             )
-        return [
-            self.run_benchmark(runs, include_held_out=filter.include_held_out).scorecard()
-            for runs in by_version.values()
-        ]
+            cards.append(scored.scorecard().model_copy(update={"auditor_versions": (version,)}))
+        return cards
 
     def rule_packs(self) -> list[RulePack]:
         """The rule packs the deployment scans with."""
@@ -1275,18 +1320,32 @@ class DetectionQualityService:
                 first[o.finding_id] = run
         return first
 
+    def _benchmark_key(self) -> Imported[BenchmarkTargetArtifact]:
+        answer_key = self._publisher.latest_imported(BenchmarkTargetArtifact)
+        if answer_key is None:
+            raise NotFoundError("no benchmark answer key recorded")
+        return answer_key
+
     def _run_report(self, assessment_id: UUID) -> tuple[str, ReportArtifact] | str:
-        """The run's assessor version and report, or why the run can't be scored."""
-        with self._uow:
-            assessment = self._log.get(assessment_id)
-            reports = self._publisher.list_for_assessment(assessment_id, kind=_REPORT)
+        return self._benchmark_report(self._log.get(assessment_id))
+
+    def _benchmark_report(
+        self, assessment: Assessment, *, read_budget: RecordBudget | None = None
+    ) -> tuple[str, ReportArtifact] | str:
         if assessment.kind != AssessmentKind.BENCHMARK_AUDIT:
             raise ValidationError(
-                f"assessment {assessment_id} is {assessment.kind}, not a benchmark audit"
+                f"assessment {assessment.id} is {assessment.kind}, not a benchmark audit"
             )
+        assert assessment.id is not None
+        reports = self._publisher.list_for_assessment(
+            assessment.id, kind=_REPORT, read_budget=read_budget
+        )
         if len(reports) != 1:
-            return f"{len(reports)} reports for run {assessment_id}"
-        report = self._publisher.read(reports[0].id, ReportArtifact)  # type: ignore[arg-type]
+            return f"{len(reports)} reports for run {assessment.id}"
+        assert reports[0].id is not None
+        report = self._publisher.read(reports[0].id, ReportArtifact, read_budget=read_budget)
+        if read_budget is not None:
+            read_budget.consume(len(report.findings))
         return assessment.assessor_version, report
 
 

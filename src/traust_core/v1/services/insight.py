@@ -283,6 +283,7 @@ class InsightService:
                 n
                 for n, v in self._views.items()
                 if not getattr(v, "per_item", False)
+                and not getattr(v, "on_demand", False)
                 and (filter.window is None or _accepts_window(v))
                 and ((supports := getattr(v, "supports_filter", None)) is None or supports(filter))
             ]
@@ -432,7 +433,7 @@ class CriticalMissesView:
 
 
 def _rate(value: float | None) -> str:
-    return "not measured" if value is None else f"{value:.1%}"
+    return "—" if value is None else f"{value:.1%}"
 
 
 class BenchmarkScorecardsView:
@@ -440,6 +441,7 @@ class BenchmarkScorecardsView:
     release scoring, never a dashboard; scoring unrecorded runs stays `score_reports`."""
 
     name = ViewName.BENCHMARK_SCORECARDS
+    on_demand = True
 
     def __init__(self, detection_quality: DetectionQualityService) -> None:
         self._detection_quality = detection_quality
@@ -456,7 +458,9 @@ class BenchmarkScorecardsView:
                 + ", ".join(sorted(unsupported))
             )
         model = BenchmarkScorecards(
-            scorecards=tuple(self._detection_quality.scorecards(BenchmarkFilter()))
+            scorecards=tuple(
+                self._detection_quality.scorecards(BenchmarkFilter(), max_records=10_000)
+            )
         )
         contracts.validate_view(self.name, model.model_dump(mode="json"))
         return model
@@ -476,7 +480,13 @@ class BenchmarkScorecardsView:
             )
         ]
         if not model.scorecards:
-            sections.append(Section(heading="Results", body="No benchmark audit is recorded."))
+            sections.append(
+                Section(
+                    heading="Results",
+                    body="No scorecards are eligible under the newest answer key. Recorded audits "
+                    "may be absent, unmatched, held out or unadmitted.",
+                )
+            )
         for index, card in enumerate(model.scorecards, start=1):
             sections += self._scorecard(index, card)
         return Report(
@@ -489,7 +499,7 @@ class BenchmarkScorecardsView:
     @staticmethod
     def _scorecard(index: int, card: Scorecard) -> list[Section]:
         versions = ", ".join(card.auditor_versions) or "not supplied"
-        stability = "not measured" if card.mean_stability is None else f"{card.mean_stability:.3f}"
+        stability = "—" if card.mean_stability is None else f"{card.mean_stability:.3f}"
         sections = [
             Section(
                 heading=f"Scorecard {index}: {versions}",

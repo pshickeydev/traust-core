@@ -582,7 +582,7 @@ def test_scorecards_match_a_target_by_its_pinned_commit(
 def test_scorecards_include_held_out_targets_only_at_release(world: World) -> None:
     world.key(target(held_out=True))
     world.attach(audited(), AssessmentKind.BENCHMARK_AUDIT)
-    assert world.service().scorecards(BenchmarkFilter())[0].targets_scored == 0
+    assert world.service().scorecards(BenchmarkFilter()) == []
     release = world.service().scorecards(BenchmarkFilter(include_held_out=True))
     assert release[0].by_split.keys() == {"held_out"}
 

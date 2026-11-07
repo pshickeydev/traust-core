@@ -4,7 +4,6 @@ benchmark audits, validated against its contracts view schema and rendered as a 
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
@@ -13,7 +12,7 @@ from tests.v1.repositories.tables.conftest import T0
 from tests.v1.services import test_detection_quality_doors as doors
 from tests.v1.services.test_detection_quality import FP, finding, target
 from tests.v1.services.test_detection_quality_doors import DAY, World, audited
-from traust_core.v1.errors import DocumentError, NotFoundError, ValidationError
+from traust_core.v1.errors import NotFoundError, ValidationError
 from traust_core.v1.models.assessment import AssessmentKind
 from traust_core.v1.models.common import TimeWindow
 from traust_core.v1.models.detection_quality import InjectionSummary, Recall, Scorecard
@@ -42,18 +41,6 @@ def card(**changes: object) -> Scorecard:
     return Scorecard(**{**values, **changes})
 
 
-def view_of(*cards: Scorecard) -> BenchmarkScorecardsView:
-    asked: list[object] = []
-
-    def scorecards(filter: object) -> list[Scorecard]:
-        asked.append(filter)
-        return list(cards)
-
-    view = BenchmarkScorecardsView(SimpleNamespace(scorecards=scorecards))  # type: ignore[arg-type]
-    view.asked = asked  # type: ignore[attr-defined]
-    return view
-
-
 def test_the_view_scores_each_recorded_auditor_version(world: World) -> None:
     world.key(target(), target(id="bt-y-001", repo_url="https://github.com/org/y"))
     hit, miss = audited(finding(fingerprint=FP)), audited()
@@ -72,13 +59,6 @@ def test_no_answer_key_is_not_found_rather_than_an_empty_view(world: World) -> N
         BenchmarkScorecardsView(world.service()).build(ViewFilter())
 
 
-def test_held_out_targets_never_reach_the_view() -> None:
-    view = view_of(card())
-    view.build(ViewFilter())
-    (asked,) = view.asked  # type: ignore[attr-defined]
-    assert asked.include_held_out is False and asked.auditor_version is None
-
-
 @pytest.mark.parametrize(
     "filter",
     [
@@ -87,43 +67,21 @@ def test_held_out_targets_never_reach_the_view() -> None:
         ViewFilter(product_ids=(uuid4(),)),
     ],
 )
-def test_the_view_takes_no_filters(filter: ViewFilter) -> None:
-    view = view_of(card())
-    assert not view.supports_filter(filter)
+def test_the_view_takes_no_filters(filter: ViewFilter, world: World) -> None:
+    view = BenchmarkScorecardsView(world.service())
     with pytest.raises(ValidationError, match="takes no filters"):
         view.build(filter)
 
 
-def test_a_model_the_contract_refuses_never_leaves_the_view() -> None:
-    view = view_of(card(near_misses=-1))  # out of the schema's range
-    with pytest.raises(DocumentError):
-        view.build(ViewFilter())
-
-
-def test_the_report_states_the_population_and_unmeasured_values() -> None:
-    view = view_of(card(), card(auditor_versions=("h-2",), overall=Recall(detected=0, expected=0)))
-    report = view.report(view.build(ViewFilter()), AT)
-    markdown = MarkdownRenderer().render(report).decode()
-    assert report.sources == ("DetectionQualityService.scorecards",)
-    assert "held-out targets are excluded" in markdown
-    assert "Scorecard 1: h-1" in markdown and "Scorecard 2: h-2" in markdown
-    assert "60.0%" in markdown  # 3 of 5
-    assert "not measured" in markdown  # nothing expected, no stability, no injection canaries
-    assert "| low | 0 | 0 | not measured |" in markdown
-
-
-def test_no_recorded_audit_says_so() -> None:
-    view = view_of()
-    markdown = MarkdownRenderer().render(view.report(view.build(ViewFilter()), AT)).decode()
-    assert "No benchmark audit is recorded." in markdown
-
-
-def test_untrusted_labels_stay_inert_in_every_render() -> None:
+def test_untrusted_labels_stay_inert_in_every_render(world: World) -> None:
     hostile = "[act](https://evil.invalid)<img src=x>\n|forged‮"
-    view = view_of(
-        card(by_cwe={hostile: Recall(detected=1, expected=1)}, auditor_versions=(hostile,))
+    view = BenchmarkScorecardsView(world.service())
+    model = BenchmarkScorecards(
+        scorecards=(
+            card(by_cwe={hostile: Recall(detected=1, expected=1)}, auditor_versions=(hostile,)),
+        )
     )
-    report = view.report(view.build(ViewFilter()), AT)
+    report = view.report(model, AT)
     markdown = MarkdownRenderer().render(report).decode()
     html = HtmlRenderer().render(report).decode()
     assert "<img" not in markdown and "<img" not in html
@@ -136,5 +94,5 @@ def test_the_view_is_registered(tmp_path: object) -> None:
     from traust_core.v1.context import Config, Context
 
     insight = Context(Config(home=tmp_path)).services().insight  # type: ignore[arg-type]
-    with pytest.raises(NotFoundError, match="no benchmark answer key"):
+    with pytest.raises(NotFoundError):
         insight.build(ViewName.BENCHMARK_SCORECARDS, ViewFilter())

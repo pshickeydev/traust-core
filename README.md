@@ -99,14 +99,19 @@ The remaining correctness changes are:
   dependency in the contracts facade.
 
 - `ViewName.BENCHMARK_SCORECARDS` is a global, on-demand view of
-  `DetectionQualityService.scorecards`: one recall scorecard per auditor version over the
-  recorded benchmark audits, scored against the newest answer key. It takes no filters (scope,
-  `as_of` and windows are refused) and never includes held-out targets, which are release
-  scoring. The model is validated by `contracts.validate_view("benchmark-scorecards", …)`.
-  The report renders population, strict recall, near misses (adjudication items, never
-  detections), injection and stability per scorecard, with unmeasured values stated as not
-  measured, never 0. No answer key recorded is `NotFoundError`. Scoring a directory of
-  unrecorded runs stays `DetectionQualityService.score_reports`, a door, not a view.
+  `DetectionQualityService.scorecards`: one recall scorecard per eligible auditor version,
+  scored against one snapshot of the newest answer key. Unadmitted and held-out-only cohorts
+  are omitted; held-out targets remain available only through release scoring. An empty view
+  means no eligible scorecards, not necessarily no recorded audits. The view takes no filters
+  and is excluded from implicit refresh; explicit publication remains available.
+  Reads share a 10,000-record workload budget across the answer key, audit history, report
+  metadata, findings and target matching/scoring. Overflow raises `ValidationError` (HTTP 422),
+  never a partial scorecard. Matching and scoring reuse the same loaded reports.
+  The model is validated by `contracts.validate_view("benchmark-scorecards", …)`. The report
+  renders strict recall, near misses (adjudication items, never detections), injection and
+  stability; unmeasured cells show `—`, never 0. No recorded answer key is `NotFoundError`.
+  `scorecards(filter, max_records=…)` offers the same cumulative bound to direct callers;
+  scoring unrecorded runs stays `DetectionQualityService.score_reports`, a door, not a view.
 
 ## Repository checkouts
 

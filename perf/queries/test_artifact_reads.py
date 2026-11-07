@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import pytest
 import sqlalchemy as sa
 
 from perf.harness import Profile
 from perf.queries.test_ledger import fast
 from traust_core.v1.models.assessment import Artifact
+from traust_core.v1.models.common import RecordBudget
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 
 
@@ -20,16 +22,20 @@ def test_latest_assessment_uses_ref_kind_index(engine: sa.Engine, explained: Pro
     fast(latest, "idx_assessment_ref_kind_occurred", 5)
 
 
+@pytest.mark.parametrize("max_records", [None, 1])
 def test_artifact_kind_read_stays_scoped_to_one_assessment(
-    engine: sa.Engine, explained: Profile
+    engine: sa.Engine, explained: Profile, max_records: int | None
 ) -> None:
     with SqlTraustUnitOfWork(engine) as unit:
         c = unit.artifacts.table.c
         assessment_id = unit.connection.execute(
             sa.select(c.assessment_id).where(c.assessment_id.is_not(None)).limit(1)
         ).scalar_one()
+    budget = RecordBudget(max_records, "scorecards") if max_records is not None else None
     (artifacts,) = explained(
-        lambda unit: unit.artifacts.list_for_assessment(assessment_id, kind="code-facts")
+        lambda unit: unit.artifacts.list_for_assessment(
+            assessment_id, kind="code-facts", read_budget=budget
+        )
     )
     fast(artifacts, "idx_artifact_assessment", 5)
 
