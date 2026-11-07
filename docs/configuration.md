@@ -130,6 +130,7 @@ target or an applicable discovery domain; execution must also verify the resolve
 `ValidationScope.expires` is valid through its date; timezone-aware `expires_at` expires at the
 specified instant. Bindings intersect both constraints. `decide`/`permits` accept a date or an
 aware datetime; timestamp-scoped grants require an aware datetime. Cluster crypto checks every
-discovery read and exec against the current clock and action, with denied operations recorded as
-gaps. Expiry, off-limits and denied verbs also apply to HTTP actions; node mutations still require
+discovery read and exec against the current clock and action. A denied operation is recorded as a
+gap and marks its requested namespace denied in the census scope. Expiry, off-limits and denied
+verbs also apply to HTTP actions; node mutations still require
 separate cluster-wide authorization.

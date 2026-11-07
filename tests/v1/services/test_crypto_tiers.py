@@ -254,6 +254,8 @@ def test_cluster_discovery_checks_real_resource_and_verb() -> None:
     )
     assert not any(call[3:5] == ["get", "svc"] for call in oc.calls)
     assert any("scope denied: list services in app-ns" in gap for gap in census.gaps)
+    assert not census.scope[0].decision.allowed
+    assert any(gap.startswith("scope denied: app-ns —") for gap in census.gaps)
     assert census.discovery == ()
 
     denied_list = scope(["app-ns"]).model_copy(
@@ -275,6 +277,8 @@ def test_cluster_discovery_checks_real_resource_and_verb() -> None:
     )
     assert not oc.calls
     assert any("scope denied: list pods" in gap for gap in census.gaps)
+    assert not census.scope[0].decision.allowed
+    assert any(gap.startswith("scope denied: app-ns —") for gap in census.gaps)
 
 
 def test_the_cluster_door_needs_its_probe_and_oc(monkeypatch: pytest.MonkeyPatch) -> None:

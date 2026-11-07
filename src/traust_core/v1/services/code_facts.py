@@ -375,20 +375,23 @@ class CodeFactsService:
                 decision.allowed,
                 decision.reason,
             )
-            if verb == "exec" and (namespace not in decisions or not decision.allowed):
+            if namespace in request.namespaces and (
+                namespace not in decisions
+                or (decisions[namespace].allowed and not decision.allowed)
+            ):
                 decisions[namespace] = decision
             return decision
 
         allowed = [ns for ns in request.namespaces if gate(ns, "exec", "pods", None).allowed]
+        census = ClusterCensus(context=request.context)
+        if allowed:
+            _require_ready(self._cluster)
+            census = self._cluster.collect(request, allowed, gate).data
         denied = tuple(
             f"scope denied: {ns} — {decisions[ns].reason}"
             for ns in request.namespaces
             if not decisions[ns].allowed
         )
-        census = ClusterCensus(context=request.context)
-        if allowed:
-            _require_ready(self._cluster)
-            census = self._cluster.collect(request, allowed, gate).data
         scoped = tuple(NamespaceScope(namespace=ns, decision=d) for ns, d in decisions.items())
         return census.model_copy(update={"scope": scoped, "gaps": (*census.gaps, *denied)})
 
