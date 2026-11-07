@@ -1161,6 +1161,41 @@ def test_a_report_on_an_order_scheduling_no_longer_vouches_for_is_refused(
     assert context.services().remediation.get(scheduled.work_item.work_item_id).report is None
 
 
+def test_an_attached_report_still_finishes_its_resolution_after_the_policy_changed(
+    service: RemediationSchedulingService,
+    context: Context,
+    engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from traust_core.v1.services.findings.decisions import FindingDecisions
+
+    world = World(engine, patched_name="main")
+    audited(engine, world, world.base)
+    request = pairs(world.ids, [world.repo.id] * len(world.ids))
+    scheduled = service.create(fork_of(engine, request), world.patched.name, request, PERSON)
+    doc = pushed(scheduled, world.ids, fork__fix_commit=world.patched.sha)
+    write = FindingDecisions.record_resolution
+
+    def interrupted(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("connection lost")
+
+    monkeypatch.setattr(FindingDecisions, "record_resolution", interrupted)
+    with pytest.raises(RuntimeError):
+        context.services().remediation.record(doc, provenance())  # attached, unresolved
+    monkeypatch.setattr(FindingDecisions, "record_resolution", write)
+    with SqlTraustUnitOfWork(engine) as uow:  # a private mirror registered since: a new fork
+        Seed(uow).repository(
+            url="https://github.com/mirror-org/registered-since",
+            upstream_id=world.repo.id,
+            public=False,
+        )
+        uow.commit()
+    remediation = context.services().remediation
+    assert remediation.scheduled_order(scheduled.work_item.work_item_id) is None
+    finished = remediation.record(doc, provenance())
+    assert finished.report is not None and finished.status == "checks_passed"
+
+
 def test_the_listing_follows_its_cursor_page_after_page(
     service: RemediationSchedulingService, engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:

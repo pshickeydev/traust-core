@@ -646,9 +646,11 @@ class RemediationService:
         order = self._ops.order_for_work_item(item.work_item_id)
         if order is not None and (order.fork_url or order.fork_branch):
             # an order's fork facts bind its report; ones scheduling can't vouch for bind
-            # nothing, so the report is refused rather than recorded unchecked
-            if order.repository_id is None or not self.vouches(
-                order, self.policy_fork(order.repository_id)
+            # nothing, so a new report is refused rather than attached unchecked (one already
+            # attached still finishes its resolution)
+            if item.report is None and (
+                order.repository_id is None
+                or not self.vouches(order, self.policy_fork(order.repository_id))
             ):
                 raise ValidationError(
                     f"work item {item.work_item_id}'s order names a fork scheduling can't "
