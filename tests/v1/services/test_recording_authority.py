@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
+import pydantic
 import pytest
 import sqlalchemy as sa
 from sqlalchemy.engine import Engine
@@ -19,7 +20,13 @@ from traust_core.v1.errors import ConflictError, ForbiddenError, NotFoundError, 
 from traust_core.v1.models.artifacts import RunManifestArtifact
 from traust_core.v1.models.common import Provenance
 from traust_core.v1.models.identity import IdentitySource, Principal
-from traust_core.v1.models.operations import JobResult, OrderProgress, OrderRequest, WorkerId
+from traust_core.v1.models.operations import (
+    JobResult,
+    OrderProgress,
+    OrderRequest,
+    RecordKind,
+    WorkerId,
+)
 from traust_core.v1.models.vocabulary import ActorKind, SourceType
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services.artifact_publishing import PublishSpec, PublishSpecs
@@ -83,7 +90,7 @@ def test_owned_live_lease_commits_record_work_without_extending_or_completing_it
     engine: Engine, tmp_path: Path
 ) -> None:
     context, ops, order, provenance, _ = scoped(engine, tmp_path)
-    with ops.recording(order.id, OWNER, "verification", order.repository_id, provenance):
+    with ops.recording(order.id, OWNER, RecordKind.VERIFICATION, order.repository_id, provenance):
         ops.save_progress(order.id, OrderProgress(step=3))
     saved = ops.get(order.id)
     assert saved.artifact_id is not None
@@ -117,7 +124,7 @@ def test_record_authority_denies_before_work_or_progress_is_written(
     if fault == "unverified":
         principal = OWNER.model_copy(update={"verified_by": None})
     repository_id = uuid4() if fault == "repository" else order.repository_id
-    kind = "triage" if fault == "kind" else "verification"
+    kind = RecordKind.TRIAGE if fault == "kind" else RecordKind.VERIFICATION
     if fault == "provenance":
         provenance = provenance.model_copy(update={"run_id": uuid4()})
     if fault == "source":
@@ -141,7 +148,7 @@ def test_expired_or_boundary_lease_cannot_authorize_recording(
     clock.at = T0 + elapsed
     with (
         pytest.raises(ConflictError),
-        ops.recording(order.id, OWNER, "verification", order.repository_id, provenance),
+        ops.recording(order.id, OWNER, RecordKind.VERIFICATION, order.repository_id, provenance),
     ):
         ops.save_progress(order.id, OrderProgress(step=1))
     assert ops.get(order.id).artifact_id is None
@@ -152,7 +159,7 @@ def test_expiry_during_recording_rolls_back_nested_commits(engine: Engine, tmp_p
     before = ops.get(order.id)
     with (
         pytest.raises(ConflictError),
-        ops.recording(order.id, OWNER, "verification", order.repository_id, provenance),
+        ops.recording(order.id, OWNER, RecordKind.VERIFICATION, order.repository_id, provenance),
     ):
         ops.save_progress(order.id, OrderProgress(step=2))
         clock.at = T0 + LEASE
@@ -168,7 +175,7 @@ def test_finished_order_is_not_recording_authority(engine: Engine, tmp_path: Pat
     finished = ops.complete(order.id, WorkerId(OWNER.ref), JobResult.succeeded())
     with (
         pytest.raises(ConflictError),
-        ops.recording(order.id, OWNER, "verification", order.repository_id, provenance),
+        ops.recording(order.id, OWNER, RecordKind.VERIFICATION, order.repository_id, provenance),
     ):
         ops.save_progress(order.id, OrderProgress(step=1))
     assert ops.get(order.id) == finished
@@ -182,9 +189,25 @@ def test_unknown_order_does_not_authorize_recording(engine: Engine, tmp_path: Pa
         ops.recording(
             missing,
             OWNER,
-            "verification",
+            RecordKind.VERIFICATION,
             order.repository_id,
             provenance.model_copy(update={"run_id": missing}),
         ),
     ):
         ops.save_progress(order.id, OrderProgress(step=1))
+
+
+def test_an_asset_on_two_report_kinds_allowlists_is_refused() -> None:
+    """Stage gates resolve a report kind from the asset name alone, so an asset bound to two
+    kinds is ambiguous — the config refuses it rather than deny its first orders. The
+    remediation alias (remediate_finding riding the triage allowlist) stays legal on triage
+    only: bound to any other kind it is a misbinding whose remediation prerequisite nothing
+    wires (Qodo 392), and it runs as its own stage."""
+    with pytest.raises(pydantic.ValidationError, match="one report kind"):
+        RecordingConfig(assessment=("audit",), triage=("audit",))
+    with pytest.raises(pydantic.ValidationError, match="one report kind"):
+        RecordingConfig(triage=("triage",), validation=("triage",))
+    RecordingConfig(triage=("triage", "remediate_finding"), verification=("verify",))
+    for kind in ("assessment", "validation", "verification"):
+        with pytest.raises(pydantic.ValidationError, match="remediation alias"):
+            RecordingConfig(**{kind: ("remediate_finding",)})

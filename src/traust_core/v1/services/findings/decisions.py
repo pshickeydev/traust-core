@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from collections import defaultdict
 from collections.abc import Collection, Mapping, Sequence
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
@@ -53,6 +54,7 @@ from traust_core.v1.models.findings import (
 from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.models.inventory import DEFAULT_FORGE_HOSTS
+from traust_core.v1.models.operations import REMEDIATE_FINDING, RecordKind
 from traust_core.v1.models.validation import (
     ValidationAttempt,
     ValidationFilter,
@@ -257,6 +259,27 @@ class FindingDecisions:
                 else []
             )
 
+    def for_findings(
+        self, finding_ids: Collection[UUID], until: datetime | None = None
+    ) -> list[Decision]:
+        """Every decision on these findings, restated ones included, judgement order; those made
+        after `until` are left out."""
+        with self._uow as uow:
+            return [
+                normalize_decision(row)
+                for row in uow.decisions.list_for_findings(finding_ids, until=until)
+            ]
+
+    def for_assessments(self, assessment_ids: Collection[UUID]) -> list[Decision]:
+        """The decisions these assessments made, judgement order (a work item's fold)."""
+        if not assessment_ids:
+            return []
+        with self._uow as uow:
+            return [
+                normalize_decision(row)
+                for row in uow.decisions.list_for_assessments(assessment_ids)
+            ]
+
     def require_signable(self) -> None:
         """Refuse up front, writing nothing, when the ledger must sign and can't."""
         if self._ledger is not None:
@@ -392,13 +415,11 @@ class FindingDecisions:
         """Record triage under a live triage lease, never a remediation run's lease."""
         if self._recording is None:
             raise ConfigError("triage recording requires operations authorization")
-        # Local import avoids remediation's findings-service dependency cycle.
-        from traust_core.v1.services.remediation_scheduling import REMEDIATE_FINDING
 
         triaged = self._log.get(assessment_id)
         repository_id = self._inventory.get_ref(triaged.repository_ref_id).repository_id
         with self._recording.recording(
-            run_order_id, principal, "triage", repository_id, provenance
+            run_order_id, principal, RecordKind.TRIAGE, repository_id, provenance
         ) as order:
             if order.asset == REMEDIATE_FINDING:
                 raise ForbiddenError(
@@ -736,7 +757,7 @@ class FindingDecisions:
             raise ForbiddenError("validation recording exceeds a single order's repository scope")
         (repository_id,) = repositories
         with self._recording.recording(
-            run_order_id, principal, "validation", repository_id, provenance
+            run_order_id, principal, RecordKind.VALIDATION, repository_id, provenance
         ):
             return self.record_validation(doc, provenance, bindings, run_order_id=run_order_id)
 

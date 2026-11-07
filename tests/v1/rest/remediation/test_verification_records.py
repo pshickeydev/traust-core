@@ -67,14 +67,28 @@ def machine(context: Context, identity: str = "runner-7") -> Principal:
     return context.identity.authenticate(Credential(token=grant.token))
 
 
+def person(context: Context, identity: str = "asker@example.com") -> Principal:
+    assert context.identity is not None
+    grant = context.local_issuer.mint(identity)
+    return context.identity.authenticate(Credential(token=grant.token))
+
+
 def leased(context: Context, world: World, *, asset: str = "verify") -> RunOrder:
-    principal = machine(context)
     ops = context.services().ops
     assert world.repo.id is not None
+    # the deployment gates verify behind a completed remediate_finding order (verification
+    # follows remediation); give the subject its predecessor
+    with SqlTraustUnitOfWork(context.database) as uow:
+        Seed(uow).run_order(
+            asset="remediate_finding", repository_id=world.repo.id, state="succeeded"
+        )
+        uow.commit()
     queued = ops.submit(
-        OrderRequest(asset=AssetName(asset), priority=1, repository_id=world.repo.id), principal
+        OrderRequest(asset=AssetName(asset), priority=1, repository_id=world.repo.id),
+        person(context),
     )
-    order = ops.claim(WorkerId(principal.ref), timedelta(hours=2), (AssetName(asset),))
+    runner = machine(context)
+    order = ops.claim(WorkerId(runner.ref), timedelta(hours=2), (AssetName(asset),))
     assert order is not None and order.id == queued.id
     return order
 
@@ -422,17 +436,33 @@ def test_order_authorization_refusals_leave_rows_and_objects_unchanged(
     if case == "wrong repository":
         order = leased(context, World(engine))
     elif case == "wrong asset":
-        order = leased(context, world, asset="triage")
+        order = leased(context, world, asset="audit")
     elif case in {"repositoryless order", "queued order"}:
-        repository_id = None if case == "repositoryless order" else world.repo.id
-        ops = context.services().ops
-        order = ops.submit(
-            OrderRequest(asset="verify", priority=1, repository_id=repository_id), owner
-        )
+        # submit refuses a subjectless gated order now, so the record door's refusal is proven
+        # against an order seeded straight into the store (a routed order, not a submitted one)
         if case == "repositoryless order":
-            claimed = ops.claim(WorkerId(owner.ref), timedelta(hours=2))
-            assert claimed is not None and claimed.id == order.id
-            order = claimed
+            with SqlTraustUnitOfWork(engine) as uow:
+                order = Seed(uow).run_order(
+                    asset="verify",
+                    repository_id=None,
+                    state="leased",
+                    lease_holder="machine:runner-7",
+                    lease_expires_at=context.clock.now() + timedelta(hours=2),
+                )
+                uow.commit()
+        else:
+            with SqlTraustUnitOfWork(context.database) as uow:
+                Seed(uow).run_order(
+                    asset="remediate_finding",
+                    repository_id=world.repo.id,
+                    state="succeeded",
+                )
+                uow.commit()
+            ops = context.services().ops
+            order = ops.submit(
+                OrderRequest(asset="verify", priority=1, repository_id=world.repo.id),
+                person(context),
+            )
     else:
         order = leased(context, world)
     assert order.id is not None
@@ -525,6 +555,12 @@ def test_explicit_worker_start_records_exact_report_bytes_under_its_native_order
     world = World(engine)
     audited(engine, world, world.base)
     assert world.repo.id is not None
+    # the deployment gates verify behind a completed remediate_finding order; give it one
+    with SqlTraustUnitOfWork(engine) as uow:
+        Seed(uow).run_order(
+            asset="remediate_finding", repository_id=world.repo.id, state="succeeded"
+        )
+        uow.commit()
     scope = RecordingStartScope(
         principal=machine(context).ref,
         assets=("verify",),

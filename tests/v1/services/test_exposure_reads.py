@@ -25,6 +25,7 @@ from traust_core.v1.errors import ConfigError, IntegrityError, NotFoundError, Va
 from traust_core.v1.models.common import Cursor, PageRequest, Provenance, every_item
 from traust_core.v1.models.dependencies import (
     AdvisoryIdentifier,
+    AdvisoryRecord,
     ExposureDimension,
     ExposureFilter,
     ImpactAnalysis,
@@ -47,7 +48,12 @@ CVE = AdvisoryIdentifier("CVE-2023-44487")
 
 
 def reads(
-    engine: Engine, *, findings: bool = True, objects: InMemoryObjectStore | None = None
+    engine: Engine,
+    *,
+    findings: bool = True,
+    objects: InMemoryObjectStore | None = None,
+    advisory: AdvisoryRecord = GRPC,
+    tool: object | None = None,
 ) -> ExposureService:
     uow = SqlTraustUnitOfWork(engine)
     return ExposureService(
@@ -55,10 +61,11 @@ def reads(
         FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy()),
         feeds=ProviderRegistry[FeedProvider]("feed"),
         objects=objects or InMemoryObjectStore(),
-        advisories=Lookup(GRPC),  # type: ignore[arg-type]
+        advisories=Lookup(advisory),  # type: ignore[arg-type]
         portfolio=PortfolioService(uow, PortfolioPolicy()),
         clock=FixedClock(AT),
         findings=finding_service(engine) if findings else None,
+        sbom_tool=tool,  # type: ignore[arg-type]
     )
 
 
@@ -66,7 +73,7 @@ def record(exposure: ExposureService, ref_id: UUID, version: str, reached: bool,
     exposure.ingest_sbom(sbom(("google.golang.org/grpc", version)), ref_id)
     record = exposure.find_advisory(GHSA)
     assert record is not None and record.advisory_id is not None
-    prepared = exposure.prepare(record.advisory_id, ref_id)
+    [prepared] = exposure.prepare(record.advisory_id, ref_id)
     doc = affected_doc(prepared) if reached else prepared.document("1.0.0")
     at = AT + timedelta(days=day)
     return exposure.record(

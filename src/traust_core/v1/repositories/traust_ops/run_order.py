@@ -39,6 +39,8 @@ RUN_ORDER = TableSpec(
         timestamp_column("started_at", nullable=True),
         timestamp_column("finished_at", nullable=True),
         uuid_column("work_item_id", nullable=True),
+        text_column("fork_url", nullable=True),
+        text_column("fork_branch", nullable=True),
     ),
 )
 
@@ -67,6 +69,10 @@ class RunOrderRepository(MutableRecordRepository[RunOrder], Protocol):
         """An open order (planned through leased) for an asset and repository, if any."""
         ...
 
+    def find_by_work_item(self, work_item_id: UUID) -> RunOrder | None:
+        """The order running a work item, if any (remediate_finding orders name theirs)."""
+        ...
+
     def subjects(
         self,
         asset: str,
@@ -75,6 +81,15 @@ class RunOrderRepository(MutableRecordRepository[RunOrder], Protocol):
         reason: str | None = None,
     ) -> set[UUID | None]:
         """Repositories (None = fleet-wide) with an order of `asset` in `states`."""
+        ...
+
+    def subject_has_order(
+        self,
+        assets: Collection[str],
+        repository_id: UUID,
+        states: Collection[OrderState],
+    ) -> bool:
+        """Whether one subject has any order of these assets in these states (bounded read)."""
         ...
 
     def search(
@@ -192,6 +207,19 @@ class SqlRunOrderRepository(SqlMutableRepository[RunOrder]):
         row = self._execute(f"find open {asset} for {repository_id}", stmt).mappings().first()
         return None if row is None else self._to_record(row)
 
+    def find_by_work_item(self, work_item_id: UUID) -> RunOrder | None:
+        """The oldest order naming the work item — the one that scheduled its effort, should
+        a second ever name it."""
+        c = self.table.c
+        stmt = (
+            self._select()
+            .where(c.work_item_id == work_item_id)
+            .order_by(c.created_at, c.id)
+            .limit(1)
+        )
+        row = self._execute(f"find order for work item {work_item_id}", stmt).mappings().first()
+        return None if row is None else self._to_record(row)
+
     def search(
         self,
         *,
@@ -199,6 +227,7 @@ class SqlRunOrderRepository(SqlMutableRepository[RunOrder]):
         asset: str | None = None,
         repository_id: UUID | None = None,
         run_batch_id: UUID | None = None,
+        work_item: bool = False,
         limit: int,
         after: tuple[datetime, UUID] | None = None,
     ) -> list[RunOrder]:
@@ -210,6 +239,7 @@ class SqlRunOrderRepository(SqlMutableRepository[RunOrder]):
                 (asset, c.asset == asset),
                 (repository_id, c.repository_id == repository_id),
                 (run_batch_id, c.run_batch_id == run_batch_id),
+                (work_item, c.work_item_id.is_not(None)),
             )
             if value
         ]
@@ -255,6 +285,25 @@ class SqlRunOrderRepository(SqlMutableRepository[RunOrder]):
             where.append(c.reason == reason)
         stmt = sa.select(c.repository_id).where(*where).distinct()
         return set(self._execute(f"subjects of {asset}", stmt).scalars())
+
+    def subject_has_order(
+        self,
+        assets: Collection[str],
+        repository_id: UUID,
+        states: Collection[OrderState],
+    ) -> bool:
+        c = self.table.c
+        stmt = (
+            self._select()
+            .where(
+                c.asset.in_(list(assets)),
+                c.state.in_(list(states)),
+                c.repository_id == repository_id,
+            )
+            .limit(1)
+        )
+        row = self._execute(f"order of {sorted(assets)} for {repository_id}", stmt).first()
+        return row is not None
 
     def feed_after(
         self, after: tuple[datetime, UUID] | None, states: Collection[OrderState], limit: int

@@ -12,6 +12,8 @@ from traust_core.v1.models.dependencies import (
     AdvisoryPackage,
     AdvisoryRecord,
     AffectedDependency,
+    ImpactExport,
+    ImpactInput,
 )
 from traust_core.v1.rest.common.deps import Caller
 from traust_core.v1.rest.common.problems import PROBLEMS
@@ -48,3 +50,19 @@ def packages_affected(advisory_id: UUID, exposure: Exposure, _: Caller) -> list[
 def affected(advisory_id: UUID, exposure: Exposure, _: Caller) -> list[AffectedDependency]:
     """The advisory's blast radius: the commits and the path by which each is affected."""
     return exposure.affected(advisory_id)
+
+
+@router.get("/v1/advisories/{advisory_id}/impact-report", responses=PROBLEMS(401, 404))
+def export_advisory_impacts(advisory_id: UUID, exposure: Exposure, _: Caller) -> ImpactExport:
+    """Every commit's latest recorded verdicts for the advisory, one row per package and
+    installed version, each with its complete document; read from what is kept, never refreshed."""
+    return exposure.export_impacts(advisory_id)
+
+
+@router.get("/v1/advisories/{advisory_id}/impact-inputs", responses=PROBLEMS(401, 404, 422))
+def prepare_advisory_impacts(
+    advisory_id: UUID, repository_ref_id: UUID, exposure: Exposure, _: Caller
+) -> tuple[ImpactInput, ...]:
+    """What one commit's analysis would work from, one input per package and installed version
+    (the SBOM pass; nothing is recorded)."""
+    return exposure.prepare(advisory_id, repository_ref_id)

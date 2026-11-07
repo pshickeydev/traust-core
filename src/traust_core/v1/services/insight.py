@@ -44,7 +44,13 @@ from traust_core.v1.models.dependencies import (
     malicious_id,
     package_name,
 )
-from traust_core.v1.models.detection_quality import BenchmarkFilter, MissReason, Recall, Scorecard
+from traust_core.v1.models.detection_quality import (
+    COMPLIANCE_PRECISION_GATE,
+    BenchmarkFilter,
+    MissReason,
+    Recall,
+    Scorecard,
+)
 from traust_core.v1.models.findings import (
     FindingClock,
     FindingDimension,
@@ -67,6 +73,7 @@ from traust_core.v1.models.insight import (
     CensusLayer,
     CensusProduct,
     ComplianceDashboard,
+    CompliancePrecision,
     ContainerFinding,
     ContainerFindings,
     ContainerReport,
@@ -109,6 +116,7 @@ from traust_core.v1.models.insight import (
     PqcSiteRow,
     PqcVendorRoadmap,
     PqcVendorRow,
+    PqcWorklist,
     PrivilegeRow,
     PrivilegesRollup,
     ProductRollup,
@@ -285,6 +293,14 @@ class InsightService:
                 if not getattr(v, "per_item", False)
                 and not getattr(v, "on_demand", False)
                 and (filter.window is None or _accepts_window(v))
+                and (
+                    n == ViewName.PQC_WORKLIST
+                    or (filter.repository_ref_ids is None and not filter.pqc_chokepoints)
+                )
+                and (
+                    n == ViewName.COMPLIANCE_PRECISION
+                    or (filter.framework is None and filter.precision_gate is None)
+                )
                 and ((supports := getattr(v, "supports_filter", None)) is None or supports(filter))
             ]
             if views is None
@@ -316,9 +332,219 @@ class InsightService:
             raise ValidationError(
                 f"view {name.value!r} is not built; built views: {known}"
             ) from None
+        if (
+            filter is not None
+            and name != ViewName.PQC_WORKLIST
+            and (filter.repository_ref_ids is not None or filter.pqc_chokepoints)
+        ):
+            raise ValidationError(
+                "repository_ref_ids and pqc_chokepoints are supported only by pqc-worklist"
+            )
+        if (
+            filter is not None
+            and name != ViewName.COMPLIANCE_PRECISION
+            and (filter.framework is not None or filter.precision_gate is not None)
+        ):
+            raise ValidationError(
+                "framework and precision_gate are supported only by compliance-precision"
+            )
         if filter is not None and filter.window is not None and not _accepts_window(found):
             raise ValidationError(f"{name.value} does not support a window")
         return found
+
+
+class CompliancePrecisionView:
+    name = ViewName.COMPLIANCE_PRECISION
+
+    def __init__(self, detection_quality: DetectionQualityService) -> None:
+        self._detection_quality = detection_quality
+
+    @staticmethod
+    def supports_filter(filter: ViewFilter) -> bool:
+        return filter.framework is not None and not filter.model_dump(
+            exclude={"framework", "precision_gate"}, exclude_defaults=True
+        )
+
+    def build(self, filter: ViewFilter) -> CompliancePrecision:
+        if filter.framework is None:
+            raise ValidationError("compliance-precision requires a framework")
+        if not self.supports_filter(filter):
+            unsupported = filter.model_dump(
+                exclude={"framework", "precision_gate"}, exclude_defaults=True
+            )
+            raise ValidationError(
+                "compliance-precision supports only framework and precision_gate; "
+                "unsupported filters: " + ", ".join(sorted(unsupported))
+            )
+        calibration = self._detection_quality.calibrate_compliance(
+            filter.framework,
+            gate=(
+                COMPLIANCE_PRECISION_GATE
+                if filter.precision_gate is None
+                else filter.precision_gate
+            ),
+        )
+        model = CompliancePrecision(calibration=calibration)
+        document: dict[str, contracts.JsonValue] = model.model_dump(mode="json")
+        contracts.validate_view(self.name, document)
+        return model
+
+    def report(self, model: CompliancePrecision, generated_at: datetime) -> Report:
+        calibration = model.calibration
+        population = Section(
+            heading="Population",
+            body="Distinct recorded compliance documents for the selected framework, counted "
+            "once per digest. A firing is an automatic not-satisfied check or an attributed "
+            "human override reversing that verdict; the latter is a dismissal. This is "
+            "field precision, not evaluator idempotence, seeded efficacy or clean coverage.",
+            table=Table(
+                columns=("Framework", "Distinct assessments", "Precision gate (inclusive)"),
+                rows=(
+                    (
+                        calibration.framework.value,
+                        str(calibration.assessments),
+                        str(calibration.gate),
+                    ),
+                ),
+            ),
+        )
+        if not calibration.assessments:
+            results = Section(
+                heading="Results",
+                body="No assessments recorded for this framework; field precision is unmeasured.",
+            )
+        elif not calibration.checks:
+            results = Section(
+                heading="Results",
+                body="No eligible automatic check firings; field precision is unmeasured.",
+            )
+        else:
+            results = Section(
+                heading="Check precision",
+                body="Flagged checks require human demotion review, not automatic changes.",
+                table=Table(
+                    columns=("Check", "Fired", "Dismissed", "Precision", "Demotion review"),
+                    rows=tuple(
+                        (
+                            check.check_id,
+                            str(check.fired),
+                            str(check.dismissed),
+                            "—" if check.precision is None else str(check.precision),
+                            "flagged" if check.flagged else "not flagged",
+                        )
+                        for check in calibration.checks
+                    ),
+                ),
+            )
+        return Report(
+            title="Compliance field precision",
+            generated_at=generated_at,
+            sections=(population, results),
+        )
+
+
+class PqcWorklistView:
+    name = ViewName.PQC_WORKLIST
+
+    def __init__(self, pqc: PqcService) -> None:
+        self._pqc = pqc
+
+    @staticmethod
+    def supports_filter(filter: ViewFilter) -> bool:
+        return len(filter.product_ids) <= 1 and not filter.model_dump(
+            exclude={"product_ids", "repository_ref_ids", "pqc_chokepoints"},
+            exclude_defaults=True,
+        )
+
+    def build(self, filter: ViewFilter) -> PqcWorklist:
+        if not self.supports_filter(filter):
+            raise ValidationError(
+                "pqc-worklist supports only one product, repository_ref_ids and pqc_chokepoints"
+            )
+        product_id = filter.product_ids[0] if filter.product_ids else None
+        entries = self._pqc.worklist(
+            PqcFilter(product_id=product_id, repository_ref_ids=filter.repository_ref_ids),
+            chokepoints=filter.pqc_chokepoints,
+        )
+        model = PqcWorklist(
+            product_id=product_id,
+            repository_ref_ids=filter.repository_ref_ids,
+            chokepoints=tuple(fragment.strip() for fragment in filter.pqc_chokepoints),
+            entries=entries,
+        )
+        document: dict[str, contracts.JsonValue] = model.model_dump(mode="json")
+        contracts.validate_view(self.name, document)
+        return model
+
+    def report(self, model: PqcWorklist, generated_at: datetime) -> Report:
+        population = Section(
+            heading="Population",
+            body="One entry per registered repository in scope, including repositories with "
+            "no registered commit. The representative commit follows the existing sweep's "
+            "default-ref, registration-time and ID ordering. Priority is caller-supplied "
+            "chokepoint fragments, recorded crypto-CWE associations, then the tail. "
+            "Availability and scan currency are recorded evidence, not an access grant or "
+            "a readiness score. Building this worklist does not scan or check out repositories.",
+            table=Table(
+                columns=("Product ID", "Repository-ref scope", "Chokepoint fragments"),
+                rows=(
+                    (
+                        str(model.product_id) if model.product_id is not None else "All inventory",
+                        "All registered commits"
+                        if model.repository_ref_ids is None
+                        else str(len(model.repository_ref_ids)),
+                        ", ".join(model.chokepoints) if model.chokepoints else "—",
+                    ),
+                ),
+            ),
+        )
+        results = Section(
+            heading="Worklist",
+            body="No repositories matched this scope; an empty worklist does not establish "
+            "PQC readiness."
+            if not model.entries
+            else "Order and cursors match the native sweep. The JSON model retains full "
+            "repository/ref IDs, liveness, scan provenance and nullable currency.",
+            table=Table(
+                columns=(
+                    "Priority",
+                    "Repository",
+                    "Commit",
+                    "Route",
+                    "Observation",
+                    "Scan currency",
+                    "Reason",
+                ),
+                rows=tuple(
+                    (
+                        entry.priority_tier.value,
+                        entry.repository,
+                        entry.sha if entry.sha is not None else "—",
+                        entry.route.value,
+                        entry.access.unobserved.value
+                        if entry.access.unobserved is not None
+                        else entry.access.observed_at.isoformat()
+                        if entry.access.observed_at is not None
+                        else "—",
+                        "—"
+                        if entry.scan is None or entry.scan.current is None
+                        else "current"
+                        if entry.scan.current
+                        else "stale",
+                        entry.reason if entry.reason is not None else "—",
+                    )
+                    for entry in model.entries
+                ),
+            ),
+        )
+        return Report(
+            title="PQC worklist",
+            generated_at=generated_at,
+            sections=(population, results),
+            sources=(
+                "PqcService.worklist: registered inventory, recorded findings and scan states",
+            ),
+        )
 
 
 class CriticalMissesView:
@@ -1071,10 +1297,8 @@ def _scoped_findings(
     """The scope (`_scope`) and each repository's findings as of the filter's point in time;
     a category scope keeps only findings carrying one of those category labels."""
     products, shipped, repositories = _scope(portfolio, filter)
-    views = {
-        r.id: findings.all(FindingFilter(repository_id=r.id, as_of=filter.as_of))  # type: ignore[arg-type]
-        for r in repositories
-    }
+    found = findings.all_in([r.id for r in repositories], filter.as_of)  # type: ignore[misc,arg-type]
+    views = {r.id: found.get(r.id, []) for r in repositories}  # type: ignore[misc,arg-type]
     if filter.categories:
         wanted = set(filter.categories)
         views = {rid: [v for v in vs if v.label(CATEGORY) in wanted] for rid, vs in views.items()}
@@ -1292,15 +1516,14 @@ class FindingsTrendView:
         _, _, repositories = _scope(self._portfolio, filter)
         by_bucket: defaultdict[datetime, list[FindingSeriesPoint]] = defaultdict(list)
         dispositioned: Counter[datetime] = Counter()
-        accepted: list[AcceptedRisk] = []
-        for r in repositories:
-            query = FindingFilter(repository_id=r.id, as_of=as_of)  # type: ignore[arg-type]
+        ids = [r.id for r in repositories]  # type: ignore[misc]
+        for points in self._findings.timelines(ids, filter.bucket, as_of).values():
             decided = 0
-            for point in self._findings.timeline(query, filter.bucket):
+            for point in points:
                 decided += point.decisions
                 by_bucket[point.bucket].append(point)
                 dispositioned[point.bucket] += decided > 0
-            accepted += self._accepted(r, query)
+        accepted = self._accepted(repositories, as_of)
         window = filter.window
         points = tuple(
             _summed(bucket, points, dispositioned[bucket])
@@ -1322,21 +1545,32 @@ class FindingsTrendView:
             ),
         )
 
-    def _accepted(self, repository: Repository, query: FindingFilter) -> list[AcceptedRisk]:
-        """The repository's accepted findings, each with its latest risk acceptance."""
-        views = [v for v in self._findings.all(query) if _is(v, FindingState.ACCEPTED)]
+    def _accepted(self, repositories: Sequence[Repository], as_of: datetime) -> list[AcceptedRisk]:
+        """The scope's accepted findings, each with its latest risk acceptance."""
+        views = [
+            v
+            for vs in self._findings.all_in(
+                [r.id for r in repositories],
+                as_of,  # type: ignore[misc,arg-type]
+            ).values()
+            for v in vs
+            if _is(v, FindingState.ACCEPTED)
+        ]
         if not views:
             return []
+        urls = {r.id: r.url for r in repositories}
         accepted_by = {
             d.finding_id: d
-            for d in self._findings.decisions.for_repository(repository.id)  # type: ignore[arg-type]
+            for d in self._findings.decisions.for_findings(
+                {v.finding.id for v in views},
+                until=as_of,  # type: ignore[arg-type]
+            )
             if d.resolution == DispositionResolution.RISK_ACCEPTED
-            and (query.as_of is None or d.occurred_at <= query.as_of)
         }
         return [
             AcceptedRisk(
                 finding_id=v.finding.id,  # type: ignore[arg-type]
-                repository_url=repository.url,
+                repository_url=urls[v.finding.repository_id],
                 title=v.finding.title,
                 severity=v.effective_severity,
                 cvss_score=v.occurrence.cvss_score if v.occurrence else None,
@@ -1708,10 +1942,11 @@ class LocView:
         for r in measured:
             for language in r.languages:
                 totals[language.name].append(language.code)
-        tallies = [
-            _tally(self._findings.all(FindingFilter(repository_id=r.id, as_of=filter.as_of)))  # type: ignore[arg-type]
-            for r in repositories
-        ]
+        found = self._findings.all_in(
+            [r.id for r in repositories],
+            filter.as_of,  # type: ignore[misc,arg-type]
+        )
+        tallies = [_tally(found.get(r.id, ())) for r in repositories]  # type: ignore[misc,arg-type]
         code = sum(r.code for r in measured if r.code is not None)
         return LocDashboard(
             as_of=at,

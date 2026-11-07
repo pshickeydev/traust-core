@@ -19,6 +19,7 @@ from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import Seed
 from traust_core.v1.errors import (
     ConfigError,
+    ConflictError,
     NotFoundError,
     RepositoryError,
     ServiceError,
@@ -64,7 +65,12 @@ from traust_core.v1.repositories.objects import (
     ObjectKey,
     ObjectStore,
 )
-from traust_core.v1.services.exposure import REACHED_THROUGH, UNKNOWN_COVERAGE, ExposureService
+from traust_core.v1.services.exposure import (
+    REACHED_THROUGH,
+    SHARED_FIX,
+    UNKNOWN_COVERAGE,
+    ExposureService,
+)
 from traust_core.v1.services.findings import FindingIntake, IdentityPolicy, TaxonomyPolicy
 from traust_core.v1.services.portfolio import PortfolioPolicy, PortfolioService
 from traust_core.v1.services.reporting import ReportingService
@@ -131,6 +137,12 @@ def sbom(*components: tuple[str, str]) -> bytes:
 
 def provenance() -> Provenance:
     return Provenance(run_id=uuid4(), source=SourceType("impact_report"), occurred_at=AT)
+
+
+def one(prepared: tuple[ImpactInput, ...]) -> ImpactInput:
+    """The commit's only package input (these advisories name one package)."""
+    [item] = prepared
+    return item
 
 
 def advisory_id(exposure: ExposureService) -> UUID:
@@ -213,7 +225,7 @@ def test_the_recorded_sample_against_the_real_grpc_advisory(engine: Engine) -> N
     exposure = service(engine)
     exposure.ingest_sbom(SAMPLE, app.id)
     found = advisory_id(exposure)
-    prepared = exposure.prepare(found, app.id)
+    [prepared] = exposure.prepare(found, app.id)
     assert prepared.evidence == ImpactEvidence(
         l1_depends_on=True, l1_version_in_range=True, manifest_version="v1.56.2"
     )
@@ -248,7 +260,7 @@ def test_impact_without_a_report_repository_validates_and_records(
     assert app.id is not None
     exposure = service(engine)
     exposure.ingest_sbom(SAMPLE, app.id)
-    doc = exposure.prepare(advisory_id(exposure), app.id).document("1.0.0-abc1234")
+    doc = one(exposure.prepare(advisory_id(exposure), app.id)).document("1.0.0-abc1234")
     assert "repository" not in json.loads(doc.payload)["metadata"]
     path = tmp_path / "app-impact-analysis.json"
     path.write_bytes(doc.payload)
@@ -271,7 +283,7 @@ def test_replayed_impact_does_not_log_another_outcome(
     assert app.id is not None
     exposure = service(engine)
     exposure.ingest_sbom(SAMPLE, app.id)
-    doc = exposure.prepare(advisory_id(exposure), app.id).document("1.0.0-abc1234")
+    doc = one(exposure.prepare(advisory_id(exposure), app.id)).document("1.0.0-abc1234")
     logger = logging.getLogger("traust_core.v1.services.exposure")
     with caplog.at_level(logging.INFO, logger=logger.name):
         logger.addHandler(caplog.handler)
@@ -294,7 +306,7 @@ def test_a_fixed_version_is_not_in_range(engine: Engine) -> None:
     assert app.id is not None
     exposure = service(engine)
     exposure.ingest_sbom(sbom(("google.golang.org/grpc", "v1.58.3")), app.id)
-    prepared = exposure.prepare(advisory_id(exposure), app.id)
+    [prepared] = exposure.prepare(advisory_id(exposure), app.id)
     assert prepared.evidence.l1_version_in_range is False
     assert prepared.document("1").repos[0].classification == "version_not_in_range"
 
@@ -312,13 +324,13 @@ def test_images_built_from_the_commit_are_cross_checked(engine: Engine) -> None:
         seed.image(repository_ref_id=other.id, sbom_id=clean.id)
         uow.commit()
     found = advisory_id(exposure)
-    on_app = exposure.prepare(found, app.id)
+    [on_app] = exposure.prepare(found, app.id)
     assert (on_app.evidence.sbom_scan, on_app.evidence.sbom_shipped_version) == (
         "shipped_in_range",
         "v1.58.0",
     )
     assert on_app.tiers == ("L1", "sbom_cross_check")
-    assert exposure.prepare(found, other.id).evidence.sbom_scan == "module_not_in_sbom"
+    assert one(exposure.prepare(found, other.id)).evidence.sbom_scan == "module_not_in_sbom"
 
 
 def test_a_document_sbom_lacking_the_package_leaves_it_unknown(engine: Engine) -> None:
@@ -326,7 +338,7 @@ def test_a_document_sbom_lacking_the_package_leaves_it_unknown(engine: Engine) -
     assert app.id is not None
     exposure = service(engine)
     exposure.ingest_sbom(sbom(("example.com/other", "v1.0.0")), app.id)
-    prepared = exposure.prepare(advisory_id(exposure), app.id)
+    [prepared] = exposure.prepare(advisory_id(exposure), app.id)
     assert prepared.evidence == ImpactEvidence(l1_depends_on=None, notes=UNKNOWN_COVERAGE)
     assert prepared.document("1").repos[0].classification == "inconclusive"
     assert prepared.package == GRPC.affected[0]
@@ -343,7 +355,7 @@ def test_a_commit_reached_through_an_internal_library_says_so(engine: Engine) ->
         assert library is not None
         uow.packages.update(library.model_copy(update={"source_repository_id": lib.repository_id}))
         uow.commit()
-    prepared = exposure.prepare(advisory_id(exposure), app.id)
+    [prepared] = exposure.prepare(advisory_id(exposure), app.id)
     assert prepared.evidence == ImpactEvidence(l1_depends_on=True, notes=REACHED_THROUGH)
     assert [d.vulnerable for d in prepared.dependencies] == [False]
 
@@ -358,7 +370,8 @@ def test_products_shipping_the_commit_are_named(engine: Engine) -> None:
     assert app.id is not None
     exposure = service(engine)
     exposure.ingest_sbom(sbom(("example.com/other", "v1.0.0")), app.id)
-    assert exposure.prepare(advisory_id(exposure), app.id).products == ("product-a", "product-b")
+    [prepared] = exposure.prepare(advisory_id(exposure), app.id)
+    assert prepared.products == ("product-a", "product-b")
 
 
 def test_a_commit_with_no_manifest_sbom_is_unknown_not_unimported(engine: Engine) -> None:
@@ -366,7 +379,7 @@ def test_a_commit_with_no_manifest_sbom_is_unknown_not_unimported(engine: Engine
     assert app.id is not None
     exposure = service(engine)
     with pytest.raises(NoManifestSbomError):
-        exposure.prepare(advisory_id(exposure), app.id)
+        one(exposure.prepare(advisory_id(exposure), app.id))
 
 
 def test_an_advisory_naming_no_package_cant_be_prepared(engine: Engine) -> None:
@@ -377,7 +390,7 @@ def test_an_advisory_naming_no_package_cant_be_prepared(engine: Engine) -> None:
     record = exposure.find_advisory(bare.identifier)
     assert record is not None and record.advisory_id is not None
     with pytest.raises(NotFoundError, match="names no package"):
-        exposure.prepare(record.advisory_id, app.id)
+        one(exposure.prepare(record.advisory_id, app.id))
 
 
 def test_a_cve_asked_first_is_analyzed_through_its_aliases_packages(engine: Engine) -> None:
@@ -393,14 +406,17 @@ def test_a_cve_asked_first_is_analyzed_through_its_aliases_packages(engine: Engi
     found = exposure.find_advisory(cve.identifier)
     assert found is not None and found.advisory_id is not None
     assert {r.repository_ref_id for r in exposure.affected(found.advisory_id)} == {app.id, fixed.id}
-    doc = exposure.prepare(found.advisory_id, app.id).document("1")
+    # the SBOMs are documents: stdlib, which they don't list, is unknown rather than absent
+    by_module = {p.package.name: p for p in exposure.prepare(found.advisory_id, app.id)}
+    assert set(by_module) == {"golang.org/x/net", "stdlib"}
+    doc = by_module["golang.org/x/net"].document("1")
     assert doc.repos[0].classification == "inconclusive"
-    assert doc.metadata.module == "golang.org/x/net"
     assert doc.metadata.advisory_sources[:3] == ("osv/CVE-2023-39325", ghsa.source, go.source)
+    assert by_module["stdlib"].evidence.l1_depends_on is None
     later = exposure.find_advisory(go.identifier)
     assert later is not None and later.advisory_id == found.advisory_id
-    out = exposure.prepare(found.advisory_id, fixed.id).document("1")
-    assert out.repos[0].classification == "version_not_in_range"
+    out = {p.package.name: p for p in exposure.prepare(found.advisory_id, fixed.id)}
+    assert out["golang.org/x/net"].document("1").repos[0].classification == "version_not_in_range"
 
 
 def affected_doc(prepared: ImpactInput) -> ImpactAnalysisArtifact:
@@ -416,7 +432,7 @@ def test_an_affected_commit_gets_one_dependency_finding(engine: Engine) -> None:
     exposure = service(engine)
     exposure.ingest_sbom(SAMPLE, app.id)
     found = advisory_id(exposure)
-    doc = affected_doc(exposure.prepare(found, app.id))
+    doc = affected_doc(one(exposure.prepare(found, app.id)))
     recorded = exposure.record(app.id, doc, provenance())
     assert recorded.finding_id is not None
     assert exposure.record(app.id, doc, provenance()).finding_id == recorded.finding_id
@@ -439,7 +455,7 @@ def test_record_refuses_a_document_for_another_commit_or_advisory(engine: Engine
     assert app.id is not None and other.id is not None
     exposure = service(engine)
     exposure.ingest_sbom(SAMPLE, app.id)
-    doc = exposure.prepare(advisory_id(exposure), app.id).document("1")
+    doc = one(exposure.prepare(advisory_id(exposure), app.id)).document("1")
     with pytest.raises(ValidationError, match="not https://"):
         exposure.record(other.id, doc, provenance())
     with pytest.raises(NotFoundError, match="unknown to its source"):
@@ -478,7 +494,7 @@ def test_record_refuses_promotions_and_demotions_without_partial_state(
     assert app.id is not None
     exposure = service(engine)
     exposure.ingest_sbom(SAMPLE, app.id)
-    prepared = exposure.prepare(advisory_id(exposure), app.id)
+    [prepared] = exposure.prepare(advisory_id(exposure), app.id)
     original = prepared.model_copy(update={"evidence": evidence}).document("1.0.0")
     assert original.repos[0].classification == expected
     before = record_counts(engine)
@@ -515,7 +531,7 @@ def test_a_late_occurrence_database_refusal_rolls_back_and_can_be_retried(
     exposure = service(engine, objects=objects)
     exposure.ingest_sbom(SAMPLE, app.id)
     found = advisory_id(exposure)
-    doc = affected_doc(exposure.prepare(found, app.id))
+    doc = affected_doc(one(exposure.prepare(found, app.id)))
     reported = provenance().model_copy(update={"occurred_at": AT - timedelta(days=2)})
     before = record_counts(engine)
 
@@ -572,7 +588,7 @@ def test_nested_intake_cannot_commit_an_uncommitted_caller_transaction(engine: E
     shared = SqlTraustUnitOfWork(engine)
     exposure = service(engine, uow=shared)
     exposure.ingest_sbom(SAMPLE, app.id)
-    doc = affected_doc(exposure.prepare(advisory_id(exposure), app.id))
+    doc = affected_doc(one(exposure.prepare(advisory_id(exposure), app.id)))
     before = record_counts(engine)
 
     with shared as outer:
@@ -628,7 +644,7 @@ def test_record_uses_original_payload_not_the_mutable_caller_view(
     exposure = service(engine, objects=objects)
     exposure.ingest_sbom(SAMPLE, app.id)
     found = advisory_id(exposure)
-    prepared = exposure.prepare(found, app.id)
+    [prepared] = exposure.prepare(found, app.id)
     original = prepared.model_copy(update={"evidence": original_evidence}).document(
         "1.0.0-original"
     )
@@ -820,7 +836,7 @@ def test_record_retains_supported_l4_evidence_and_legacy_precedence(
     exposure = service(engine, objects=objects)
     exposure.ingest_sbom(SAMPLE, app.id)
     found = advisory_id(exposure)
-    prepared = exposure.prepare(found, app.id)
+    [prepared] = exposure.prepare(found, app.id)
     doc = prepared.model_copy(update={"evidence": evidence}).document("1.0.0-l4")
     assert doc.repos[0].classification == expected
     assert doc.repos[0].evidence.l4_package_imported is evidence.l4_package_imported
@@ -907,7 +923,7 @@ def test_with_a_checkout_the_go_tier_decides(engine: Engine, tmp_path: Path) -> 
     tier = Analyzer(REACHED)
     exposure = analyzing(engine, tier, SourceScanAnalyzer(FixedClock(AT)))
     exposure.ingest_sbom(SAMPLE, app.id)
-    prepared = exposure.prepare(advisory_id(exposure), app.id, tmp_path)
+    [prepared] = exposure.prepare(advisory_id(exposure), app.id, tmp_path)
     assert tier.seen == [tmp_path]
     assert prepared.evidence.govulncheck == "symbol_reachable"
     assert prepared.evidence.evidence_level == "symbol"
@@ -922,7 +938,7 @@ def test_a_tier_that_cant_run_says_so_and_decides_nothing(engine: Engine, tmp_pa
     tier = Analyzer(REACHED, ready=False)
     exposure = analyzing(engine, tier)
     exposure.ingest_sbom(SAMPLE, app.id)
-    prepared = exposure.prepare(advisory_id(exposure), app.id, tmp_path)
+    [prepared] = exposure.prepare(advisory_id(exposure), app.id, tmp_path)
     assert tier.seen == []
     assert prepared.evidence.notes == "govulncheck skipped: not on PATH"
     assert (prepared.evidence.evidence_level, prepared.tiers) == ("none", ("L1",))
@@ -935,7 +951,7 @@ def test_a_commit_the_sboms_rule_out_isnt_scanned(engine: Engine, tmp_path: Path
     tier = Analyzer(REACHED)
     exposure = analyzing(engine, tier)
     exposure.ingest_sbom(sbom(("google.golang.org/grpc", "v1.58.3")), app.id)
-    prepared = exposure.prepare(advisory_id(exposure), app.id, tmp_path)
+    [prepared] = exposure.prepare(advisory_id(exposure), app.id, tmp_path)
     assert (tier.seen, prepared.evidence.evidence_level) == ([], None)
 
 
@@ -962,7 +978,7 @@ def test_a_pinned_package_without_reachability_is_likely_affected(
     exposure.ingest_sbom(SAMPLE, app.id)
     record = exposure.find_advisory(LODASH.identifier)
     assert record is not None and record.advisory_id is not None
-    graph = exposure.prepare(record.advisory_id, app.id)
+    [graph] = exposure.prepare(record.advisory_id, app.id)
     assert (graph.evidence.manifest_scan, graph.tiers) == (
         "module_pinned_in_range",
         ("L1", "manifest_scan"),
@@ -970,7 +986,7 @@ def test_a_pinned_package_without_reachability_is_likely_affected(
     assert graph.document("1").repos[0].classification == "likely_affected"
     (tmp_path / "web").mkdir()
     (tmp_path / "web" / "a.js").write_text("const _ = require('lodash')\n")
-    scanned = exposure.prepare(record.advisory_id, app.id, tmp_path)
+    [scanned] = exposure.prepare(record.advisory_id, app.id, tmp_path)
     assert (scanned.evidence.source_import_scan, scanned.evidence.evidence_level) == (
         "imports_found",
         "manifest",
@@ -994,7 +1010,7 @@ def test_an_undecided_range_is_not_recorded_as_a_pinned_in_range_claim(
     )
     record = exposure.find_advisory(LODASH.identifier)
     assert record is not None and record.advisory_id is not None
-    graph = exposure.prepare(record.advisory_id, app.id)
+    [graph] = exposure.prepare(record.advisory_id, app.id)
     assert graph.evidence.manifest_scan is None
     assert graph.document("1").repos[0].classification == "inconclusive"
 
@@ -1016,7 +1032,7 @@ def test_a_manifest_surface_says_it_has_no_reachability(engine: Engine) -> None:
     )
     record = exposure.find_advisory(checkout.identifier)
     assert record is not None and record.advisory_id is not None
-    prepared = exposure.prepare(record.advisory_id, app.id)
+    [prepared] = exposure.prepare(record.advisory_id, app.id)
     assert prepared.evidence.notes == "actions surface: manifest-level, no reachability"
 
 
@@ -1177,7 +1193,7 @@ def test_a_checkout_scan_uses_the_mined_symbols_and_records_them(
     )
     record = exposure.find_advisory(advisory.identifier)
     assert record is not None and record.advisory_id is not None
-    prepared = exposure.prepare(record.advisory_id, app.id, tmp_path)
+    [prepared] = exposure.prepare(record.advisory_id, app.id, tmp_path)
     assert prepared.evidence.symbol_usage_scan == "symbols_used"
     assert prepared.evidence.evidence_level == "symbol-usage"
     doc = prepared.document("1")
@@ -1201,7 +1217,7 @@ def test_judged_symbols_join_the_mined_ones_and_the_feature_description_is_kept(
     record = exposure.find_advisory(advisory.identifier)
     assert record is not None and record.advisory_id is not None
     judged = ("org.lib.Binder#bind", "org.lib.Parser#parse", "")
-    prepared = exposure.prepare(record.advisory_id, app.id, tmp_path, judged=judged)
+    [prepared] = exposure.prepare(record.advisory_id, app.id, tmp_path, judged=judged)
     assert prepared.symbols is not None
     assert [(s.symbol, s.source) for s in prepared.symbols.symbols] == [
         ("org.lib.Parser#parse", "fix_commit"),
@@ -1218,7 +1234,52 @@ def test_judged_symbols_are_recorded_without_a_checkout(engine: Engine) -> None:
     exposure = service(engine)
     exposure.ingest_sbom(sbom(("example.com/other", "v1.0.0")), app.id)
     found = advisory_id(exposure)
-    prepared = exposure.prepare(found, app.id, judged=("grpc.Server.Serve",))
+    [prepared] = exposure.prepare(found, app.id, judged=("grpc.Server.Serve",))
     assert prepared.symbols is not None and prepared.symbols.status == "resolved"
     assert prepared.document("1").metadata.vulnerable_symbols == ("grpc.Server.Serve",)
-    assert exposure.prepare(found, app.id).symbols is None
+    assert one(exposure.prepare(found, app.id)).symbols is None
+
+
+def test_fix_commits_are_not_mined_for_one_package_of_several(
+    engine: Engine, tmp_path: Path
+) -> None:
+    [app] = refs(engine, 1)
+    assert app.id is not None
+    single = maven("GHSA-twoo-0000-0000", references=(FIX,))
+    other = single.affected[0].model_copy(update={"name": "org.other:other"})
+    advisory = single.model_copy(update={"affected": (*single.affected, other)})
+    forge = Forge({"abc1234": LIB_PATCH})
+    exposure = mining(engine, forge, advisory)
+    exposure.ingest_sbom(
+        json.dumps(
+            {"bomFormat": "CycloneDX", "components": [{"purl": "pkg:maven/org.lib/lib@1.0.0"}]}
+        ).encode(),
+        app.id,
+    )
+    record = exposure.find_advisory(advisory.identifier)
+    assert record is not None and record.advisory_id is not None
+    prepared = {
+        p.package.name: p
+        for p in exposure.prepare(record.advisory_id, app.id, tmp_path, judged=("org.lib.X#y",))
+    }
+    held = prepared["org.lib:lib"]
+    assert held.symbols is not None and held.symbols.note == SHARED_FIX
+    assert [(s.symbol, s.source) for s in held.symbols.symbols] == [("org.lib.X#y", "judged")]
+    assert forge.asked == []
+
+
+def test_a_scan_landing_while_a_commit_is_prepared_is_refused(engine: Engine) -> None:
+    [app] = refs(engine, 1)
+    assert app.id is not None
+    exposure = service(engine)
+    exposure.ingest_sbom(sbom(("google.golang.org/grpc", "v1.56.2")), app.id)
+    found = advisory_id(exposure)
+    walk = exposure._reach
+
+    def overtaken(start: set[UUID], version: str | None = None):  # type: ignore[no-untyped-def]
+        exposure.ingest_sbom(sbom(("google.golang.org/grpc", "v1.58.3")), app.id)
+        return walk(start, version)
+
+    exposure._reach = overtaken  # type: ignore[method-assign]
+    with pytest.raises(ConflictError, match="changed while it was prepared"):
+        exposure.prepare(found, app.id)

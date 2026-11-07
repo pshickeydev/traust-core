@@ -5,7 +5,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from enum import StrEnum
 from functools import cache
-from typing import TYPE_CHECKING, NewType
+from typing import TYPE_CHECKING, NewType, Self
 from uuid import UUID
 
 import pydantic
@@ -30,6 +30,25 @@ ModelName = NewType("ModelName", str)
 SkillName = NewType("SkillName", str)
 
 
+class RecordKind(StrEnum):
+    """The report kinds a recording order can run as. The stage gates resolve an asset's kind
+    from the recording config alone, so a kind outside this closed set cannot be wired and
+    a misspelling is a type error, not a silently skipped gate."""
+
+    ASSESSMENT = "assessment"
+    TRIAGE = "triage"
+    VALIDATION = "validation"
+    VERIFICATION = "verification"
+    # NEED(contracts: remediation recording section): contracts' recording config has no
+    # remediation key yet; the door shares the triage allowlist until one lands.
+    REMEDIATION = "remediation"
+
+
+# The native remediation-scheduling asset: contracts' recording config has no remediation
+# section yet, so its orders ride the triage allowlist and only this name tells them apart.
+REMEDIATE_FINDING = AssetName("remediate_finding")
+
+
 class Outcome(StrEnum):
     SUCCEEDED = "succeeded"
     DEGRADED = "degraded"
@@ -43,12 +62,14 @@ if TYPE_CHECKING:
     WorkLane = StrEnum
     RescanEventSource = StrEnum
     DegradedKey = StrEnum
+    DenyCode = StrEnum
 else:
     OrderState = contracts.enum("run-order-state")
     OrderReason = contracts.enum("run-order-reason")
     WorkLane = contracts.enum("work-lane")
     RescanEventSource = contracts.enum("rescan-event-source")
     DegradedKey = contracts.enum("degraded-key")
+    DenyCode = contracts.enum("deny-code")
 
 
 class JobResult(Model):
@@ -170,6 +191,44 @@ class OrderRequest(Model):
     rule: str | None = None
     event_source: str | None = None
     work_item_id: UUID | None = None  # the remediation work item the order runs, if any
+    fork_url: str | None = None  # the mirror the effort runs on (remediate_finding only)
+    fork_branch: str | None = None  # its fix branch
+
+    @pydantic.model_validator(mode="after")
+    def _fork_facts_come_whole_and_only_with_their_asset(self) -> Self:
+        # the generic orders door would otherwise carry fork facts past the scheduling door's
+        # ForkPolicy and branch checks; a partial pair would steer prepare without binding
+        # record's push guard to the same destination
+        given = (self.fork_url is not None, self.fork_branch is not None)
+        if any(given) and (self.asset != "remediate_finding" or not all(given)):
+            raise ValueError(
+                "fork_url and fork_branch belong to a remediate_finding order, together"
+            )
+        return self
+
+
+class DenyIssue(Model):
+    """One typed reason a policy gate refused an action (problem+json `issues[]`)."""
+
+    code: DenyCode
+    detail: str
+
+
+class PreflightRequest(Model):
+    """May this stage run on this subject now, under the config generation the caller holds."""
+
+    asset: AssetName
+    repository_id: UUID
+    config_generation: str | None = None
+    lane: LaneName | None = None
+
+
+class PreflightResult(Model):
+    allowed: bool
+    asset: AssetName
+    repository_id: UUID
+    config_generation: str | None = None
+    lane: LaneName | None = None
 
 
 class StartRecordingRequest(Model):
@@ -426,6 +485,14 @@ class BudgetStatus(StrEnum):
     NO_BUDGET = "no_budget"
 
 
+# The enforcement levels under which admission may withhold a lane's orders: shared by
+# BudgetVerdict.binding and the ops policy gates so the two cannot drift.
+WITHHOLDING_ENFORCEMENT: tuple[BudgetEnforcement, ...] = (
+    BudgetEnforcement.ADVISORY,
+    BudgetEnforcement.ENFORCED,
+)
+
+
 class BudgetVerdict(Model):
     """One lane's month-to-date spend plus an estimate, judged against its budget."""
 
@@ -441,7 +508,7 @@ class BudgetVerdict(Model):
         """Admission may withhold: over, enforcing, and the cost is known."""
         return (
             self.status is BudgetStatus.OVER
-            and self.enforcement in (BudgetEnforcement.ADVISORY, BudgetEnforcement.ENFORCED)
+            and self.enforcement in WITHHOLDING_ENFORCEMENT
             and self.estimate_usd is not None
         )
 
@@ -490,6 +557,8 @@ class RunOrder(Entity):
     started_at: datetime | None = None
     finished_at: datetime | None = None
     work_item_id: UUID | None = None  # the remediation work item the order runs, if any
+    fork_url: str | None = None  # the mirror the effort runs on (remediate_finding only)
+    fork_branch: str | None = None  # its fix branch
 
 
 FEED_ORDER_STATES = (*FINISHED_ORDER_STATES, OrderState.AWAITING_APPROVAL)

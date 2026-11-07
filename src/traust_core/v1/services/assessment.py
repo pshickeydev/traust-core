@@ -96,6 +96,7 @@ from traust_core.v1.models.observation import (
     is_deps_manifest,
     is_first_party,
 )
+from traust_core.v1.models.operations import RecordKind
 from traust_core.v1.providers.base import ProviderRegistry
 from traust_core.v1.providers.checkout import GitCheckout, NumstatRow
 from traust_core.v1.providers.clock import Clock, SystemClock
@@ -520,7 +521,7 @@ class AssessmentService:
         with self._recording.recording(
             order_id=run_order_id,
             principal=principal,
-            kind="assessment",
+            kind=RecordKind.ASSESSMENT,
             repository_id=ref.repository_id,
             provenance=provenance,
         ):

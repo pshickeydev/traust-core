@@ -68,7 +68,7 @@ def context(engine: Engine, tmp_path: Path) -> Context:
 @pytest.fixture
 def ref(context: Context) -> UUID:
     with SqlTraustUnitOfWork(context.database) as uow:
-        saved = Seed(uow).repository_ref()
+        saved = Seed(uow).repository_ref(is_default=True)
         uow.commit()
     assert saved.id is not None
     return saved.id

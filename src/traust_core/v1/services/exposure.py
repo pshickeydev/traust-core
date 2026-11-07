@@ -65,7 +65,9 @@ from traust_core.v1.models.dependencies import (
     ImpactExportRepo,
     ImpactFilter,
     ImpactInput,
+    ImpactPreparationScope,
     ImpactQuery,
+    ImpactScopeMember,
     ItemSignals,
     NoImageSbomError,
     NoManifestSbomError,
@@ -179,10 +181,19 @@ SEVERITY_RANK = {
     ScannerSeverity.INFORMATIONAL: 0,
     ScannerSeverity.UNRATED: 0,
 }
+_IMPACT_RANK = {
+    ImpactClassification.AFFECTED: 5,
+    ImpactClassification.LIKELY_AFFECTED: 4,
+    ImpactClassification.INCONCLUSIVE: 3,
+    ImpactClassification.NOT_OBSERVED: 2,
+    ImpactClassification.VERSION_NOT_IN_RANGE: 1,
+    ImpactClassification.NOT_IMPORTED: 0,
+}
 MAX_FIX_COMMITS = 4  # backports repeat the same change; more commits only add API calls
 REACHED_THROUGH = "reached through a base image or an internal library; not listed itself"
 SURFACE = "{} surface: manifest-level, no reachability"
 UNRESOLVED = "not in the SBOM, but these manifests could not be resolved: {}"
+SHARED_FIX = "fix commits not mined: the advisory names several packages they can't tell apart"
 UNKNOWN_COVERAGE = "not in the SBOM, whose coverage is unknown: no manifest scan recorded it"
 _TICK = timedelta(microseconds=1)
 _SURFACES = frozenset({Ecosystem.ACTIONS, Ecosystem.DOCKER, Ecosystem.HELM})
@@ -594,34 +605,114 @@ class ExposureService:
         repository_ref_id: UUID,
         checkout: Path | None = None,
         judged: Sequence[str] = (),
-    ) -> ImpactInput:
-        """One commit against one advisory: the advisory as its source states it now, what the
-        commit's manifest and the images built from it hold of it, and the evidence that gives.
-        Given the commit's checkout, the analysis tiers for the package's ecosystem run too,
-        unless its SBOMs already rule it out. A commit with no manifest SBOM raises: unknown is
-        never read as not imported."""
+    ) -> tuple[ImpactInput, ...]:
+        """One commit against one advisory, one input per package and installed version the
+        commit holds (each with its own range and fix; every package when it holds none): the
+        advisory as its source states it now, what the commit's manifest and the images built
+        from it hold, and the evidence that gives. Given the commit's checkout, the analysis tiers
+        for each package's ecosystem run too, unless its SBOMs already rule it out. All share one
+        preparation scope: the complete set prepared from this snapshot. A commit with no manifest
+        SBOM raises: unknown is never read as not imported."""
+        prepared_at = self._clock.now()
         advisory = self.get_advisory(advisory_id)
         record = self.find_advisory(AdvisoryIdentifier(advisory.identifier))
         if record is None or not record.affected:
             raise NotFoundError(f"advisory {advisory.identifier}: its source names no package")
-        with self._uow:
-            if self._inventory.get_ref(repository_ref_id).manifest_sbom_id is None:
+        with self._uow as uow:
+            ref = self._inventory.get_ref(repository_ref_id)
+            if ref.manifest_sbom_id is None:
                 raise NoManifestSbomError(repository_ref_id)
-        rows = [r for r in self.affected(advisory_id) if r.repository_ref_id == repository_ref_id]
+            images = uow.images.list_built_from(repository_ref_id)
+            kept = [(p, uow.packages.find(p.ecosystem, p.name)) for p in record.affected]
+        held_sboms = self._held_sboms(repository_ref_id)
+        candidates = [
+            (
+                package,
+                [
+                    AffectedDependency(
+                        repository_ref_id=ref_id,
+                        image_id=image_id,
+                        dependency=dependency,
+                        vulnerable=dependency.package_id == found.id,
+                    )
+                    for dependency, ref_id, image_id in self._reach({found.id})
+                    if ref_id == repository_ref_id
+                ]
+                if found is not None and found.id is not None
+                else [],
+            )
+            for package, found in kept
+        ]
+        coverage = self.unresolved_manifests(repository_ref_id)
+        if self._held_sboms(repository_ref_id) != held_sboms:
+            # the walks above read one package each; a scan landing between them mixes snapshots
+            raise ConflictError(
+                f"ref {repository_ref_id}: its SBOMs changed while it was prepared; prepare again"
+            )
+        unread = None if coverage is None else {m.ecosystem for m in coverage}
+        held = [
+            (package, rows)
+            for package, rows in candidates
+            if rows or unread is None or package.ecosystem in unread
+        ]
+        prepared = []
+        for package, rows in held if any(rows for _, rows in held) else candidates:
+            manifest = {r.dependency.version for r in rows if r.vulnerable and r.image_id is None}
+            versions = sorted(manifest or {r.dependency.version for r in rows if r.vulnerable})
+            for version in versions or [None]:
+                selected = [
+                    r
+                    for r in rows
+                    if not r.vulnerable
+                    or (bool(manifest) and r.image_id is not None)
+                    or r.dependency.version == version
+                ]
+                prepared.append(
+                    self._prepare(
+                        record, package, repository_ref_id, selected, checkout, judged, prepared_at
+                    )
+                )
+        members = tuple(item.scope_member for item in prepared)
+        snapshot = {
+            "prepared_at": prepared_at.isoformat(),
+            "advisory": record.model_dump(mode="json", exclude={"advisory_id"}),
+            "manifest_sbom_id": str(ref.manifest_sbom_id),
+            "images": sorted((str(image.id), str(image.sbom_id)) for image in images),
+            "members": [member.model_dump(mode="json") for member in members],
+        }
+        scope = ImpactPreparationScope(
+            digest=sha256_hex(json.dumps(snapshot, sort_keys=True).encode()), members=members
+        )
+        return tuple(item.model_copy(update={"preparation_scope": scope}) for item in prepared)
+
+    def _held_sboms(self, repository_ref_id: UUID) -> tuple[object, ...]:
+        """The commit's manifest SBOM and scan, and the SBOMs of the images built from it."""
+        with self._uow as uow:
+            ref = self._inventory.get_ref(repository_ref_id)
+            images = uow.images.list_built_from(repository_ref_id)
+        return (
+            ref.manifest_sbom_id,
+            ref.manifest_sbom_assessment_id,
+            sorted((str(i.id), str(i.sbom_id)) for i in images),
+        )
+
+    def _prepare(
+        self,
+        record: AdvisoryRecord,
+        package: AffectedPackage,
+        repository_ref_id: UUID,
+        rows: list[AffectedDependency],
+        checkout: Path | None,
+        judged: Sequence[str],
+        prepared_at: datetime,
+    ) -> ImpactInput:
         portfolio = self._require_portfolio()
         with self._uow as uow:
             subject = self._inventory.subject(repository_ref_id)
             scanned = any(i.sbom_id for i in uow.images.list_built_from(repository_ref_id))
-            named = {
-                d.package_id: record.package(Ecosystem(p.ecosystem), p.name)
-                for d in {r.dependency for r in rows if r.vulnerable}
-                for p in [uow.packages.get(d.package_id)]
-            }
-        package = next((p for p in named.values() if p is not None), record.affected[0])
+        named = {r.dependency.package_id: package for r in rows if r.vulnerable}
         coverage = () if rows else self.unresolved_manifests(repository_ref_id)
-        unread = [
-            m.path for m in coverage or () if m.ecosystem in {a.ecosystem for a in record.affected}
-        ]
+        unread = [m.path for m in coverage or () if m.ecosystem == package.ecosystem]
         listed = any(r.image_id is None for r in rows)
         in_manifest = [r.dependency for r in rows if r.vulnerable and r.image_id is None]
         in_images = [r.dependency for r in rows if r.vulnerable and r.image_id is not None]
@@ -664,13 +755,20 @@ class ExposureService:
         undecided = (ImpactClassification.INCONCLUSIVE, ImpactClassification.LIKELY_AFFECTED)
         symbols = _with_judged(None, judged)
         if checkout is not None and evidence.classification(package.ecosystem) in undecided:
-            # govulncheck carries its own symbol data: Go never mines fix commits.
-            found = _published(record) or (
-                None if package.ecosystem == Ecosystem.GO else self._mined(record)
+            # This package's symbols only; govulncheck carries its own: Go never mines commits.
+            # Fix commits are the advisory's, so they speak for a package only when it is the
+            # advisory's one package.
+            scoped = record.model_copy(update={"affected": (package,)})
+            found = _published(scoped) or (
+                None
+                if package.ecosystem == Ecosystem.GO
+                else self._mined(record)
+                if len(record.affected) == 1
+                else SymbolResolution(status=SymbolStatus.DEGRADED, note=SHARED_FIX)
             )
             symbols = _with_judged(found, judged)
             query = ImpactQuery(
-                advisory=record,
+                advisory=scoped,
                 package=package,
                 symbols=tuple(s.symbol for s in symbols.symbols) if symbols else (),
             )
@@ -679,7 +777,7 @@ class ExposureService:
         return ImpactInput(
             subject=subject,
             findings=FindingContext(),
-            prepared_at=self._clock.now(),
+            prepared_at=prepared_at,
             advisory=record,
             package=package,
             dependencies=tuple(rows),
@@ -733,6 +831,18 @@ class ExposureService:
         [entry] = doc.repos
         classification = ImpactClassification(entry.classification)
         ecosystem = getattr(doc.metadata, "ecosystem", None)
+        raw_scope = getattr(doc.metadata, "preparation_scope", None)
+        if raw_scope is not None:
+            if ecosystem is None:
+                raise ValidationError("scoped impact analysis requires an ecosystem")
+            scope = ImpactPreparationScope.model_validate(raw_scope, from_attributes=True)
+            member = ImpactScopeMember(
+                ecosystem=Ecosystem(ecosystem),
+                module=doc.metadata.module,
+                version=Version(entry.version) if entry.version is not None else None,
+            )
+            if member not in scope.members:
+                raise ValidationError(f"impact analysis {member}: not in its preparation scope")
         expected = ImpactEvidence.model_validate(
             entry.evidence, from_attributes=True
         ).classification(Ecosystem(ecosystem) if ecosystem else Ecosystem.GO)
@@ -1312,7 +1422,7 @@ class ExposureService:
             canonical = uow.advisories.get(known.alias_of_id) if known.alias_of_id else known
         assert canonical.id is not None
         rows = sorted(
-            _latest_members(self._recorded(ImpactFilter(advisory_id=canonical.id))),
+            _latest(_scoped(self._recorded(ImpactFilter(advisory_id=canonical.id))), None),
             key=lambda row: row.at,
             reverse=True,
         )
@@ -1352,28 +1462,38 @@ class ExposureService:
         )
 
     def summary(self, filter: ExposureFilter, group_by: ExposureDimension) -> list[ExposureRollup]:
-        """The latest impact analysis of each commit for each advisory (as of `as_of`), counted
-        per group, largest first. A commit counts in each product that ships it."""
-        groups: defaultdict[str | None, list[ImpactClassification]] = defaultdict(list)
-        for row in _latest(self._exposure_rows(filter), filter.as_of):
+        """The latest complete preparation of each commit for each advisory (as of `as_of`),
+        counted per group at its worst verdict, largest first. A commit counts in each product
+        that ships it."""
+        every = _scoped(self._advisory_rows(filter))
+        latest = [r for r in _latest(every, filter.as_of) if _of(r, filter)]
+        groups: defaultdict[str | None, list[_Recorded]] = defaultdict(list)
+        for row in _worst(latest) if group_by == ExposureDimension.CLASSIFICATION else latest:
             for key in self._exposure_keys(row, group_by):
-                groups[key].append(row.analysis.classification)
+                groups[key].append(row)
         return sorted(
-            (ExposureRollup.of(found, key=key) for key, found in groups.items()),
+            (
+                ExposureRollup.of([r.analysis.classification for r in _worst(found)], key=key)
+                for key, found in groups.items()
+            ),
             key=lambda r: (-r.commits, r.key is None, r.key or ""),
         )
 
     def timeline(self, filter: ExposureFilter, bucket: TimeBucket) -> list[ExposureSeriesPoint]:
         """`summary`'s counts standing at each bucket's end, from the first analysis to `as_of`
         (else the last analysis); `analysed` counts the analyses recorded within the bucket."""
-        rows = [r for r in self._exposure_rows(filter) if _by(r, filter.as_of)]
+        every = [r for r in self._advisory_rows(filter) if _by(r, filter.as_of)]
+        rows = [r for r in every if _of(r, filter)]
         if not rows:
             return []
-        end = filter.as_of or max(r.at[0] for r in rows)
+        end = filter.as_of or max(r.at[0] for r in every)
         points = []
         window = bucket.window_of(min(r.at[0] for r in rows))
+        parsed = _scoped(every)  # once: each bucket re-reads which run stands, not the scopes
         while window.start <= end:
-            standing = _latest(rows, min(window.end - _TICK, end))
+            standing = _worst(
+                [r for r in _latest(parsed, min(window.end - _TICK, end)) if _of(r, filter)]
+            )
             points.append(
                 ExposureSeriesPoint.of(
                     [r.analysis.classification for r in standing],
@@ -1384,12 +1504,9 @@ class ExposureService:
             window = bucket.window_of(window.end)
         return points
 
-    def _exposure_rows(self, filter: ExposureFilter) -> list[_Recorded]:
-        return [
-            r
-            for r in self._recorded(ImpactFilter(advisory_id=filter.advisory_id))
-            if filter.ecosystem in (None, r.doc.metadata.ecosystem)
-        ]
+    def _advisory_rows(self, filter: ExposureFilter) -> list[_Recorded]:
+        # every ecosystem: a preparation scope is complete only with all its members
+        return self._recorded(ImpactFilter(advisory_id=filter.advisory_id))
 
     def _exposure_keys(self, row: _Recorded, group_by: ExposureDimension) -> list[str | None]:
         meta = row.doc.metadata
@@ -1607,32 +1724,101 @@ def _by(row: _Recorded, until: datetime | None) -> bool:
     return until is None or row.at[0] <= until
 
 
-def _latest(rows: Sequence[_Recorded], until: datetime | None) -> list[_Recorded]:
-    """The latest analysis of each commit for each advisory, recorded by `until`."""
-    latest: dict[tuple[UUID, UUID], _Recorded] = {}
+def _of(row: _Recorded, filter: ExposureFilter) -> bool:
+    return filter.ecosystem in (None, row.doc.metadata.ecosystem)
+
+
+_Member = tuple[str, str, str | None]
+
+
+@dataclass(frozen=True)
+class _Scoped:
+    """A recorded row with its package member and, for a scoped document, its run's digest,
+    declared members and preparation time, read once per read."""
+
+    row: _Recorded
+    member: _Member
+    digest: str | None = None
+    declared: frozenset[_Member] = frozenset()
+    prepared: str = ""
+
+
+def _scoped(rows: Sequence[_Recorded]) -> list[_Scoped]:
+    """Each row with its scope, oldest first. A document whose scope disagrees with the
+    members first recorded under its digest is left out, with one warning, rather than failing
+    every read of the advisory or displacing the run it claims."""
+    first: dict[tuple[UUID, UUID, str], frozenset[_Member]] = {}
+    kept = []
+    for row in sorted(rows, key=lambda r: r.at):
+        metadata = row.doc.metadata
+        ecosystem = metadata.ecosystem or Ecosystem.GO.value
+        member = (ecosystem, metadata.module, row.doc.repos[0].version)
+        raw_scope = getattr(metadata, "preparation_scope", None)
+        if raw_scope is None:
+            kept.append(_Scoped(row, member))
+            continue
+        scope = ImpactPreparationScope.model_validate(raw_scope, from_attributes=True)
+        stated = frozenset((m.ecosystem.value, m.module, m.version) for m in scope.members)
+        key = (row.analysis.repository_ref_id, row.analysis.advisory_id, scope.digest)
+        if first.setdefault(key, stated) != stated or member not in stated:
+            log.warning(
+                "impact analysis %s of ref %s: scope %s disagrees with its first members",
+                row.analysis.assessment_id,
+                key[0],
+                scope.digest,
+            )
+            continue
+        kept.append(_Scoped(row, member, scope.digest, stated, str(metadata.generated_at)))
+    return kept
+
+
+def _latest(rows: Sequence[_Scoped], until: datetime | None) -> list[_Recorded]:
+    """What stands for each commit and advisory by `until`: its latest-prepared complete run
+    (every package and version it declared), so a run finishing late or a newer partial run
+    never displaces a newer complete one; else its latest-prepared partial run, so recorded
+    verdicts (and the findings they filed) still show; else, for documents recorded before
+    scopes, the latest of each package and version."""
+    runs: dict[tuple[UUID, UUID, str], dict[_Member, _Scoped]] = {}
+    legacy: dict[tuple[UUID, UUID], dict[_Member, _Recorded]] = {}
+    for item in rows:
+        row = item.row
+        if not _by(row, until):
+            continue
+        commit = (row.analysis.repository_ref_id, row.analysis.advisory_id)
+        if item.digest is None:
+            legacy.setdefault(commit, {})[item.member] = row
+        else:
+            runs.setdefault((*commit, item.digest), {})[item.member] = item
+    Rank = tuple[bool, str, tuple[datetime, UUID]]
+    standing: dict[tuple[UUID, UUID], tuple[Rank, list[_Recorded]]] = {}
+    for key, members in runs.items():
+        some = next(iter(members.values()))
+        rank = (
+            frozenset(members) == some.declared,
+            max(m.prepared for m in members.values()),
+            max(m.row.at for m in members.values()),
+        )
+        commit = (key[0], key[1])
+        if commit not in standing or standing[commit][0] < rank:
+            standing[commit] = (rank, [m.row for m in members.values()])
+    chosen = [r for _, found in standing.values() for r in found]
+    return chosen + [
+        r for commit, members in legacy.items() if commit not in standing for r in members.values()
+    ]
+
+
+def _worst(rows: Sequence[_Recorded]) -> list[_Recorded]:
+    """One row per commit and advisory: its worst verdict, the latest among equals."""
+    worst: dict[tuple[UUID, UUID], _Recorded] = {}
     for row in rows:
         key = (row.analysis.repository_ref_id, row.analysis.advisory_id)
-        if _by(row, until) and (key not in latest or latest[key].at < row.at):
-            latest[key] = row
-    return list(latest.values())
-
-
-def _latest_members(rows: Sequence[_Recorded]) -> list[_Recorded]:
-    """The latest analysis of each commit, advisory and affected package version; a document
-    that omits its ecosystem is Go, as the impact-analysis contract defines."""
-    latest: dict[tuple[UUID, UUID, str, str, str | None], _Recorded] = {}
-    for row in rows:
-        metadata = row.doc.metadata
-        key = (
-            row.analysis.repository_ref_id,
-            row.analysis.advisory_id,
-            metadata.ecosystem or Ecosystem.GO.value,
-            metadata.module,
-            row.doc.repos[0].version,
-        )
-        if key not in latest or latest[key].at < row.at:
-            latest[key] = row
-    return list(latest.values())
+        previous = worst.get(key)
+        if previous is None or (_IMPACT_RANK[row.analysis.classification], row.at) > (
+            _IMPACT_RANK[previous.analysis.classification],
+            previous.at,
+        ):
+            worst[key] = row
+    return list(worst.values())
 
 
 @dataclass(frozen=True)

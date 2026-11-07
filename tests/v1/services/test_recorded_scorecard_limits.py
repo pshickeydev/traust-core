@@ -49,6 +49,27 @@ def test_only_eligible_versions_are_published_without_losing_skipped_targets(wor
     assert {card.auditor_versions for card in release} == {("eligible",), ("held-only",)}
 
 
+def test_a_commit_less_audit_of_a_shared_repository_does_not_fall_to_the_eligible_target(
+    world: World,
+) -> None:
+    """Qodo 393: eligibility is applied after resolution, not before."""
+    shared = "https://github.com/org/shared"
+    world.key(
+        target(repo_url=shared),
+        target(id="bt-held-shared", repo_url=shared, held_out=True),
+    )
+    world.attach(
+        audited(finding(fingerprint=FP), repository=shared),
+        AssessmentKind.BENCHMARK_AUDIT,
+        "h-1",
+    )
+    # The audit is ambiguous between the two targets and matches neither: it must not
+    # fall to the eligible one just because the held-out one was excluded up front.
+    assert world.service().scorecards(BenchmarkFilter()) == []
+    # Release scoring sees both candidates, so the same ambiguity holds there.
+    assert world.service().scorecards(BenchmarkFilter(include_held_out=True)) == []
+
+
 def test_routine_refresh_does_not_render_or_fail_on_demand_scorecards_without_a_key(
     world: World,
 ) -> None:

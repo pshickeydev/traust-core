@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Collection
 from datetime import datetime
+from heapq import merge
 from typing import Any, Protocol
 from uuid import UUID
 
@@ -61,6 +62,7 @@ class DecisionRepository(RecordRepository[Decision], Protocol):
         ...
 
     def list_for_finding(self, finding_id: UUID) -> list[Decision]: ...
+    def list_for_assessments(self, assessment_ids: Collection[UUID]) -> list[Decision]: ...
     def list_for_findings(
         self,
         finding_ids: Collection[UUID],
@@ -123,6 +125,14 @@ class SqlDecisionRepository(SqlAppendOnlyRepository[Decision]):
             f"list for {finding_id}", c.finding_id == finding_id, order_by=(c.occurred_at,)
         )
 
+    def list_for_assessments(self, assessment_ids: Collection[UUID]) -> list[Decision]:
+        c = self.table.c
+        return self._many(
+            f"list for {len(assessment_ids)} assessments",
+            c.assessment_id.in_(assessment_ids),
+            order_by=(c.occurred_at,),
+        )
+
     def list_for_findings(
         self,
         finding_ids: Collection[UUID],
@@ -130,16 +140,20 @@ class SqlDecisionRepository(SqlAppendOnlyRepository[Decision]):
         *,
         read_budget: RecordBudget | None = None,
     ) -> list[Decision]:
+        """Decisions on these findings, those made after `until` left out, in judgement order;
+        read in bounded batches so a whole scope's ids cannot exceed the bind limit."""
         c = self.table.c
-        where = [c.finding_id.in_(finding_ids)]
-        if until is not None:
-            where.append(c.occurred_at <= until)
-        return self._many(
-            f"list for {len(finding_ids)} findings",
-            *where,
-            order_by=(c.occurred_at,),
-            read_budget=read_budget,
+        pages = (
+            self._many(
+                f"list for {len(finding_ids)} findings",
+                c.finding_id.in_(batch),
+                *([] if until is None else [c.occurred_at <= until]),
+                order_by=(c.occurred_at,),
+                read_budget=read_budget,
+            )
+            for batch in self._batches(finding_ids)
         )
+        return list(merge(*pages, key=lambda d: (d.occurred_at, d.created_at, d.id)))
 
     def list_since(self, since: datetime, limit: int) -> list[Decision]:
         c = self.table.c

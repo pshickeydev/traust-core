@@ -44,6 +44,7 @@ from traust_core.v1.models.operations import (
     OrderRequest,
     OrderState,
     Outcome,
+    PreflightRequest,
     RunOrder,
     SpendDimension,
     SpendEvent,
@@ -55,7 +56,8 @@ from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.repositories.objects.store import InMemoryObjectStore
 from traust_core.v1.services.artifact_publishing import ArtifactPublisher, PublishSpec, PublishSpecs
-from traust_core.v1.services.operations import OpsService, SpendService
+from traust_core.v1.services.operations import OpsService, PolicyDenied, SpendService
+from traust_core.v1.services.portfolio import Inventory
 
 LEASE = timedelta(minutes=5)
 W1, W2 = WorkerId("w1"), WorkerId("w2")
@@ -950,3 +952,271 @@ def test_check_budget_logs_an_overrun_as_a_warning(
 def test_two_budgets_for_one_lane_are_refused(engine: Engine) -> None:
     with pytest.raises(ConfigError):
         spend(engine, audit_budget("observe"), audit_budget("advisory", "20"))
+
+
+# preflight ----------------------------------------------------------------------------------------
+
+
+def gated(engine: Engine, *budgets: Budget) -> OpsService:
+    """An OpsService with the doors the policy checks need (inventory, spend with budgets) and
+    the deployment's stage assets declared, so the ordering gate applies."""
+    return OpsService(
+        SqlTraustUnitOfWork(engine),
+        FixedClock(T0),
+        publisher(engine),
+        spend=spend(engine, *budgets),
+        inventory=Inventory(SqlTraustUnitOfWork(engine)),
+        recording_assets={"assessment": ("assessment",), "triage": ("triage",)},
+    )
+
+
+def subject(engine: Engine) -> UUID:
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        repo = seed.repository()
+        # Onboarded, not merely registered: a default line, which is what a run works on.
+        seed.repository_ref(repo, is_default=True)
+        uow.commit()
+    return repo.id
+
+
+MACHINE = Principal(
+    identity="runner-1",
+    kind=ActorKind("machine"),
+    display="runner",
+    verified_by=IdentitySource.DATABASE,
+)
+
+
+def test_preflight_allows_a_stage_whose_prior_record_exists(engine: Engine) -> None:
+    repo = subject(engine)
+    seeded(engine, asset="assessment", repository_id=repo, state="succeeded")
+    result = gated(engine).preflight(
+        PreflightRequest(asset="triage", repository_id=repo, config_generation="g7"), OPERATOR
+    )
+    assert result.allowed is True
+    assert (result.asset, result.repository_id, result.config_generation) == ("triage", repo, "g7")
+
+
+def test_preflight_denies_an_unknown_subject(engine: Engine) -> None:
+    with pytest.raises(PolicyDenied) as denied:
+        gated(engine).preflight(PreflightRequest(asset="triage", repository_id=uuid4()), OPERATOR)
+    assert denied.value.deny_code == "subject_unknown"
+
+
+def test_preflight_denies_a_caller_without_the_role(engine: Engine) -> None:
+    repo = subject(engine)
+    spent(engine, "50.00")
+    with pytest.raises(PolicyDenied) as denied:
+        gated(engine, audit_budget("advisory")).preflight(
+            PreflightRequest(asset="triage", repository_id=repo, lane=AUDIT), MACHINE
+        )
+    assert denied.value.deny_code == "role_denied"
+
+
+def test_a_caller_without_the_role_learns_nothing_else(engine: Engine) -> None:
+    """A caller who may not ask for a run gets the role denial alone: no subject answer, no
+    stage ordering, no lane figures — the other gates are not even evaluated."""
+    with pytest.raises(PolicyDenied) as denied:
+        gated(engine, audit_budget("advisory")).preflight(
+            PreflightRequest(asset="triage", repository_id=uuid4(), lane=AUDIT), MACHINE
+        )
+    assert [i.code for i in denied.value.deny_issues] == ["role_denied"]
+    assert "50" not in denied.value.deny_issues[0].detail
+
+
+def test_preflight_denies_a_stage_whose_prior_record_is_missing(engine: Engine) -> None:
+    with pytest.raises(PolicyDenied) as denied:
+        gated(engine).preflight(
+            PreflightRequest(asset="triage", repository_id=subject(engine)), OPERATOR
+        )
+    assert [i.code for i in denied.value.deny_issues] == ["ordering_violated"]
+
+
+def test_preflight_denies_an_exhausted_lane_budget(engine: Engine) -> None:
+    repo = subject(engine)
+    seeded(engine, asset="assessment", repository_id=repo, state="succeeded")
+    spent(engine, "50.00")
+    with pytest.raises(PolicyDenied) as denied:
+        gated(engine, audit_budget("advisory")).preflight(
+            PreflightRequest(asset="triage", repository_id=repo, lane=AUDIT), OPERATOR
+        )
+    assert denied.value.deny_code == "budget_exhausted"
+
+
+def test_subject_checks_need_the_inventory_door(engine: Engine) -> None:
+    with pytest.raises(ConfigError):
+        ops(engine).preflight(PreflightRequest(asset="triage", repository_id=uuid4()), OPERATOR)
+
+
+def test_submit_rejects_what_preflight_would_deny_without_preflight_being_called(
+    engine: Engine,
+) -> None:
+    with pytest.raises(PolicyDenied) as denied:
+        gated(engine).submit(
+            OrderRequest(asset="triage", priority=1, repository_id=subject(engine)), OPERATOR
+        )
+    assert denied.value.deny_code == "ordering_violated"
+
+
+def test_submit_accepts_what_preflight_allowed(engine: Engine) -> None:
+    repo = subject(engine)
+    seeded(engine, asset="assessment", repository_id=repo, state="succeeded")
+    order = gated(engine).submit(
+        OrderRequest(asset="triage", priority=1, repository_id=repo), OPERATOR
+    )
+    assert order.state == OrderState.QUEUED
+
+
+def test_the_gate_follows_the_configured_asset_names(engine: Engine) -> None:
+    """A deployment whose assessments run as "audit" (not "assessment") still gates triage,
+    and one whose assessments are not wired is not gated at all."""
+    audit_gated = OpsService(
+        SqlTraustUnitOfWork(engine),
+        FixedClock(T0),
+        publisher(engine),
+        inventory=Inventory(SqlTraustUnitOfWork(engine)),
+        recording_assets={"assessment": ("audit",), "triage": ("triage",)},
+    )
+    repo = subject(engine)
+    seeded(engine, asset="audit", repository_id=repo, state="succeeded")
+    order = audit_gated.submit(
+        OrderRequest(asset="triage", priority=1, repository_id=repo), OPERATOR
+    )
+    assert order.state == OrderState.QUEUED
+
+
+def test_a_predecessor_that_did_not_run_does_not_unlock_the_next_stage(engine: Engine) -> None:
+    """A failed, refused or withheld predecessor finished as an order, not as work: the gate
+    wants a completed one."""
+    repo = subject(engine)
+    for unfinished in ("failed", "refused", "withheld"):
+        seeded(engine, asset="assessment", repository_id=repo, state=unfinished)
+    with pytest.raises(PolicyDenied) as denied:
+        gated(engine).submit(OrderRequest(asset="triage", priority=1, repository_id=repo), OPERATOR)
+    assert denied.value.deny_code == "ordering_violated"
+
+
+def test_a_gated_stage_cannot_be_submitted_without_a_subject(engine: Engine) -> None:
+    """A subjectless order cannot show its predecessor ran for the subject, so it is refused
+    rather than queued unverified."""
+    with pytest.raises(PolicyDenied) as denied:
+        gated(engine).submit(OrderRequest(asset="triage", priority=1), OPERATOR)
+    assert denied.value.deny_code == "ordering_violated"
+
+
+def test_remediation_follows_triage_not_another_remediation_order(engine: Engine) -> None:
+    """Remediation rides the triage allowlist but is its own stage: a completed assessment
+    does not unlock it, a completed triage does, and its own orders never do."""
+    remediating = OpsService(
+        SqlTraustUnitOfWork(engine),
+        FixedClock(T0),
+        publisher(engine),
+        inventory=Inventory(SqlTraustUnitOfWork(engine)),
+        recording_assets={
+            "assessment": ("assessment",),
+            "triage": ("triage", "remediate_finding"),
+            "remediation": ("triage", "remediate_finding"),
+        },
+    )
+    repo = subject(engine)
+    with pytest.raises(PolicyDenied) as denied:
+        remediating.submit(
+            OrderRequest(asset="remediate_finding", priority=1, repository_id=repo), OPERATOR
+        )
+    assert denied.value.deny_code == "ordering_violated"
+    seeded(engine, asset="assessment", repository_id=repo, state="succeeded")
+    with pytest.raises(PolicyDenied):
+        remediating.submit(
+            OrderRequest(asset="remediate_finding", priority=1, repository_id=repo), OPERATOR
+        )
+    seeded(engine, asset="triage", repository_id=repo, state="succeeded")
+    order = remediating.submit(
+        OrderRequest(asset="remediate_finding", priority=1, repository_id=repo), OPERATOR
+    )
+    assert order.state == OrderState.QUEUED
+
+
+def test_verification_follows_remediation_not_ordinary_triage(engine: Engine) -> None:
+    """Verification's prerequisite is remediation: only the native scheduling asset satisfies
+    it — a completed ordinary triage order on the shared allowlist does not."""
+    remediating = OpsService(
+        SqlTraustUnitOfWork(engine),
+        FixedClock(T0),
+        publisher(engine),
+        inventory=Inventory(SqlTraustUnitOfWork(engine)),
+        recording_assets={
+            "assessment": ("assessment",),
+            "triage": ("triage", "remediate_finding"),
+            "remediation": ("triage", "remediate_finding"),
+            "verification": ("verify",),
+        },
+    )
+    repo = subject(engine)
+    seeded(engine, asset="assessment", repository_id=repo, state="succeeded")
+    seeded(engine, asset="triage", repository_id=repo, state="succeeded")
+    with pytest.raises(PolicyDenied) as denied:
+        remediating.submit(OrderRequest(asset="verify", priority=1, repository_id=repo), OPERATOR)
+    assert denied.value.deny_code == "ordering_violated"
+    seeded(engine, asset="remediate_finding", repository_id=repo, state="succeeded")
+    order = remediating.submit(
+        OrderRequest(asset="verify", priority=1, repository_id=repo), OPERATOR
+    )
+    assert order.state == OrderState.QUEUED
+
+
+def test_verification_keeps_a_prerequisite_when_remediation_is_not_wired(engine: Engine) -> None:
+    """A deployment without remediation on its allowlist falls back to ordinary triage for
+    verification's prerequisite: a completed stage before it, never nothing (Qodo 392)."""
+    unwired = OpsService(
+        SqlTraustUnitOfWork(engine),
+        FixedClock(T0),
+        publisher(engine),
+        inventory=Inventory(SqlTraustUnitOfWork(engine)),
+        recording_assets={
+            "assessment": ("assessment",),
+            "triage": ("triage",),
+            "verification": ("verify",),
+        },
+    )
+    repo = subject(engine)
+    seeded(engine, asset="assessment", repository_id=repo, state="succeeded")
+    with pytest.raises(PolicyDenied) as denied:
+        unwired.submit(OrderRequest(asset="verify", priority=1, repository_id=repo), OPERATOR)
+    assert denied.value.deny_code == "ordering_violated"
+    seeded(engine, asset="triage", repository_id=repo, state="succeeded")
+    order = unwired.submit(OrderRequest(asset="verify", priority=1, repository_id=repo), OPERATOR)
+    assert order.state == OrderState.QUEUED
+
+
+def test_an_asset_bound_to_two_kinds_outside_the_config_is_a_config_error(engine: Engine) -> None:
+    """RecordingConfig refuses ambiguous bindings, so a service wired with the same asset on
+    two kinds was built outside the config: refuse the run rather than guess its stage
+    (Qodo 392) — the gate is never silently skipped."""
+    ambiguous = OpsService(
+        SqlTraustUnitOfWork(engine),
+        FixedClock(T0),
+        publisher(engine),
+        inventory=Inventory(SqlTraustUnitOfWork(engine)),
+        recording_assets={
+            "assessment": ("audit",),
+            "triage": ("audit", "triage"),
+        },
+    )
+    repo = subject(engine)
+    with pytest.raises(ConfigError, match="several record kinds"):
+        ambiguous.submit(OrderRequest(asset="audit", priority=1, repository_id=repo), OPERATOR)
+
+
+def test_a_registered_repository_without_an_imported_line_is_not_a_subject(engine: Engine) -> None:
+    """Onboarding is an imported default line, not a registered row: a repository that was
+    never imported has nothing for a run to work on, so the subject gate refuses it."""
+    with SqlTraustUnitOfWork(engine) as uow:
+        repo = Seed(uow).repository(url=f"https://github.com/example/{uuid4()}")
+        uow.commit()
+    assert repo.id is not None
+    with pytest.raises(PolicyDenied) as denied:
+        gated(engine).submit(
+            OrderRequest(asset="assessment", priority=1, repository_id=repo.id), OPERATOR
+        )
+    assert denied.value.deny_code == "subject_unknown"

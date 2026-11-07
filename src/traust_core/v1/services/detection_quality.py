@@ -372,8 +372,13 @@ class DetectionQualityService:
         answer_key: Imported[BenchmarkTargetArtifact],
         *,
         read_budget: RecordBudget | None = None,
+        budget_owns_reads: bool = False,
     ) -> BenchmarkRun:
-        """The answer key's scored targets, each over its loaded run (and rerun) reports."""
+        """The answer key's scored targets, each over its loaded run (and rerun) reports.
+
+        `budget_owns_reads` counts every materialized row against `read_budget`; without
+        it, `scorecards` already paid for the rows through its matching pass and only
+        re-consumes in-memory ones, so each row counts once (smith-xyz, #393)."""
         doc = answer_key.document
         if unknown := sorted(set(runs) - {t.id for t in doc.targets}):
             raise ValidationError(f"runs for targets not in the answer key: {unknown}")
@@ -384,7 +389,7 @@ class DetectionQualityService:
         for target in doc.targets:
             if not target.admitted or (target.held_out and not include_held_out):
                 continue
-            if read_budget is not None:
+            if read_budget is not None and budget_owns_reads:
                 read_budget.consume(1 + len(target.expected))
             target_id = BenchmarkTargetId(target.id)
             reports = load(target_id)
@@ -398,7 +403,7 @@ class DetectionQualityService:
                 skipped.append(SkippedTarget(target_id=target_id, reason=f"wrong clone: {got}"))
                 continue
             versions.add(version)
-            if read_budget is not None:
+            if read_budget is not None and budget_owns_reads:
                 read_budget.consume(len(report.findings))
             reported = _reported(report, target.repo_url)
             matches = _match(target, reported)
@@ -415,7 +420,7 @@ class DetectionQualityService:
             )
             rerun = reports[1] if len(reports) > 1 else None
             if isinstance(rerun, tuple):
-                if read_budget is not None:
+                if read_budget is not None and budget_owns_reads:
                     read_budget.consume(len(rerun[1].findings))
                 again = {r.fingerprint for r in _reported(rerun[1], target.repo_url)}
                 once = {row.fingerprint for row in reported}
@@ -646,15 +651,14 @@ class DetectionQualityService:
         targets = answer_key.document.targets
         if read_budget is not None:
             read_budget.consume(len(targets) + sum(len(target.expected) for target in targets))
-        eligible = [
-            target
-            for target in targets
-            if target.admitted and (filter.include_held_out or not target.held_out)
-        ]
-        if not eligible:
+        admitted = [target for target in targets if target.admitted]
+        if not admitted:
             return []
+        # Audits resolve against the full admitted key first: excluding held-out targets
+        # up front would let a commit-less audit of a held-out repository fall to the
+        # eligible target that shares it (Qodo 393: held-out audits skewed the dashboard).
         by_repo = defaultdict(list)
-        for target in eligible:
+        for target in admitted:
             by_repo[canon_repo(target.repo_url)].append(target)
         by_version: dict[str, dict[BenchmarkTargetId, list[tuple[str, ReportArtifact]]]] = {}
         audits = self._log.list_of(AssessmentKind.BENCHMARK_AUDIT, read_budget=read_budget)
@@ -668,6 +672,13 @@ class DetectionQualityService:
             if read_budget is not None:
                 read_budget.consume(len(candidates))
             target_id = _target_of(candidates, run[1].metadata)
+            resolved = (
+                next((t for t in candidates if t.id == target_id), None) if target_id else None
+            )
+            if resolved is not None and not (
+                resolved.admitted and (filter.include_held_out or not resolved.held_out)
+            ):
+                continue
             if target_id is None:
                 log.warning(
                     "benchmark audit %s has no eligible answer-key target: not scored", audit.id
@@ -684,6 +695,7 @@ class DetectionQualityService:
                 filter.include_held_out,
                 answer_key,
                 read_budget=read_budget,
+                budget_owns_reads=True,
             )
             cards.append(scored.scorecard().model_copy(update={"auditor_versions": (version,)}))
         return cards

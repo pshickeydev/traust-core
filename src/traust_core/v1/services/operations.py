@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from statistics import median
-from typing import Any, Protocol, TypeVar
+from typing import Any, Final, Protocol, TypeVar
 from uuid import UUID
 
 from traust_core.v1.errors import (
@@ -24,7 +24,9 @@ from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.operations import (
     FEED_ORDER_STATES,
     FINISHED_ORDER_STATES,
+    REMEDIATE_FINDING,
     SPEND_UNPRICED,
+    WITHHOLDING_ENFORCEMENT,
     AssetName,
     AssetRequest,
     Budget,
@@ -32,6 +34,8 @@ from traust_core.v1.models.operations import (
     BudgetVerdict,
     ConfigDigest,
     DegradedKey,
+    DenyCode,
+    DenyIssue,
     FeedEvent,
     Freshness,
     JobResult,
@@ -45,7 +49,10 @@ from traust_core.v1.models.operations import (
     OrderReason,
     OrderRequest,
     OrderState,
+    PreflightRequest,
+    PreflightResult,
     RecordingStartScope,
+    RecordKind,
     Refusal,
     RescanEventSource,
     Route,
@@ -67,7 +74,11 @@ from traust_core.v1.models.operations import (
     WorkerId,
     WorkLane,
 )
-from traust_core.v1.models.vocabulary import ActorKind, AssessmentKind, SourceType
+from traust_core.v1.models.vocabulary import (
+    ActorKind,
+    AssessmentKind,
+    SourceType,
+)
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.feeds import FeedStatus
 from traust_core.v1.providers.model_catalog import ModelCatalog, ModelSpec
@@ -80,15 +91,40 @@ from traust_core.v1.services.provider_catalog import ProviderBinding, ProviderCa
 
 log = logging.getLogger(__name__)
 
-_RECORDING_SOURCES = {
-    "assessment": SourceType.VULN_SCAN_REPORT,
-    "triage": SourceType.TRIAGE_REPORT,
-    "validation": SourceType.VALIDATION_REPORT,
-    "verification": SourceType.VERIFICATION_REPORT,
+_RECORDING_SOURCES: Final[Mapping[RecordKind, SourceType]] = {
+    RecordKind.ASSESSMENT: SourceType.VULN_SCAN_REPORT,
+    RecordKind.TRIAGE: SourceType.TRIAGE_REPORT,
+    RecordKind.VALIDATION: SourceType.VALIDATION_REPORT,
+    RecordKind.VERIFICATION: SourceType.VERIFICATION_REPORT,
     # NEED(contracts: remediation source type): contracts' source-type has no remediation
     # value; the remediation report records under its triage source until one lands.
-    "remediation": SourceType.TRIAGE_REPORT,
+    RecordKind.REMEDIATION: SourceType.TRIAGE_REPORT,
 }
+
+# A stage may run only after its predecessor left a completed order for the subject. Stages
+# are record kinds and the deployment's recording config names each kind's assets, so the gate
+# follows the configured names (one deployment's assessments run as "audit", another's as
+# "assessment"). Remediation orders ride the triage allowlist until contracts grows a
+# recording.remediation section; its predecessor is the triage stage minus the remediation asset
+# itself, and verification needs remediation completed — only REMEDIATE_FINDING satisfies it,
+# not the allowlist's ordinary triage names. A predecessor the deployment does not wire is not
+# required: the gate enforces what the config declares. Remediation's plan-level gate is a
+# disposition, which lives on the findings service behind OpsService (a wiring cycle), so a
+# finished triage order is its record until that door is reachable.
+_PRIOR_RECORD_KIND: Final[Mapping[RecordKind, RecordKind]] = {
+    RecordKind.TRIAGE: RecordKind.ASSESSMENT,
+    RecordKind.REMEDIATION: RecordKind.TRIAGE,
+    RecordKind.VALIDATION: RecordKind.TRIAGE,
+    RecordKind.VERIFICATION: RecordKind.REMEDIATION,
+}
+
+# Ordering counts a predecessor that actually ran. FINISHED_ORDER_STATES also covers refused,
+# withheld and failed orders (they finished as orders, not as work); a failed assessment must
+# not unlock triage.
+_COMPLETED_ORDER_STATES: Final[tuple[OrderState, ...]] = (
+    OrderState.SUCCEEDED,
+    OrderState.DEGRADED,
+)
 
 S = TypeVar("S", contravariant=True)
 E = TypeVar("E", contravariant=True)
@@ -121,6 +157,18 @@ class Router(Protocol[S, E]):
     ) -> tuple[Route, ...]: ...
 
 
+class PolicyDenied(ForbiddenError):
+    """A policy gate refused the action; every issue carries a deny code the envelope shows."""
+
+    def __init__(self, issues: Sequence[DenyIssue]) -> None:
+        super().__init__("; ".join(f"{issue.code}: {issue.detail}" for issue in issues))
+        self.deny_issues = tuple(issues)
+
+    @property
+    def deny_code(self) -> DenyCode:
+        return self.deny_issues[0].code
+
+
 class OpsService:
     def __init__(
         self,
@@ -130,7 +178,7 @@ class OpsService:
         *,
         degraded_keys: Callable[[], Collection[str]] = tuple,
         spend: SpendService | None = None,
-        recording_assets: Mapping[str, Collection[str]] | None = None,
+        recording_assets: Mapping[RecordKind | str, Collection[str]] | None = None,
         recording_starts: Sequence[RecordingStartScope] = (),
         inventory: Inventory | None = None,
         assessments: AssessmentLog | None = None,
@@ -141,8 +189,10 @@ class OpsService:
         self._config_manifests: dict[tuple[ConfigDigest, ...], UUID] = {}
         self._degraded_keys = degraded_keys
         self._spend = spend or SpendService(uow, clock, ())
+        # The context hands config sections as plain strings; an unknown kind is a typo in
+        # the wiring, refused here rather than silently ungating a stage.
         self._recording_assets = {
-            kind: frozenset(assets) for kind, assets in (recording_assets or {}).items()
+            RecordKind(kind): frozenset(assets) for kind, assets in (recording_assets or {}).items()
         }
         self._recording_starts = tuple(recording_starts)
         self._inventory = inventory
@@ -152,6 +202,14 @@ class OpsService:
         self, request: OrderRequest, principal: Principal, config: Sequence[ConfigDigest] = ()
     ) -> RunOrder:
         """Queue an order directly, with the config it must run under in its run manifest."""
+        issues = self._policy_issues(
+            asset=request.asset,
+            repository_id=request.repository_id,
+            lane=request.lane,
+            principal=principal,
+        )
+        if issues:
+            raise PolicyDenied(issues)
         _classifiers(lane=request.lane, event_source=request.event_source)
         self._check_work_item(request)
         order = RunOrder(
@@ -195,6 +253,163 @@ class OpsService:
                 f"work item {request.work_item_id} is not a remediation work item of "
                 f"repository {request.repository_id}"
             )
+
+    def preflight(self, request: PreflightRequest, principal: Principal) -> PreflightResult:
+        """May this stage run on this subject now: fail-fast courtesy; submit re-verifies."""
+        issues = self._policy_issues(
+            asset=request.asset,
+            repository_id=request.repository_id,
+            lane=request.lane,
+            principal=principal,
+        )
+        if issues:
+            raise PolicyDenied(issues)
+        return PreflightResult(
+            allowed=True,
+            asset=request.asset,
+            repository_id=request.repository_id,
+            config_generation=request.config_generation,
+            lane=request.lane,
+        )
+
+    def _policy_issues(
+        self,
+        *,
+        asset: AssetName,
+        repository_id: UUID | None,
+        lane: LaneName | None,
+        principal: Principal,
+    ) -> tuple[DenyIssue, ...]:
+        """The gates preflight reports and submit enforces: one code path, called from both."""
+        if not self._may_request(asset, repository_id, principal):
+            # A caller who may not ask learns nothing else about the subject, its stages or
+            # the lane's spend: the role denial is the whole answer.
+            return (
+                DenyIssue(
+                    code=DenyCode.ROLE_DENIED,
+                    detail="asking for a run is a person's, or a machine granted it in "
+                    "recording.start",
+                ),
+            )
+        issues: list[DenyIssue] = []
+        if repository_id is not None:
+            issues.extend(self._subject_issues(repository_id))
+        issues.extend(self._ordering_issues(asset, repository_id))
+        if lane is not None:
+            verdict = self._spend.check_budget(lane, None)
+            if (
+                verdict.status is BudgetStatus.OVER
+                and verdict.enforcement in WITHHOLDING_ENFORCEMENT
+            ):
+                # No estimate exists before the run, so the gate is measured spend alone
+                # (BudgetVerdict.binding also needs the estimate; a preflight cannot have one).
+                # The figures stay server-side: a denial names the lane, never the amounts.
+                issues.append(
+                    DenyIssue(
+                        code=DenyCode.BUDGET_EXHAUSTED,
+                        detail=f"lane {lane} is over its monthly budget",
+                    )
+                )
+        return tuple(issues)
+
+    def _subject_issues(self, repository_id: UUID) -> tuple[DenyIssue, ...]:
+        """The subject gate, shared by every door that starts a run: the repository must be
+        registered and onboarded (an imported default line — registered alone is not a
+        subject, for preflight, submit and recording start alike)."""
+        if self._inventory is None:
+            raise ConfigError("subject checks need the inventory door")
+        try:
+            self._inventory.get_repository(repository_id)
+        except NotFoundError:
+            return (
+                DenyIssue(code=DenyCode.SUBJECT_UNKNOWN, detail=f"no repository {repository_id}"),
+            )
+        if self._inventory.default_line(repository_id) is None:
+            return (
+                DenyIssue(
+                    code=DenyCode.SUBJECT_UNKNOWN,
+                    detail=f"repository {repository_id} has no imported default line",
+                ),
+            )
+        return ()
+
+    def _may_request(
+        self, asset: AssetName, repository_id: UUID | None, principal: Principal
+    ) -> bool:
+        """Who may ask for a run: a verified person, or a verified machine within a
+        `recording.start` grant for this asset and repository. `authorize_request` enforces this
+        rule; the policy gates report it as a typed issue — one rule, two doors."""
+        return principal.is_verified_human() or (
+            principal.kind == ActorKind.MACHINE
+            and principal.verified_by is not None
+            and repository_id is not None
+            and self._in_start_scope(principal, asset, repository_id)
+        )
+
+    def _ordering_issues(self, asset: AssetName, repository_id: UUID | None) -> Iterator[DenyIssue]:
+        """The stage-ordering gate, from the deployment's recording config: a gated asset needs
+        its predecessor's completed order on the very subject. A subjectless order cannot show
+        one, so it is refused rather than queued unverified."""
+        kind = self._stage_of(asset)
+        if kind is None:
+            return
+        prior = _PRIOR_RECORD_KIND.get(kind)
+        if prior is None:
+            return
+        prior_assets = self._recording_assets.get(prior, frozenset())
+        if prior is RecordKind.REMEDIATION:
+            # Verification follows remediation specifically: only the native scheduling
+            # asset unlocks it, never the triage allowlist's ordinary names. A deployment
+            # that wires no remediation asset leaves that alias empty, so verification's
+            # prerequisite falls back to ordinary triage: a completed stage before it,
+            # never nothing (Qodo 392).
+            remediation = prior_assets & {REMEDIATE_FINDING}
+            prior_assets = (
+                remediation
+                if remediation
+                else self._recording_assets.get(RecordKind.TRIAGE, frozenset())
+                - {REMEDIATE_FINDING}
+            )
+        elif kind is RecordKind.REMEDIATION:
+            # Remediation rides the triage allowlist; its predecessor is triage's work,
+            # not another remediation order.
+            prior_assets = prior_assets - {REMEDIATE_FINDING}
+        if not prior_assets:
+            return  # the deployment wires no such stage: nothing to require
+        if repository_id is None:
+            yield DenyIssue(
+                code=DenyCode.ORDERING_VIOLATED,
+                detail=f"{asset} needs a repository: its {prior} prerequisite is per-subject",
+            )
+            return
+        with self._uow as uow:
+            completed = uow.run_orders.subject_has_order(
+                tuple(prior_assets), repository_id, _COMPLETED_ORDER_STATES
+            )
+        if not completed:
+            yield DenyIssue(
+                code=DenyCode.ORDERING_VIOLATED,
+                detail=f"{asset} needs a completed {prior} order for the subject first",
+            )
+
+    def _stage_of(self, asset: AssetName) -> RecordKind | None:
+        """The one record kind an asset runs as, or None when ungated. The context copies the
+        triage allowlist into a remediation key (contracts has no recording.remediation
+        section yet), so that alias cannot disambiguate a name: REMEDIATE_FINDING is the only
+        remediation asset, every other name resolves among the primary kinds, and an asset on
+        several of those is ambiguous. RecordingConfig refuses such bindings, so more than one
+        answer here means the service was wired outside the config: refuse the run rather
+        than guess its stage."""
+        if asset == REMEDIATE_FINDING:
+            return RecordKind.REMEDIATION
+        kinds = [
+            RecordKind(k)
+            for k, assets in self._recording_assets.items()
+            if k != RecordKind.REMEDIATION and asset in assets
+        ]
+        if len(kinds) > 1:
+            raise ConfigError(f"asset {asset} is bound to several record kinds")
+        return kinds[0] if kinds else None
 
     def plan(
         self, request: OrderRequest, principal: Principal, config: Sequence[ConfigDigest] = ()
@@ -363,7 +578,13 @@ class OpsService:
             raise ForbiddenError("recording start is outside the machine's asset/repository scope")
         if self._inventory is None:
             raise ConfigError("recording start requires inventory reads (Context wires them)")
-        self._inventory.get_repository(request.repository_id)
+        if issues := (*self._subject_issues(request.repository_id),):
+            # The subject gate submit and preflight enforce; a recording start is a run, so
+            # a registered-but-never-imported repository cannot lease one either.
+            raise PolicyDenied(issues)
+        if issues := tuple(self._ordering_issues(request.asset, request.repository_id)):
+            # The same stage ordering submit and preflight enforce; a recording start is a run.
+            raise PolicyDenied(issues)
         return self.start(request, principal, WorkerId(principal.ref), lease_for)
 
     def authorize_request(
@@ -372,13 +593,7 @@ class OpsService:
         """Who may ask for a run outside routing: a verified person (as for a direct order), or a
         verified machine within a `recording.start` grant for this asset and repository (the
         deployment's explicit machine scope; default deny)."""
-        if principal.is_verified_human():
-            return
-        if not (
-            principal.kind == ActorKind.MACHINE
-            and principal.verified_by is not None
-            and self._in_start_scope(principal, asset, repository_id)
-        ):
+        if not self._may_request(asset, repository_id, principal):
             raise ForbiddenError(
                 f"not allowed to ask for {asset} on repository {repository_id}: a verified "
                 "person, or a machine granted it in recording.start, may"
@@ -410,7 +625,7 @@ class OpsService:
         self,
         order_id: UUID,
         principal: Principal,
-        kind: str,
+        kind: RecordKind,
         repository_id: UUID,
         provenance: Provenance,
     ) -> Iterator[RunOrder]:
@@ -667,6 +882,32 @@ class OpsService:
     def get(self, order_id: UUID) -> RunOrder:
         with self._uow as uow:
             return uow.run_orders.get(order_id)
+
+    def order_for_work_item(self, work_item_id: UUID) -> RunOrder | None:
+        """The order running a work item, if any (remediate_finding orders name theirs)."""
+        with self._uow as uow:
+            return uow.run_orders.find_by_work_item(work_item_id)
+
+    def work_item_orders(
+        self, asset: AssetName, repository_id: UUID | None = None
+    ) -> list[RunOrder]:
+        """Every order of `asset` that names a work item (an asset that runs one named item —
+        remediate_finding's scheduled efforts), optionally one repository's; oldest first."""
+        orders: list[RunOrder] = []
+        after = None
+        with self._uow as uow:
+            while True:
+                batch = uow.run_orders.search(
+                    asset=str(asset),
+                    repository_id=repository_id,
+                    work_item=True,
+                    limit=500,
+                    after=after,
+                )
+                orders.extend(batch)
+                if len(batch) < 500:
+                    return orders
+                after = (batch[-1].created_at, batch[-1].id)  # type: ignore[assignment]
 
     def manifest(self, order_id: UUID) -> OrderManifest:
         """The config an order was planned with and its approval, from its run manifest."""

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import timedelta
+from uuid import uuid4
 
 import pytest
 
@@ -27,6 +28,15 @@ def test_findings_known_as_an_advisory(seed: Seed) -> None:
     known = seed.finding(advisory_id=advisory.id, advisory_match="confirmed")
     seed.finding()
     assert seed.uow.findings.list_for_advisory(advisory.id) == [known]
+
+
+def test_findings_of_several_repositories_in_one_batched_read(seed: Seed) -> None:
+    repo, other, out = seed.repository(), seed.repository(), seed.repository()
+    mine = [seed.finding(repo), seed.finding(other)]
+    seed.finding(out)  # a repository the batch does not name
+    found = seed.uow.findings.list_for_repositories([repo.id, other.id])
+    assert same_rows(found, mine)
+    assert seed.uow.findings.list_for_repositories([]) == []
 
 
 def test_finding_title_can_be_corrected(seed: Seed) -> None:
@@ -252,3 +262,37 @@ def test_historical_spellings_of_confirmed_are_confirmed_candidates(seed: Seed) 
     seed.decision(refuted, validity="false_positive")
     found = seed.uow.decisions.list_finding_ids_with_validity(Validity.CONFIRMED)
     assert sorted(found, key=str) == sorted([current.id, legacy.id, hardening.id], key=str)
+
+
+def test_decisions_for_assessments_are_only_theirs_in_judgement_order(seed: Seed) -> None:
+    finding = seed.finding()
+    elsewhere = seed.finding()
+    work = seed.assessment(kind="remediation")
+    other = seed.assessment(kind="remediation")
+    later = seed.decision(
+        finding,
+        assessment_id=work.id,
+        actor=None,
+        occurred_at=T0 + timedelta(days=2),
+        reason="forked",
+    )
+    first = seed.decision(
+        finding, assessment_id=work.id, actor=None, occurred_at=T0, reason="candidate"
+    )
+    seed.decision(finding, assessment_id=other.id, actor=None, occurred_at=T0, reason="forked")
+    also_works = seed.decision(
+        elsewhere, assessment_id=work.id, actor=None, occurred_at=T0 + timedelta(days=1)
+    )
+    orders = seed.uow.decisions.list_for_assessments({work.id, other.id})
+    assert [d.id for d in orders if d.assessment_id == work.id] == [
+        first.id,
+        also_works.id,
+        later.id,
+    ]
+    assert all(d.assessment_id in {work.id, other.id} for d in orders)
+    assert seed.uow.decisions.list_for_assessments({}) == []
+
+
+def test_decisions_for_absent_assessments_is_empty(seed: Seed) -> None:
+    seed.decision(seed.finding())
+    assert seed.uow.decisions.list_for_assessments({uuid4()}) == []

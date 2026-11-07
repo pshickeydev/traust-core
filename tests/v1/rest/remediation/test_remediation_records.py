@@ -63,9 +63,16 @@ def machine(context: Context, identity: str = "runner-7") -> Principal:
     return context.identity.authenticate(Credential(token=grant.token))
 
 
+def human(context: Context, identity: str = "asker@example.com") -> Principal:
+    assert context.identity is not None
+    grant = context.local_issuer.mint(identity)
+    return context.identity.authenticate(Credential(token=grant.token))
+
+
 def leased(
     context: Context, world: World, *, asset: str = ASSET, work_item_id: UUID | None = None
 ) -> RunOrder:
+    # a person asks for the order (submit re-verifies who may ask); the runner claims it
     principal = machine(context)
     ops = context.services().ops
     assert world.repo.id is not None
@@ -76,7 +83,7 @@ def leased(
             repository_id=world.repo.id,
             work_item_id=work_item_id,
         ),
-        principal,
+        human(context),
     )
     order = ops.claim(WorkerId(principal.ref), timedelta(hours=2), (AssetName(asset),))
     assert order is not None and order.id == queued.id
@@ -397,6 +404,12 @@ def test_order_authorization_refusals_leave_rows_and_objects_unchanged(
     if case == "wrong repository":
         order = leased(context, World(engine))
     elif case == "wrong asset":
+        # the deployment gates verify behind a completed remediate_finding order; give it one
+        with SqlTraustUnitOfWork(context.database) as uow:
+            Seed(uow).run_order(
+                asset="remediate_finding", repository_id=world.repo.id, state="succeeded"
+            )
+            uow.commit()
         order = leased(context, world, asset="verify")
     elif case in {"triage lease", "obsolete remediation asset"}:
         asset = "triage" if case == "triage lease" else "remediation"
@@ -410,7 +423,7 @@ def test_order_authorization_refusals_leave_rows_and_objects_unchanged(
         repository_id = None if case == "repositoryless order" else world.repo.id
         ops = context.services().ops
         order = ops.submit(
-            OrderRequest(asset=ASSET, priority=1, repository_id=repository_id), owner
+            OrderRequest(asset=ASSET, priority=1, repository_id=repository_id), human(context)
         )
         if case == "repositoryless order":
             claimed = ops.claim(WorkerId(owner.ref), timedelta(hours=2))
@@ -530,7 +543,7 @@ def test_scheduled_runner_records_its_report_through_the_native_doors(
     order = context.services().ops.claim(
         WorkerId(owner.ref), timedelta(hours=2), (AssetName("remediate_finding"),)
     )
-    assert order is not None and order.work_item_id == UUID(effort["assessment_id"])
+    assert order is not None and order.work_item_id == UUID(effort["work_item"]["work_item_id"])
     doc = report(
         world,
         (
@@ -547,8 +560,11 @@ def test_scheduled_runner_records_its_report_through_the_native_doors(
     item = WorkItem.model_validate(response.json())
     assert item.work_item_id == order.work_item_id
     assert item.report is not None and item.report.digest == sha256_hex(doc.payload)
-    assert context.services().remediation_scheduling.get(UUID(effort["id"])).remediation.status == (
-        RemediationStatus.CHECKS_PASSED
+    assert (
+        context.services()
+        .remediation_scheduling.get(UUID(effort["work_item"]["work_item_id"]))
+        .status
+        == RemediationStatus.CHECKS_PASSED
     )
 
 
