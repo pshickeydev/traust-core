@@ -737,7 +737,8 @@ class Context:
         else:
             _manifest_scan_pointer(engine, upgrade=local)
             _default_named_at(engine, upgrade=local)
-            _run_order_fork_columns(engine)
+            _run_order_fork_columns(engine)  # artifact_run_order's upgrade needs these first
+            _artifact_run_order(engine, upgrade=local)
         return engine
 
     @cached_property
@@ -1250,28 +1251,50 @@ def _manifest_scan_pointer(engine: Engine, *, upgrade: bool) -> None:
 
 
 def _default_named_at(engine: Engine, *, upgrade: bool) -> None:
-    """contracts added `repository_ref.default_named_at`: a local store is upgraded; a
+    """contracts added `repository_ref.default_named_at`."""
+    _additive_column(
+        engine,
+        ("traust", "repository_ref", "default_named_at"),
+        "default_named_at_upgrade",
+        upgrade=upgrade,
+    )
+
+
+def _artifact_run_order(engine: Engine, *, upgrade: bool) -> None:
+    """contracts added `artifact.run_order_id` (contracts#128)."""
+    _additive_column(
+        engine,
+        ("traust", "artifact", "run_order_id"),
+        "artifact_run_order_upgrade",
+        upgrade=upgrade,
+    )
+
+
+def _additive_column(
+    engine: Engine, where: tuple[str, str, str], upgrade_door: str, *, upgrade: bool
+) -> None:
+    """A column contracts added with an explicit upgrade: a local store is upgraded; a
     configured database's schema is its deployment's, so its absence is refused here rather
-    than failing the first default-head lookup."""
+    than failing the first read."""
+    namespace, table, column = where
     dialect = Dialect.of(engine)
-    schema = "traust" if dialect == Dialect.POSTGRES else None
+    schema = namespace if dialect == Dialect.POSTGRES else None
 
     def present() -> bool | None:
         inspector = sa.inspect(engine)
-        if not inspector.has_table("repository_ref", schema=schema):
+        if not inspector.has_table(table, schema=schema):
             return None
-        columns = inspector.get_columns("repository_ref", schema=schema)
-        return any(c["name"] == "default_named_at" for c in columns)
+        return any(c["name"] == column for c in inspector.get_columns(table, schema=schema))
 
     if present() is not False:
         return
     if not upgrade:
         raise ConfigError(
-            "the database's repository_ref predates default_named_at: apply "
-            "traust_core.v1.contracts.default_named_at_upgrade(dialect) to it"
+            f"the database's {table} predates {column}: apply "
+            f"traust_core.v1.contracts.{upgrade_door}(dialect) to it"
         )
     try:
-        apply_schema(engine, contracts.default_named_at_upgrade(dialect))
+        apply_schema(engine, getattr(contracts, upgrade_door)(dialect))
     except RepositoryError:
         if not present():  # else another process opening the same store upgraded it first
             raise

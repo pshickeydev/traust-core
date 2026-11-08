@@ -21,6 +21,7 @@ ARTIFACT = TableSpec(
     "artifact",
     lambda: (
         uuid_column("assessment_id", nullable=True),
+        uuid_column("run_order_id", nullable=True),
         text_column("digest"),
         text_column("kind"),
         text_column("uri"),

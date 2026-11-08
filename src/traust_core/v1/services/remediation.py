@@ -611,11 +611,23 @@ class RemediationService:
                     f"order {run_order_id}: remediation report covers findings of another"
                     " repository"
                 )
-            return self.record(doc, provenance, work_item_id=order.work_item_id)
+            # an order credits only the work item it runs (contracts#128's guard); one naming
+            # none records as before, uncredited
+            return self.record(
+                doc,
+                provenance,
+                work_item_id=order.work_item_id,
+                run_order_id=order.id if order.work_item_id is not None else None,
+            )
 
     @overload
     def record(
-        self, doc: RemediationArtifact, provenance: Provenance, *, work_item_id: UUID | None = None
+        self,
+        doc: RemediationArtifact,
+        provenance: Provenance,
+        *,
+        work_item_id: UUID | None = None,
+        run_order_id: UUID | None = None,
     ) -> WorkItem: ...
     @overload
     def record(self, doc: FleetFixArtifact, provenance: Provenance) -> FleetFix: ...
@@ -625,10 +637,12 @@ class RemediationService:
         provenance: Provenance,
         *,
         work_item_id: UUID | None = None,
+        run_order_id: UUID | None = None,
     ) -> WorkItem | FleetFix:
         """A report on the open work item for exactly its findings (`finding_ref` = finding id),
         the one the run prepared when it names it (`work_item_id`; the report itself doesn't):
-        attached, its Jira keys linked, the item moved to its status; re-recording is a no-op."""
+        attached by the order whose run recorded it, its Jira keys linked, the item moved to its
+        status; re-recording is a no-op."""
         if isinstance(doc, FleetFixArtifact):
             return self._record_fleet_fix(doc, provenance)
         if doc.fork.visibility == ForkVisibility.PUBLIC:
@@ -672,7 +686,7 @@ class RemediationService:
         item.advance(status)
         published = (provenance.artifact or self._publisher.publish_ref(doc)).id
         with self._uow as uow:
-            report = self._log.attach(item.work_item_id, published, digest)
+            report = self._log.attach(item.work_item_id, published, digest, run_order_id)
             for key in doc.metadata.jira_keys:
                 for finding_id in wanted:
                     self._findings.records.link_external(finding_id, JIRA, key)
@@ -1040,6 +1054,7 @@ class RemediationService:
         doc = self._publisher.read(report.id, RemediationArtifact)
         return item.model_copy(
             update={
+                "reported_by": report.run_order_id,
                 "strategy": FixStrategy(doc.patch.strategy),
                 "fork": self._forks.of(_url(doc.fork.url), ForkVisibility(doc.fork.visibility)),
                 "evidence": tuple(

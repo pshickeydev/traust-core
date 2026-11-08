@@ -151,6 +151,30 @@ def test_a_store_another_process_upgraded_first_opens(
     }
 
 
+@pytest.mark.parametrize(
+    ("column", "door"),
+    [
+        (("traust", "artifact", "run_order_id"), "_artifact_run_order"),
+        (("traust", "repository_ref", "default_named_at"), "_default_named_at"),
+    ],
+)
+def test_an_additive_column_upgrades_a_local_store_and_refuses_a_configured_one(
+    tmp_path: Path, column: tuple[str, str, str], door: str
+) -> None:
+    from traust_core.v1.context import context as wiring
+
+    _, table, name = column
+    engine = sa.create_engine(f"sqlite:///{tmp_path / 'old.db'}")
+    with engine.begin() as conn:  # the table as it was before the column, after contracts#117
+        conn.exec_driver_sql(f"CREATE TABLE {table} (id TEXT, repository_id TEXT, is_default INT)")
+        conn.exec_driver_sql("CREATE TABLE ops_run_order (id TEXT, work_item_id TEXT)")
+    with pytest.raises(ConfigError, match=f"{table} predates {name}: apply"):
+        getattr(wiring, door)(engine, upgrade=False)
+    getattr(wiring, door)(engine, upgrade=True)
+    assert name in {c["name"] for c in sa.inspect(engine).get_columns(table)}
+    getattr(wiring, door)(engine, upgrade=False)  # present now: nothing to refuse
+
+
 def test_a_store_whose_run_order_predates_the_fork_columns_is_refused(tmp_path: Path) -> None:
     home = tmp_path / "home"
     Context(Config(home=home)).services()  # a local store with the current schema
