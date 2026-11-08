@@ -15,6 +15,7 @@ from traust_core.v1.repositories.tables import (
     SqlMutableRepository,
     TableSpec,
     text_column,
+    timestamp_column,
     uuid_column,
 )
 
@@ -26,6 +27,7 @@ REPOSITORY_REF = TableSpec(
         text_column("name", nullable=True),
         text_column("kind", nullable=True),
         sa.Column("is_default", sa.Boolean, nullable=False),
+        timestamp_column("default_named_at", nullable=True),
         text_column("sha"),
         uuid_column("manifest_sbom_id", nullable=True),
         uuid_column("manifest_sbom_assessment_id", nullable=True),
@@ -107,12 +109,14 @@ class SqlRepositoryRefRepository(SqlMutableRepository[RepositoryRef]):
         )
 
     def default(self, repository_id: UUID) -> RepositoryRef | None:
-        """The latest ref recorded as the default branch."""
+        """The latest ref named the default branch; legacy rows fall back to their
+        creation time, which ordered namings before default_named_at existed."""
         c = self.table.c
+        named = sa.func.coalesce(c.default_named_at, c.created_at)
         stmt = (
             self._select()
             .where(c.repository_id == repository_id, c.is_default.is_(True))
-            .order_by(c.created_at.desc())
+            .order_by(named.desc(), c.created_at.desc())
             .limit(1)
         )
         row = self._execute(f"default for {repository_id}", stmt).mappings().first()

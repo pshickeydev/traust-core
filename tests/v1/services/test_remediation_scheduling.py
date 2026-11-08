@@ -305,6 +305,38 @@ def test_create_patches_the_latest_default_line_once_the_branch_has_moved(
     assert patched == moved.id != imported
 
 
+def test_create_patches_a_reimported_head_even_though_its_row_predates_the_observation(
+    service: RemediationSchedulingService, engine: Engine
+) -> None:
+    """B's row is recorded first, A is observed after (A→B→A's tail), then B is imported
+    again: the work item patches B, the newest naming, even though B's row was created
+    before the observation (Qodo 401: a line is immutable once recorded, so the row's
+    creation time can't order the namings)."""
+    repository_id, finding_ids, repository_ids = seeded(engine)
+    with SqlTraustUnitOfWork(engine) as uow:
+        repo = uow.repositories.get(repository_id)
+        seed = Seed(uow)
+        b = seed.repository_ref(repo, name="main", sha="b" * 40, is_default=True)
+        apart()
+        a = seed.repository_ref(repo, name="main", sha="e" * 40, is_default=True)
+        apart()
+        observed_at = a.created_at + timedelta(minutes=1)  # the last observation: A
+        seed.assessment(a, kind="repo-state", occurred_at=observed_at)
+        uow.commit()
+        imported = uow.repository_refs.update(
+            b.model_copy(update={"default_named_at": observed_at + timedelta(minutes=1)})
+        )
+        uow.commit()
+        reimported = b.id
+    request = pairs(finding_ids, repository_ids)
+    scheduled = service.create(fork_of(engine, request), BRANCH, request, PERSON)
+    detail = service.get(scheduled.work_item.work_item_id)
+    with SqlTraustUnitOfWork(engine) as uow:
+        patched = uow.assessments.get(detail.work_item.work_item_id).repository_ref_id
+    assert patched == reimported != a.id
+    assert imported.default_named_at is not None
+
+
 # get, list
 
 

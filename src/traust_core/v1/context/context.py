@@ -736,7 +736,9 @@ class Context:
             apply_schema(engine, contracts.database_ddl(Dialect.of(engine)))
         else:
             _manifest_scan_pointer(engine, upgrade=local)
-            _hand_upgraded_columns(engine)
+            _default_named_at(engine, upgrade=local)
+            _artifact_run_order(engine, upgrade=local)
+            _run_order_fork_columns(engine)
         return engine
 
     @cached_property
@@ -1096,7 +1098,7 @@ class Context:
             remediation=remediation,
             verification=verification,
             remediation_scheduling=RemediationSchedulingService(
-                uow, findings, remediation, verification, ops
+                uow, findings, remediation, verification, ops, portfolio
             ),
             insight=InsightService(
                 (
@@ -1199,35 +1201,25 @@ def _sla_policy(path: Path) -> SlaPolicy:
         raise ConfigError(f"SLA policy {path}: {e}") from e
 
 
-# Columns contracts added with no upgrade channel (existing databases alter by hand, per the
-# PR named): (namespace, table, columns, where the statements are).
-_HAND_UPGRADES = (
-    (
-        "traust_ops",
-        "run_order",
-        {"work_item_id", "fork_url", "fork_branch"},
-        "traust-contracts#117",
-    ),
-    ("traust", "artifact", {"run_order_id"}, "traust-contracts#128"),
-)
-
-
-def _hand_upgraded_columns(engine: Engine) -> None:
-    """A store whose tables predate a hand-applied contracts change is refused here, with where
-    its statements are, rather than failing the first read with a raw driver error."""
-    postgres = Dialect.of(engine) == Dialect.POSTGRES
+def _run_order_fork_columns(engine: Engine) -> None:
+    """contracts added `run_order.fork_url` / `fork_branch`: there is deliberately no upgrade
+    channel (contracts#117 — existing databases alter by hand), so a store whose run_order
+    predates the columns is refused here, with the statements to apply, rather than failing
+    the first remediate_finding order with a raw driver error."""
+    dialect = Dialect.of(engine)
+    schema = "traust_ops" if dialect == Dialect.POSTGRES else None
+    table = "run_order" if dialect == Dialect.POSTGRES else "ops_run_order"
     inspector = sa.inspect(engine)
-    for namespace, name, wanted, where in _HAND_UPGRADES:
-        schema = namespace if postgres else None
-        table = name if postgres or namespace == "traust" else f"ops_{name}"
-        if not inspector.has_table(table, schema=schema):
-            continue
-        if missing := wanted - {c["name"] for c in inspector.get_columns(table, schema=schema)}:
-            raise ConfigError(
-                f"the database's {table} predates {', '.join(sorted(missing))}: apply the "
-                f"additive statements documented in {where} (its 'Upgrading an existing "
-                "database' section), or recreate the store"
-            )
+    if not inspector.has_table(table, schema=schema):
+        return
+    columns = {c["name"] for c in inspector.get_columns(table, schema=schema)}
+    if {"work_item_id", "fork_url", "fork_branch"} <= columns:
+        return
+    raise ConfigError(
+        f"the database's {table} predates the fork columns: apply the additive statements "
+        "documented in traust-contracts#117 (its 'Upgrading an existing database' section), "
+        "or recreate the store"
+    )
 
 
 def _manifest_scan_pointer(engine: Engine, *, upgrade: bool) -> None:
@@ -1253,6 +1245,56 @@ def _manifest_scan_pointer(engine: Engine, *, upgrade: bool) -> None:
         )
     try:
         apply_schema(engine, contracts.manifest_sbom_binding_upgrade(dialect))
+    except RepositoryError:
+        if not present():  # else another process opening the same store upgraded it first
+            raise
+
+
+def _default_named_at(engine: Engine, *, upgrade: bool) -> None:
+    """contracts added `repository_ref.default_named_at`."""
+    _additive_column(
+        engine,
+        ("traust", "repository_ref", "default_named_at"),
+        "default_named_at_upgrade",
+        upgrade=upgrade,
+    )
+
+
+def _artifact_run_order(engine: Engine, *, upgrade: bool) -> None:
+    """contracts added `artifact.run_order_id` (contracts#128)."""
+    _additive_column(
+        engine,
+        ("traust", "artifact", "run_order_id"),
+        "artifact_run_order_upgrade",
+        upgrade=upgrade,
+    )
+
+
+def _additive_column(
+    engine: Engine, where: tuple[str, str, str], upgrade_door: str, *, upgrade: bool
+) -> None:
+    """A column contracts added with an explicit upgrade: a local store is upgraded; a
+    configured database's schema is its deployment's, so its absence is refused here rather
+    than failing the first read."""
+    namespace, table, column = where
+    dialect = Dialect.of(engine)
+    schema = namespace if dialect == Dialect.POSTGRES else None
+
+    def present() -> bool | None:
+        inspector = sa.inspect(engine)
+        if not inspector.has_table(table, schema=schema):
+            return None
+        return any(c["name"] == column for c in inspector.get_columns(table, schema=schema))
+
+    if present() is not False:
+        return
+    if not upgrade:
+        raise ConfigError(
+            f"the database's {table} predates {column}: apply "
+            f"traust_core.v1.contracts.{upgrade_door}(dialect) to it"
+        )
+    try:
+        apply_schema(engine, getattr(contracts, upgrade_door)(dialect))
     except RepositoryError:
         if not present():  # else another process opening the same store upgraded it first
             raise

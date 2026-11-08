@@ -85,6 +85,9 @@ class RepositoryRef(Entity):
     name: str | None = None
     kind: str | None = None
     is_default: bool = False
+    # When this row was last named the default head (import or observation); None is
+    # unknown (legacy rows never named since the column landed).
+    default_named_at: datetime | None = None
     sha: str
     manifest_sbom_id: UUID | None = None
     # The manifest scan whose coverage is current; None (an SBOM given as a document) is unknown.

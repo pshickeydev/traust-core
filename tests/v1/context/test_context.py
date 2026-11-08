@@ -151,14 +151,27 @@ def test_a_store_another_process_upgraded_first_opens(
     }
 
 
-def test_a_store_whose_artifacts_predate_the_recording_order_is_refused(tmp_path: Path) -> None:
-    from traust_core.v1.context.context import _hand_upgraded_columns
+@pytest.mark.parametrize(
+    ("column", "door"),
+    [
+        (("traust", "artifact", "run_order_id"), "_artifact_run_order"),
+        (("traust", "repository_ref", "default_named_at"), "_default_named_at"),
+    ],
+)
+def test_an_additive_column_upgrades_a_local_store_and_refuses_a_configured_one(
+    tmp_path: Path, column: tuple[str, str, str], door: str
+) -> None:
+    from traust_core.v1.context import context as wiring
 
+    _, table, name = column
     engine = sa.create_engine(f"sqlite:///{tmp_path / 'old.db'}")
-    with engine.begin() as conn:  # artifact as it was before traust-contracts#128
-        conn.exec_driver_sql("CREATE TABLE artifact (id TEXT, assessment_id TEXT, digest TEXT)")
-    with pytest.raises(ConfigError, match=r"artifact predates run_order_id.*contracts#128"):
-        _hand_upgraded_columns(engine)
+    with engine.begin() as conn:  # the table as it was before the column
+        conn.exec_driver_sql(f"CREATE TABLE {table} (id TEXT, repository_id TEXT, is_default INT)")
+    with pytest.raises(ConfigError, match=f"{table} predates {name}: apply"):
+        getattr(wiring, door)(engine, upgrade=False)
+    getattr(wiring, door)(engine, upgrade=True)
+    assert name in {c["name"] for c in sa.inspect(engine).get_columns(table)}
+    getattr(wiring, door)(engine, upgrade=False)  # present now: nothing to refuse
 
 
 def test_a_store_whose_run_order_predates_the_fork_columns_is_refused(tmp_path: Path) -> None:
