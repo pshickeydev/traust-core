@@ -321,9 +321,15 @@ class RemediationService:
         item = self.get(work_item_id)
         subject = self._inventory.subject(item.repository_ref_id, work_item_id)
         views = self._findings.list_by_ids(item.finding_ids)
-        # a scheduled effort's fork is the policy's (checked at scheduling); its branch is the
-        # one the scheduler named, on the order that runs the work item
+        # a scheduled effort pushes where its order says (fork and branch, checked at
+        # scheduling), whatever the policy says since; the rest go where the policy says now
         order = self.scheduled_order(work_item_id)
+        fork = item.fork or (
+            self._scheduled_fork(order, subject.repository_url)
+            if order is not None
+            else self.resolve_fork(subject.repository_id)
+        )
+        self._refuse_public(str(fork.url))  # a fork that turned public since is no push target
         return RemediationInput(
             subject=subject,
             findings=FindingContext(),
@@ -339,11 +345,19 @@ class RemediationService:
                 )
                 for v in views
             ),
-            fork=item.fork or self.resolve_fork(subject.repository_id),
+            fork=fork,
             fix_branch=order.fork_branch
             if order is not None and order.fork_branch is not None
             else self._forks.fix_branch(views[0].finding.id, views[0].finding.title),  # type: ignore[arg-type]
         )
+
+    def _scheduled_fork(self, order: RunOrder, repository_url: str) -> Fork:
+        """The fork a scheduled order names: the repository itself on a private forge
+        (internal), else a private mirror."""
+        assert order.fork_url is not None
+        url = _url(order.fork_url)
+        internal = str(url) == str(_url(repository_url))
+        return self._forks.of(url, ForkVisibility.INTERNAL if internal else ForkVisibility.PRIVATE)
 
     def _hint(self, view: FindingView, repository_url: str) -> str | None:
         """The `remediation` text of the finding's entry in the report its occurrence came from;

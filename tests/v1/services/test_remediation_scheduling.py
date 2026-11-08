@@ -1422,6 +1422,37 @@ def test_a_stamped_effort_keeps_its_fork_facts_whatever_the_policy_says_since(
         )
 
 
+def test_a_stamped_effort_prepares_and_records_on_its_scheduled_fork(
+    service: RemediationSchedulingService, context: Context, engine: Engine
+) -> None:
+    world = World(engine, patched_name="main")
+    audited(engine, world, world.base)
+    request = pairs(world.ids, [world.repo.id] * len(world.ids))
+    scheduled = service.create(fork_of(engine, request), world.patched.name, request, PERSON)
+    with SqlTraustUnitOfWork(engine) as uow:  # the policy moves to a private mirror since
+        Seed(uow).repository(
+            url="https://github.com/mirror-org/registered-since",
+            upstream_id=world.repo.id,
+            public=False,
+        )
+        uow.commit()
+    remediation = context.services().remediation
+    prepared = remediation.prepare(scheduled.work_item.work_item_id)
+    assert (str(prepared.fork.url), prepared.fix_branch) == (
+        scheduled.fork_url,
+        scheduled.fork_branch,
+    )
+    recorded = remediation.record(
+        pushed(scheduled, world.ids, fork__fix_commit=world.patched.sha), provenance()
+    )
+    assert recorded.report is not None
+    with SqlTraustUnitOfWork(engine) as uow:  # and the scheduled fork turned public: no push
+        Seed(uow).repository(url=str(scheduled.fork_url), public=True)
+        uow.commit()
+    with pytest.raises(ValidationError, match="public repository"):
+        remediation.prepare(scheduled.work_item.work_item_id)
+
+
 def test_a_repository_whose_fork_policy_fails_drops_out_of_the_listing_alone(
     service: RemediationSchedulingService,
     engine: Engine,
