@@ -1208,7 +1208,7 @@ def _run_order_fork_columns(engine: Engine) -> None:
     if not inspector.has_table(table, schema=schema):
         return
     columns = {c["name"] for c in inspector.get_columns(table, schema=schema)}
-    if {"fork_url", "fork_branch"} <= columns:
+    if {"work_item_id", "fork_url", "fork_branch"} <= columns:
         return
     raise ConfigError(
         f"the database's {table} predates the fork columns: apply the additive statements "

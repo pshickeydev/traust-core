@@ -73,6 +73,10 @@ class RunOrderRepository(MutableRecordRepository[RunOrder], Protocol):
         """The order running a work item, if any (remediate_finding orders name theirs)."""
         ...
 
+    def scheduling_orders(self, work_item_ids: Collection[UUID]) -> dict[UUID, RunOrder]:
+        """Each work item's scheduling order: the oldest carrying both fork facts."""
+        ...
+
     def subjects(
         self,
         asset: str,
@@ -99,8 +103,10 @@ class RunOrderRepository(MutableRecordRepository[RunOrder], Protocol):
         asset: str | None = None,
         repository_id: UUID | None = None,
         run_batch_id: UUID | None = None,
+        work_item: bool = False,
         limit: int,
         after: tuple[datetime, UUID] | None = None,
+        oldest_first: bool = False,
     ) -> list[RunOrder]: ...
 
     def finished_between(
@@ -208,17 +214,41 @@ class SqlRunOrderRepository(SqlMutableRepository[RunOrder]):
         return None if row is None else self._to_record(row)
 
     def find_by_work_item(self, work_item_id: UUID) -> RunOrder | None:
-        """The oldest order naming the work item — the one that scheduled its effort, should
-        a second ever name it."""
+        """The order that scheduled the work item's effort: one carrying both fork facts before
+        any other order naming it, then the oldest."""
         c = self.table.c
         stmt = (
             self._select()
             .where(c.work_item_id == work_item_id)
-            .order_by(c.created_at, c.id)
+            .order_by(c.fork_url.is_(None) | c.fork_branch.is_(None), c.created_at, c.id)
             .limit(1)
         )
         row = self._execute(f"find order for work item {work_item_id}", stmt).mappings().first()
         return None if row is None else self._to_record(row)
+
+    def scheduling_orders(self, work_item_ids: Collection[UUID]) -> dict[UUID, RunOrder]:
+        c = self.table.c
+        first: dict[UUID, RunOrder] = {}
+        for batch in self._batches(work_item_ids):
+            rank = (
+                sa.func.row_number()
+                .over(partition_by=c.work_item_id, order_by=(c.created_at, c.id))
+                .label("rank")
+            )
+            ranked = (
+                sa.select(self.table, rank)
+                .where(
+                    c.work_item_id.in_(batch), c.fork_url.is_not(None), c.fork_branch.is_not(None)
+                )
+                .subquery()
+            )
+            stmt = sa.select(*(ranked.c[col.name] for col in c)).where(ranked.c.rank == 1)
+            rows = self._execute(f"scheduling orders of {len(batch)} work items", stmt)
+            first.update(
+                (o.work_item_id, o)  # type: ignore[misc]
+                for o in map(self._to_record, rows.mappings())
+            )
+        return first
 
     def search(
         self,
@@ -230,6 +260,7 @@ class SqlRunOrderRepository(SqlMutableRepository[RunOrder]):
         work_item: bool = False,
         limit: int,
         after: tuple[datetime, UUID] | None = None,
+        oldest_first: bool = False,
     ) -> list[RunOrder]:
         c = self.table.c
         conditions = [
@@ -243,7 +274,9 @@ class SqlRunOrderRepository(SqlMutableRepository[RunOrder]):
             )
             if value
         ]
-        return self._page("search", *conditions, limit=limit, after=after)
+        return self._page(
+            "search", *conditions, limit=limit, after=after, oldest_first=oldest_first
+        )
 
     def finished_between(
         self,

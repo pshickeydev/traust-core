@@ -296,3 +296,16 @@ def test_decisions_for_assessments_are_only_theirs_in_judgement_order(seed: Seed
 def test_decisions_for_absent_assessments_is_empty(seed: Seed) -> None:
     seed.decision(seed.finding())
     assert seed.uow.decisions.list_for_assessments({uuid4()}) == []
+
+
+def test_decisions_for_many_assessments_are_read_in_batches(seed: Seed) -> None:
+    finding = seed.finding()
+    works = [seed.assessment(kind="remediation") for _ in range(501)]  # past one batch of 500
+    made = [
+        seed.decision(
+            finding, assessment_id=w.id, actor=None, occurred_at=T0 + timedelta(minutes=i)
+        )
+        for i, w in enumerate(works)
+    ]
+    found = seed.uow.decisions.list_for_assessments({w.id for w in works})
+    assert [d.id for d in found] == [d.id for d in made]  # every one, in judgement order

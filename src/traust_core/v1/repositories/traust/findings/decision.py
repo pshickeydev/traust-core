@@ -126,12 +126,13 @@ class SqlDecisionRepository(SqlAppendOnlyRepository[Decision]):
         )
 
     def list_for_assessments(self, assessment_ids: Collection[UUID]) -> list[Decision]:
-        c = self.table.c
-        return self._many(
+        """In judgement order, read in batches so a long id list stays under the bind limit."""
+        rows = self._many_in(
             f"list for {len(assessment_ids)} assessments",
-            c.assessment_id.in_(assessment_ids),
-            order_by=(c.occurred_at,),
+            self.table.c.assessment_id,
+            assessment_ids,
         )
+        return sorted(rows, key=lambda d: (d.occurred_at, d.created_at, d.id))  # type: ignore[arg-type]
 
     def list_for_findings(
         self,

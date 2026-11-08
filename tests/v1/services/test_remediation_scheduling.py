@@ -3,6 +3,7 @@ and the status sync that keeps the remediation row beside the decisions that mov
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from collections.abc import Iterator
@@ -318,12 +319,14 @@ def test_get_and_list_filter_the_scheduled_efforts(
         pairs(finding_ids[:1], repository_ids[:1]),
         PERSON,
     )
+    apart()  # listed by when each was scheduled: the store stamps milliseconds
     second = service.create(
         fork_of(engine, pairs(finding_ids[1:], repository_ids[1:])),
         BRANCH,
         pairs(finding_ids[1:], repository_ids[1:]),
         PERSON,
     )
+    apart()
     third = service.create(
         fork_of(engine, pairs(other_findings, other_repos)),
         BRANCH,
@@ -1056,8 +1059,16 @@ def test_the_orders_door_refuses_fork_facts_it_cannot_vouch_for(
             "work_item_id": item.id,
             "fork_branch": BRANCH,
         },
+        # a whole pair too: only the scheduling door, after its checks, sets fork facts
+        {
+            "asset": REMEDIATE_FINDING,
+            "priority": 0,
+            "work_item_id": item.id,
+            "fork_url": "https://github.com/attacker/fork",
+            "fork_branch": "fix/anything",
+        },
     ):
-        with pytest.raises(pydantic.ValidationError, match="together"):
+        with pytest.raises(pydantic.ValidationError, match="Extra inputs are not permitted"):
             ops.submit(OrderRequest(**values), PERSON)  # type: ignore[arg-type]
 
 
@@ -1069,3 +1080,294 @@ def test_get_answers_not_found_for_what_was_never_scheduled(
     item = remediation.open(finding_ids, default_ref(engine, repository_id))
     with pytest.raises(NotFoundError, match="schedules no remediation"):
         service.get(item.work_item_id)
+
+
+@pytest.mark.parametrize(
+    "fork",
+    [
+        {"fork_url": "https://github.com/attacker/fork", "fork_branch": "fix/anything"},
+        {"fork_branch": "../../etc"},  # the policy's fork, a branch git refuses
+    ],
+)
+def test_fork_facts_scheduling_never_checked_steer_nothing(
+    service: RemediationSchedulingService,
+    context: Context,
+    engine: Engine,
+    fork: dict[str, str],
+) -> None:
+    """Orders from the generic door before it lost its fork fields carry unchecked facts."""
+    repository_id, finding_ids, _ = seeded(engine)
+    remediation = context.services().remediation
+    item = remediation.open(finding_ids, default_ref(engine, repository_id))
+    policy = str(remediation.resolve_fork(repository_id).url)
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        at = {"asset": "remediate_finding", "state": "queued", "repository_id": repository_id}
+        seed.run_order(**at, work_item_id=item.work_item_id)  # bare, older
+        apart()
+        seed.run_order(**at, work_item_id=item.work_item_id, **{"fork_url": policy, **fork})
+        uow.commit()
+    with pytest.raises(NotFoundError, match="schedules no remediation"):
+        service.get(item.work_item_id)
+    assert service.list(PageRequest()).items == ()
+    assert remediation.scheduled_order(item.work_item_id) is None
+    prepared = remediation.prepare(item.work_item_id)
+    assert prepared.fix_branch != fork["fork_branch"]  # the policy's branch, not the order's
+
+
+def test_a_repository_whose_fork_policy_fails_drops_out_of_the_listing_alone(
+    service: RemediationSchedulingService,
+    engine: Engine,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    efforts = []
+    for _ in range(2):
+        _, finding_ids, repository_ids = seeded(engine)
+        request = pairs(finding_ids, repository_ids)
+        efforts.append(service.create(fork_of(engine, request), BRANCH, request, PERSON))
+        apart()
+    broken, kept = efforts
+    with SqlTraustUnitOfWork(engine) as uow:  # its mirror turned public: no fork for it now
+        Seed(uow).repository(url=str(broken.fork_url), public=True)
+        uow.commit()
+    with caplog.at_level(logging.WARNING, logger="traust_core.v1.services.remediation"):
+        listed = service.list(PageRequest()).items
+    assert [e.work_item.work_item_id for e in listed] == [kept.work_item.work_item_id]
+    assert f"repository {broken.repository_id}: remediation fork unresolved" in caplog.text
+    with pytest.raises(NotFoundError, match="schedules no remediation"):
+        service.get(broken.work_item.work_item_id)
+
+
+def test_a_report_on_an_order_scheduling_no_longer_vouches_for_is_refused(
+    service: RemediationSchedulingService, context: Context, engine: Engine
+) -> None:
+    """Policy changed after the order was leased: its report binds to nothing, so never lands."""
+    world = World(engine, patched_name="main")
+    audited(engine, world, world.base)
+    request = pairs(world.ids, [world.repo.id] * len(world.ids))
+    scheduled = service.create(fork_of(engine, request), world.patched.name, request, PERSON)
+    with SqlTraustUnitOfWork(engine) as uow:
+        Seed(uow).repository(url=str(scheduled.fork_url), public=True)
+        uow.commit()
+    elsewhere = pushed(
+        scheduled,
+        world.ids,
+        fork__url="https://github.com/mirror-org/elsewhere",
+        fork__fix_branch="fix/elsewhere",
+        fork__fix_commit=world.patched.sha,
+    )
+    with pytest.raises(ValidationError, match="can't vouch for"):
+        context.services().remediation.record(elsewhere, provenance())
+    assert context.services().remediation.get(scheduled.work_item.work_item_id).report is None
+
+
+def test_an_attached_report_still_finishes_its_resolution_after_the_policy_changed(
+    service: RemediationSchedulingService,
+    context: Context,
+    engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from traust_core.v1.services.findings.decisions import FindingDecisions
+
+    world = World(engine, patched_name="main")
+    audited(engine, world, world.base)
+    request = pairs(world.ids, [world.repo.id] * len(world.ids))
+    scheduled = service.create(fork_of(engine, request), world.patched.name, request, PERSON)
+    doc = pushed(scheduled, world.ids, fork__fix_commit=world.patched.sha)
+    write = FindingDecisions.record_resolution
+
+    def interrupted(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("connection lost")
+
+    monkeypatch.setattr(FindingDecisions, "record_resolution", interrupted)
+    with pytest.raises(RuntimeError):
+        context.services().remediation.record(doc, provenance())  # attached, unresolved
+    monkeypatch.setattr(FindingDecisions, "record_resolution", write)
+    with SqlTraustUnitOfWork(engine) as uow:  # a private mirror registered since: a new fork
+        Seed(uow).repository(
+            url="https://github.com/mirror-org/registered-since",
+            upstream_id=world.repo.id,
+            public=False,
+        )
+        uow.commit()
+    remediation = context.services().remediation
+    assert remediation.scheduled_order(scheduled.work_item.work_item_id) is None
+    finished = remediation.record(doc, provenance())
+    assert finished.report is not None and finished.status == "checks_passed"
+
+
+def test_the_listing_follows_its_cursor_page_after_page(
+    service: RemediationSchedulingService, engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from traust_core.v1.services import remediation_scheduling
+
+    monkeypatch.setattr(remediation_scheduling, "_BATCH", 2)  # several rounds per page
+    _, finding_ids, repository_ids = seeded(engine, findings=5)
+    made = []
+    for finding_id, repository_id in zip(finding_ids, repository_ids, strict=True):
+        request = pairs([finding_id], [repository_id])
+        made.append(service.create(fork_of(engine, request), BRANCH, request, PERSON))
+        apart()
+    seen, cursor = [], None
+    while True:
+        page = service.list(PageRequest(limit=2, cursor=cursor))
+        seen += [e.work_item.work_item_id for e in page.items]
+        if page.next is None:
+            break
+        cursor = page.next
+    assert seen == [e.work_item.work_item_id for e in made]  # every effort once, in order
+
+
+def test_create_and_the_reads_agree_on_a_failed_attempt_later_verified_fixed(
+    service: RemediationSchedulingService, context: Context, engine: Engine
+) -> None:
+    world = World(engine, patched_name="main")
+    audited(engine, world, world.base)
+    request = pairs(world.ids, [world.repo.id] * len(world.ids))
+    scheduled = service.create(fork_of(engine, request), world.patched.name, request, PERSON)
+    context.services().remediation.record(
+        pushed(
+            scheduled,
+            world.ids,
+            fork__fix_commit=world.patched.sha,
+            summary__status="checks_failed",
+        ),
+        provenance(),
+    )
+    assert folded(service, scheduled) == "checks_failed"
+    context.services().verification.record(verification_report(world), verification_provenance())
+    assert folded(service, scheduled) == "revalidated_fixed"
+    (listed,) = service.list(PageRequest()).items
+    assert listed.status == "revalidated_fixed"
+    with pytest.raises(ValidationError, match="closed"):  # no retry beside a fixed effort
+        service.create(fork_of(engine, request), world.patched.name, request, PERSON)
+    assert [e.work_item.work_item_id for e in service.list(PageRequest()).items] == [
+        scheduled.work_item.work_item_id
+    ]
+
+
+def test_a_listing_reads_each_repositorys_history_once_across_batches(
+    service: RemediationSchedulingService, engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from traust_core.v1.services import remediation_scheduling
+    from traust_core.v1.services.remediation import RemediationService
+
+    monkeypatch.setattr(remediation_scheduling, "_BATCH", 1)
+    _, finding_ids, repository_ids = seeded(engine, findings=3)
+    for finding_id, repository_id in zip(finding_ids, repository_ids, strict=True):
+        request = pairs([finding_id], [repository_id])
+        service.create(fork_of(engine, request), BRANCH, request, PERSON)
+        apart()
+    reads: list[UUID] = []
+    items_of = RemediationService.items_of
+    monkeypatch.setattr(
+        RemediationService,
+        "items_of",
+        lambda self, repository_id: reads.append(repository_id) or items_of(self, repository_id),
+    )
+    # a sparse filter: every batch is read, none matches
+    assert service.list(PageRequest(), status=RemediationStatus("merged")).items == ()
+    assert reads == [repository_ids[0]]
+
+
+def test_the_listing_shows_a_work_item_once_at_the_order_get_reads(
+    service: RemediationSchedulingService,
+    context: Context,
+    engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from traust_core.v1.services import remediation_scheduling
+
+    monkeypatch.setattr(remediation_scheduling, "_BATCH", 1)  # the two orders in two batches
+    repository_id, finding_ids, repository_ids = seeded(engine)
+    request = pairs(finding_ids, repository_ids)
+    scheduled = service.create(fork_of(engine, request), BRANCH, request, PERSON)
+    apart()
+    context.services().ops.schedule_fix(
+        OrderRequest(
+            asset=REMEDIATE_FINDING,
+            priority=0,
+            repository_id=repository_id,
+            work_item_id=scheduled.work_item.work_item_id,
+        ),
+        PERSON,
+        "https://github.com/mirror-org/elsewhere",
+        "fix/elsewhere",
+    )
+    seen = []
+    cursor = None
+    while True:
+        page = service.list(PageRequest(limit=1, cursor=cursor))
+        seen += page.items
+        if page.next is None:
+            break
+        cursor = page.next
+    assert [e.order_id for e in seen] == [service.get(scheduled.work_item.work_item_id).order_id]
+    assert seen[0].fork_url == scheduled.fork_url
+
+
+def test_schedule_fix_sets_fork_facts_only_on_a_work_items_remediation_order(
+    context: Context,
+) -> None:
+    with pytest.raises(ValidationError, match="fork facts ride only a remediate_finding order"):
+        context.services().ops.schedule_fix(
+            OrderRequest(asset=REMEDIATE_FINDING, priority=0), PERSON, "https://x.test/a", "fix/a"
+        )
+
+
+def test_a_verification_recorded_before_the_effort_was_scheduled_never_revalidates_it(
+    service: RemediationSchedulingService, context: Context, engine: Engine
+) -> None:
+    world = World(engine, patched_name="main")
+    audited(engine, world, world.base)
+    context.services().verification.record(
+        verification_report(world, dict.fromkeys(world.ids, "unresolved")),
+        verification_provenance(),
+    )  # an older check of the same branch and commit
+    apart()
+    request = pairs(world.ids, [world.repo.id] * len(world.ids))
+    scheduled = service.create(fork_of(engine, request), world.patched.name, request, PERSON)
+    context.services().remediation.record(
+        pushed(scheduled, world.ids, fork__fix_commit=world.patched.sha), provenance()
+    )
+    assert folded(service, scheduled) == "checks_passed"  # not that earlier check's verdict
+
+
+def test_a_verification_recorded_before_a_late_report_still_revalidates_the_fix(
+    service: RemediationSchedulingService, context: Context, engine: Engine
+) -> None:
+    world = World(engine, patched_name="main")
+    audited(engine, world, world.base)
+    request = pairs(world.ids, [world.repo.id] * len(world.ids))
+    scheduled = service.create(fork_of(engine, request), world.patched.name, request, PERSON)
+    apart()
+    context.services().verification.record(verification_report(world), verification_provenance())
+    apart()
+    context.services().remediation.record(
+        pushed(scheduled, world.ids, fork__fix_commit=world.patched.sha), provenance()
+    )
+    assert folded(service, scheduled) == "revalidated_fixed"
+
+
+def test_tied_verifications_break_by_id_never_by_verdict() -> None:
+    from datetime import UTC, datetime
+
+    from traust_core.v1.models.assessment import Assessment
+    from traust_core.v1.services.remediation import _verdict_order
+
+    at = datetime(2026, 11, 6, tzinfo=UTC)
+    a, b = (
+        Assessment(
+            id=uuid4(),
+            created_at=at,
+            repository_ref_id=uuid4(),
+            kind="verification",
+            status="completed",
+            assessor="skill:verify",
+            assessor_version="1",
+            occurred_at=at,
+        )
+        for _ in range(2)
+    )
+    assert _verdict_order(a) != _verdict_order(b)  # same times: the id breaks the tie
+    assert (_verdict_order(a) < _verdict_order(b)) == (a.id < b.id)  # type: ignore[operator]

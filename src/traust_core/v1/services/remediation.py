@@ -141,6 +141,9 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 REMEDIATION = AssessmentKind.REMEDIATION
+# The remediation report's `fork.fix_branch` (traust-contracts remediation schema): a branch
+# scheduled here becomes that field, so it must pass it as well as git's rules.
+_FIX_BRANCH = re.compile(r"[A-Za-z0-9._/-]{1,200}")
 ASSESSOR = "skill:remediate-finding"
 FLEET_FIX = AssessmentKind.FLEET_FIX
 FLEET_FIX_ASSESSOR = "skill:fleet-fix"
@@ -320,7 +323,7 @@ class RemediationService:
         views = self._findings.list_by_ids(item.finding_ids)
         # a scheduled effort's fork is the policy's (checked at scheduling); its branch is the
         # one the scheduler named, on the order that runs the work item
-        order = self._ops.order_for_work_item(work_item_id)
+        order = self.scheduled_order(work_item_id)
         return RemediationInput(
             subject=subject,
             findings=FindingContext(),
@@ -493,6 +496,40 @@ class RemediationService:
             key=lambda c: (_rank(c.findings[0]), -len(c.findings), c.url),
         )
 
+    def scheduled_order(self, work_item_id: UUID) -> RunOrder | None:
+        """The order that scheduled the work item's effort, when scheduling vouches for its
+        fork facts; None for an item opened by hand or by an order it doesn't."""
+        order = self._ops.order_for_work_item(work_item_id)
+        if order is None or order.repository_id is None:
+            return None
+        return order if self.vouches(order, self.policy_fork(order.repository_id)) else None
+
+    def policy_fork(self, repository_id: UUID) -> Fork | None:
+        """The repository's remediation fork, or None when the policy can no longer name one
+        (a fork org or forge host unset since): its orders are then unvouched, not an error."""
+        try:
+            return self.resolve_fork(repository_id)
+        except (ConfigError, NotFoundError, ValidationError) as e:
+            log.warning("repository %s: remediation fork unresolved: %s", repository_id, e)
+            return None
+
+    @staticmethod
+    def vouches(order: RunOrder, fork: Fork | None) -> bool:
+        """Whether an order's fork facts are what scheduling sets: the repository's remediation
+        fork and a fix branch. The generic orders door once took unchecked ones."""
+        # NEED(contracts: run_order records that scheduling set its fork facts): until then
+        # they're checked against today's policy, so a fork policy changed since scheduling
+        # hides the effort
+        if fork is None or order.fork_url is None or order.fork_branch is None:
+            return False
+        if order.fork_url != str(fork.url):
+            return False
+        try:
+            check_fix_branch(order.fork_branch)
+        except ValidationError:
+            return False
+        return True
+
     def resolve_fork(self, repository_id: UUID) -> Fork:
         repository = self._inventory.get_repository(repository_id)
         mirror = self._inventory.private_mirror(repository_id)
@@ -607,16 +644,23 @@ class RemediationService:
         # a scheduled fix is pushed where it was scheduled: its commit is what verification of
         # that branch later revalidates
         order = self._ops.order_for_work_item(item.work_item_id)
-        if (
-            order is not None
-            and order.fork_url is not None
-            and order.fork_branch is not None
-            and (pushed_to, doc.fork.fix_branch) != (order.fork_url, order.fork_branch)
-        ):
-            raise ValidationError(
-                f"remediation report pushes to {pushed_to} {doc.fork.fix_branch}, not the "
-                f"scheduled {order.fork_url} {order.fork_branch}"
-            )
+        if order is not None and (order.fork_url or order.fork_branch):
+            # an order's fork facts bind its report; ones scheduling can't vouch for bind
+            # nothing, so a new report is refused rather than attached unchecked (one already
+            # attached still finishes its resolution)
+            if item.report is None and (
+                order.repository_id is None
+                or not self.vouches(order, self.policy_fork(order.repository_id))
+            ):
+                raise ValidationError(
+                    f"work item {item.work_item_id}'s order names a fork scheduling can't "
+                    "vouch for: reschedule the fix"
+                )
+            if (pushed_to, doc.fork.fix_branch) != (order.fork_url, order.fork_branch):
+                raise ValidationError(
+                    f"remediation report pushes to {pushed_to} {doc.fork.fix_branch}, not the "
+                    f"scheduled {order.fork_url} {order.fork_branch}"
+                )
         if item.report is not None:  # recorded before; finish a run that stopped part-way
             if item.status != status:
                 with self._uow.write() as uow:
@@ -883,6 +927,11 @@ class RemediationService:
     def _active(self, repository_id: UUID) -> list[WorkItem]:
         return [i for i in self._items(repository_id) if i.status not in OVER and not i.is_done()]
 
+    def items_of(self, repository_id: UUID) -> list[WorkItem]:
+        """Every work item of the repository, oldest first: the fold a scheduling listing
+        reads once per repository."""
+        return self._items(repository_id)
+
     def covering(self, repository_id: UUID, finding_ids: Collection[UUID]) -> list[WorkItem]:
         """The repository's work items that cover any of these findings: scheduling's
         idempotency and overlap checks, and the newer-effort rule of the revalidation fold."""
@@ -1060,11 +1109,12 @@ def _source_finding(item: RemediationItem) -> dict[str, Any]:
     }
 
 
-def _verdict_order(verification: Assessment) -> tuple[datetime, datetime]:
-    """When a verification happened, then when it was recorded: an equal-time tie goes to the
-    later recorded, never to the verdict's text."""
-    assert verification.created_at is not None
-    return verification.occurred_at, verification.created_at
+def _verdict_order(verification: Assessment) -> tuple[datetime, datetime, UUID]:
+    """When a verification happened, then when it was recorded, then its id. Nothing stored
+    orders two verifications recorded in the same tick, so the id is an arbitrary but fixed
+    tie-break: the result never turns on the verdict's text."""
+    assert verification.created_at is not None and verification.id is not None
+    return verification.occurred_at, verification.created_at, verification.id
 
 
 def _finding_id(ref: str) -> UUID:
@@ -1591,7 +1641,7 @@ class VerificationService:
         )
 
     def revalidated_verdicts(
-        self, item: WorkItem, fork_branch: str | None
+        self, item: WorkItem, fork_branch: str | None, scheduled_at: datetime | None
     ) -> list[RemediationStatus]:
         """The effort's revalidation verdicts, folded at read from the verification decisions
         and ordered as their verifications happened — the rules the removed scheduled row's
@@ -1600,8 +1650,17 @@ class VerificationService:
         or another's: fixed only when every covered finding verified fixed, still vulnerable
         when any verified one isn't, nothing while some are unverified and the rest fixed.
         Merged or abandoned efforts are past revalidation."""
-        if fork_branch is None or item.fix_commit is None or item.status in _PAST_REVALIDATION:
+        if (
+            fork_branch is None
+            or scheduled_at is None
+            or item.fix_commit is None
+            or item.report is None
+            or item.status in _PAST_REVALIDATION
+        ):
             return []
+        # only verifications recorded once the effort was scheduled can revalidate it (both
+        # record times): an earlier check of the same commit was never about this effort, while
+        # one recorded before a late or retried report still checks this effort's fix
         refs = self._inventory.list_refs_by_ids({item.repository_ref_id})
         if not refs:
             return []
@@ -1611,7 +1670,10 @@ class VerificationService:
             for a in self._log.list_by_ids(
                 {d.assessment_id for ds in history.values() for d in ds if d.assessment_id}
             )
-            if a.kind == VERIFICATION and a.repository_ref_id is not None
+            if a.kind == VERIFICATION
+            and a.repository_ref_id is not None
+            and a.created_at is not None
+            and a.created_at >= scheduled_at
         ]
         patched = {
             r.id: r
@@ -1636,12 +1698,12 @@ class VerificationService:
         }
 
         def latest_so_far(
-            pairs: list[tuple[tuple[datetime, datetime], str]],
-            moment: tuple[datetime, datetime],
+            pairs: list[tuple[tuple[datetime, datetime, UUID], str]],
+            moment: tuple[datetime, datetime, UUID],
         ) -> str | None:
             # the first verdict at the greatest order not past the moment: an equal-time tie
             # never turns on the verdict text (the max() _verified_on used)
-            best: tuple[tuple[datetime, datetime], str] | None = None
+            best: tuple[tuple[datetime, datetime, UUID], str] | None = None
             for order, verdict in pairs:
                 if order <= moment and (best is None or order > best[0]):
                     best = (order, verdict)
@@ -1727,3 +1789,21 @@ class VerificationService:
 
 def _scanned(assessment: Assessment) -> bool:
     return assessment.kind == AssessmentKind.SCANNER and assessment.status == ASSESSMENT_COMPLETED
+
+
+def check_fix_branch(name: str) -> None:
+    """Reject what `git check-ref-format --branch` rejects, and what the remediation report's
+    `fork.fix_branch` pattern does."""
+    parts = name.split("/")
+    bad = (
+        not _FIX_BRANCH.fullmatch(name)
+        or name == "@"
+        or name.startswith("-")
+        or ".." in name
+        or name.endswith(".")
+        # per component: not empty (no leading, trailing or doubled /), no leading dot,
+        # no .lock ending
+        or any(not p or p.startswith(".") or p.endswith(".lock") for p in parts)
+    )
+    if bad:
+        raise ValidationError(f"fork_branch is not a branch name: {name!r}")
