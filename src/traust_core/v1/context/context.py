@@ -191,6 +191,7 @@ from traust_core.v1.services.findings.restatement import RestatementPolicy
 from traust_core.v1.services.identity import IdentityService
 from traust_core.v1.services.insight import (
     AttackCoverageView,
+    BenchmarkScorecardsView,
     CensusView,
     ComplianceDashboardView,
     CompliancePrecisionView,
@@ -1101,6 +1102,7 @@ class Context:
                     ContainerFindingsView(findings, portfolio, assessment, rating),
                     InsecurePatternsView(findings, portfolio),
                     CriticalMissesView(detection_quality),
+                    BenchmarkScorecardsView(detection_quality),
                     CompliancePrecisionView(detection_quality),
                     trend,
                     ProgramView(spend, ops, self.assets.names),

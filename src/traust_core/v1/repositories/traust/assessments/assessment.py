@@ -63,6 +63,7 @@ class AssessmentRepository(RecordRepository[Assessment], Protocol):
         repository_ref_ids: Collection[UUID],
         kind: str | None = None,
         *,
+        assessor_version: str | None = None,
         read_budget: RecordBudget | None = None,
     ) -> list[Assessment]: ...
     def list_for_run_order(self, run_order_id: UUID) -> list[Assessment]: ...
@@ -75,6 +76,7 @@ class AssessmentRepository(RecordRepository[Assessment], Protocol):
         repository_ref_id: UUID | None = None,
         kind: str | None = None,
         status: str | None = None,
+        assessor_version: str | None = None,
         since: datetime | None = None,
         until: datetime | None = None,
         limit: int,
@@ -211,6 +213,7 @@ class SqlAssessmentRepository(SqlAppendOnlyRepository[Assessment]):
         repository_ref_id: UUID | None = None,
         kind: str | None = None,
         status: str | None = None,
+        assessor_version: str | None = None,
         since: datetime | None = None,
         until: datetime | None = None,
         limit: int,
@@ -229,6 +232,8 @@ class SqlAssessmentRepository(SqlAppendOnlyRepository[Assessment]):
             conditions.append(c.kind == kind)
         if status is not None:
             conditions.append(c.status == status)
+        if assessor_version is not None:
+            conditions.append(c.assessor_version == assessor_version)
         return self._page("search", *conditions, limit=limit, after=after, at="occurred_at")
 
     def feed_after(self, after: tuple[datetime, UUID] | None, limit: int) -> list[Assessment]:
@@ -239,12 +244,15 @@ class SqlAssessmentRepository(SqlAppendOnlyRepository[Assessment]):
         repository_ref_ids: Collection[UUID],
         kind: str | None = None,
         *,
+        assessor_version: str | None = None,
         read_budget: RecordBudget | None = None,
     ) -> list[Assessment]:
         c = self.table.c
         where = [c.repository_ref_id.in_(repository_ref_ids)]
         if kind is not None:
             where.append(c.kind == kind)
+        if assessor_version is not None:
+            where.append(c.assessor_version == assessor_version)
         return self._many(
             f"list {kind or 'all'} for {len(repository_ref_ids)} refs",
             *where,

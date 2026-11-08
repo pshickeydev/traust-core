@@ -6,6 +6,7 @@ from typing import Protocol
 from uuid import UUID
 
 from traust_core.v1.models.assessment import Artifact
+from traust_core.v1.models.common import RecordBudget
 from traust_core.v1.repositories.tables import (
     TRAUST,
     RecordRepository,
@@ -46,7 +47,11 @@ class ArtifactRepository(RecordRepository[Artifact], Protocol):
         ...
 
     def list_for_assessment(
-        self, assessment_id: UUID, *, kind: str | None = None
+        self,
+        assessment_id: UUID,
+        *,
+        kind: str | None = None,
+        read_budget: RecordBudget | None = None,
     ) -> list[Artifact]: ...
     def list_for_assessments(
         self, assessment_ids: Collection[UUID], kinds: Collection[str] | None
@@ -120,12 +125,16 @@ class SqlArtifactRepository(SqlAppendOnlyRepository[Artifact]):
         return None if row is None else self._to_record(row)
 
     def list_for_assessment(
-        self, assessment_id: UUID, *, kind: str | None = None
+        self,
+        assessment_id: UUID,
+        *,
+        kind: str | None = None,
+        read_budget: RecordBudget | None = None,
     ) -> list[Artifact]:
         conditions = [self.table.c.assessment_id == assessment_id]
         if kind is not None:
             conditions.append(self.table.c.kind == kind)
-        return self._many(f"list for {assessment_id}", *conditions)
+        return self._many(f"list for {assessment_id}", *conditions, read_budget=read_budget)
 
     def list_for_assessments(
         self, assessment_ids: Collection[UUID], kinds: Collection[str] | None

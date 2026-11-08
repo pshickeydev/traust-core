@@ -170,17 +170,21 @@ class AssessmentLog:
         kind: str | None,
         repository_ref_ids: Sequence[UUID] | None = None,
         *,
+        assessor_version: str | None = None,
         read_budget: RecordBudget | None = None,
     ) -> list[Assessment]:
         """The assessments of `kind` (any when None) on the refs, or on every ref when None."""
         if repository_ref_ids is None:
-            return self._scan(kind, read_budget=read_budget)
+            return self._scan(kind, assessor_version=assessor_version, read_budget=read_budget)
         with self._uow as uow:
             return [
                 a
                 for i in range(0, len(repository_ref_ids), _BATCH)
                 for a in uow.assessments.list_for_refs(
-                    repository_ref_ids[i : i + _BATCH], kind, read_budget=read_budget
+                    repository_ref_ids[i : i + _BATCH],
+                    kind,
+                    assessor_version=assessor_version,
+                    read_budget=read_budget,
                 )
             ]
 
@@ -200,6 +204,7 @@ class AssessmentLog:
         since: datetime | None = None,
         until: datetime | None = None,
         *,
+        assessor_version: str | None = None,
         read_budget: RecordBudget | None = None,
     ) -> list[Assessment]:
         found: list[Assessment] = []
@@ -207,6 +212,7 @@ class AssessmentLog:
         with self._uow as uow:
             while page := uow.assessments.search(
                 kind=kind,
+                assessor_version=assessor_version,
                 since=since,
                 until=until,
                 limit=min(_BATCH, read_budget.remaining + 1) if read_budget else _BATCH,
@@ -435,8 +441,12 @@ class ArtifactPublisher:
         """The recorded bytes, including companions without an artifact schema."""
         return stored_bytes(self._objects, self.metadata(artifact_id))
 
-    def read(self, artifact_id: UUID, artifact: type[A]) -> A:
+    def read(
+        self, artifact_id: UUID, artifact: type[A], *, read_budget: RecordBudget | None = None
+    ) -> A:
         """The stored document as `artifact`; IntegrityError if it is another kind."""
+        if read_budget is not None:
+            read_budget.consume(1)
         doc = self.get(artifact_id)
         if not isinstance(doc, artifact):
             raise IntegrityError(f"artifact {artifact_id} is not a {artifact.schema} document")
@@ -490,10 +500,16 @@ class ArtifactPublisher:
         return None if row is None else self._read(row, artifact)
 
     def list_for_assessment(
-        self, assessment_id: UUID, *, kind: str | None = None
+        self,
+        assessment_id: UUID,
+        *,
+        kind: str | None = None,
+        read_budget: RecordBudget | None = None,
     ) -> list[Artifact]:
         with self._uow as uow:
-            return uow.artifacts.list_for_assessment(assessment_id, kind=kind)
+            return uow.artifacts.list_for_assessment(
+                assessment_id, kind=kind, read_budget=read_budget
+            )
 
     def documents(
         self, assessments: Iterable[Assessment], artifact: type[A]
