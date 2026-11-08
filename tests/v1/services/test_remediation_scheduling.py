@@ -497,10 +497,15 @@ def test_states_of_fold_a_lineage_to_its_head_with_its_priors(
         remediation.record_progress(effort.work_item.work_item_id, RemediationStatus("abandoned"))
         return effort
 
+    apart()  # the store stamps milliseconds: keeps each lineage's scheduling order apart
     first = over(pairs(finding_ids[:2], repository_ids[:2]))  # {f1, f2}: the lineage's prior
+    apart()
     overlap = over(pairs(finding_ids[1:2], repository_ids[1:2]))  # {f2}: another lineage
+    apart()
     separate = over(pairs(finding_ids[2:], repository_ids[2:]))  # {f3}: another lineage
+    apart()
     head = over(pairs(finding_ids[:2], repository_ids[:2]))  # {f1, f2} again: the retry
+    apart()
     live = service.create(  # {f1}: live beside the over lineages that cover it
         fork_of(engine, pairs(finding_ids[:1], repository_ids[:1])),
         BRANCH,
@@ -521,9 +526,10 @@ def test_states_of_fold_a_lineage_to_its_head_with_its_priors(
     assert states[separate.work_item.work_item_id].reattempts == 0
     assert states[live.work_item.work_item_id].reattempts == 0
     assert states[live.work_item.work_item_id].status == RemediationStatus("candidate")
-    # The keyed read resolves a lineage only for the status a reattempt limit gates on:
-    # the superseded prior at any other status reports as itself (abandoned — no order a
-    # trigger would plan), not as no effort.
+    # The keyed read resolves the effort's own lineage, so it agrees with the listing for
+    # the head at any status — and a superseded prior at a status no limit gates on still
+    # reports as itself (abandoned: no order a trigger would plan).
+    assert service.state_of(head.work_item.work_item_id) == states[head.work_item.work_item_id]
     assert service.state_of(first.work_item.work_item_id) == RemediationState(
         work_item_id=first.work_item.work_item_id,
         repository_id=repository_id,

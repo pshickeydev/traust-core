@@ -203,40 +203,25 @@ class RemediationSchedulingService:
         )
 
     def state_of(self, work_item_id: UUID) -> RemediationState | None:
-        """One scheduled effort's state report, or None when the work item is no scheduled
-        effort — no work item, or no order carrying its fork facts (it was not opened through
-        the scheduling door). The miss is soft by design: the feed-driven consumers that key
-        on the assessment (the work item, contracts#117) replay events naming efforts that
-        were never scheduled, and a raised miss would make them suppress a 404 per event.
-
-        The read stays on the keyed `get` except for the one status a reattempt limit gates
-        on: a still-vulnerable effort resolves through its repository's lineages, so its
-        priors and any superseding newer effort are read with it — an effort a newer one over
-        the same findings superseded reads as no effort at all, so a replayed event naming it
-        dispatches nothing and cannot bypass the lineage's reattempt limit. Every other
-        status carries no count the limit asks for, and a superseded effort at one of them
-        waits on its own actor anyway."""
+        """One effort's state report; None when the work item schedules no effort, or a newer
+        effort over the same findings superseded its still-vulnerable one."""
         try:
             effort = self.get(work_item_id)
         except NotFoundError:
             return None
-        if effort.status != RemediationStatus.REVALIDATED_STILL_VULNERABLE:
-            return self._state(effort, ())
-        return next(
-            (s for s in self.states_of(effort.repository_id) if s.work_item_id == work_item_id),
-            None,
-        )
+        lineage = self._lineage(effort)
+        mine = next(i for i, e in enumerate(lineage) if e.work_item.work_item_id == work_item_id)
+        if (
+            effort.status == RemediationStatus.REVALIDATED_STILL_VULNERABLE
+            and mine != len(lineage) - 1
+        ):
+            return None
+        return self._state(effort, lineage[:mine])
 
     def states_of(self, repository_id: UUID) -> list[RemediationState]:
-        """The repository's scheduled efforts as state reports, one per lineage: an attempt
-        that is over is retried as a new work item over the same findings, so the efforts
-        over one finding set are one lineage and its newest effort — the head — reports for
-        it, with the lineage's over efforts as its `reattempts`. An over effort a newer one
-        over the same findings supersedes is not reported (its attempt was already retried);
-        a live effort always is, whatever was opened beside it — the door opens no second
-        live effort over findings a live one covers, so nothing live is ever displaced. An
-        effort over overlapping-but-different findings is another lineage's, and never
-        counts against this one."""
+        """The repository's efforts as state reports, one per lineage: the newest effort over
+        a finding set reports for it with the lineage's over attempts as its `reattempts`;
+        an over attempt a newer one over the same findings supersedes is not reported."""
         lineages: dict[frozenset[UUID], list[ScheduledEffort]] = {}
         history: dict[UUID, list[WorkItem]] = {}
         forks: dict[UUID, Fork | None] = {}
@@ -249,26 +234,47 @@ class RemediationSchedulingService:
                 break
             after = (orders[-1].created_at, orders[-1].id)  # type: ignore[assignment]
         # orders come oldest first, so each lineage's head — its newest effort — is its last.
-        return [self._state(efforts[-1], efforts) for efforts in lineages.values()]
+        return [self._state(efforts[-1], efforts[:-1]) for efforts in lineages.values()]
+
+    def _lineage(self, effort: ScheduledEffort) -> list[ScheduledEffort]:
+        # the efforts over the effort's finding set, in scheduling order: the keyed read
+        # folds one lineage, never the repository
+        wanted = set(effort.work_item.finding_ids)
+        covering = self._remediation.covering(effort.repository_id, wanted)
+        members = [item for item in covering if set(item.finding_ids) == wanted]
+        orders = self._ops.scheduling_orders({i.work_item_id for i in members})
+        fork = self._remediation.policy_fork(effort.repository_id)
+        made: list[ScheduledEffort] = []
+        for item in members:
+            order = orders.get(item.work_item_id)
+            if order is None or not self._remediation.vouches(order, fork):
+                continue  # opened by hand, or by no order scheduling vouches for
+            assert order.repository_id is not None
+            assert order.fork_url is not None and order.fork_branch is not None
+            member = ScheduledEffort(
+                work_item=item,
+                repository_id=order.repository_id,
+                fork_url=order.fork_url,
+                fork_branch=order.fork_branch,
+                status=item.status,
+                order_id=order.id,
+                scheduled_at=order.created_at,
+            )
+            made.append(
+                member.model_copy(
+                    update={"status": self._status(member, order.repository_id, covering)}
+                )
+            )
+        return sorted(made, key=lambda e: (e.scheduled_at, e.order_id))
 
     def _state(
-        self, effort: ScheduledEffort, lineage: Collection[ScheduledEffort]
+        self, effort: ScheduledEffort, priors: Collection[ScheduledEffort]
     ) -> RemediationState:
-        """One effort as the state report: the handle is the work item (the assessment), the
-        status the effort's effective one — the fold core reads — and `reattempts` the
-        lineage's over efforts besides it: core retries an over attempt as a new work item
-        over the same findings, so those are its priors."""
-        reattempts = sum(
-            1
-            for other in lineage
-            if other.work_item.work_item_id != effort.work_item.work_item_id
-            and other.status in OVER
-        )
         return RemediationState(
             work_item_id=effort.work_item.work_item_id,
             repository_id=effort.repository_id,
             status=effort.status,
-            reattempts=reattempts,
+            reattempts=sum(1 for other in priors if other.status in OVER),
         )
 
     def _efforts(

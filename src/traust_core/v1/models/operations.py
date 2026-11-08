@@ -48,12 +48,8 @@ class RecordKind(StrEnum):
 # section yet, so its orders ride the triage allowlist and only this name tells them apart.
 REMEDIATE_FINDING = AssetName("remediate_finding")
 
-# The rules the remediation trigger's orders carry: "remediation:<work_item_id>" (an attempt
-# of the effort the work item is) and "verify-remediation:<work_item_id>" (the verification
-# sweep of its implemented fix). The trigger that mints them is the engine's planning loop;
-# the vocabulary is the remediation pipeline's, so consumers that key or classify work by
-# rule — the trigger's retry window, the shadow's cadence comparison — read it here rather
-# than re-declaring it.
+# The rules the remediation trigger's orders carry, keyed by the work item that is the
+# effort: "remediation:<id>" (an attempt) and "verify-remediation:<id>" (its verification).
 REMEDIATE_RULE_PREFIX = "remediation:"
 VERIFY_RULE_PREFIX = "verify-remediation:"
 
