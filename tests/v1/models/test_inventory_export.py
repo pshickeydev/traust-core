@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 from pydantic import ValidationError
 
@@ -56,6 +58,27 @@ def test_empty_values_and_empty_lists_remain_representable() -> None:
     row = InventoryExportRow.model_validate(document)
     assert row.model_dump(mode="json") == document
     assert InventoryExport(rows=()).model_dump(mode="json") == {"rows": []}
+
+
+def test_unknown_values_remain_internal_while_default_json_keeps_legacy_empty_values() -> None:
+    document = {label: [] if label in COLUMNS[5:] else "" for label in COLUMNS}
+    empty = InventoryExportRow.model_validate(document)
+    unknown = empty.model_copy(
+        update={"host": None, "organization": None, "repo_name": None, "accountable_contacts": None}
+    )
+    assert unknown != empty
+    for label in ("Host", "Organization/Group", "Repo Name", "Accountable Contacts"):
+        assert unknown.model_dump()[label] is None
+    assert (empty.host, empty.organization, empty.repo_name, empty.accountable_contacts) == (
+        "",
+        "",
+        "",
+        (),
+    )
+    for row in (unknown, empty):
+        exported = InventoryExport(rows=(row,))
+        assert exported.model_dump(mode="json") == {"rows": [document]}
+        assert json.loads(exported.model_dump_json()) == {"rows": [document]}
 
 
 @pytest.mark.parametrize("label", COLUMNS)

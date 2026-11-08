@@ -390,7 +390,11 @@ class InventoryExportView:
             sections=(
                 Section(
                     heading="Repositories",
-                    body="" if model.rows else "No repositories registered.",
+                    body=(
+                        ("" if model.rows else "No repositories registered. ")
+                        + "Unknown contacts do not establish that no accountable party exists; "
+                        "candidate contacts confer no disclosure authority."
+                    ),
                     table=self.export(model),
                 ),
             ),
@@ -404,12 +408,14 @@ class InventoryExportView:
                 (
                     row.repository,
                     row.url,
-                    row.host,
-                    row.organization,
-                    row.repo_name,
+                    "—" if row.host is None else row.host,
+                    "—" if row.organization is None else row.organization,
+                    "—" if row.repo_name is None else row.repo_name,
                     "; ".join(row.owner_teams),
                     "; ".join(row.products),
-                    "; ".join(row.accountable_contacts),
+                    "—"
+                    if row.accountable_contacts is None
+                    else "; ".join(row.accountable_contacts),
                 )
                 for row in model.rows
             ),

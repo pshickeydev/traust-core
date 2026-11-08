@@ -72,6 +72,7 @@ from traust_core.v1.models.product_definitions import (
     ProductDefinitions,
     ProductDefinitionsSnapshot,
     ProductMappings,
+    ProductMatchTier,
     ProductResolution,
     ProductSourceStatus,
     drop_rate_warning,
@@ -824,7 +825,9 @@ class PortfolioService:
                 for c in match.contacts
             )
             for match in resolution.results
-            if match.query is not None
+            if resolution.source_status is not ProductSourceStatus.UNAVAILABLE
+            and match.query is not None
+            and match.match_tier is not ProductMatchTier.NONE
         }
         rows = []
         for repository in repositories:
@@ -835,12 +838,12 @@ class PortfolioService:
                 InventoryExportRow(
                     repository=f"{organization}/{name}" if organization else name,
                     url=repository.url,
-                    host=parts.hostname or "",
-                    organization=organization,
-                    repo_name=name,
+                    host=parts.hostname or None,
+                    organization=organization or None,
+                    repo_name=name or None,
                     owner_teams=tuple(sorted(owners[repository.id])),
                     products=tuple(sorted(shipping[repository.id])),
-                    accountable_contacts=contacts.get(repository.url, ()),
+                    accountable_contacts=contacts.get(repository.url),
                 )
             )
         return tuple(rows)

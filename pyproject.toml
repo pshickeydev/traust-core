@@ -10,7 +10,7 @@ description = "traust platform API (v1): domain models, repositories, service in
 requires-python = ">=3.11"
 dependencies = [
     "jsonschema[format-nongpl]>=4.0",
-    "pydantic>=2.6",
+    "pydantic>=2.11",
     "pyjwt[crypto]>=2.8",
     "pyyaml>=6.0",
     "referencing>=0.30",
@@ -23,7 +23,7 @@ dependencies = [
     "tree-sitter-java==0.23.5",
     "tree-sitter-rust==0.24.2",
     "tree-sitter-ruby==0.23.1",
-    "traust-contracts @ git+https://github.com/traust-security/traust-contracts.git@fe4362e1e495419b1cde21c6952e0bc0b1f76b14",
+    "traust-contracts @ git+https://github.com/traust-security/traust-contracts.git@105cca4f16e2bbf52349156f1971f1dba6f53c22",
     "traust-ledger @ git+https://github.com/traust-security/traust-ledger.git@6a5a3eef950d7657e0107dfa95bffd5829cc4fe4"
 ]
 

@@ -105,9 +105,14 @@ The remaining correctness changes are:
   `{rows: [...]}` wrapper preserves the eight existing human-label columns and raw JSON
   values. Repositories retain newest-first `(created_at, id)` registration order; current
   owners and shipping products retain their existing sort/deduplication rules.
-  Contacts are optional product-definition
-  candidates from `locations.feeds_cache` and the recorded product map, never ownership
-  declarations or disclosure authority. An unavailable cache retains empty contact lists.
+  Contacts are optional product-definition candidates from `locations.feeds_cache` and the
+  recorded product map, never ownership declarations or disclosure authority. Unknown URL
+  parts and unestablished contacts remain `None` internally; explicit JSON serializers retain
+  the legacy blank strings and empty contact arrays. Human/CSV cells show `—` for unknowns,
+  while known empty values remain empty. Neither state establishes no accountable party.
+  Malformed optional freshness metadata leaves valid definitions usable with unknown freshness;
+  malformed consumed registry shapes become unavailable without dropping registered inventory
+  or swallowing quota errors. Pydantic 2.11 is the minimum for default alias serialization.
   Product/team/history and other nondefault filters are refused rather than ignored.
   Implicit refresh omits this view; explicit publication and authenticated
   `GET /v1/insights/inventory-export` remain available. Reads share a 10,000-record workload

@@ -147,6 +147,37 @@ def test_http_empty_export_keeps_the_canonical_wrapper(
     assert snapshot(context) == before
 
 
+@pytest.mark.parametrize("source_available", [True, False])
+def test_http_unknown_parts_and_contacts_keep_exact_legacy_json(
+    context: Context, client: TestClient, source_available: bool
+) -> None:
+    if not source_available:
+        cache = context.config.locations.feeds_cache_dir()
+        assert cache is not None
+        (cache / "product_definitions.json").unlink()
+    with SqlTraustUnitOfWork(context.database) as uow:
+        Seed(uow).repository(url="loose-repository-name")
+        uow.commit()
+    (row,) = context.services().portfolio.inventory_export()
+    assert row.host is row.organization is row.accountable_contacts is None
+    response = client.get(URL, headers=bearer(context))
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "rows": [
+            {
+                "Repository": "loose-repository-name",
+                "URL": "loose-repository-name",
+                "Host": "",
+                "Organization/Group": "",
+                "Repo Name": "loose-repository-name",
+                "Owner Team": [],
+                "Products": [],
+                "Accountable Contacts": [],
+            }
+        ]
+    }
+
+
 def test_http_budget_refusal_returns_a_problem_not_partial_inventory(
     context: Context,
     client: TestClient,

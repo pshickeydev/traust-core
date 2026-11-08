@@ -21,7 +21,8 @@ from traust_core.v1.context import Config, Context
 from traust_core.v1.errors import ConfigError, ValidationError
 from traust_core.v1.models.artifacts import ProductDefinitionsMapArtifact
 from traust_core.v1.models.common import TimeBucket, TimeWindow
-from traust_core.v1.models.insight import ExecutivePanel, ViewFilter, ViewName
+from traust_core.v1.models.insight import ExecutivePanel, InventoryExport, ViewFilter, ViewName
+from traust_core.v1.models.inventory import InventoryExportRow
 from traust_core.v1.models.vocabulary import ComplianceFramework
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.process import ProcessRunner
@@ -87,10 +88,11 @@ def test_all_registered_repositories_keep_legacy_newest_first_order_and_url_part
     ] == [
         ("zeta/nested/project.git", "example.com", "zeta/nested", "project.git"),
         ("alpha/empty", "example.com", "alpha", "empty"),
-        ("loose-repository-name", "", "", "loose-repository-name"),
-        ("", "example.com", "", ""),
+        ("loose-repository-name", None, None, "loose-repository-name"),
+        ("", "example.com", None, None),
     ]
-    assert all(row.owner_teams == row.products == row.accountable_contacts == () for row in rows)
+    assert all(row.owner_teams == row.products == () for row in rows)
+    assert all(row.accountable_contacts is None for row in rows)
 
 
 def test_current_owners_and_shipping_products_are_sorted_without_duplicates(
@@ -215,8 +217,78 @@ def test_unavailable_optional_cache_keeps_registered_inventory(
         Seed(uow).repository()
         uow.commit()
     (row,) = context.services().portfolio.inventory_export()
-    assert row.accountable_contacts == ()
+    assert row.accountable_contacts is None
     assert row.repository
+
+
+def test_unmatched_contacts_are_unknown_but_matched_empty_contacts_are_known(
+    context: Context, cache: Path
+) -> None:
+    path = cache / "product_definitions.json"
+    document = json.loads(path.read_text())
+    module = document["ps_modules"]["widget-1"]
+    module["private_tracker_cc"] = []
+    module["component_cc"] = {}
+    module["default_cc"] = []
+    path.write_text(json.dumps(document))
+    with SqlTraustUnitOfWork(context.database) as uow:
+        seed = Seed(uow)
+        matched = seed.repository(url="https://github.com/acme/widget-api")
+        unmatched = seed.repository(url="https://example.com/unmatched/repository")
+        uow.commit()
+    rows = {row.url: row for row in context.services().portfolio.inventory_export()}
+    assert rows[matched.url].accountable_contacts == ()
+    assert rows[unmatched.url].accountable_contacts is None
+    rendered = context.services().insight.publish(ViewName.INVENTORY_EXPORT, ViewFilter())
+    assert rendered.csv is not None
+    records = {row["URL"]: row for row in csv.DictReader(io.StringIO(rendered.csv))}
+    assert records[matched.url]["Accountable Contacts"] == ""
+    assert records[unmatched.url]["Accountable Contacts"] == "—"
+    assert all(
+        row["Accountable Contacts"] == [] for row in rendered.model.model_dump(mode="json")["rows"]
+    )
+
+
+def test_unknown_url_parts_and_contacts_are_explicit_in_published_human_formats(
+    context: Context,
+) -> None:
+    with SqlTraustUnitOfWork(context.database) as uow:
+        Seed(uow).repository(url="/")
+        uow.commit()
+    rendered = context.services().insight.publish(ViewName.INVENTORY_EXPORT, ViewFilter())
+    assert rendered.csv is not None
+    assert list(csv.reader(io.StringIO(rendered.csv))) == [
+        list(COLUMNS),
+        ["", "/", "—", "—", "—", "", "", "—"],
+    ]
+    assert rendered.model.model_dump(mode="json") == {
+        "rows": [
+            {
+                label: [] if label in COLUMNS[5:] else "/" if label == "URL" else ""
+                for label in COLUMNS
+            }
+        ]
+    }
+
+
+def test_human_table_preserves_known_empty_cells_instead_of_marking_them_unknown(
+    context: Context,
+) -> None:
+    empty = InventoryExportRow.model_validate(
+        {label: [] if label in COLUMNS[5:] else "" for label in COLUMNS}
+    )
+    unknown = empty.model_copy(
+        update={"host": None, "organization": None, "repo_name": None, "accountable_contacts": None}
+    )
+    view = InventoryExportView(context.services().portfolio)
+    model = InventoryExport(rows=(empty, unknown))
+    table = view.export(model)
+    assert table.columns == COLUMNS
+    assert table.rows == (
+        ("", "", "", "", "", "", "", ""),
+        ("", "", "—", "—", "—", "", "", "—"),
+    )
+    assert view.report(model, T0).sections[0].table == table
 
 
 def test_empty_inventory_has_no_rows(context: Context) -> None:

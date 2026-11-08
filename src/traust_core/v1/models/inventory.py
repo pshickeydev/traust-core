@@ -49,18 +49,28 @@ class Repository(Entity):
 
 
 class InventoryExportRow(Model):
+    """Unknowns stay `None` internally; JSON retains the legacy empty-string/list boundary."""
+
     model_config = ConfigDict(
         frozen=True, extra="forbid", populate_by_name=True, serialize_by_alias=True
     )
 
     repository: str = Field(alias="Repository")
     url: str = Field(alias="URL")
-    host: str = Field(alias="Host")
-    organization: str = Field(alias="Organization/Group")
-    repo_name: str = Field(alias="Repo Name")
+    host: str | None = Field(alias="Host")
+    organization: str | None = Field(alias="Organization/Group")
+    repo_name: str | None = Field(alias="Repo Name")
     owner_teams: tuple[str, ...] = Field(alias="Owner Team")
     products: tuple[str, ...] = Field(alias="Products")
-    accountable_contacts: tuple[str, ...] = Field(alias="Accountable Contacts")
+    accountable_contacts: tuple[str, ...] | None = Field(alias="Accountable Contacts")
+
+    @field_serializer("host", "organization", "repo_name", when_used="json")
+    def _serialize_url_part(self, value: str | None) -> str:
+        return "" if value is None else value
+
+    @field_serializer("accountable_contacts", when_used="json")
+    def _serialize_contacts(self, value: tuple[str, ...] | None) -> tuple[str, ...]:
+        return () if value is None else value
 
 
 INVENTORY_COLUMNS = tuple(
