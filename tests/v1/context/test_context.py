@@ -165,8 +165,9 @@ def test_an_additive_column_upgrades_a_local_store_and_refuses_a_configured_one(
 
     _, table, name = column
     engine = sa.create_engine(f"sqlite:///{tmp_path / 'old.db'}")
-    with engine.begin() as conn:  # the table as it was before the column
+    with engine.begin() as conn:  # the table as it was before the column, after contracts#117
         conn.exec_driver_sql(f"CREATE TABLE {table} (id TEXT, repository_id TEXT, is_default INT)")
+        conn.exec_driver_sql("CREATE TABLE ops_run_order (id TEXT, work_item_id TEXT)")
     with pytest.raises(ConfigError, match=f"{table} predates {name}: apply"):
         getattr(wiring, door)(engine, upgrade=False)
     getattr(wiring, door)(engine, upgrade=True)

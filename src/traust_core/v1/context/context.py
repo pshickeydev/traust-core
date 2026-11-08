@@ -737,8 +737,8 @@ class Context:
         else:
             _manifest_scan_pointer(engine, upgrade=local)
             _default_named_at(engine, upgrade=local)
+            _run_order_fork_columns(engine)  # artifact_run_order's upgrade needs these first
             _artifact_run_order(engine, upgrade=local)
-            _run_order_fork_columns(engine)
         return engine
 
     @cached_property
