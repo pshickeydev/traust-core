@@ -205,6 +205,7 @@ from traust_core.v1.services.insight import (
     FindingsTrendView,
     InsecurePatternsView,
     InsightService,
+    InventoryExportView,
     LocView,
     OscalExport,
     PqcPortfolioView,
@@ -853,6 +854,7 @@ class Context:
             clock=self.clock,
             hosts=hosts,
             tools=self.tools,
+            product_definitions=self.product_definitions(),
             publisher=ArtifactPublisher(
                 PublishSpecs(
                     PublishSpec(CorpusRegistryArtifact),
@@ -1101,6 +1103,7 @@ class Context:
                     FindingsRollupView(findings, portfolio, assessment),
                     ContainerFindingsView(findings, portfolio, assessment, rating),
                     InsecurePatternsView(findings, portfolio),
+                    InventoryExportView(portfolio),
                     CriticalMissesView(detection_quality),
                     BenchmarkScorecardsView(detection_quality),
                     CompliancePrecisionView(detection_quality),
