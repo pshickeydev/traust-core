@@ -25,7 +25,7 @@ from traust_core.v1.models.remediation_scheduling import (
 from traust_core.v1.models.vocabulary import RemediationStatus
 from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.services.findings.service import FindingService
-from traust_core.v1.services.portfolio import Inventory
+from traust_core.v1.services.portfolio import Inventory, PortfolioService
 from traust_core.v1.services.remediation import (
     RemediationService,
     VerificationService,
@@ -53,9 +53,11 @@ class RemediationSchedulingService:
         remediation: RemediationService,
         verification: VerificationService,
         ops: OpsService,
+        portfolio: PortfolioService,
     ) -> None:
         self._uow = uow
         self._inventory = Inventory(uow)
+        self._portfolio = portfolio
         self._findings = findings
         self._remediation = remediation
         self._verification = verification
@@ -316,8 +318,8 @@ class RemediationSchedulingService:
         return None
 
     def _patch_ref(self, repository_id: UUID) -> RepositoryRef:
-        """The commit the work item patches: the repository's default line."""
-        ref = self._inventory.default_line(repository_id)
+        """The commit the work item patches: the default branch's current head."""
+        ref = self._portfolio.current_default_ref(repository_id)
         if ref is None:
             raise ValidationError(
                 f"repository {repository_id} has no single default ref: a fix needs the "

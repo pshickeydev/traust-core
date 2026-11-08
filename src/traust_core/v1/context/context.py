@@ -1094,7 +1094,7 @@ class Context:
             remediation=remediation,
             verification=verification,
             remediation_scheduling=RemediationSchedulingService(
-                uow, findings, remediation, verification, ops
+                uow, findings, remediation, verification, ops, portfolio
             ),
             insight=InsightService(
                 (

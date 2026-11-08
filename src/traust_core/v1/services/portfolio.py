@@ -164,8 +164,9 @@ class Inventory:
         """The latest ref recorded as the repository's default line (import or observation) —
         the onboarding step that gives a run something to work on; None for a registered row
         alone. Earlier flags stay: each was the forge's answer when it was recorded."""
-        # NEED(contracts: when the forge last named a ref the default head): a branch moved
-        # A -> B -> A re-flags A's existing row, so the latest created flag still answers B
+        # NEED(contracts: when the forge last named a ref the default head): imports only —
+        # observations order by their own record (current_default_ref), but an import that
+        # re-flags a line it recorded before keeps that row's age
         with self._uow as uow:
             return uow.repository_refs.default(repository_id)
 
@@ -580,6 +581,18 @@ class PortfolioService:
         refs = self.inventory.list_refs_by_ids({a.repository_ref_id for a in latest.values()})
         by_id = {r.id: r for r in refs}
         return {repository_id: by_id[a.repository_ref_id] for repository_id, a in latest.items()}
+
+    def current_default_ref(self, repository_id: UUID) -> RepositoryRef | None:
+        """The default branch's current head: the latest default-line observation's, unless a
+        default line was imported since (the data model's default-branch cohort)."""
+        imported = self.inventory.default_line(repository_id)
+        observed = self._latest_default_assessment(repository_id)
+        if observed is None:
+            return imported
+        assert imported is not None and imported.created_at and observed.created_at
+        if imported.created_at > observed.created_at:
+            return imported
+        return self.inventory.get_ref(observed.repository_ref_id)
 
     def _latest_default_assessment(self, repository_id: UUID) -> Assessment | None:
         """The repository's latest completed default-branch repo-state assessment."""
