@@ -611,8 +611,13 @@ class RemediationService:
                     f"order {run_order_id}: remediation report covers findings of another"
                     " repository"
                 )
+            # an order credits only the work item it runs (contracts#128's guard); one naming
+            # none records as before, uncredited
             return self.record(
-                doc, provenance, work_item_id=order.work_item_id, run_order_id=order.id
+                doc,
+                provenance,
+                work_item_id=order.work_item_id,
+                run_order_id=order.id if order.work_item_id is not None else None,
             )
 
     @overload

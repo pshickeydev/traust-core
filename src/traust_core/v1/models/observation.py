@@ -160,9 +160,10 @@ class ForgeFacts(Model):
         stored = json.loads(doc.payload)
         compared = stored.get("comparison") or {}
         fork_of = stored.get("fork_of")
-        # `fork` is the forge's answer; a document from before it only had `fork_of`, whose
-        # absence can't tell a non-fork from no answer — the inventory's lineage may override
-        fork = facts.pop("fork", stored.get("fork", fork_of is not None))
+        # the forge's stored answer stands; a document from before it only had `fork_of`, whose
+        # absence can't tell a non-fork from no answer, so the inventory's lineage decides then
+        lineage = facts.pop("fork", fork_of is not None)
+        fork = stored.get("fork", lineage)
         parent = facts.pop("parent", urlsplit(fork_of).path.strip("/") if fork_of else None)
         return cls(
             repository_id=target.repository_id,

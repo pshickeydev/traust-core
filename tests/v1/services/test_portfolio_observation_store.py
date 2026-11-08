@@ -233,6 +233,11 @@ def test_an_observation_records_the_forges_fork_answer(observed: Observed) -> No
         "absent",
     ]
     assert observed.service.fork_answer(observed.repository.id) is None
+    table_fixtures.apart()
+    observed.observe(fork=True, parent=None, pushed_at="2026-10-03T00:00:00Z")  # no usable parent
+    assert observed.row().upstream_id is None
+    assert observed.service.fork_answer(observed.repository.id) is True
+    assert observed.service.forge_facts(observed.repository.id).fork is True  # not the lineage
 
 
 def test_two_documents_on_one_assessment_read_the_newest(observed: Observed) -> None:
