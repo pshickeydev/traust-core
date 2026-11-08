@@ -33,6 +33,7 @@ from traust_core.v1.providers.route_ownership import (
     HandlerFacts,
     classify,
     path_params,
+    privileged_only,
     rank,
 )
 from traust_core.v1.providers.syntax import grammar_missing
@@ -2479,6 +2480,7 @@ def route_guards(files: list[TreeFile]) -> RouteGuardFact:
                     evidence=RepoPath(evidence) if evidence else None,
                 )
             )
+    gaps += _unclassified_ownership(rows)
     rows.sort(
         key=lambda r: (
             not r.judgement_required,
@@ -2493,6 +2495,33 @@ def route_guards(files: list[TreeFile]) -> RouteGuardFact:
         asymmetries=tuple(asymmetries),
         coverage_gaps=tuple(gaps),
     )
+
+
+def _unclassified_ownership(rows: Sequence[_Row]) -> list[CoverageGap]:
+    """Authenticated id routes no ownership reader classified (frameworks without one yet),
+    named per family: unclassified is a gap, never a blank that reads as nothing to flag."""
+    by_family: dict[str, list[_Row]] = {}
+    for r in rows:
+        guards = [] if r.unguards else [*r.guards, *r.scope_guards]
+        if (
+            r.ownership is None
+            and guards
+            and not any(privileged_only(g) for g in guards)
+            and path_params(r.pattern)
+        ):
+            by_family.setdefault(r.family, []).append(r)
+    return [
+        CoverageGap(
+            system=f"{family} ownership",
+            reason=f"{family}: object ownership is UNCLASSIFIED on {len(unread)} authenticated "
+            "id route(s), with no ownership reader for this framework yet; check by hand that "
+            "each ties the object it acts on to the caller (CWE-639)",
+            count=len(unread),
+            paths=tuple(dict.fromkeys(RepoPath(r.path) for r in unread))[:20],
+            evidence=RepoPath(unread[0].path),
+        )
+        for family, unread in by_family.items()
+    ]
 
 
 class RouteGuardMatrix:

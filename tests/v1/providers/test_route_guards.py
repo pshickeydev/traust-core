@@ -1364,3 +1364,40 @@ def test_symlinked_files_are_never_read(tmp_path):
 def test_unparseable_python_is_skipped(tmp_path):
     (tmp_path / "views.py").write_text("from flask import Flask\ndef broken(:\n")
     assert _enum(tmp_path)["routes"] == []
+
+
+def _ownership_gaps(result: dict) -> list[dict]:
+    return [g for g in result["coverage_gaps"] if g["system"].endswith(" ownership")]
+
+
+def test_unclassified_ownership_is_named_per_framework_never_blank(flask_asym_repo):
+    """Flask has no ownership reader yet: its authenticated id route is a named gap, not a
+    blank `ownership` that reads as nothing to flag."""
+    result = _enum(flask_asym_repo)
+    assert _row(result, "DELETE", "/items/<id>")["ownership"] is None
+    [gap] = _ownership_gaps(result)
+    assert (gap["system"], gap["count"], gap["paths"], gap["evidence"]) == (
+        "flask ownership",
+        1,  # GET /items has no id; POST /items/import is unauthenticated
+        ["app/views.py"],
+        "app/views.py",
+    )
+    assert "UNCLASSIFIED" in gap["reason"] and "CWE-639" in gap["reason"]
+
+
+def test_privileged_and_unguarded_id_routes_are_no_ownership_gap(tmp_path):
+    _write(
+        tmp_path,
+        "app/views.py",
+        "from flask import Blueprint\n"
+        "from .auth import admin_required\n\n"
+        "bp = Blueprint('items', __name__)\n\n"
+        "@bp.route('/admin/items/<id>', methods=['DELETE'])\n"
+        "@admin_required\n"
+        "def purge(id):\n"
+        "    return ''\n\n"
+        "@bp.get('/public/items/<id>')\n"
+        "def show(id):\n"
+        "    return ''\n",
+    )
+    assert _ownership_gaps(_enum(tmp_path)) == []

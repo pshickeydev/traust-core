@@ -967,3 +967,8 @@ def test_holes_qodo_found_in_the_fixes_stay_closed(
         },
     )
     assert _row(result, method, pattern)["ownership"] == ownership
+
+
+def test_a_framework_with_an_ownership_reader_names_no_ownership_gap(app: dict) -> None:
+    assert [g for g in app["coverage_gaps"] if g["system"].endswith(" ownership")] == []
+    assert all(r["ownership"] is not None for r in app["routes"] if r["family"] == "fastapi")
