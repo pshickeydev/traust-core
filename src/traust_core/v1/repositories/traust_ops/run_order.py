@@ -41,6 +41,7 @@ RUN_ORDER = TableSpec(
         uuid_column("work_item_id", nullable=True),
         text_column("fork_url", nullable=True),
         text_column("fork_branch", nullable=True),
+        timestamp_column("fork_scheduled_at", nullable=True),
     ),
 )
 

@@ -1386,6 +1386,42 @@ def test_fork_facts_scheduling_never_checked_steer_nothing(
     assert prepared.fix_branch != fork["fork_branch"]  # the policy's branch, not the order's
 
 
+def unstamped(engine: Engine, effort: ScheduledEffort) -> None:
+    """The effort's order as one from before contracts#130: fork facts without the scheduling
+    stamp, so they're checked against the fork policy of the day."""
+    with SqlTraustUnitOfWork(engine) as uow:
+        order = uow.run_orders.get(effort.order_id)  # type: ignore[arg-type]
+        uow.run_orders.update(order.model_copy(update={"fork_scheduled_at": None}))
+        uow.commit()
+
+
+def test_a_stamped_effort_keeps_its_fork_facts_whatever_the_policy_says_since(
+    service: RemediationSchedulingService, context: Context, engine: Engine
+) -> None:
+    world = World(engine, patched_name="main")
+    audited(engine, world, world.base)
+    request = pairs(world.ids, [world.repo.id] * len(world.ids))
+    scheduled = service.create(fork_of(engine, request), world.patched.name, request, PERSON)
+    remediation = context.services().remediation
+    order = remediation.scheduled_order(scheduled.work_item.work_item_id)
+    assert order is not None and order.fork_scheduled_at is not None
+    with SqlTraustUnitOfWork(engine) as uow:  # the policy moves: a private mirror now, and
+        Seed(uow).repository(  # the scheduled fork turned public
+            url="https://github.com/mirror-org/registered-since",
+            upstream_id=world.repo.id,
+            public=False,
+        )
+        Seed(uow).repository(url=str(scheduled.fork_url), public=True)
+        uow.commit()
+    assert service.get(scheduled.work_item.work_item_id).order_id == scheduled.order_id
+    assert [e.order_id for e in service.list(PageRequest()).items] == [scheduled.order_id]
+    assert remediation.scheduled_order(scheduled.work_item.work_item_id) == order
+    with pytest.raises(ConflictError, match="already schedules these findings"):  # no duplicate
+        service.create(
+            "https://github.com/mirror-org/registered-since", world.patched.name, request, PERSON
+        )
+
+
 def test_a_repository_whose_fork_policy_fails_drops_out_of_the_listing_alone(
     service: RemediationSchedulingService,
     engine: Engine,
@@ -1398,6 +1434,7 @@ def test_a_repository_whose_fork_policy_fails_drops_out_of_the_listing_alone(
         efforts.append(service.create(fork_of(engine, request), BRANCH, request, PERSON))
         apart()
     broken, kept = efforts
+    unstamped(engine, broken)
     with SqlTraustUnitOfWork(engine) as uow:  # its mirror turned public: no fork for it now
         Seed(uow).repository(url=str(broken.fork_url), public=True)
         uow.commit()
@@ -1417,6 +1454,7 @@ def test_a_report_on_an_order_scheduling_no_longer_vouches_for_is_refused(
     audited(engine, world, world.base)
     request = pairs(world.ids, [world.repo.id] * len(world.ids))
     scheduled = service.create(fork_of(engine, request), world.patched.name, request, PERSON)
+    unstamped(engine, scheduled)
     with SqlTraustUnitOfWork(engine) as uow:
         Seed(uow).repository(url=str(scheduled.fork_url), public=True)
         uow.commit()
@@ -1444,6 +1482,7 @@ def test_an_attached_report_still_finishes_its_resolution_after_the_policy_chang
     audited(engine, world, world.base)
     request = pairs(world.ids, [world.repo.id] * len(world.ids))
     scheduled = service.create(fork_of(engine, request), world.patched.name, request, PERSON)
+    unstamped(engine, scheduled)
     doc = pushed(scheduled, world.ids, fork__fix_commit=world.patched.sha)
     write = FindingDecisions.record_resolution
 

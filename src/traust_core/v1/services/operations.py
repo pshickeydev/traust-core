@@ -208,17 +208,24 @@ class OpsService:
         self, request: OrderRequest, principal: Principal, fork_url: str, fork_branch: str
     ) -> RunOrder:
         """Queue a scheduled fix's order with its fork facts (RemediationSchedulingService only:
-        it checked them against ForkPolicy and git's branch rules)."""
+        it checked them against ForkPolicy and git's branch rules), stamped as checked."""
         if request.asset != "remediate_finding" or request.work_item_id is None:
             raise ValidationError("fork facts ride only a remediate_finding order naming its item")
-        return self._queue(request, principal, (), fork_url=fork_url, fork_branch=fork_branch)
+        return self._queue(
+            request,
+            principal,
+            (),
+            fork_url=fork_url,
+            fork_branch=fork_branch,
+            fork_scheduled_at=self._clock.now(),
+        )
 
     def _queue(
         self,
         request: OrderRequest,
         principal: Principal,
         config: Sequence[ConfigDigest],
-        **fork: str,
+        **fork: object,
     ) -> RunOrder:
         issues = self._policy_issues(
             asset=request.asset,

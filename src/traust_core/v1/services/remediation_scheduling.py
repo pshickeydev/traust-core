@@ -250,11 +250,11 @@ class RemediationSchedulingService:
         covering = self._remediation.covering(effort.repository_id, wanted)
         members = [item for item in covering if set(item.finding_ids) == wanted]
         orders = self._ops.scheduling_orders({i.work_item_id for i in members})
-        fork = self._remediation.policy_fork(effort.repository_id)
+        forks: dict[UUID, Fork | None] = {}
         made: list[ScheduledEffort] = []
         for item in members:
             order = orders.get(item.work_item_id)
-            if order is None or not self._remediation.vouches(order, fork):
+            if order is None or not self._remediation.vouched(order, forks):
                 continue  # opened by hand, or by no order scheduling vouches for
             assert order.repository_id is not None
             assert order.fork_url is not None and order.fork_branch is not None
@@ -305,9 +305,7 @@ class RemediationSchedulingService:
                 continue
             # A work-item order's repository is never null (contracts#117's pairing trigger).
             assert order.repository_id is not None
-            if order.repository_id not in forks:
-                forks[order.repository_id] = self._remediation.policy_fork(order.repository_id)
-            if not self._remediation.vouches(order, forks[order.repository_id]):
+            if not self._remediation.vouched(order, forks):
                 continue
             assert order.fork_url is not None and order.fork_branch is not None
             made.append(

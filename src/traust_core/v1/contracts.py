@@ -283,6 +283,12 @@ def manifest_sbom_binding_upgrade(dialect: Dialect) -> list[str]:
     return storage_sql.manifest_sbom_binding_upgrade(dialect)
 
 
+def run_order_fork_scheduled_upgrade(dialect: Dialect) -> list[str]:
+    """The additive upgrade for a database whose `run_order` predates the scheduling stamp;
+    apply it only when that column is absent. Old orders carry no stamp."""
+    return ops_sql.run_order_fork_scheduled_upgrade(dialect)
+
+
 def artifact_run_order_upgrade(dialect: Dialect) -> list[str]:
     """The additive upgrade for a database whose `artifact` predates the recording order;
     apply it only when that column is absent. Old artifacts name no order."""
