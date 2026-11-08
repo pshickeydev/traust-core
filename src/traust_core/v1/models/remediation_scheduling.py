@@ -45,3 +45,22 @@ class ScheduledEffort(Model):
     status: RemediationStatus
     order_id: UUID | None = None
     scheduled_at: datetime | None = None  # when its order was queued: the listing's order
+
+
+class RemediationState(Model):
+    """One scheduled effort's current state, keyed for the consumers that plan work off it
+    (the engine's trigger): the work item that is the effort — and the assessment, so feed
+    events name it directly (contracts#117) — the repository its findings belong to, the
+    effort's effective status (the fold `ScheduledEffort.status` carries), and how many
+    attempts over the same findings preceded it. `RemediationSchedulingService.state_of`
+    and `states_of` read these; the projection is deliberately slim — a consumer that needs
+    the fork facts or the work item's detail reads the effort itself.
+
+    `reattempts` counts the lineage's over efforts: an attempt that is over is retried as a
+    NEW work item over the same findings, so one repository's efforts over one finding set
+    are one lineage, its newest effort the head, and the head's priors its reattempts."""
+
+    work_item_id: UUID
+    repository_id: UUID
+    status: RemediationStatus
+    reattempts: int = 0

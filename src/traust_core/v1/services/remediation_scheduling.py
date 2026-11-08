@@ -1,14 +1,15 @@
 """Scheduling remediation: the door that starts the pipeline (SCI's trigger, the console's
-button). One call opens the work item (candidate decisions, one per finding) and submits the
-order that runs the fix, carrying the fork facts — nothing before it started remediation
-alone. There is no scheduling table (contracts#117): the effort is the work item, its status
-folded from its decisions; the fork facts ride the order until the run's report records them;
-a verification's verdicts fold back at read (VerificationService.revalidated_verdicts)."""
+button) and the state reports consumers plan work off (the engine's trigger). One call opens
+the work item (candidate decisions, one per finding) and submits the order that runs the fix,
+carrying the fork facts — nothing before it started remediation alone. There is no scheduling
+table (contracts#117): the effort is the work item, its status folded from its decisions; the
+fork facts ride the order until the run's report records them; a verification's verdicts fold
+back at read (VerificationService.revalidated_verdicts)."""
 
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from typing import TYPE_CHECKING
 from uuid import UUID
 
@@ -20,6 +21,7 @@ from traust_core.v1.models.operations import REMEDIATE_FINDING, OrderRequest, Ru
 from traust_core.v1.models.remediation import OVER, Fork, WorkItem, furthest
 from traust_core.v1.models.remediation_scheduling import (
     RemediationFindingRequest,
+    RemediationState,
     ScheduledEffort,
 )
 from traust_core.v1.models.vocabulary import RemediationStatus
@@ -33,6 +35,8 @@ from traust_core.v1.services.remediation import (
 )
 
 if TYPE_CHECKING:
+    from datetime import datetime
+
     from traust_core.v1.services.operations import OpsService
 
 log = logging.getLogger(__name__)
@@ -196,6 +200,75 @@ class RemediationSchedulingService:
             found[: page.limit + 1],
             page.limit,
             lambda e: (e.scheduled_at, e.order_id),
+        )
+
+    def state_of(self, work_item_id: UUID) -> RemediationState | None:
+        """One scheduled effort's state report, or None when the work item is no scheduled
+        effort — no work item, or no order carrying its fork facts (it was not opened through
+        the scheduling door). The miss is soft by design: the feed-driven consumers that key
+        on the assessment (the work item, contracts#117) replay events naming efforts that
+        were never scheduled, and a raised miss would make them suppress a 404 per event.
+
+        The read stays on the keyed `get` except for the one status a reattempt limit gates
+        on: a still-vulnerable effort resolves through its repository's lineages, so its
+        priors and any superseding newer effort are read with it — an effort a newer one over
+        the same findings superseded reads as no effort at all, so a replayed event naming it
+        dispatches nothing and cannot bypass the lineage's reattempt limit. Every other
+        status carries no count the limit asks for, and a superseded effort at one of them
+        waits on its own actor anyway."""
+        try:
+            effort = self.get(work_item_id)
+        except NotFoundError:
+            return None
+        if effort.status != RemediationStatus.REVALIDATED_STILL_VULNERABLE:
+            return self._state(effort, ())
+        return next(
+            (s for s in self.states_of(effort.repository_id) if s.work_item_id == work_item_id),
+            None,
+        )
+
+    def states_of(self, repository_id: UUID) -> list[RemediationState]:
+        """The repository's scheduled efforts as state reports, one per lineage: an attempt
+        that is over is retried as a new work item over the same findings, so the efforts
+        over one finding set are one lineage and its newest effort — the head — reports for
+        it, with the lineage's over efforts as its `reattempts`. An over effort a newer one
+        over the same findings supersedes is not reported (its attempt was already retried);
+        a live effort always is, whatever was opened beside it — the door opens no second
+        live effort over findings a live one covers, so nothing live is ever displaced. An
+        effort over overlapping-but-different findings is another lineage's, and never
+        counts against this one."""
+        lineages: dict[frozenset[UUID], list[ScheduledEffort]] = {}
+        history: dict[UUID, list[WorkItem]] = {}
+        forks: dict[UUID, Fork | None] = {}
+        after: tuple[datetime, UUID] | None = None
+        while True:
+            orders = self._ops.orders_after(REMEDIATE_FINDING, repository_id, after, _BATCH)
+            for effort in self._efforts(orders, history, forks):
+                lineages.setdefault(frozenset(effort.work_item.finding_ids), []).append(effort)
+            if len(orders) < _BATCH:
+                break
+            after = (orders[-1].created_at, orders[-1].id)  # type: ignore[assignment]
+        # orders come oldest first, so each lineage's head — its newest effort — is its last.
+        return [self._state(efforts[-1], efforts) for efforts in lineages.values()]
+
+    def _state(
+        self, effort: ScheduledEffort, lineage: Collection[ScheduledEffort]
+    ) -> RemediationState:
+        """One effort as the state report: the handle is the work item (the assessment), the
+        status the effort's effective one — the fold core reads — and `reattempts` the
+        lineage's over efforts besides it: core retries an over attempt as a new work item
+        over the same findings, so those are its priors."""
+        reattempts = sum(
+            1
+            for other in lineage
+            if other.work_item.work_item_id != effort.work_item.work_item_id
+            and other.status in OVER
+        )
+        return RemediationState(
+            work_item_id=effort.work_item.work_item_id,
+            repository_id=effort.repository_id,
+            status=effort.status,
+            reattempts=reattempts,
         )
 
     def _efforts(
