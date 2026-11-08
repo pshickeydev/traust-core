@@ -116,9 +116,12 @@ The remaining correctness changes are:
   Product/team/history and other nondefault filters are refused rather than ignored.
   Implicit refresh omits this view; explicit publication and authenticated
   `GET /v1/insights/inventory-export` remain available. Reads share a 10,000-record workload
-  budget across inventory, related rows, mappings and definition/contact work; overflow is
-  `ValidationError` (HTTP 422), never a partial inventory. As with other record budgets,
-  this does not bound individual row/file byte size or database query-planning work.
+  budget across inventory, related rows, recorded mappings and per-repository definition/contact
+  resolution. Shared registry indexing does not consume the export allowance; unrelated registry
+  entries cannot exhaust it. Overflow is `ValidationError` (HTTP 422), never a partial inventory.
+  Larger workloads can use `portfolio.inventory_export(max_records=…)` directly; the global view
+  and HTTP route retain the default allowance. This budget does not bound shared cache loading
+  or indexing, individual row/file byte size, or database query-planning work.
   Building and publishing do not fetch feeds, scan, write SQL rows or write object bytes.
   CSV uses the shared one-line, formula-neutralizing renderer; JSON retains original text.
 - `ViewName.COMPLIANCE_PRECISION` wraps the existing

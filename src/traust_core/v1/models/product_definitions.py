@@ -166,21 +166,17 @@ class ProductDefinitions:
         self._today = today
         self._read_budget = read_budget
         streams = document.get("ps_update_streams") or {}
-        self._consume(1 + len(self._products) + len(self._modules) + len(streams))
         self._module_products: dict[str, list[str]] = {}
         for pid, product in self._products.items():
-            self._consume(len(product.get("ps_modules") or []))
             for mid in product.get("ps_modules") or []:
                 self._module_products.setdefault(mid, []).append(pid)
         self._stream_modules: dict[str, list[str]] = {}
         for mid, module in self._modules.items():
-            self._consume(len(module.get("ps_update_streams") or []))
             for sid in module.get("ps_update_streams") or []:
                 self._stream_modules.setdefault(sid, []).append(mid)
         self._repo_streams: dict[str, list[str]] = {}
         self._repo_components: dict[str, set[str]] = {}
         for sid, stream in streams.items():
-            self._consume(len(stream.get("managed_service_components") or []))
             for component in stream.get("managed_service_components") or []:
                 if url := component.get("git_repo_url"):
                     key = norm_repo_url(url)
@@ -243,6 +239,8 @@ class ProductDefinitions:
         key = norm_repo_url(url)
         if not (streams := self._repo_streams.get(key)):
             return None
+        components = self._repo_components.get(key, ())
+        self._consume(len(streams) + len(components))
         modules = []
         for sid in streams:
             mids = self._stream_modules.get(sid, [])
@@ -256,7 +254,7 @@ class ProductDefinitions:
         evidence = ProductEvidence(
             repo_url=url,
             ps_update_streams=tuple(sorted(set(streams))),
-            components=tuple(sorted(c for c in self._repo_components.get(key, ()) if c)),
+            components=tuple(sorted(c for c in components if c)),
         )
         return self._match(ProductMatchTier.REPO_URL, products, modules, evidence)
 

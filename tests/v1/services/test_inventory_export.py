@@ -379,25 +379,60 @@ def test_recorded_product_mappings_share_the_export_budget(context: Context, cac
     assert len(portfolio.inventory_export(max_records=10_000)) == 1
 
 
-def test_product_definition_index_work_shares_the_export_budget(
+def test_unrelated_registry_size_does_not_consume_the_inventory_budget(
     context: Context,
     cache: Path,
 ) -> None:
     with SqlTraustUnitOfWork(context.database) as uow:
         Seed(uow).repository(url="https://github.com/acme/widget-api")
         uow.commit()
-    portfolio = context.services().portfolio
-    assert len(portfolio.inventory_export(max_records=100)) == 1
     path = cache / "product_definitions.json"
     document = json.loads(path.read_text())
-    document["ps_update_streams"]["widget-1-default"]["managed_service_components"].extend(
-        {"name": f"component-{n}", "git_repo_url": f"https://example.com/group/repo-{n}"}
-        for n in range(101)
-    )
+    for number in range(10_001):
+        key = f"unrelated-{number}"
+        document["ps_products"][key] = {"ps_modules": [key]}
+        document["ps_modules"][key] = {"ps_update_streams": [key]}
+        document["ps_update_streams"][key] = {
+            "managed_service_components": [
+                {"name": key, "git_repo_url": f"https://example.com/group/{key}"}
+            ]
+        }
     path.write_text(json.dumps(document))
+    (row,) = context.services().portfolio.inventory_export(max_records=100)
+    assert row.url == "https://github.com/acme/widget-api"
+    assert row.accountable_contacts == (
+        "embargoperson (private_tracker_cc; embargo_cleared=True)",
+        "componentperson (component_cc; embargo_cleared=False)",
+        "publicperson (default_cc; embargo_cleared=False)",
+    )
+    rendered = context.services().insight.publish(ViewName.INVENTORY_EXPORT, ViewFilter())
+    assert rendered.model.rows == (row,)
+
+
+def test_matched_registry_evidence_is_bounded_even_without_product_links(
+    context: Context,
+    cache: Path,
+) -> None:
+    with SqlTraustUnitOfWork(context.database) as uow:
+        Seed(uow).repository(url="https://github.com/acme/widget-api")
+        uow.commit()
+    path = cache / "product_definitions.json"
+    document = json.loads(path.read_text())
+    document["ps_update_streams"]["unlinked"] = {
+        "managed_service_components": [
+            {"name": f"component-{n}", "git_repo_url": "https://github.com/acme/widget-api"}
+            for n in range(101)
+        ]
+    }
+    path.write_text(json.dumps(document))
+    portfolio = context.services().portfolio
     with pytest.raises(ValidationError):
         portfolio.inventory_export(max_records=100)
-    assert len(portfolio.inventory_export(max_records=10_000)) == 1
+    assert portfolio.inventory_export(max_records=10_000)[0].accountable_contacts == (
+        "embargoperson (private_tracker_cc; embargo_cleared=True)",
+        "componentperson (component_cc; embargo_cleared=False)",
+        "publicperson (default_cc; embargo_cleared=False)",
+    )
 
 
 UNSUPPORTED_FILTERS = [

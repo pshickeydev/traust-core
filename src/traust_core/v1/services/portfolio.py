@@ -774,7 +774,9 @@ class PortfolioService:
         if self._product_definitions is None:
             raise ConfigError("inventory export requires ProductDefinitionsCache")
         budget = RecordBudget(
-            max_records, "inventory export", hint="increase max_records or reduce the inventory"
+            max_records,
+            "inventory export",
+            hint="use PortfolioService.inventory_export(max_records=...) for a larger workload",
         )
         with self._uow as uow:
             repositories = uow.repositories.list_all(read_budget=budget)
