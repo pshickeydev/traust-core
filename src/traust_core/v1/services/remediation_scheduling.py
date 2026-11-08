@@ -233,7 +233,12 @@ class RemediationSchedulingService:
             if len(orders) < _BATCH:
                 break
             after = (orders[-1].created_at, orders[-1].id)  # type: ignore[assignment]
-        # orders come oldest first, so each lineage's head — its newest effort — is its last.
+        # Orders stamp one value per statement (milliseconds on SQLite), so a door-separated
+        # retry can share its prior's stamp with an adverse id: members fold by lineage
+        # chronology instead — over attempts before the live one, then attempt creation — so
+        # a tie never chooses the head (qodo #400: a rapid retry once reported its prior).
+        for efforts in lineages.values():
+            efforts.sort(key=_created)
         return [self._state(efforts[-1], efforts[:-1]) for efforts in lineages.values()]
 
     def _lineage(self, effort: ScheduledEffort) -> list[ScheduledEffort]:
@@ -265,7 +270,7 @@ class RemediationSchedulingService:
                     update={"status": self._status(member, order.repository_id, covering)}
                 )
             )
-        return sorted(made, key=lambda e: (e.scheduled_at, e.order_id))
+        return sorted(made, key=_created)
 
     def _state(
         self, effort: ScheduledEffort, priors: Collection[ScheduledEffort]
@@ -403,3 +408,11 @@ class RemediationSchedulingService:
                 "commit to patch"
             )
         return ref
+
+
+def _created(effort: ScheduledEffort) -> tuple[bool, datetime, UUID | None]:
+    """One effort's place in its lineage's chronology: an over attempt before every live one
+    (the door opens no attempt over findings a live effort covers, so a lineage's live
+    attempt is its head), then attempt creation — the work item's opening, the order's id
+    breaking ties: an order's statement stamp never chooses the lineage's head."""
+    return (effort.status not in OVER, effort.work_item.opened_at, effort.order_id)

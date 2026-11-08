@@ -14,10 +14,11 @@ from uuid import UUID, uuid4
 
 import pydantic
 import pytest
+import sqlalchemy as sa
 from sqlalchemy.engine import Engine
 
 from tests.v1.conftest import SQL_BACKENDS, contract_db
-from tests.v1.repositories.tables.conftest import Seed, apart
+from tests.v1.repositories.tables.conftest import Seed, apart, repository_for
 from tests.v1.services.test_remediation import provenance, report
 from tests.v1.services.test_verification import World, audited
 from tests.v1.services.test_verification import provenance as verification_provenance
@@ -31,6 +32,7 @@ from traust_core.v1.models.operations import (
     OrderRequest,
     OrderState,
     RecordingStartScope,
+    RunOrder,
     WorkerId,
 )
 from traust_core.v1.models.remediation_scheduling import (
@@ -118,6 +120,22 @@ def folded(service: RemediationSchedulingService, effort: ScheduledEffort) -> Re
     """The effort's effective status, folded from its decisions and the verification verdicts
     on its fix (what the removed scheduled row's status sync kept)."""
     return service.get(effort.work_item.work_item_id).status
+
+
+def tied_id_for(engine: Engine, order_id: UUID, before: UUID, stamp: datetime) -> RunOrder:
+    """Re-stamp the order to `stamp` with an id sorting before `before`: the door never
+    opens two efforts one statement apart, so only a direct row write reaches the tie —
+    and the re-read shows the store kept both."""
+    with SqlTraustUnitOfWork(engine) as uow:
+        table = repository_for(uow, "run_order").table
+        id_ = uuid4()
+        while not id_.hex < before.hex:
+            id_ = uuid4()
+        uow.connection.execute(
+            sa.update(table).where(table.c.id == order_id).values(id=id_, created_at=stamp)
+        )
+        uow.commit()
+        return uow.run_orders.get(id_)
 
 
 def pushed(scheduled: ScheduledEffort, finding_ids: list[UUID], **changes: Any) -> Any:
@@ -590,6 +608,49 @@ def test_a_superseded_still_vulnerable_effort_reads_as_no_effort(
             reattempts=1,
         )
     ]
+
+
+def test_a_retry_reported_under_a_tied_scheduling_stamp_still_folds_as_the_head(
+    service: RemediationSchedulingService, context: Context, engine: Engine
+) -> None:
+    """A lineage's head under a tie: orders stamp one value per statement (milliseconds on
+    SQLite), so a retry the door opened a write later can share its prior's stamp — and, ids
+    being random, land before it. Head selection never reads the stamps as chronology: the
+    door opens no attempt over findings a live effort covers, so the lineage's live attempt
+    is its head and its over priors fold before it, whatever the stamps and ids say. The
+    door never produces the tie itself (a retry needs a write between the two creates), so
+    the test re-stamps the retry's order directly."""
+    repository_id, finding_ids, repository_ids = seeded(engine, findings=2)
+    remediation = context.services().remediation
+    request = pairs(finding_ids, repository_ids)
+
+    prior = service.create(fork_of(engine, request), BRANCH, request, PERSON)
+    remediation.record_progress(prior.work_item.work_item_id, RemediationStatus("abandoned"))
+    apart()  # the stamps stay tied only by the row write below, never the door
+    retry = service.create(fork_of(engine, request), BRANCH, request, PERSON)
+
+    assert retry.work_item.work_item_id != prior.work_item.work_item_id
+    prior_stamp = service.get(prior.work_item.work_item_id).scheduled_at
+    assert prior_stamp is not None
+    assert retry.order_id is not None and prior.order_id is not None
+    tied = tied_id_for(engine, retry.order_id, prior.order_id, prior_stamp)
+    assert tied.created_at == prior_stamp and tied.id < prior.order_id
+
+    states = {s.work_item_id: s for s in service.states_of(repository_id)}
+    assert set(states) == {retry.work_item.work_item_id}
+    assert states[retry.work_item.work_item_id] == RemediationState(
+        work_item_id=retry.work_item.work_item_id,
+        repository_id=repository_id,
+        status=RemediationStatus("candidate"),
+        reattempts=1,  # the tied, abandoned prior: folded by liveness, not by stamps
+    )
+    # the keyed read folds the same lineage chronology, so it agrees under the tie too
+    assert service.state_of(retry.work_item.work_item_id) == states[retry.work_item.work_item_id]
+    assert service.state_of(prior.work_item.work_item_id) == RemediationState(
+        work_item_id=prior.work_item.work_item_id,
+        repository_id=repository_id,
+        status=RemediationStatus("abandoned"),
+    )
 
 
 def test_states_of_name_only_the_repository_asked_for(
