@@ -7,7 +7,7 @@ moved and missing have no stored observation, see the NEED on Liveness).
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -63,8 +63,10 @@ class Forge:
 STORE = InMemoryObjectStore()
 
 
-def portfolio(uow: SqlTraustUnitOfWork, forge: Forge | None = None) -> PortfolioService:
-    clock = FixedClock(NOW)
+def portfolio(
+    uow: SqlTraustUnitOfWork, forge: Forge | None = None, at: datetime = NOW
+) -> PortfolioService:
+    clock = FixedClock(at)
     publisher = ArtifactPublisher(PublishSpecs(PublishSpec(RepoStateArtifact)), STORE, uow)
     return PortfolioService(
         uow,
@@ -170,6 +172,27 @@ def test_the_current_default_ref_follows_a_head_that_moved_back(
     assert current is not None and current.sha == "a" * 40  # the latest observation's head
 
 
+def test_a_reimported_head_is_the_current_default_ref_over_an_older_observation(
+    uow: SqlTraustUnitOfWork, seed: Seed
+) -> None:
+    """A→B→A observed, then B imported again: the import is the newest naming, even
+    though B's row predates the last observation (a line is immutable once recorded,
+    so the row's own creation time can't order the namings — Qodo 401)."""
+    repo = audited(seed, "reimported")
+    forge = Forge({"o/reimported": {"pushed_at": RECENT, "archived": False}})
+    observer = portfolio(uow, forge)
+    for day, sha in enumerate("aba"):  # A -> B -> A: the last observation re-flags A's row
+        forge.answers["o/reimported"]["pushed_at"] = (NOW - timedelta(days=10 - day)).isoformat()
+        forge.sha = sha * 40
+        observer.record_forge_facts(repository_id=repo.id)
+        apart()
+    later = portfolio(uow, at=NOW + timedelta(minutes=1))  # the import happens after
+    imported = later.mark_default_branch(repo.id, GitSha("b" * 40), RefName("main"))
+    current = later.current_default_ref(repo.id)
+    assert current is not None and current.id == imported.id and current.sha == "b" * 40
+    assert later.inventory.default_line(repo.id).sha == "b" * 40
+
+
 def test_a_default_line_imported_after_the_last_observation_is_current(
     uow: SqlTraustUnitOfWork, seed: Seed
 ) -> None:
@@ -177,8 +200,9 @@ def test_a_default_line_imported_after_the_last_observation_is_current(
     observer = portfolio(uow, Forge({"o/imported": {"pushed_at": RECENT, "archived": False}}))
     observer.record_forge_facts(repository_id=repo.id)
     apart()
-    imported = observer.mark_default_branch(repo.id, GitSha("d" * 40), RefName("main"))
-    assert observer.current_default_ref(repo.id) == imported
+    later = portfolio(uow, at=NOW + timedelta(minutes=1))  # the import happens after
+    imported = later.mark_default_branch(repo.id, GitSha("d" * 40), RefName("main"))
+    assert later.current_default_ref(repo.id) == imported
     assert portfolio(uow).current_default_ref(seed.repository().id) is None  # never imported
 
 
