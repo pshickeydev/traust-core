@@ -45,3 +45,14 @@ class ScheduledEffort(Model):
     status: RemediationStatus
     order_id: UUID | None = None
     scheduled_at: datetime | None = None  # when its order was queued: the listing's order
+
+
+class RemediationState(Model):
+    """One scheduled effort's state for the consumers that plan work off it (the engine's
+    trigger): the handle is the work item — the assessment, so feed events name it
+    (contracts#117); a consumer needing the fork facts reads the effort itself."""
+
+    work_item_id: UUID
+    repository_id: UUID
+    status: RemediationStatus
+    reattempts: int = 0  # the lineage's over priors: an over attempt retries as a new item

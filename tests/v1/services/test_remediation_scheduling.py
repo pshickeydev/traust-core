@@ -14,10 +14,11 @@ from uuid import UUID, uuid4
 
 import pydantic
 import pytest
+import sqlalchemy as sa
 from sqlalchemy.engine import Engine
 
 from tests.v1.conftest import SQL_BACKENDS, contract_db
-from tests.v1.repositories.tables.conftest import Seed, apart
+from tests.v1.repositories.tables.conftest import Seed, apart, repository_for
 from tests.v1.services.test_remediation import provenance, report
 from tests.v1.services.test_verification import World, audited
 from tests.v1.services.test_verification import provenance as verification_provenance
@@ -31,10 +32,12 @@ from traust_core.v1.models.operations import (
     OrderRequest,
     OrderState,
     RecordingStartScope,
+    RunOrder,
     WorkerId,
 )
 from traust_core.v1.models.remediation_scheduling import (
     RemediationFindingRequest,
+    RemediationState,
     ScheduledEffort,
 )
 from traust_core.v1.models.vocabulary import ActorKind, RemediationStatus
@@ -117,6 +120,22 @@ def folded(service: RemediationSchedulingService, effort: ScheduledEffort) -> Re
     """The effort's effective status, folded from its decisions and the verification verdicts
     on its fix (what the removed scheduled row's status sync kept)."""
     return service.get(effort.work_item.work_item_id).status
+
+
+def tied_id_for(engine: Engine, order_id: UUID, before: UUID, stamp: datetime) -> RunOrder:
+    """Re-stamp the order to `stamp` with an id sorting before `before`: the door never
+    opens two efforts one statement apart, so only a direct row write reaches the tie —
+    and the re-read shows the store kept both."""
+    with SqlTraustUnitOfWork(engine) as uow:
+        table = repository_for(uow, "run_order").table
+        id_ = uuid4()
+        while not id_.hex < before.hex:
+            id_ = uuid4()
+        uow.connection.execute(
+            sa.update(table).where(table.c.id == order_id).values(id=id_, created_at=stamp)
+        )
+        uow.commit()
+        return uow.run_orders.get(id_)
 
 
 def pushed(scheduled: ScheduledEffort, finding_ids: list[UUID], **changes: Any) -> Any:
@@ -473,6 +492,226 @@ def test_a_verification_that_leaves_a_finding_open_marks_the_effort_still_vulner
     )
     assert len(got.verdicts) == 2
     assert folded(service, scheduled) == "revalidated_still_vulnerable"
+
+
+# the state reports (what the engine's trigger plans off)
+
+
+def test_state_of_reports_the_effort_the_work_item_is(
+    service: RemediationSchedulingService, context: Context, engine: Engine
+) -> None:
+    """The keyed read maps the effort onto its state: the handle is the work item (the
+    assessment, so the feed's events name it directly), the repository comes off the
+    effort — no ref resolution — and the status is the fold the effort reads."""
+    repository_id, finding_ids, repository_ids = seeded(engine)
+    request = pairs(finding_ids, repository_ids)
+    scheduled = service.create(fork_of(engine, request), BRANCH, request, PERSON)
+    context.services().remediation.record_progress(
+        scheduled.work_item.work_item_id, RemediationStatus("patched")
+    )
+    assert service.state_of(scheduled.work_item.work_item_id) == RemediationState(
+        work_item_id=scheduled.work_item.work_item_id,
+        repository_id=repository_id,
+        status=RemediationStatus("patched"),
+    )
+
+
+def test_state_of_of_what_was_never_scheduled_is_none(
+    service: RemediationSchedulingService, context: Context, engine: Engine
+) -> None:
+    """The keyed read misses softly: no work item at all, or a work item whose order carries
+    no fork facts (opened beside the scheduling door), reads None — the feed-driven consumer
+    that replays events naming them suppresses no 404 of its own."""
+    repository_id, finding_ids, _ = seeded(engine)
+    beside = context.services().remediation.open(finding_ids, default_ref(engine, repository_id))
+    assert service.state_of(beside.work_item_id) is None
+    assert service.state_of(uuid4()) is None
+
+
+def test_states_of_fold_a_lineage_to_its_head_with_its_priors(
+    service: RemediationSchedulingService, context: Context, engine: Engine
+) -> None:
+    """The repository's lineages, one report each: the newest effort over a finding set —
+    the head — reports for it with the lineage's over attempts as its `reattempts` (an
+    over attempt is retried as a new work item over the same findings, so those are its
+    priors); an over attempt a newer one over the same findings supersedes is not reported;
+    an effort over overlapping-but-different findings is another lineage's, never counting
+    against this one; and a live effort is reported whatever was opened beside it — the
+    door opens no second live effort over findings a live one covers, so nothing live is
+    ever displaced."""
+    repository_id, finding_ids, repository_ids = seeded(engine, findings=3)
+    remediation = context.services().remediation
+
+    def over(request: list[RemediationFindingRequest]) -> ScheduledEffort:
+        effort = service.create(fork_of(engine, request), BRANCH, request, PERSON)
+        remediation.record_progress(effort.work_item.work_item_id, RemediationStatus("abandoned"))
+        return effort
+
+    apart()  # the store stamps milliseconds: keeps each lineage's scheduling order apart
+    first = over(pairs(finding_ids[:2], repository_ids[:2]))  # {f1, f2}: the lineage's prior
+    apart()
+    overlap = over(pairs(finding_ids[1:2], repository_ids[1:2]))  # {f2}: another lineage
+    apart()
+    separate = over(pairs(finding_ids[2:], repository_ids[2:]))  # {f3}: another lineage
+    apart()
+    head = over(pairs(finding_ids[:2], repository_ids[:2]))  # {f1, f2} again: the retry
+    apart()
+    live = service.create(  # {f1}: live beside the over lineages that cover it
+        fork_of(engine, pairs(finding_ids[:1], repository_ids[:1])),
+        BRANCH,
+        pairs(finding_ids[:1], repository_ids[:1]),
+        PERSON,
+    )
+
+    states = {s.work_item_id: s for s in service.states_of(repository_id)}
+
+    assert set(states) == {
+        head.work_item.work_item_id,
+        overlap.work_item.work_item_id,
+        separate.work_item.work_item_id,
+        live.work_item.work_item_id,
+    }  # the lineage's over prior is not reported; every head and the live effort are
+    assert states[head.work_item.work_item_id].reattempts == 1  # the abandoned prior
+    assert states[overlap.work_item.work_item_id].reattempts == 0  # another lineage's
+    assert states[separate.work_item.work_item_id].reattempts == 0
+    assert states[live.work_item.work_item_id].reattempts == 0
+    assert states[live.work_item.work_item_id].status == RemediationStatus("candidate")
+    # The keyed read resolves the effort's own lineage, so it agrees with the listing for
+    # the head at any status — and a superseded prior at a status no limit gates on still
+    # reports as itself (abandoned: no order a trigger would plan).
+    assert service.state_of(head.work_item.work_item_id) == states[head.work_item.work_item_id]
+    assert service.state_of(first.work_item.work_item_id) == RemediationState(
+        work_item_id=first.work_item.work_item_id,
+        repository_id=repository_id,
+        status=RemediationStatus("abandoned"),
+    )
+
+
+def test_a_superseded_still_vulnerable_effort_reads_as_no_effort(
+    service: RemediationSchedulingService, context: Context, engine: Engine
+) -> None:
+    """A still-vulnerable effort a newer one over the same findings superseded reads as no
+    effort: a replayed event naming it dispatches nothing and cannot bypass the lineage's
+    reattempt limit. The retry — the lineage's head, itself still vulnerable on the same
+    fix — reports with the lineage's priors, the count the limit gates on, because a
+    still-vulnerable effort resolves through its repository's lineages."""
+    world = World(engine, patched_name="main")
+    audited(engine, world, world.base)
+    request = pairs(world.ids, [world.repo.id] * len(world.ids))
+    first = service.create(fork_of(engine, request), world.patched.name, request, PERSON)
+    context.services().remediation.record(
+        pushed(first, world.ids, fork__fix_commit=world.patched.sha), provenance()
+    )
+    verification = context.services().verification
+    verification.record(
+        verification_report(world, dict.fromkeys(world.ids, "unresolved")),
+        verification_provenance(),
+    )
+    assert folded(service, first) == "revalidated_still_vulnerable"
+    retry = service.create(fork_of(engine, request), world.patched.name, request, PERSON)
+    assert retry.work_item.work_item_id != first.work_item.work_item_id
+    context.services().remediation.record(
+        pushed(retry, world.ids, fork__fix_commit=world.patched.sha),
+        provenance(),
+        work_item_id=retry.work_item.work_item_id,
+    )
+    apart()
+    # a check recorded before the retry was scheduled never counts for it (#396): re-check it
+    verification.record(
+        verification_report(
+            world, dict.fromkeys(world.ids, "unresolved"), metadata__date="2026-11-08"
+        ),
+        verification_provenance(),
+    )
+    assert folded(service, retry) == "revalidated_still_vulnerable"
+
+    assert service.state_of(first.work_item.work_item_id) is None
+    assert service.state_of(retry.work_item.work_item_id) == RemediationState(
+        work_item_id=retry.work_item.work_item_id,
+        repository_id=world.repo.id,
+        status=RemediationStatus("revalidated_still_vulnerable"),
+        reattempts=1,
+    )
+    assert service.states_of(world.repo.id) == [
+        RemediationState(
+            work_item_id=retry.work_item.work_item_id,
+            repository_id=world.repo.id,
+            status=RemediationStatus("revalidated_still_vulnerable"),
+            reattempts=1,
+        )
+    ]
+
+
+def test_a_retry_reported_under_a_tied_scheduling_stamp_still_folds_as_the_head(
+    service: RemediationSchedulingService, context: Context, engine: Engine
+) -> None:
+    """A lineage's head under a tie: orders stamp one value per statement (milliseconds on
+    SQLite), so a retry the door opened a write later can share its prior's stamp — and, ids
+    being random, land before it. Head selection never reads the stamps as chronology: the
+    door opens no attempt over findings a live effort covers, so the lineage's live attempt
+    is its head and its over priors fold before it, whatever the stamps and ids say. The
+    door never produces the tie itself (a retry needs a write between the two creates), so
+    the test re-stamps the retry's order directly."""
+    repository_id, finding_ids, repository_ids = seeded(engine, findings=2)
+    remediation = context.services().remediation
+    request = pairs(finding_ids, repository_ids)
+
+    prior = service.create(fork_of(engine, request), BRANCH, request, PERSON)
+    remediation.record_progress(prior.work_item.work_item_id, RemediationStatus("abandoned"))
+    apart()  # the stamps stay tied only by the row write below, never the door
+    retry = service.create(fork_of(engine, request), BRANCH, request, PERSON)
+
+    assert retry.work_item.work_item_id != prior.work_item.work_item_id
+    prior_stamp = service.get(prior.work_item.work_item_id).scheduled_at
+    assert prior_stamp is not None
+    assert retry.order_id is not None and prior.order_id is not None
+    tied = tied_id_for(engine, retry.order_id, prior.order_id, prior_stamp)
+    assert tied.created_at == prior_stamp and tied.id < prior.order_id
+
+    states = {s.work_item_id: s for s in service.states_of(repository_id)}
+    assert set(states) == {retry.work_item.work_item_id}
+    assert states[retry.work_item.work_item_id] == RemediationState(
+        work_item_id=retry.work_item.work_item_id,
+        repository_id=repository_id,
+        status=RemediationStatus("candidate"),
+        reattempts=1,  # the tied, abandoned prior: folded by liveness, not by stamps
+    )
+    # the keyed read folds the same lineage chronology, so it agrees under the tie too
+    assert service.state_of(retry.work_item.work_item_id) == states[retry.work_item.work_item_id]
+    assert service.state_of(prior.work_item.work_item_id) == RemediationState(
+        work_item_id=prior.work_item.work_item_id,
+        repository_id=repository_id,
+        status=RemediationStatus("abandoned"),
+    )
+
+
+def test_states_of_name_only_the_repository_asked_for(
+    service: RemediationSchedulingService, engine: Engine
+) -> None:
+    repository_id, finding_ids, repository_ids = seeded(engine)
+    _, other_findings, other_repos = seeded(engine)
+    here = service.create(
+        fork_of(engine, pairs(finding_ids, repository_ids)),
+        BRANCH,
+        pairs(finding_ids, repository_ids),
+        PERSON,
+    )
+    service.create(
+        fork_of(engine, pairs(other_findings, other_repos)),
+        BRANCH,
+        pairs(other_findings, other_repos),
+        PERSON,
+    )
+
+    states = service.states_of(repository_id)
+
+    assert states == [
+        RemediationState(
+            work_item_id=here.work_item.work_item_id,
+            repository_id=repository_id,
+            status=RemediationStatus("candidate"),
+        )
+    ]
 
 
 # who may schedule (a verified person; a machine only within its recording.start grant)

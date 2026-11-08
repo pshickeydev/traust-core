@@ -1,14 +1,15 @@
 """Scheduling remediation: the door that starts the pipeline (SCI's trigger, the console's
-button). One call opens the work item (candidate decisions, one per finding) and submits the
-order that runs the fix, carrying the fork facts — nothing before it started remediation
-alone. There is no scheduling table (contracts#117): the effort is the work item, its status
-folded from its decisions; the fork facts ride the order until the run's report records them;
-a verification's verdicts fold back at read (VerificationService.revalidated_verdicts)."""
+button) and the state reports consumers plan work off (the engine's trigger). One call opens
+the work item (candidate decisions, one per finding) and submits the order that runs the fix,
+carrying the fork facts — nothing before it started remediation alone. There is no scheduling
+table (contracts#117): the effort is the work item, its status folded from its decisions; the
+fork facts ride the order until the run's report records them; a verification's verdicts fold
+back at read (VerificationService.revalidated_verdicts)."""
 
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from typing import TYPE_CHECKING
 from uuid import UUID
 
@@ -20,6 +21,7 @@ from traust_core.v1.models.operations import REMEDIATE_FINDING, OrderRequest, Ru
 from traust_core.v1.models.remediation import OVER, Fork, WorkItem, furthest
 from traust_core.v1.models.remediation_scheduling import (
     RemediationFindingRequest,
+    RemediationState,
     ScheduledEffort,
 )
 from traust_core.v1.models.vocabulary import RemediationStatus
@@ -33,6 +35,8 @@ from traust_core.v1.services.remediation import (
 )
 
 if TYPE_CHECKING:
+    from datetime import datetime
+
     from traust_core.v1.services.operations import OpsService
 
 log = logging.getLogger(__name__)
@@ -200,6 +204,86 @@ class RemediationSchedulingService:
             lambda e: (e.scheduled_at, e.order_id),
         )
 
+    def state_of(self, work_item_id: UUID) -> RemediationState | None:
+        """One effort's state report; None when the work item schedules no effort, or a newer
+        effort over the same findings superseded its still-vulnerable one."""
+        try:
+            effort = self.get(work_item_id)
+        except NotFoundError:
+            return None
+        lineage = self._lineage(effort)
+        mine = next(i for i, e in enumerate(lineage) if e.work_item.work_item_id == work_item_id)
+        if (
+            effort.status == RemediationStatus.REVALIDATED_STILL_VULNERABLE
+            and mine != len(lineage) - 1
+        ):
+            return None
+        return self._state(effort, lineage[:mine])
+
+    def states_of(self, repository_id: UUID) -> list[RemediationState]:
+        """The repository's efforts as state reports, one per lineage: the newest effort over
+        a finding set reports for it with the lineage's over attempts as its `reattempts`;
+        an over attempt a newer one over the same findings supersedes is not reported."""
+        lineages: dict[frozenset[UUID], list[ScheduledEffort]] = {}
+        history: dict[UUID, list[WorkItem]] = {}
+        forks: dict[UUID, Fork | None] = {}
+        after: tuple[datetime, UUID] | None = None
+        while True:
+            orders = self._ops.orders_after(REMEDIATE_FINDING, repository_id, after, _BATCH)
+            for effort in self._efforts(orders, history, forks):
+                lineages.setdefault(frozenset(effort.work_item.finding_ids), []).append(effort)
+            if len(orders) < _BATCH:
+                break
+            after = (orders[-1].created_at, orders[-1].id)  # type: ignore[assignment]
+        # Orders stamp one value per statement (milliseconds on SQLite), so a door-separated
+        # retry can share its prior's stamp with an adverse id: members fold by lineage
+        # chronology instead — over attempts before the live one, then attempt creation — so
+        # a tie never chooses the head (qodo #400: a rapid retry once reported its prior).
+        for efforts in lineages.values():
+            efforts.sort(key=_created)
+        return [self._state(efforts[-1], efforts[:-1]) for efforts in lineages.values()]
+
+    def _lineage(self, effort: ScheduledEffort) -> list[ScheduledEffort]:
+        # the efforts over the effort's finding set, in scheduling order: the keyed read
+        # folds one lineage, never the repository
+        wanted = set(effort.work_item.finding_ids)
+        covering = self._remediation.covering(effort.repository_id, wanted)
+        members = [item for item in covering if set(item.finding_ids) == wanted]
+        orders = self._ops.scheduling_orders({i.work_item_id for i in members})
+        fork = self._remediation.policy_fork(effort.repository_id)
+        made: list[ScheduledEffort] = []
+        for item in members:
+            order = orders.get(item.work_item_id)
+            if order is None or not self._remediation.vouches(order, fork):
+                continue  # opened by hand, or by no order scheduling vouches for
+            assert order.repository_id is not None
+            assert order.fork_url is not None and order.fork_branch is not None
+            member = ScheduledEffort(
+                work_item=item,
+                repository_id=order.repository_id,
+                fork_url=order.fork_url,
+                fork_branch=order.fork_branch,
+                status=item.status,
+                order_id=order.id,
+                scheduled_at=order.created_at,
+            )
+            made.append(
+                member.model_copy(
+                    update={"status": self._status(member, order.repository_id, covering)}
+                )
+            )
+        return sorted(made, key=_created)
+
+    def _state(
+        self, effort: ScheduledEffort, priors: Collection[ScheduledEffort]
+    ) -> RemediationState:
+        return RemediationState(
+            work_item_id=effort.work_item.work_item_id,
+            repository_id=effort.repository_id,
+            status=effort.status,
+            reattempts=sum(1 for other in priors if other.status in OVER),
+        )
+
     def _efforts(
         self,
         orders: Sequence[RunOrder],
@@ -326,3 +410,11 @@ class RemediationSchedulingService:
                 "commit to patch"
             )
         return ref
+
+
+def _created(effort: ScheduledEffort) -> tuple[bool, datetime, UUID | None]:
+    """One effort's place in its lineage's chronology: an over attempt before every live one
+    (the door opens no attempt over findings a live effort covers, so a lineage's live
+    attempt is its head), then attempt creation — the work item's opening, the order's id
+    breaking ties: an order's statement stamp never chooses the lineage's head."""
+    return (effort.status not in OVER, effort.work_item.opened_at, effort.order_id)
