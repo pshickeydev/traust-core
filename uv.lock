@@ -1726,13 +1726,13 @@ requires-dist = [
     { name = "fastapi", marker = "extra == 'rest'", specifier = ">=0.115" },
     { name = "jsonschema", extras = ["format-nongpl"], specifier = ">=4.0" },
     { name = "psycopg", extras = ["binary"], marker = "extra == 'postgres'", specifier = ">=3.1" },
-    { name = "pydantic", specifier = ">=2.6" },
+    { name = "pydantic", specifier = ">=2.11" },
     { name = "pyjwt", extras = ["crypto"], specifier = ">=2.8" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "referencing", specifier = ">=0.30" },
     { name = "sqlalchemy", specifier = ">=2.0" },
     { name = "traust-contracts", git = "https://github.com/traust-security/traust-contracts.git?rev=10c5fbb06d27b9188a430d067164a1fe78f70fe6" },
-    { name = "traust-ledger", git = "https://github.com/traust-security/traust-ledger.git?rev=6a5a3eef950d7657e0107dfa95bffd5829cc4fe4" },
+    { name = "traust-ledger", git = "https://github.com/traust-security/traust-ledger.git?rev=c0e7f4560132414d48958dc38655259f7d1b189c" },
     { name = "tree-sitter", specifier = "==0.26.0" },
     { name = "tree-sitter-java", specifier = "==0.23.5" },
     { name = "tree-sitter-javascript", specifier = "==0.25.0" },
@@ -1759,7 +1759,7 @@ dev = [
 [[package]]
 name = "traust-ledger"
 version = "0.0.0"
-source = { git = "https://github.com/traust-security/traust-ledger.git?rev=6a5a3eef950d7657e0107dfa95bffd5829cc4fe4#6a5a3eef950d7657e0107dfa95bffd5829cc4fe4" }
+source = { git = "https://github.com/traust-security/traust-ledger.git?rev=c0e7f4560132414d48958dc38655259f7d1b189c#c0e7f4560132414d48958dc38655259f7d1b189c" }
 
 [[package]]
 name = "tree-sitter"

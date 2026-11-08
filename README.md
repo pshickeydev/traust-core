@@ -38,6 +38,7 @@ All modules live under `traust_core.v1` (see [Versioning](#versioning)).
 | **Secret detection** | `models.redaction` | `SecretDetector.publication_rules()` / `evidence_rules()` yield ordered `SecretRule`s whose `spans(text)` return exact `SecretSpan(tag, start, end)` offsets; `RedactionPolicy` publishes through the same catalog, so it is the one owner of secret patterns | a consumer-owned credential regex table |
 | **Verification worklists** | `services.remediation`, `models.remediation`, `services.findings` | `verification.sweep(repository_ids, include_branches=False)` keeps repository/ref identity, branch head source and line-specific counts; `sweep_markdown(sweep)` renders the same queue; `findings.on_ref(repository_ref_id)` folds resolution on that ref's line | a second worklist store |
 | **PQC worklist** | `services.pqc`, `models.pqc`, `services.insight` | `pqc.worklist(PqcFilter(...), chokepoints=(...))` owns the existing per-repository selection, ordering and routes; `insight.publish(ViewName.PQC_WORKLIST, ViewFilter(...))` adds the contracts-owned model and shared human rendering | client-side sweep ranking or consumer-owned report formatting |
+| **Inventory export** | `services.portfolio`, `models.inventory`, `services.insight` | `portfolio.inventory_export(max_records=…)` composes current ownership, shipping products and cached product-definition contacts; `insight.publish(ViewName.INVENTORY_EXPORT, ViewFilter())` returns the canonical model and shared Markdown/HTML/CSV | client-side per-repository joins or consumer-owned inventory renderers |
 | **Historical report signatures** | `services.reporting`, `services.ledger`, `models.ledger` | `validate_reports(..., signing_pubkey=Path(...))` requires a historical layer document's Merkle tree and public-key signature through `LedgerService.verify_document`; `ReportValidation.integrity` holds the typed `DocumentVerification` | trusting an unsigned layer |
 | **Jobs** | `models.operations`, `services.operations` | `Materializer.materialize(AssetRequest) -> JobResult` (succeeded · degraded · refused · failed): the seam traust-engine calls; `Router` for continuous-ops `route()` | each CLI inventing its own exit codes |
 | **Providers** | `providers` | the outside world: `base` (`Provider`, `Readiness`, `Provenance`, registry), `tools`, `sources`, `feeds` (`FeedProvider`, `HttpFileFeed` for single-file feeds, `validate_payload`), `http` (`HttpFetcher` + `RetryPolicy`, the outbound HTTP path), `correlation` (`correlation_scope`: scoped request/order/run IDs passed to HTTP and subprocesses), `depsdev` (`DepsDevResolver`: deps.dev graphs and default versions through the feeds registry's `deps_dev` source, answers cached a day in the object store; `ctx.deps_dev`), `process` (`ProcessRunner`, the only subprocess path), `report_files` (`ReportFiles`: the report files a caller names on disk), `clock`, `model_catalog` (`ctx.model_catalog`: list prices and cost, plus roles: `list_roles()`, `resolve_role(role, tier)` (never below the floor), `resolve_routing(role, tier)` (the model plus its provider section and that provider's connection — wire type, `base_url`, harness, credential source — the default, the Anthropic wire and the environment's credential, when the section declares none; an unroutable connection, or a model id two provider sections list, refuses the config load), `validate()`, `stamp(role, model)` for a report's `model_routing`), `transcripts` (`ctx.session_transcripts.source(workspace, skills)`: Claude Code transcripts as a `SpendSource` for `SpendService.collect` and `usage_summary`, each request's skill inferred from the session's signals) | ad hoc `subprocess`/`git`/fetch code, 22 private `run` wrappers |
@@ -100,6 +101,29 @@ The remaining correctness changes are:
   `GET /v1/insights/critical-misses?window_start=…&window_end=…`; both boundaries are required
   together. View-schema validation exposes a recursive JSON type without a model-layer
   dependency in the contracts facade.
+- `ViewName.INVENTORY_EXPORT` is a global, on-demand inventory view. Its schema-valid
+  `{rows: [...]}` wrapper preserves the eight existing human-label columns and raw JSON
+  values. Repositories retain newest-first `(created_at, id)` registration order; current
+  owners and shipping products retain their existing sort/deduplication rules.
+  Contacts are optional product-definition candidates from `locations.feeds_cache` and the
+  recorded product map, never ownership declarations or disclosure authority. Unknown URL
+  parts and unestablished contacts remain `None` internally; explicit JSON serializers retain
+  the legacy blank strings and empty contact arrays. Human/CSV cells show `—` for unknowns,
+  while known empty values remain empty. Neither state establishes no accountable party.
+  Malformed optional freshness metadata leaves valid definitions usable with unknown freshness;
+  malformed consumed registry shapes become unavailable without dropping registered inventory
+  or swallowing quota errors. Pydantic 2.11 is the minimum for default alias serialization.
+  Product/team/history and other nondefault filters are refused rather than ignored.
+  Implicit refresh omits this view; explicit publication and authenticated
+  `GET /v1/insights/inventory-export` remain available. Reads share a 10,000-record workload
+  budget across inventory, related rows, recorded mappings and per-repository definition/contact
+  resolution. Shared registry indexing does not consume the export allowance; unrelated registry
+  entries cannot exhaust it. Overflow is `ValidationError` (HTTP 422), never a partial inventory.
+  Larger workloads can use `portfolio.inventory_export(max_records=…)` directly; the global view
+  and HTTP route retain the default allowance. This budget does not bound shared cache loading
+  or indexing, individual row/file byte size, or database query-planning work.
+  Building and publishing do not fetch feeds, scan, write SQL rows or write object bytes.
+  CSV uses the shared one-line, formula-neutralizing renderer; JSON retains original text.
 - `ViewName.COMPLIANCE_PRECISION` wraps the existing
   `DetectionQualityService.calibrate_compliance` result under `calibration`. Its packaged
   view schema reuses the canonical compliance-assessment framework vocabulary through

@@ -31,6 +31,7 @@ from traust_core.v1.models.findings import (
     Occurrence,
     ReviewCase,
 )
+from traust_core.v1.models.inventory import InventoryExportRow
 from traust_core.v1.models.operations import SpendAttribution, SpendRollup, ThroughputPoint
 from traust_core.v1.models.pqc import (
     PqcReadiness,
@@ -54,6 +55,7 @@ from traust_core.v1.models.vocabulary import (
 
 class ViewName(StrEnum):
     FINDINGS_ROLLUP = "findings-rollup"
+    INVENTORY_EXPORT = "inventory-export"
     CONTAINER_FINDINGS = "container-findings"
     INSECURE_PATTERNS = "insecure-patterns"
     CRITICAL_MISSES = "critical-misses"
@@ -89,6 +91,10 @@ class ViewName(StrEnum):
 
 # Each view's model is a contracts JSON schema (I4); shapes land with the view's slice.
 class ViewModel(Model): ...
+
+
+class InventoryExport(ViewModel):
+    rows: tuple[InventoryExportRow, ...]
 
 
 class CriticalMisses(ViewModel):
