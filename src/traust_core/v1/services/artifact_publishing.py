@@ -267,8 +267,15 @@ class AssessmentLog:
                 found += [(a, held[i]) for i, a in runs.items() if i in held]
         return found
 
-    def attach(self, assessment_id: UUID, artifact_id: UUID, digest: str) -> Artifact:
-        """Record the published artifact on the assessment; IntegrityError unless it is `digest`."""
+    def attach(
+        self,
+        assessment_id: UUID,
+        artifact_id: UUID,
+        digest: str,
+        run_order_id: UUID | None = None,
+    ) -> Artifact:
+        """Record the published artifact on the assessment, by the order whose run recorded it;
+        IntegrityError unless it is `digest`."""
         with self._uow as uow:
             published = uow.artifacts.get(artifact_id)
             if published.digest != digest:
@@ -279,6 +286,7 @@ class AssessmentLog:
                 uow,
                 Artifact(
                     assessment_id=assessment_id,
+                    run_order_id=run_order_id,
                     digest=published.digest,
                     kind=published.kind,
                     uri=published.uri,

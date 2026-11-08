@@ -220,6 +220,21 @@ def test_observation_uses_a_previously_registered_branch_ref(observed: Observed)
     assert observed.service.default_ref(observed.repository.id).id == prior.id
 
 
+def test_an_observation_records_the_forges_fork_answer(observed: Observed) -> None:
+    assert observed.repository.id is not None
+    observed.observe(fork=False, pushed_at="2026-10-01T00:00:00Z")
+    assert [o.get("fork") for o in observed.observations()] == [False]
+    assert observed.service.fork_answer(observed.repository.id) is False
+    assert observed.service.forge_facts(observed.repository.id).fork is False
+    table_fixtures.apart()
+    observed.observe(fork=None, pushed_at="2026-10-02T00:00:00Z")  # the forge didn't say
+    assert sorted(str(o.get("fork", "absent")) for o in observed.observations()) == [
+        "False",
+        "absent",
+    ]
+    assert observed.service.fork_answer(observed.repository.id) is None
+
+
 def test_two_documents_on_one_assessment_read_the_newest(observed: Observed) -> None:
     observed.observe(pushed_at="2026-10-01T00:00:00Z")
     latest = observed.assessments.latest_on_default_line(

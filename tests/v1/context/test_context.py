@@ -151,6 +151,16 @@ def test_a_store_another_process_upgraded_first_opens(
     }
 
 
+def test_a_store_whose_artifacts_predate_the_recording_order_is_refused(tmp_path: Path) -> None:
+    from traust_core.v1.context.context import _hand_upgraded_columns
+
+    engine = sa.create_engine(f"sqlite:///{tmp_path / 'old.db'}")
+    with engine.begin() as conn:  # artifact as it was before traust-contracts#128
+        conn.exec_driver_sql("CREATE TABLE artifact (id TEXT, assessment_id TEXT, digest TEXT)")
+    with pytest.raises(ConfigError, match=r"artifact predates run_order_id.*contracts#128"):
+        _hand_upgraded_columns(engine)
+
+
 def test_a_store_whose_run_order_predates_the_fork_columns_is_refused(tmp_path: Path) -> None:
     home = tmp_path / "home"
     Context(Config(home=home)).services()  # a local store with the current schema

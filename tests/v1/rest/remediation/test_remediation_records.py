@@ -625,3 +625,20 @@ def test_named_retry_records_identical_report_bytes_on_its_own_attempt(
     replay = client.post(URL, json=body(doc, retry_order), headers=runner(context))
     assert replay.status_code == 200 and replay.json() == recorded.json()
     assert snapshot(context) == before
+
+
+def test_a_report_names_the_order_whose_run_recorded_it(
+    context: Context, client: TestClient, engine: Engine
+) -> None:
+    world = World(engine)
+    item = opened(context, world)
+    order = leased(context, world, work_item_id=item.work_item_id)
+    recorded = client.post(URL, json=body(report(world), order), headers=runner(context))
+    assert recorded.status_code == 200, recorded.text
+    got = WorkItem.model_validate(recorded.json())
+    assert got.reported_by == order.id
+    assert context.services().remediation.get(item.work_item_id).reported_by == order.id
+    other = World(engine)
+    opened(context, other)
+    by_hand = context.services().remediation.record(report(other), provenance())
+    assert by_hand.report is not None and by_hand.reported_by is None

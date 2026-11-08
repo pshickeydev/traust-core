@@ -142,6 +142,8 @@ class ForgeFacts(Model):
                 "sensitive_lines": self.sensitive_lines,
                 "deps_only": self.deps_only,
             } | {key: value for key in COUNTED if (value := getattr(self, key)) is not None}
+        if self.fork is not None:
+            doc["fork"] = self.fork
         if fork_of is not None:
             doc["fork_of"] = str(fork_of)
         return RepoStateArtifact.from_document(doc)
@@ -158,9 +160,9 @@ class ForgeFacts(Model):
         stored = json.loads(doc.payload)
         compared = stored.get("comparison") or {}
         fork_of = stored.get("fork_of")
-        # a document omits `fork_of` both for an explicit non-fork and for an unreported
-        # status, so it cannot say "unknown" — the inventory's lineage may override
-        fork = facts.pop("fork", fork_of is not None)
+        # `fork` is the forge's answer; a document from before it only had `fork_of`, whose
+        # absence can't tell a non-fork from no answer — the inventory's lineage may override
+        fork = facts.pop("fork", stored.get("fork", fork_of is not None))
         parent = facts.pop("parent", urlsplit(fork_of).path.strip("/") if fork_of else None)
         return cls(
             repository_id=target.repository_id,

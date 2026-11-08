@@ -328,6 +328,7 @@ class Artifact(AppendOnly):
     """A document an assessment produced (or imported); bytes live at uri."""
 
     assessment_id: UUID | None = None
+    run_order_id: UUID | None = None  # the order whose run recorded it
     digest: str
     kind: str
     uri: str

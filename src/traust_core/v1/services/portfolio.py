@@ -587,6 +587,14 @@ class PortfolioService:
             raise ConfigError("default-branch head requires AssessmentService")
         return self._assessment.latest_on_default_line(repository_id, AssessmentKind.REPO_STATE)
 
+    def fork_answer(self, repository_id: UUID) -> bool | None:
+        """Whether the forge last called the repository a fork, from its latest repo-state
+        document; None when no document says (or this portfolio reads no observations)."""
+        if self._assessment is None or self._publisher is None:
+            return None
+        observed = self._latest_observation(repository_id)
+        return None if observed is None else json.loads(observed[2].payload).get("fork")
+
     def _latest_observation(
         self, repository_id: UUID
     ) -> tuple[RepositoryRef, Assessment, RepoStateArtifact] | None:
@@ -1302,13 +1310,11 @@ class PortfolioSync:
 
     def import_repository(self, url: HttpsRepoUrl) -> SyncReport:
         """Register one repository with the visibility its forge reports and its fork's
-        upstream linked. A known repository with no upstream is asked again on every import:
-        nothing stored says the forge already called it a non-fork."""
+        upstream linked. A known repository with no upstream is asked again on import unless
+        its latest observation recorded the forge's answer that it isn't a fork."""
         known = self._portfolio.find_repository(url)
         if known is not None and known.id is not None:
-            # NEED(contracts: repo-state records the forge's fork answer, a non-fork included):
-            # until then a non-fork costs one forge call per import
-            if known.upstream_id is None:
+            if known.upstream_id is None and self._portfolio.fork_answer(known.id) is not False:
                 # lineage not known yet: the forge may name a parent, or correct a parent
                 # placeholder's visibility. A forge outage, or a host the forge provider
                 # can't ask, still returns the known id.

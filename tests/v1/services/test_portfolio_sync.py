@@ -15,6 +15,7 @@ from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import T0, Seed, apart
 from traust_core.v1.context import Config, Context
 from traust_core.v1.errors import ConflictError, NotFoundError, RepositoryError, ValidationError
+from traust_core.v1.models.artifacts import RepoStateArtifact
 from traust_core.v1.models.common import PageRequest
 from traust_core.v1.models.inventory import (
     OrgName,
@@ -32,6 +33,7 @@ from traust_core.v1.providers.base import Acquisition, Result
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.sources import OwnerHint, OwnerOrigin, RepoInfo, SourceError
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
+from traust_core.v1.services.artifact_publishing import AssessmentLog
 from traust_core.v1.services.portfolio import PortfolioPolicy, PortfolioService, PortfolioSync
 
 HOSTS = ("github.com", "gitlab.com")
@@ -540,14 +542,43 @@ def test_a_new_repository_is_registered_with_its_final_visibility(
     assert registered.updated_at == registered.created_at  # written once, not flipped after
 
 
+@pytest.mark.parametrize(("answer", "asked"), [(False, False), (True, True), (None, True)])
+def test_a_known_non_fork_is_asked_again_only_without_the_forges_answer(
+    tmp_path: Path, answer: bool | None, asked: bool
+) -> None:
+    context = Context(Config(home=tmp_path))
+    portfolio = context.services().portfolio
+    known = portfolio.register_repository(url("example-org/app"), public=True)
+    said = {"observed_at": T0.isoformat(), "status": "ok"}
+    if answer is not None:
+        said["fork"] = answer  # type: ignore[assignment]
+    published = portfolio._require_publisher().publish_ref(RepoStateArtifact.from_document(said))
+    with SqlTraustUnitOfWork(context.database) as uow:
+        ref = Seed(uow).repository_ref(Seed(uow).repository(), is_default=True)
+        ref = uow.repository_refs.update(ref.model_copy(update={"repository_id": known.id}))
+        observation = Seed(uow).assessment(ref, kind="repo_state")
+        assert observation.id is not None
+        AssessmentLog(uow).attach(observation.id, published.id, published.digest)
+        uow.commit()
+    assert portfolio.fork_answer(known.id) is answer  # type: ignore[arg-type]
+    forge = Forge(described=RepoInfo(repo=url("example-org/app"), visibility="public"))
+    report = sync(portfolio, forge).import_repository(url("example-org/app"))
+    assert report.unchanged == (known.id,)
+    assert (f"info {url('example-org/app')}" in forge.calls) is asked
+
+
 def test_an_observation_without_a_fork_answer_never_stops_a_later_link(tmp_path: Path) -> None:
     context = Context(Config(home=tmp_path))
     portfolio = context.services().portfolio
     fork = portfolio.register_repository(url("example-org/fork"), public=False)
+    silent = RepoStateArtifact.from_document({"observed_at": T0.isoformat(), "status": "ok"})
+    published = portfolio._require_publisher().publish_ref(silent)
     with SqlTraustUnitOfWork(context.database) as uow:  # observed, the forge silent on forks
         ref = Seed(uow).repository_ref(Seed(uow).repository(), is_default=True)
         ref = uow.repository_refs.update(ref.model_copy(update={"repository_id": fork.id}))
-        Seed(uow).assessment(ref, kind="repo_state")
+        observation = Seed(uow).assessment(ref, kind="repo_state")
+        assert observation.id is not None
+        AssessmentLog(uow).attach(observation.id, published.id, published.digest)
         uow.commit()
     forge = Forge(described=describing("example-org/fork", "example-org/api"))
     sync(portfolio, forge).import_repository(url("example-org/fork"))

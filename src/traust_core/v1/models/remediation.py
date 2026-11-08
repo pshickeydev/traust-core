@@ -313,6 +313,7 @@ class WorkItem(Model):
     tracker: ExternalRef | None = None
     evidence: tuple[EvidenceItem, ...] = ()
     report: ArtifactRef | None = None
+    reported_by: UUID | None = None  # the order whose run recorded the report, if one did
     fix_branch: str | None = None
     fix_commit: str | None = None  # the remediation report's fork.fix_commit
 
