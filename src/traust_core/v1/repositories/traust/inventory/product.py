@@ -4,6 +4,7 @@ from collections.abc import Collection
 from typing import Protocol
 from uuid import UUID
 
+from traust_core.v1.models.common import RecordBudget
 from traust_core.v1.models.inventory import Product
 from traust_core.v1.repositories.tables import (
     TRAUST,
@@ -20,7 +21,9 @@ class ProductRepository(MutableRecordRepository[Product], Protocol):
     def get_or_add(self, record: Product) -> Product: ...
     def find_by_slug(self, slug: str) -> Product | None: ...
     def list_after(self, slug: str | None, limit: int) -> list[Product]: ...
-    def list_by_ids(self, product_ids: Collection[UUID]) -> list[Product]: ...
+    def list_by_ids(
+        self, product_ids: Collection[UUID], *, read_budget: RecordBudget | None = None
+    ) -> list[Product]: ...
 
 
 class SqlProductRepository(SqlMutableRepository[Product]):
@@ -44,5 +47,9 @@ class SqlProductRepository(SqlMutableRepository[Product]):
             stmt = stmt.where(c.slug > slug)
         return [self._to_record(r) for r in self._execute("list", stmt).mappings()]
 
-    def list_by_ids(self, product_ids: Collection[UUID]) -> list[Product]:
-        return self._many_in(f"list {len(product_ids)} by id", self.table.c.id, product_ids)
+    def list_by_ids(
+        self, product_ids: Collection[UUID], *, read_budget: RecordBudget | None = None
+    ) -> list[Product]:
+        return self._many_in(
+            f"list {len(product_ids)} by id", self.table.c.id, product_ids, read_budget=read_budget
+        )
