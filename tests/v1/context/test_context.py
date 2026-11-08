@@ -156,6 +156,7 @@ def test_a_store_another_process_upgraded_first_opens(
     [
         (("traust", "artifact", "run_order_id"), "_artifact_run_order"),
         (("traust", "repository_ref", "default_named_at"), "_default_named_at"),
+        (("traust_ops", "run_order", "fork_scheduled_at"), "_run_order_fork_scheduled"),
     ],
 )
 def test_an_additive_column_upgrades_a_local_store_and_refuses_a_configured_one(
@@ -163,15 +164,17 @@ def test_an_additive_column_upgrades_a_local_store_and_refuses_a_configured_one(
 ) -> None:
     from traust_core.v1.context import context as wiring
 
-    _, table, name = column
+    namespace, name, column_name = column
+    table = name if namespace == "traust" else f"ops_{name}"
     engine = sa.create_engine(f"sqlite:///{tmp_path / 'old.db'}")
-    with engine.begin() as conn:  # the table as it was before the column, after contracts#117
+    with engine.begin() as conn:  # the tables as they were before the column, after #117
         conn.exec_driver_sql(f"CREATE TABLE {table} (id TEXT, repository_id TEXT, is_default INT)")
-        conn.exec_driver_sql("CREATE TABLE ops_run_order (id TEXT, work_item_id TEXT)")
-    with pytest.raises(ConfigError, match=f"{table} predates {name}: apply"):
+        if table != "ops_run_order":
+            conn.exec_driver_sql("CREATE TABLE ops_run_order (id TEXT, work_item_id TEXT)")
+    with pytest.raises(ConfigError, match=f"{table} predates {column_name}: apply"):
         getattr(wiring, door)(engine, upgrade=False)
     getattr(wiring, door)(engine, upgrade=True)
-    assert name in {c["name"] for c in sa.inspect(engine).get_columns(table)}
+    assert column_name in {c["name"] for c in sa.inspect(engine).get_columns(table)}
     getattr(wiring, door)(engine, upgrade=False)  # present now: nothing to refuse
 
 

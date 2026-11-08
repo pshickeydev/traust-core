@@ -559,6 +559,7 @@ class RunOrder(Entity):
     work_item_id: UUID | None = None  # the remediation work item the order runs, if any
     fork_url: str | None = None  # the mirror the effort runs on (remediate_finding only)
     fork_branch: str | None = None  # its fix branch
+    fork_scheduled_at: datetime | None = None  # when scheduling set them, checked
 
 
 FEED_ORDER_STATES = (*FINISHED_ORDER_STATES, OrderState.AWAITING_APPROVAL)

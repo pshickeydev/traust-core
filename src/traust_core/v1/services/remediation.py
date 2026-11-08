@@ -321,9 +321,15 @@ class RemediationService:
         item = self.get(work_item_id)
         subject = self._inventory.subject(item.repository_ref_id, work_item_id)
         views = self._findings.list_by_ids(item.finding_ids)
-        # a scheduled effort's fork is the policy's (checked at scheduling); its branch is the
-        # one the scheduler named, on the order that runs the work item
+        # a scheduled effort pushes where its order says (fork and branch, checked at
+        # scheduling), whatever the policy says since; the rest go where the policy says now
         order = self.scheduled_order(work_item_id)
+        fork = item.fork or (
+            self._scheduled_fork(order, subject.repository_url)
+            if order is not None
+            else self.resolve_fork(subject.repository_id)
+        )
+        self._refuse_public(str(fork.url))  # a fork that turned public since is no push target
         return RemediationInput(
             subject=subject,
             findings=FindingContext(),
@@ -339,11 +345,19 @@ class RemediationService:
                 )
                 for v in views
             ),
-            fork=item.fork or self.resolve_fork(subject.repository_id),
+            fork=fork,
             fix_branch=order.fork_branch
             if order is not None and order.fork_branch is not None
             else self._forks.fix_branch(views[0].finding.id, views[0].finding.title),  # type: ignore[arg-type]
         )
+
+    def _scheduled_fork(self, order: RunOrder, repository_url: str) -> Fork:
+        """The fork a scheduled order names: the repository itself on a private forge
+        (internal), else a private mirror."""
+        assert order.fork_url is not None
+        url = _url(order.fork_url)
+        internal = str(url) == str(_url(repository_url))
+        return self._forks.of(url, ForkVisibility.INTERNAL if internal else ForkVisibility.PRIVATE)
 
     def _hint(self, view: FindingView, repository_url: str) -> str | None:
         """The `remediation` text of the finding's entry in the report its occurrence came from;
@@ -502,7 +516,7 @@ class RemediationService:
         order = self._ops.order_for_work_item(work_item_id)
         if order is None or order.repository_id is None:
             return None
-        return order if self.vouches(order, self.policy_fork(order.repository_id)) else None
+        return order if self.vouched(order) else None
 
     def policy_fork(self, repository_id: UUID) -> Fork | None:
         """The repository's remediation fork, or None when the policy can no longer name one
@@ -513,13 +527,28 @@ class RemediationService:
             log.warning("repository %s: remediation fork unresolved: %s", repository_id, e)
             return None
 
+    def vouched(self, order: RunOrder, forks: dict[UUID, Fork | None] | None = None) -> bool:
+        """Whether scheduling vouches for the order's fork facts: its scheduling stamp
+        (contracts#130), or, for an order from before the stamp, today's fork policy — read
+        once per repository into `forks` when given."""
+        if (
+            order.fork_scheduled_at is not None
+            and order.fork_url is not None
+            and order.fork_branch is not None
+        ):
+            return True
+        if order.repository_id is None:
+            return False
+        cache = {} if forks is None else forks
+        if order.repository_id not in cache:
+            cache[order.repository_id] = self.policy_fork(order.repository_id)
+        return self.vouches(order, cache[order.repository_id])
+
     @staticmethod
     def vouches(order: RunOrder, fork: Fork | None) -> bool:
-        """Whether an order's fork facts are what scheduling sets: the repository's remediation
-        fork and a fix branch. The generic orders door once took unchecked ones."""
-        # NEED(contracts: run_order records that scheduling set its fork facts): until then
-        # they're checked against today's policy, so a fork policy changed since scheduling
-        # hides the effort
+        """Whether an unstamped order's fork facts are what scheduling would set today: the
+        repository's remediation fork and a fix branch (the generic orders door once took
+        unchecked ones)."""
         if fork is None or order.fork_url is None or order.fork_branch is None:
             return False
         if order.fork_url != str(fork.url):
@@ -662,10 +691,7 @@ class RemediationService:
             # an order's fork facts bind its report; ones scheduling can't vouch for bind
             # nothing, so a new report is refused rather than attached unchecked (one already
             # attached still finishes its resolution)
-            if item.report is None and (
-                order.repository_id is None
-                or not self.vouches(order, self.policy_fork(order.repository_id))
-            ):
+            if item.report is None and not self.vouched(order):
                 raise ValidationError(
                     f"work item {item.work_item_id}'s order names a fork scheduling can't "
                     "vouch for: reschedule the fix"

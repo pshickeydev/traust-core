@@ -739,6 +739,7 @@ class Context:
             _default_named_at(engine, upgrade=local)
             _run_order_fork_columns(engine)  # artifact_run_order's upgrade needs these first
             _artifact_run_order(engine, upgrade=local)
+            _run_order_fork_scheduled(engine, upgrade=local)
         return engine
 
     @cached_property
@@ -1270,15 +1271,27 @@ def _artifact_run_order(engine: Engine, *, upgrade: bool) -> None:
     )
 
 
+def _run_order_fork_scheduled(engine: Engine, *, upgrade: bool) -> None:
+    """contracts added `run_order.fork_scheduled_at` (contracts#130)."""
+    _additive_column(
+        engine,
+        ("traust_ops", "run_order", "fork_scheduled_at"),
+        "run_order_fork_scheduled_upgrade",
+        upgrade=upgrade,
+    )
+
+
 def _additive_column(
     engine: Engine, where: tuple[str, str, str], upgrade_door: str, *, upgrade: bool
 ) -> None:
     """A column contracts added with an explicit upgrade: a local store is upgraded; a
     configured database's schema is its deployment's, so its absence is refused here rather
     than failing the first read."""
-    namespace, table, column = where
+    namespace, name, column = where
     dialect = Dialect.of(engine)
-    schema = namespace if dialect == Dialect.POSTGRES else None
+    postgres = dialect == Dialect.POSTGRES
+    schema = namespace if postgres else None
+    table = name if postgres or namespace == "traust" else f"ops_{name}"
 
     def present() -> bool | None:
         inspector = sa.inspect(engine)
