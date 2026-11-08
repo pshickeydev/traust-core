@@ -736,6 +736,7 @@ class Context:
             apply_schema(engine, contracts.database_ddl(Dialect.of(engine)))
         else:
             _manifest_scan_pointer(engine, upgrade=local)
+            _default_named_at(engine, upgrade=local)
             _run_order_fork_columns(engine)
         return engine
 
@@ -1096,7 +1097,7 @@ class Context:
             remediation=remediation,
             verification=verification,
             remediation_scheduling=RemediationSchedulingService(
-                uow, findings, remediation, verification, ops
+                uow, findings, remediation, verification, ops, portfolio
             ),
             insight=InsightService(
                 (
@@ -1243,6 +1244,34 @@ def _manifest_scan_pointer(engine: Engine, *, upgrade: bool) -> None:
         )
     try:
         apply_schema(engine, contracts.manifest_sbom_binding_upgrade(dialect))
+    except RepositoryError:
+        if not present():  # else another process opening the same store upgraded it first
+            raise
+
+
+def _default_named_at(engine: Engine, *, upgrade: bool) -> None:
+    """contracts added `repository_ref.default_named_at`: a local store is upgraded; a
+    configured database's schema is its deployment's, so its absence is refused here rather
+    than failing the first default-head lookup."""
+    dialect = Dialect.of(engine)
+    schema = "traust" if dialect == Dialect.POSTGRES else None
+
+    def present() -> bool | None:
+        inspector = sa.inspect(engine)
+        if not inspector.has_table("repository_ref", schema=schema):
+            return None
+        columns = inspector.get_columns("repository_ref", schema=schema)
+        return any(c["name"] == "default_named_at" for c in columns)
+
+    if present() is not False:
+        return
+    if not upgrade:
+        raise ConfigError(
+            "the database's repository_ref predates default_named_at: apply "
+            "traust_core.v1.contracts.default_named_at_upgrade(dialect) to it"
+        )
+    try:
+        apply_schema(engine, contracts.default_named_at_upgrade(dialect))
     except RepositoryError:
         if not present():  # else another process opening the same store upgraded it first
             raise

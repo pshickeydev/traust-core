@@ -165,11 +165,10 @@ class Inventory:
             return uow.repository_refs.get(repository_ref_id)
 
     def default_line(self, repository_id: UUID) -> RepositoryRef | None:
-        """The latest ref recorded as the repository's default line (import or observation) —
+        """The latest ref named the repository's default line (import or observation) —
         the onboarding step that gives a run something to work on; None for a registered row
-        alone. Earlier flags stay: each was the forge's answer when it was recorded."""
-        # NEED(contracts: when the forge last named a ref the default head): a branch moved
-        # A -> B -> A re-flags A's existing row, so the latest created flag still answers B
+        alone. Earlier flags stay: each was the forge's answer when it was recorded; the
+        naming time (default_named_at), not the row's age, orders them."""
         with self._uow as uow:
             return uow.repository_refs.default(repository_id)
 
@@ -390,17 +389,21 @@ class PortfolioService:
             if metadata_changed:
                 uow.repositories.update(current)
             if observed:
+                named = _named_at(self._clock.now())
                 ref = uow.repository_refs.get_or_add(
                     RepositoryRef(
                         repository_id=facts.repository_id,
                         name=facts.default_branch,
                         kind=RefKind.BRANCH,
                         is_default=True,
+                        default_named_at=named,
                         sha=facts.head,
                     )
                 )
-                if not ref.is_default:
-                    ref = uow.repository_refs.update(ref.model_copy(update={"is_default": True}))
+                if not ref.is_default or ref.default_named_at != named:
+                    ref = uow.repository_refs.update(
+                        ref.model_copy(update={"is_default": True, "default_named_at": named})
+                    )
             uow.commit()
         if metadata_changed:
             self._log_metadata_change(current, started)
@@ -591,6 +594,23 @@ class PortfolioService:
         by_id = {r.id: r for r in refs}
         return {repository_id: by_id[a.repository_ref_id] for repository_id, a in latest.items()}
 
+    def current_default_ref(self, repository_id: UUID) -> RepositoryRef | None:
+        """The default branch's current head: the latest default-line observation's, unless a
+        default line was named more recently (the data model's default-branch cohort) — the
+        naming time, not the row's creation: a line is immutable once recorded, so an
+        imported head re-flags a row older than the last observation. Both times are the
+        service's clock (the observation's occurred_at), not the database's."""
+        imported = self.inventory.default_line(repository_id)
+        observed = self._latest_default_assessment(repository_id)
+        if observed is None:
+            return imported
+        assert imported is not None
+        named = imported.default_named_at or imported.created_at  # legacy rows: creation time
+        assert named and observed.occurred_at
+        if named > observed.occurred_at:
+            return imported
+        return self.inventory.get_ref(observed.repository_ref_id)
+
     def _latest_default_assessment(self, repository_id: UUID) -> Assessment | None:
         """The repository's latest completed default-branch repo-state assessment."""
         if self._assessment is None:
@@ -718,17 +738,21 @@ class PortfolioService:
         and flagged when already imported: a named line is immutable once recorded, so the
         default flag is what a new answer moves."""
         with self._uow as uow:
+            named = _named_at(self._clock.now())
             ref = uow.repository_refs.get_or_add(
                 RepositoryRef(
                     repository_id=repository_id,
                     name=branch,
                     kind=RefKind.BRANCH,
                     is_default=True,
+                    default_named_at=named,
                     sha=str(sha),
                 )
             )
-            if not ref.is_default:
-                ref = uow.repository_refs.update(ref.model_copy(update={"is_default": True}))
+            if not ref.is_default or ref.default_named_at != named:
+                ref = uow.repository_refs.update(
+                    ref.model_copy(update={"is_default": True, "default_named_at": named})
+                )
             uow.commit()
             return ref
 
@@ -1261,6 +1285,12 @@ class PortfolioService:
         with self._uow as uow:
             rows = uow.components.search(limit=page.limit + 1, after=after)
         return Page.of(rows, page.limit, lambda r: (r.created_at, r.id))
+
+
+def _named_at(at: datetime) -> datetime:
+    """The naming time truncated to the store's millisecond precision, so the value
+    written equals the value read back (contracts' timestamp TEXT format)."""
+    return at.replace(microsecond=at.microsecond // 1000 * 1000)
 
 
 def _bump(version: str, previous: str) -> ReleaseBump:
