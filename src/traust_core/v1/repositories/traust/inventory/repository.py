@@ -8,6 +8,7 @@ from uuid import UUID
 import sqlalchemy as sa
 
 from traust_core.v1.errors import NotFoundError
+from traust_core.v1.models.common import RecordBudget
 from traust_core.v1.models.inventory import Repository
 from traust_core.v1.repositories.tables import (
     TRAUST,
@@ -39,6 +40,7 @@ class RepositoryRepository(MutableRecordRepository[Repository], Protocol):
     def lock_url(self, url: str) -> None: ...
     def find_private_mirror(self, upstream_id: UUID) -> Repository | None: ...
     def list_by_ids(self, repository_ids: Collection[UUID]) -> list[Repository]: ...
+    def list_all(self, *, read_budget: RecordBudget | None = None) -> list[Repository]: ...
     def search(self, *, limit: int, after: tuple[datetime, UUID] | None) -> list[Repository]: ...
 
 
@@ -94,6 +96,14 @@ class SqlRepositoryRepository(SqlMutableRepository[Repository]):
 
     def list_by_ids(self, repository_ids: Collection[UUID]) -> list[Repository]:
         return self._many_in(f"list {len(repository_ids)} by id", self.table.c.id, repository_ids)
+
+    def list_all(self, *, read_budget: RecordBudget | None = None) -> list[Repository]:
+        c = self.table.c
+        return self._many(
+            "list all",
+            order_by=(c.created_at.desc(), c.id.desc()),
+            read_budget=read_budget,
+        )
 
     def search(self, *, limit: int, after: tuple[datetime, UUID] | None) -> list[Repository]:
         return self._page("search", limit=limit, after=after)

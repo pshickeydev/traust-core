@@ -1,10 +1,10 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.11"
 resolution-markers = [
     "python_full_version >= '3.14'",
     "python_full_version >= '3.12' and python_full_version < '3.14' and sys_platform == 'emscripten'",
-    "(python_full_version < '3.14' and sys_platform != 'emscripten') or (python_full_version < '3.12' and sys_platform == 'emscripten')",
+    "python_full_version < '3.12' or (python_full_version >= '3.12' and python_full_version < '3.14' and sys_platform != 'emscripten')",
 ]
 
 [[package]]
@@ -1726,7 +1726,7 @@ requires-dist = [
     { name = "fastapi", marker = "extra == 'rest'", specifier = ">=0.115" },
     { name = "jsonschema", extras = ["format-nongpl"], specifier = ">=4.0" },
     { name = "psycopg", extras = ["binary"], marker = "extra == 'postgres'", specifier = ">=3.1" },
-    { name = "pydantic", specifier = ">=2.6" },
+    { name = "pydantic", specifier = ">=2.11" },
     { name = "pyjwt", extras = ["crypto"], specifier = ">=2.8" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "referencing", specifier = ">=0.30" },

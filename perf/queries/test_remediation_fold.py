@@ -105,6 +105,18 @@ def test_find_by_work_item_is_one_indexed_read(
     fast(statement, "idx_ops_run_order_work_item", 5)
 
 
+def test_scheduling_orders_read_the_work_item_index(
+    engine: sa.Engine, explained: Profile, scheduled: dict[str, object]
+) -> None:
+    items = scheduled["items"]
+
+    def read(uow: SqlTraustUnitOfWork) -> object:
+        return uow.run_orders.scheduling_orders(set(list(items)[:200]))  # type: ignore[call-overload]
+
+    (statement,) = explained(read)
+    fast(statement, "idx_ops_run_order_work_item", 25)
+
+
 def test_decisions_for_assessments_use_the_assessment_index(
     engine: sa.Engine, explained: Profile, scheduled: dict[str, object]
 ) -> None:

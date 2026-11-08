@@ -33,11 +33,12 @@ All modules live under `traust_core.v1` (see [Versioning](#versioning)).
 | **Validation report REST** | `rest.validation` | `POST /v1/validation-records` → `services.validation.record_order`; live leased `run_order_id`, exact report text, `Provenance`, native `ValidationRecordInput` bindings → `ValidationRecordResult` | source-label lookups, route-owned authorization or verdict rules, human decision commands |
 | **Reporting** | `services.reporting`, `providers.report_files` | `ctx.reporting` (the same instance as `ctx.services().reporting`; it never opens the record store, so file-only callers use it) over a report document the caller holds, nothing stored: `validate(payload, XArtifact)` → contract `Issue`s; `validate_reports(path, strict=, schema=)` → a `ReportValidation` (errors, warnings) per report file at `path` (a directory sweeps its .json files; the schema comes from each file name unless a contract schema is named): the contract schema, then the family's content checks (`services.reporting.checks`: counts against findings, canonical ids, `metadata.repository`, dispositions, review surfaces, OWASP threat ratings) and, with `strict`, the audit-report warnings; `lint(doc, files=None)` runs every core `Lint` registered for the type; `render(doc, RenderFormat.MARKDOWN \| HTML)` (triage in both; security reports and threat models as Markdown: `services.reporting.report_markdown`, `services.reporting.threat_model`); `lint_threat_models(paths, strict=)` lints THREAT_MODEL.md prose (`threat_model.lint_threat_model`, OWASP cells via `services.reporting.threat_rating`; ATT&CK and ATLAS ids against the registered catalogs, which the pack always pins; without them the door raises naming the register doors); `lost_sections(existing, rendered)` (the render guard); `sarif_reports(root)` is the SARIF sweep's report selection; `sarif(doc)` for report and cloud-config audits (`SarifExport.report`, `locations.sarif_tool_uri` as `informationUri`). `ctx.services().redaction.redact(payload)` scrubs secrets (`RedactionPolicy`; `scan(text)` finds them without redacting) | `traust_engine.reporting` (`validate`, `lint`, `render`, `sarif`), `_util/redact.py` |
 | **Rendering** | `rendering` | `Report` → `MarkdownRenderer` → `publish()`; `markdown_table()`; `markdown_text()` escapes a structured cell as plain text (no HTML, links or inline formatting) | 18 copies of `render_md` |
-| **Detection-quality and compliance renderers** | `rendering.benchmark`, `rendering.compliance` | `benchmark_markdown(run)` / `scorecards_markdown(cards)` render typed benchmark results; `rendering.compliance.assessment_report(document)` → `ComplianceService.render_assessment(document)` Markdown bytes | consumer-owned report renderers |
+| **Detection-quality and compliance renderers** | `rendering.benchmark`, `rendering.compliance`, `rendering.compliance_precision` | `benchmark_markdown(run)` (scoring a runs dir; recorded scorecards are the `benchmark-scorecards` view) and `compliance_precision_markdown(calibration)` render typed results with untrusted cells escaped; `rendering.compliance.assessment_report(document)` → `ComplianceService.render_assessment(document)` Markdown bytes | consumer-owned report renderers |
 | **Compliance field precision** | `models.insight`, `services.insight` | `insight.publish(ViewName.COMPLIANCE_PRECISION, ViewFilter(framework=…, precision_gate=…))`: native calibration under `calibration`, with shared Markdown/HTML and a packaged view schema | standalone Markdown helpers or consumer-owned precision calculations |
 | **Secret detection** | `models.redaction` | `SecretDetector.publication_rules()` / `evidence_rules()` yield ordered `SecretRule`s whose `spans(text)` return exact `SecretSpan(tag, start, end)` offsets; `RedactionPolicy` publishes through the same catalog, so it is the one owner of secret patterns | a consumer-owned credential regex table |
 | **Verification worklists** | `services.remediation`, `models.remediation`, `services.findings` | `verification.sweep(repository_ids, include_branches=False)` keeps repository/ref identity, branch head source and line-specific counts; `sweep_markdown(sweep)` renders the same queue; `findings.on_ref(repository_ref_id)` folds resolution on that ref's line | a second worklist store |
 | **PQC worklist** | `services.pqc`, `models.pqc`, `services.insight` | `pqc.worklist(PqcFilter(...), chokepoints=(...))` owns the existing per-repository selection, ordering and routes; `insight.publish(ViewName.PQC_WORKLIST, ViewFilter(...))` adds the contracts-owned model and shared human rendering | client-side sweep ranking or consumer-owned report formatting |
+| **Inventory export** | `services.portfolio`, `models.inventory`, `services.insight` | `portfolio.inventory_export(max_records=…)` composes current ownership, shipping products and cached product-definition contacts; `insight.publish(ViewName.INVENTORY_EXPORT, ViewFilter())` returns the canonical model and shared Markdown/HTML/CSV | client-side per-repository joins or consumer-owned inventory renderers |
 | **Historical report signatures** | `services.reporting`, `services.ledger`, `models.ledger` | `validate_reports(..., signing_pubkey=Path(...))` requires a historical layer document's Merkle tree and public-key signature through `LedgerService.verify_document`; `ReportValidation.integrity` holds the typed `DocumentVerification` | trusting an unsigned layer |
 | **Jobs** | `models.operations`, `services.operations` | `Materializer.materialize(AssetRequest) -> JobResult` (succeeded · degraded · refused · failed): the seam traust-engine calls; `Router` for continuous-ops `route()` | each CLI inventing its own exit codes |
 | **Providers** | `providers` | the outside world: `base` (`Provider`, `Readiness`, `Provenance`, registry), `tools`, `sources`, `feeds` (`FeedProvider`, `HttpFileFeed` for single-file feeds, `validate_payload`), `http` (`HttpFetcher` + `RetryPolicy`, the outbound HTTP path), `correlation` (`correlation_scope`: scoped request/order/run IDs passed to HTTP and subprocesses), `depsdev` (`DepsDevResolver`: deps.dev graphs and default versions through the feeds registry's `deps_dev` source, answers cached a day in the object store; `ctx.deps_dev`), `process` (`ProcessRunner`, the only subprocess path), `report_files` (`ReportFiles`: the report files a caller names on disk), `clock`, `model_catalog` (`ctx.model_catalog`: list prices and cost, plus roles: `list_roles()`, `resolve_role(role, tier)` (never below the floor), `resolve_routing(role, tier)` (the model plus its provider section and that provider's connection — wire type, `base_url`, harness, credential source — the default, the Anthropic wire and the environment's credential, when the section declares none; an unroutable connection, or a model id two provider sections list, refuses the config load), `validate()`, `stamp(role, model)` for a report's `model_routing`), `transcripts` (`ctx.session_transcripts.source(workspace, skills)`: Claude Code transcripts as a `SpendSource` for `SpendService.collect` and `usage_summary`, each request's skill inferred from the session's signals) | ad hoc `subprocess`/`git`/fetch code, 22 private `run` wrappers |
@@ -100,6 +101,29 @@ The remaining correctness changes are:
   `GET /v1/insights/critical-misses?window_start=…&window_end=…`; both boundaries are required
   together. View-schema validation exposes a recursive JSON type without a model-layer
   dependency in the contracts facade.
+- `ViewName.INVENTORY_EXPORT` is a global, on-demand inventory view. Its schema-valid
+  `{rows: [...]}` wrapper preserves the eight existing human-label columns and raw JSON
+  values. Repositories retain newest-first `(created_at, id)` registration order; current
+  owners and shipping products retain their existing sort/deduplication rules.
+  Contacts are optional product-definition candidates from `locations.feeds_cache` and the
+  recorded product map, never ownership declarations or disclosure authority. Unknown URL
+  parts and unestablished contacts remain `None` internally; explicit JSON serializers retain
+  the legacy blank strings and empty contact arrays. Human/CSV cells show `—` for unknowns,
+  while known empty values remain empty. Neither state establishes no accountable party.
+  Malformed optional freshness metadata leaves valid definitions usable with unknown freshness;
+  malformed consumed registry shapes become unavailable without dropping registered inventory
+  or swallowing quota errors. Pydantic 2.11 is the minimum for default alias serialization.
+  Product/team/history and other nondefault filters are refused rather than ignored.
+  Implicit refresh omits this view; explicit publication and authenticated
+  `GET /v1/insights/inventory-export` remain available. Reads share a 10,000-record workload
+  budget across inventory, related rows, recorded mappings and per-repository definition/contact
+  resolution. Shared registry indexing does not consume the export allowance; unrelated registry
+  entries cannot exhaust it. Overflow is `ValidationError` (HTTP 422), never a partial inventory.
+  Larger workloads can use `portfolio.inventory_export(max_records=…)` directly; the global view
+  and HTTP route retain the default allowance. This budget does not bound shared cache loading
+  or indexing, individual row/file byte size, or database query-planning work.
+  Building and publishing do not fetch feeds, scan, write SQL rows or write object bytes.
+  CSV uses the shared one-line, formula-neutralizing renderer; JSON retains original text.
 - `ViewName.COMPLIANCE_PRECISION` wraps the existing
   `DetectionQualityService.calibrate_compliance` result under `calibration`. Its packaged
   view schema reuses the canonical compliance-assessment framework vocabulary through
@@ -116,6 +140,25 @@ The remaining correctness changes are:
   unmeasured, not zero or perfect precision; field precision is not evaluator calibration
   or coverage. Publishing changes neither database rows nor object bytes.
 
+- `ViewName.BENCHMARK_SCORECARDS` is a global, on-demand view of
+  `DetectionQualityService.scorecards`: one recall scorecard per eligible auditor version,
+  scored against one snapshot of the newest answer key. Unadmitted and held-out-only cohorts
+  are omitted; held-out targets remain available only through release scoring. An empty view
+  means no eligible scorecards, not necessarily no recorded audits. The view takes no filters
+  and is excluded from implicit refresh; explicit publication remains available.
+  Reads share a 10,000-materialized-input-record budget across the answer key, audit
+  history, artifact metadata reads and report findings. Matching, rerun comparisons and
+  per-version scoring reuse those inputs without charging them again. Each actual related
+  metadata read still counts; this is not a byte-size or scoring-iteration limit. Overflow
+  raises `ValidationError` (HTTP 422), never a partial scorecard.
+  The model is validated by `contracts.validate_view("benchmark-scorecards", …)`. The report
+  renders strict recall, near misses (adjudication items, never detections), injection and
+  stability; unmeasured cells show `—`, never 0. No recorded answer key is `NotFoundError`.
+  `scorecards(filter, max_records=…)` offers the same cumulative bound to direct callers.
+  Its optional auditor-version predicate is applied in SQL before assessment rows consume
+  the budget, so unrelated versions cannot exhaust a selected cohort's allowance. Overflow
+  advice names this direct service; it does not imply that the global view accepts filters.
+  Scoring unrecorded runs stays `DetectionQualityService.score_reports`, a door, not a view.
 
 ## Repository checkouts
 

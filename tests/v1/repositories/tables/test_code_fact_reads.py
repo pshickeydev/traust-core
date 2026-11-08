@@ -7,8 +7,9 @@ import pytest
 import sqlalchemy as sa
 
 from tests.v1.repositories.tables.conftest import T0, Seed
-from traust_core.v1.errors import IntegrityError
+from traust_core.v1.errors import IntegrityError, ValidationError
 from traust_core.v1.models.assessment import Artifact
+from traust_core.v1.models.common import RecordBudget
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services.artifact_publishing import record_artifact
 
@@ -20,6 +21,23 @@ def test_artifact_kind_filter_preserves_assessment_scope(seed: Seed) -> None:
     seed.artifact(kind="code-facts")
     assert seed.uow.artifacts.list_for_assessment(scan.id, kind="code-facts") == [expected]
     assert seed.uow.artifacts.list_for_assessment(scan.id, kind="missing") == []
+
+
+def test_assessment_artifact_budget_preserves_scope_and_refuses_partial_results(seed: Seed) -> None:
+    scan = seed.assessment()
+    rows = [seed.artifact(scan, kind="report") for _ in range(2)]
+    seed.artifact(scan, kind="triage")
+    seed.artifact(kind="report")
+    budget = RecordBudget(2, "scorecards")
+    assert set(
+        seed.uow.artifacts.list_for_assessment(scan.id, kind="report", read_budget=budget)
+    ) == set(rows)
+    with pytest.raises(ValidationError):
+        seed.uow.artifacts.list_for_assessment(scan.id, kind="report", read_budget=budget)
+    with pytest.raises(ValidationError):
+        seed.uow.artifacts.list_for_assessment(
+            scan.id, kind="report", read_budget=RecordBudget(1, "scorecards")
+        )
 
 
 def test_latest_breaks_exact_timestamp_ties_by_database_id(

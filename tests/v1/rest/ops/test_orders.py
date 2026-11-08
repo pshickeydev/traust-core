@@ -12,7 +12,7 @@ from tests.v1.rest.conftest import bearer, same_as_in_process
 from tests.v1.rest.ops.conftest import runner
 from traust_core.v1.context import Context
 from traust_core.v1.models.common import PageRequest
-from traust_core.v1.models.operations import OrderFilter, RunOrder
+from traust_core.v1.models.operations import OrderFilter, OrderState, RunOrder
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services.operations import OpsService
 
@@ -222,6 +222,24 @@ def test_an_order_without_config_has_an_empty_manifest(
     order = client.post("/v1/orders", json=body, headers=bearer(context)).json()
     manifest = client.get(f"/v1/orders/{order['id']}/manifest", headers=bearer(context))
     assert manifest.json() == {"config": [], "approval": None}
+
+
+@pytest.mark.parametrize(
+    "fork",
+    [
+        {"fork_url": "https://github.com/attacker/fork", "fork_branch": "fix/anything"},
+        {"fork_url": "https://github.com/attacker/fork", "fork_branch": "../../etc"},
+    ],
+)
+def test_the_orders_door_refuses_fork_facts(
+    context: Context, client: TestClient, fork: dict[str, str]
+) -> None:
+    """Fork facts are the scheduling door's to set, after its fork-policy and branch checks."""
+    order = {"asset": "remediate_finding", "priority": 0, "work_item_id": str(uuid4()), **fork}
+    refused = client.post("/v1/orders", json={"order": order}, headers=bearer(context))
+    assert refused.status_code == 422, refused.text
+    queued = OrderFilter(states=tuple(OrderState))
+    assert context.services().ops.list(queued, PageRequest()).items == ()
 
 
 def test_a_machine_cannot_submit(context: Context, client: TestClient) -> None:

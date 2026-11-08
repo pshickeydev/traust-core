@@ -21,7 +21,7 @@ from traust_core.v1.models.code_facts import LanguageCount
 from traust_core.v1.models.common import TimeBucket, TimeWindow
 from traust_core.v1.models.compliance import ComplianceRollup, DocVariance
 from traust_core.v1.models.dependencies import ExposureRollup
-from traust_core.v1.models.detection_quality import ComplianceCalibration, CriticalMiss
+from traust_core.v1.models.detection_quality import ComplianceCalibration, CriticalMiss, Scorecard
 from traust_core.v1.models.findings import (
     Decision,
     FindingRollup,
@@ -31,6 +31,7 @@ from traust_core.v1.models.findings import (
     Occurrence,
     ReviewCase,
 )
+from traust_core.v1.models.inventory import InventoryExportRow
 from traust_core.v1.models.operations import SpendAttribution, SpendRollup, ThroughputPoint
 from traust_core.v1.models.pqc import (
     PqcReadiness,
@@ -54,9 +55,11 @@ from traust_core.v1.models.vocabulary import (
 
 class ViewName(StrEnum):
     FINDINGS_ROLLUP = "findings-rollup"
+    INVENTORY_EXPORT = "inventory-export"
     CONTAINER_FINDINGS = "container-findings"
     INSECURE_PATTERNS = "insecure-patterns"
     CRITICAL_MISSES = "critical-misses"
+    BENCHMARK_SCORECARDS = "benchmark-scorecards"
     FINDINGS_TREND = "findings-trend"
     COVERAGE = "coverage"
     LOC = "loc"
@@ -90,9 +93,17 @@ class ViewName(StrEnum):
 class ViewModel(Model): ...
 
 
+class InventoryExport(ViewModel):
+    rows: tuple[InventoryExportRow, ...]
+
+
 class CriticalMisses(ViewModel):
     window: TimeWindow
     misses: tuple[CriticalMiss, ...]
+
+
+class BenchmarkScorecards(ViewModel):
+    scorecards: tuple[Scorecard, ...]
 
 
 class PqcWorklist(ViewModel):

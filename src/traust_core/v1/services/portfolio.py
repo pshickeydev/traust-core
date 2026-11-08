@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import re
+from collections import defaultdict
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from datetime import date, datetime
 from time import perf_counter
@@ -40,6 +41,7 @@ from traust_core.v1.models.inventory import (
     Component,
     ComponentFilter,
     ExposureClass,
+    InventoryExportRow,
     Liveness,
     OrgName,
     Ownership,
@@ -70,6 +72,7 @@ from traust_core.v1.models.product_definitions import (
     ProductDefinitions,
     ProductDefinitionsSnapshot,
     ProductMappings,
+    ProductMatchTier,
     ProductResolution,
     ProductSourceStatus,
     drop_rate_warning,
@@ -86,6 +89,7 @@ from traust_core.v1.models.values import (
 from traust_core.v1.models.vocabulary import ComparisonStatus, OwnershipClass, RefKind, Severity
 from traust_core.v1.providers.base import ProviderRegistry
 from traust_core.v1.providers.clock import Clock, SystemClock
+from traust_core.v1.providers.product_definitions import ProductDefinitionsCache
 from traust_core.v1.providers.sources import OwnerHint, RepoInfo, SourceError, SourceProvider
 from traust_core.v1.providers.tools import ToolProvider
 from traust_core.v1.repositories.traust.inventory import InventoryUnitOfWork
@@ -265,6 +269,8 @@ class ProductLookup:
         packages: Iterable[str] = (),
         repo_urls: Iterable[str] = (),
         product_ids: Iterable[str] = (),
+        *,
+        read_budget: RecordBudget | None = None,
     ) -> ProductResolution:
         """Ownership context from the product-definitions registry: candidate contacts and
         lifecycle per package, repo URL or product id; a candidate generator, never an owner."""
@@ -279,7 +285,9 @@ class ProductLookup:
                     "the feed cache is unreachable.",
                 ),
             )
-        definitions = ProductDefinitions(snapshot.document, self._clock.now().date())
+        definitions = ProductDefinitions(
+            snapshot.document, self._clock.now().date(), read_budget=read_budget
+        )
         results = definitions.resolve(mappings, packages, repo_urls, product_ids)
         warnings = []
         if drop := drop_rate_warning(results):
@@ -310,12 +318,14 @@ class PortfolioService:
         hosts: Mapping[str, str] | None = None,
         publisher: ArtifactPublisher | None = None,
         tools: ProviderRegistry[ToolProvider[Any]] | None = None,
+        product_definitions: ProductDefinitionsCache | None = None,
     ) -> None:
         self._uow, self._policy = uow, policy
         self._tools = tools
         self._hosts = dict(hosts or DEFAULT_FORGE_HOSTS)
         self.inventory = Inventory(uow, self._hosts)
         self._publisher = publisher
+        self._product_definitions = product_definitions
         self._assessment, self._sources = assessment, sources
         self._clock = clock or SystemClock()
 
@@ -759,6 +769,87 @@ class PortfolioService:
             products = {r.product_id for r in uow.releases.list_by_ids(releases)}
             return sorted(uow.products.list_by_ids(products), key=lambda p: p.slug)
 
+    def inventory_export(self, *, max_records: int = 10_000) -> tuple[InventoryExportRow, ...]:
+        """Registered repositories with current owners, shipping products and cached contacts."""
+        if self._product_definitions is None:
+            raise ConfigError("inventory export requires ProductDefinitionsCache")
+        budget = RecordBudget(
+            max_records,
+            "inventory export",
+            hint="use PortfolioService.inventory_export(max_records=...) for a larger workload",
+        )
+        with self._uow as uow:
+            repositories = uow.repositories.list_all(read_budget=budget)
+            if not repositories:
+                return ()
+            repository_ids = {r.id for r in repositories if r.id is not None}
+            ownerships = uow.ownerships.current_for_repositories(repository_ids, read_budget=budget)
+            teams = {
+                t.id: t.name
+                for t in uow.teams.list_by_ids({o.team_id for o in ownerships}, read_budget=budget)
+            }
+            refs = {
+                r.id: r.repository_id
+                for r in uow.repository_refs.list_for_repositories(
+                    repository_ids, read_budget=budget
+                )
+                if r.id is not None
+            }
+            components = uow.components.list_for_refs(refs, read_budget=budget)
+            releases = {
+                r.id: r.product_id
+                for r in uow.releases.list_by_ids(
+                    {c.release_id for c in components}, read_budget=budget
+                )
+            }
+            products = {
+                p.id: p.slug
+                for p in uow.products.list_by_ids(set(releases.values()), read_budget=budget)
+            }
+        owners: defaultdict[UUID, set[str]] = defaultdict(set)
+        shipping: defaultdict[UUID, set[str]] = defaultdict(set)
+        for ownership in ownerships:
+            owners[ownership.repository_id].add(teams[ownership.team_id])
+        for component in components:
+            shipping[refs[component.repository_ref_id]].add(
+                products[releases[component.release_id]]
+            )
+        mappings = self.product_mappings(read_budget=budget)
+        resolution = self.resolve_products(
+            self._product_definitions.read(),
+            mappings,
+            repo_urls=[r.url for r in repositories],
+            read_budget=budget,
+        )
+        contacts = {
+            match.query.value: tuple(
+                f"{c.kerberos_id} ({c.field}; embargo_cleared={c.embargo_cleared})"
+                for c in match.contacts
+            )
+            for match in resolution.results
+            if resolution.source_status is not ProductSourceStatus.UNAVAILABLE
+            and match.query is not None
+            and match.match_tier is not ProductMatchTier.NONE
+        }
+        rows = []
+        for repository in repositories:
+            assert repository.id is not None
+            parts = urlsplit(repository.url)
+            organization, _, name = parts.path.strip("/").rpartition("/")
+            rows.append(
+                InventoryExportRow(
+                    repository=f"{organization}/{name}" if organization else name,
+                    url=repository.url,
+                    host=parts.hostname or None,
+                    organization=organization or None,
+                    repo_name=name or None,
+                    owner_teams=tuple(sorted(owners[repository.id])),
+                    products=tuple(sorted(shipping[repository.id])),
+                    accountable_contacts=contacts.get(repository.url),
+                )
+            )
+        return tuple(rows)
+
     def repositories_shipping(self, repository_ids: Collection[UUID]) -> set[UUID]:
         """Repositories with any commit included in a product release."""
         with self._uow as uow:
@@ -905,12 +996,18 @@ class PortfolioService:
             log.info("product map recorded as %s by run %s", result.artifact_id, provenance.run_id)
         return result
 
-    def product_mappings(self) -> ProductMappings:
+    def product_mappings(self, *, read_budget: RecordBudget | None = None) -> ProductMappings:
         """The newest recorded product map's pairs; none recorded is none."""
         doc = self._require_publisher().latest(ProductDefinitionsMapArtifact)
         if doc is None:
             return ProductMappings()
+        if read_budget is not None:
+            read_budget.consume(1)
         mappings = json.loads(doc.payload)["mappings"]
+        if read_budget is not None:
+            read_budget.consume(
+                len(mappings.get("packages") or {}) + len(mappings.get("repos") or {})
+            )
         return ProductMappings(
             packages=mappings.get("packages") or {}, repos=mappings.get("repos") or {}
         )
@@ -1088,9 +1185,11 @@ class PortfolioService:
         packages: Iterable[str] = (),
         repo_urls: Iterable[str] = (),
         product_ids: Iterable[str] = (),
+        *,
+        read_budget: RecordBudget | None = None,
     ) -> ProductResolution:
         return ProductLookup(self._clock).resolve_products(
-            snapshot, mappings, packages, repo_urls, product_ids
+            snapshot, mappings, packages, repo_urls, product_ids, read_budget=read_budget
         )
 
     def get_repository(self, repository_id: UUID) -> Repository:
