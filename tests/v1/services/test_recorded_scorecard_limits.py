@@ -137,6 +137,31 @@ def test_exact_materialized_budget_survives_reruns_and_multiple_versions(world: 
         world.service().scorecards(BenchmarkFilter(), max_records=14)
 
 
+def test_selected_version_budget_excludes_unrelated_audit_history(world: World) -> None:
+    world.key(target())
+    for index in range(20):
+        world.attach(
+            audited(),
+            AssessmentKind.BENCHMARK_AUDIT,
+            "unrelated",
+            occurred_at=T0 + timedelta(seconds=index),
+        )
+    world.attach(audited(finding(fingerprint=FP)), AssessmentKind.BENCHMARK_AUDIT, "selected")
+    (card,) = world.service().scorecards(BenchmarkFilter(auditor_version="selected"), max_records=7)
+    assert (card.auditor_versions, card.overall.detected, card.overall.expected) == (
+        ("selected",),
+        1,
+        1,
+    )
+    assert (
+        world.service().scorecards(BenchmarkFilter(auditor_version="missing"), max_records=3) == []
+    )
+    with pytest.raises(ValidationError):
+        world.service().scorecards(BenchmarkFilter(auditor_version="selected"), max_records=6)
+    with pytest.raises(ValidationError):
+        world.service().scorecards(BenchmarkFilter(), max_records=7)
+
+
 def test_bounded_complete_results_reuse_reports_read_for_matching(
     world: World, monkeypatch: pytest.MonkeyPatch
 ) -> None:

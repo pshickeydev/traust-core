@@ -10,6 +10,9 @@ import pytest
 import sqlalchemy as sa
 
 from tests.v1.repositories.tables.conftest import T0, Seed, apart, repository_for, same_rows
+from traust_core.v1.errors import ValidationError
+from traust_core.v1.models.common import RecordBudget
+from traust_core.v1.services.artifact_publishing import AssessmentLog
 
 
 def test_latest_assessment_per_ref_and_kind(seed: Seed) -> None:
@@ -111,6 +114,38 @@ def test_search_filters_by_ref_kind_and_status(seed: Seed) -> None:
         repository_ref_id=ref.id, kind="secure-code", status="completed", limit=10
     )
     assert found == [match]
+
+
+def test_assessor_version_filters_before_paging_and_bounded_ref_reads(seed: Seed) -> None:
+    first_ref, second_ref = seed.repository_ref(), seed.repository_ref()
+    early = seed.assessment(first_ref, assessor_version="selected", occurred_at=T0)
+    late = seed.assessment(
+        second_ref, assessor_version="selected", occurred_at=T0 + timedelta(days=1)
+    )
+    for index in range(10):
+        seed.assessment(
+            first_ref, assessor_version="unrelated", occurred_at=T0 + timedelta(days=2 + index)
+        )
+    first = seed.uow.assessments.search(kind="audit", assessor_version="selected", limit=1)
+    assert first == [late]
+    assert seed.uow.assessments.search(
+        kind="audit", assessor_version="selected", limit=1, after=(late.occurred_at, late.id)
+    ) == [early]
+    log = AssessmentLog(seed.uow)
+    assert log.list_of(
+        "audit", assessor_version="selected", read_budget=RecordBudget(2, "selected audits")
+    ) == [late, early]
+    refs = [first_ref.id, second_ref.id]
+    assert log.list_of(
+        "audit", refs, assessor_version="selected", read_budget=RecordBudget(2, "selected audits")
+    ) == [early, late]
+    with pytest.raises(ValidationError):
+        log.list_of(
+            "audit",
+            refs,
+            assessor_version="selected",
+            read_budget=RecordBudget(1, "selected audits"),
+        )
 
 
 def test_search_is_newest_first_and_keyset_continues(seed: Seed) -> None:

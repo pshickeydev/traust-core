@@ -129,8 +129,11 @@ The remaining correctness changes are:
   The model is validated by `contracts.validate_view("benchmark-scorecards", …)`. The report
   renders strict recall, near misses (adjudication items, never detections), injection and
   stability; unmeasured cells show `—`, never 0. No recorded answer key is `NotFoundError`.
-  `scorecards(filter, max_records=…)` offers the same cumulative bound to direct callers;
-  scoring unrecorded runs stays `DetectionQualityService.score_reports`, a door, not a view.
+  `scorecards(filter, max_records=…)` offers the same cumulative bound to direct callers.
+  Its optional auditor-version predicate is applied in SQL before assessment rows consume
+  the budget, so unrelated versions cannot exhaust a selected cohort's allowance. Overflow
+  advice names this direct service; it does not imply that the global view accepts filters.
+  Scoring unrecorded runs stays `DetectionQualityService.score_reports`, a door, not a view.
 
 ## Repository checkouts
 

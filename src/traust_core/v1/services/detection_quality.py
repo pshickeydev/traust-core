@@ -627,7 +627,8 @@ class DetectionQualityService:
             RecordBudget(
                 max_records,
                 "benchmark scorecards",
-                hint="reduce the audit population or select an auditor version",
+                hint="call DetectionQualityService.scorecards with an auditor-version filter "
+                "or higher max_records",
             )
             if max_records is not None
             else None
@@ -648,10 +649,12 @@ class DetectionQualityService:
         for target in targets:
             by_repo[canon_repo(target.repo_url)].append(target)
         by_version: dict[str, dict[BenchmarkTargetId, list[tuple[str, ReportArtifact]]]] = {}
-        audits = self._log.list_of(AssessmentKind.BENCHMARK_AUDIT, read_budget=read_budget)
+        audits = self._log.list_of(
+            AssessmentKind.BENCHMARK_AUDIT,
+            assessor_version=filter.auditor_version,
+            read_budget=read_budget,
+        )
         for audit in sorted(audits, key=_when):
-            if filter.auditor_version not in (None, audit.assessor_version):
-                continue
             run = self._benchmark_report(audit, read_budget=read_budget)
             if isinstance(run, str):
                 continue

@@ -10,23 +10,47 @@ import sqlalchemy as sa
 
 from perf.harness import Profile
 from perf.queries.test_ledger import fast
+from traust_core.v1.models.common import RecordBudget
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
+from traust_core.v1.services.artifact_publishing import AssessmentLog
 
 
+@pytest.mark.parametrize("with_version", [False, True])
 def test_search_by_ref_and_kind_uses_the_covering_index(
-    engine: sa.Engine, explained: Profile
+    engine: sa.Engine, explained: Profile, with_version: bool
 ) -> None:
     with SqlTraustUnitOfWork(engine) as unit:
         table = unit.assessments.table
         row = unit.connection.execute(
-            sa.select(table.c.repository_ref_id, table.c.kind, table.c.status).limit(1)
+            sa.select(
+                table.c.repository_ref_id, table.c.kind, table.c.status, table.c.assessor_version
+            ).limit(1)
         ).one()
     (statement,) = explained(
         lambda uow: uow.assessments.search(
-            repository_ref_id=row.repository_ref_id, kind=row.kind, status=row.status, limit=50
+            repository_ref_id=row.repository_ref_id,
+            kind=row.kind,
+            status=row.status,
+            limit=50,
+            assessor_version=row.assessor_version if with_version else None,
         )
     )
     fast(statement, "idx_assessment_ref_kind_occurred", 5)
+
+
+def test_bounded_version_scan_does_not_charge_other_versions(explained: Profile) -> None:
+    def read(uow: SqlTraustUnitOfWork) -> None:
+        budget = RecordBudget(1, "selected audits")
+        assert (
+            AssessmentLog(uow).list_of(
+                None, assessor_version="not-a-recorded-perf-version", read_budget=budget
+            )
+            == []
+        )
+        assert budget.remaining == 1
+
+    (statement,) = explained(read)
+    assert statement.execution_ms < 100, statement.plan
 
 
 def test_latest_measurement_at_a_cutoff_uses_the_ref_kind_index(
