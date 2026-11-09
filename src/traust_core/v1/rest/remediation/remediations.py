@@ -6,11 +6,12 @@ from uuid import UUID
 from fastapi import APIRouter, Query
 
 from traust_core.v1.models.common import Cursor, Page, PageRequest
+from traust_core.v1.models.remediation import ExternalRef, WorkItem
 from traust_core.v1.models.remediation_scheduling import RemediationRequest, ScheduledEffort
 from traust_core.v1.models.vocabulary import RemediationStatus
 from traust_core.v1.rest.common.deps import Caller
 from traust_core.v1.rest.common.problems import PROBLEMS
-from traust_core.v1.rest.remediation.service import Scheduling
+from traust_core.v1.rest.remediation.service import Remediation, Scheduling
 
 router = APIRouter()
 
@@ -51,3 +52,13 @@ def get_remediation(work_item_id: UUID, scheduling: Scheduling, _: Caller) -> Sc
     """One scheduled effort: its work item — the findings, the status folded from its
     decisions, the report once recorded — and the fork facts of the order that runs it."""
     return scheduling.get(work_item_id)
+
+
+@router.post(
+    "/v1/remediations/{work_item_id}/pull-request",
+    responses=PROBLEMS(401, 403, 404, 409, 422),
+)
+def record_remediation_pull_request(
+    work_item_id: UUID, body: ExternalRef, remediation: Remediation, caller: Caller
+) -> WorkItem:
+    return remediation.record_pull_request(work_item_id, body, caller)

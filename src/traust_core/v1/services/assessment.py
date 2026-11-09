@@ -907,6 +907,19 @@ class AssessmentService:
             rows = uow.assessments.list_for_run_order(run_order_id)
         return sorted((self._read(row) for row in rows), key=lambda a: (a.occurred_at, a.id))
 
+    def latest_recorded(self, repository_id: UUID, kind: AssessmentKind) -> Assessment:
+        """The repository's newest completed or degraded assessment across all its refs."""
+        self._inventory.get_repository(repository_id)
+        with self._uow as uow:
+            found = uow.assessment_reads.latest_for_repository(
+                repository_id,
+                self._kind_spellings(kind),
+                (ASSESSMENT_COMPLETED, ASSESSMENT_DEGRADED),
+            )
+        if found is None:
+            raise NotFoundError(f"no recorded {kind} assessment for repository {repository_id}")
+        return self._read(found)
+
     def list_for_repository(
         self, repository_id: UUID, kind: AssessmentKind | None = None
     ) -> list[Assessment]:

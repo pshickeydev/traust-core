@@ -589,6 +589,33 @@ class RemediationService:
         )
         return self.get(work_item_id)
 
+    def record_pull_request(
+        self, work_item_id: UUID, tracker: ExternalRef, principal: Principal
+    ) -> WorkItem:
+        """Attach a person's actual PR to this attempt and advance it atomically."""
+        if not principal.is_verified_human():
+            raise ForbiddenError("recording a pull request requires a verified person")
+        if not tracker.system.strip():
+            raise ValidationError("pull request system must not be blank")
+        _url(tracker.ref)
+        with self._uow.write() as uow:
+            item = self.get(work_item_id)
+            self._findings.lock_findings(item.finding_ids)
+            item = self.get(work_item_id)
+            links = self._findings.records.external_refs_for_assessments((work_item_id,))
+            if links:
+                if any((link.system, link.ref) != (tracker.system, tracker.ref) for link in links):
+                    raise ConflictError(f"work item {work_item_id} already names another PR")
+                return item
+            item.advance(RemediationStatus.PR_OPENED)
+            for finding_id in item.finding_ids:
+                self._findings.records.link_external(
+                    finding_id, tracker.system, tracker.ref, assessment_id=work_item_id
+                )
+            self.record_progress(work_item_id, RemediationStatus.PR_OPENED)
+            uow.commit()
+        return self.get(work_item_id)
+
     def record_evidence(self, work_item_id: UUID, evidence: EvidenceItem) -> WorkItem:
         """Evidence before the report: it has no home yet, so it travels in the report."""
         self.get(work_item_id)
@@ -1045,7 +1072,13 @@ class RemediationService:
             }
             linked = {d.finding_id for ds in said.values() for d in ds}
             earliest_first = self._findings.records.external_refs(linked, JIRA)
-            tickets = {t.finding_id: t for t in reversed(earliest_first)}
+            tickets = {t.finding_id: t for t in reversed(earliest_first) if t.assessment_id is None}
+            trackers = {
+                link.assessment_id: ExternalRef(system=link.system, ref=link.ref)
+                for link in self._findings.records.external_refs_for_assessments(
+                    {a.id for a in assessments if a.id is not None}
+                )
+            }
         items = []
         for a in sorted(assessments, key=lambda a: (a.occurred_at, str(a.id))):
             decisions = said[a.id]  # type: ignore[index]
@@ -1054,7 +1087,10 @@ class RemediationService:
             covered = tuple(sorted({d.finding_id for d in decisions}, key=str))
             status = furthest(d.reason for d in decisions if d.reason)
             ticket = next((tickets[f] for f in covered if f in tickets), None)
-            items.append(self._item(a, covered, status, reports.get(a.id), ticket))
+            item = self._item(a, covered, status, reports.get(a.id), ticket)
+            if a.id in trackers:
+                item = item.model_copy(update={"tracker": trackers[a.id]})
+            items.append(item)
         return items
 
     def _item(

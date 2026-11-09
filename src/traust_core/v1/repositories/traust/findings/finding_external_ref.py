@@ -17,7 +17,12 @@ from traust_core.v1.repositories.tables import (
 FINDING_EXTERNAL_REF = TableSpec(
     TRAUST,
     "finding_external_ref",
-    lambda: (uuid_column("finding_id"), text_column("system"), text_column("ref")),
+    lambda: (
+        uuid_column("finding_id"),
+        uuid_column("assessment_id", nullable=True),
+        text_column("system"),
+        text_column("ref"),
+    ),
 )
 
 
@@ -26,6 +31,9 @@ class FindingExternalRefRepository(MutableRecordRepository[FindingExternalRef], 
     def list_for_ref(self, system: str, ref: str) -> list[FindingExternalRef]: ...
     def list_for_findings(
         self, finding_ids: Collection[UUID], system: str | None = None
+    ) -> list[FindingExternalRef]: ...
+    def list_for_assessments(
+        self, assessment_ids: Collection[UUID]
     ) -> list[FindingExternalRef]: ...
 
 
@@ -48,3 +56,6 @@ class SqlFindingExternalRefRepository(SqlMutableRepository[FindingExternalRef]):
         if system is not None:
             conditions.append(c.system == system)
         return self._many(f"list refs for {len(finding_ids)} findings", *conditions)
+
+    def list_for_assessments(self, assessment_ids: Collection[UUID]) -> list[FindingExternalRef]:
+        return self._many_in("list assessment links", self.table.c.assessment_id, assessment_ids)

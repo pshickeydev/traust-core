@@ -46,6 +46,20 @@ def list_findings(
     return findings.list(filter, PageRequest(limit=limit, cursor=cursor))
 
 
+@router.get(
+    "/v1/repositories/{repository_id}/findings/by-fingerprint",
+    responses=PROBLEMS(401, 404, 409, 422),
+)
+def get_finding_by_fingerprint(
+    repository_id: UUID,
+    fingerprint: str,
+    findings: Findings,
+    _: Caller,
+    fingerprint_algo: str | None = None,
+) -> FindingView:
+    return findings.get_by_fingerprint(repository_id, fingerprint, fingerprint_algo)
+
+
 @router.get("/v1/repositories/{repository_id}/findings/summary", responses=PROBLEMS(401, 422))
 def summarize_findings(
     filter: Filter, findings: Findings, _: Caller, group_by: FindingDimension

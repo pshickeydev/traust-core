@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+from datetime import timedelta
 from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
 
-from tests.v1.repositories.tables.conftest import Seed
+from tests.v1.repositories.tables.conftest import T0, Seed
 from tests.v1.rest.conftest import bearer, same_as_in_process
 from traust_core.v1.context import Context
+from traust_core.v1.models.assessment import AssessmentKind
 from traust_core.v1.models.common import PageRequest
 from traust_core.v1.models.inventory import RepositoryFilter
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
@@ -46,6 +48,49 @@ def test_get_a_ref(context: Context, client: TestClient) -> None:
     _, ref = seed(context)
     one = client.get(f"/v1/refs/{ref.id}", headers=bearer(context))
     same_as_in_process(one.json(), context.services().portfolio.inventory.get_ref(ref.id))
+
+
+@pytest.mark.parametrize("newer_import", [False, True])
+def test_current_default_ref_uses_owner_observation_and_naming_order(
+    context: Context, client: TestClient, newer_import: bool
+) -> None:
+    with SqlTraustUnitOfWork(context.database) as uow:
+        s = Seed(uow)
+        repo = s.repository()
+        imported = s.repository_ref(repo, sha="a" * 40, is_default=True, default_named_at=T0)
+        observed = s.repository_ref(
+            repo, sha="b" * 40, is_default=True, default_named_at=T0 + timedelta(days=1)
+        )
+        s.assessment(observed, kind=AssessmentKind.REPO_STATE, occurred_at=T0 + timedelta(days=2))
+        if newer_import:
+            imported = uow.repository_refs.update(
+                imported.model_copy(update={"default_named_at": T0 + timedelta(days=3)})
+            )
+        uow.commit()
+    response = client.get(
+        f"/v1/repositories/{repo.id}/refs/current-default", headers=bearer(context)
+    )
+    assert response.status_code == 200, response.text
+    expected = imported if newer_import else observed
+    assert (response.json()["id"], response.json()["sha"]) == (str(expected.id), expected.sha)
+    same_as_in_process(response.json(), context.services().portfolio.current_default_ref(repo.id))
+
+
+@pytest.mark.parametrize("registered", [False, True])
+def test_current_default_ref_missing_is_problem_404(
+    context: Context, client: TestClient, registered: bool
+) -> None:
+    repository_id = seed(context)[0].id if registered else uuid4()
+    response = client.get(
+        f"/v1/repositories/{repository_id}/refs/current-default", headers=bearer(context)
+    )
+    assert response.status_code == 404
+    assert response.headers["content-type"] == "application/problem+json"
+
+
+def test_current_default_ref_requires_authentication(context: Context, client: TestClient) -> None:
+    repo, _ = seed(context)
+    assert client.get(f"/v1/repositories/{repo.id}/refs/current-default").status_code == 401
 
 
 def test_owners_and_products_of_a_repository_match_in_process(

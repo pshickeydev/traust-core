@@ -10,9 +10,15 @@ import sqlalchemy as sa
 
 from perf.harness import Profile
 from perf.queries.test_ledger import fast
+from traust_core.v1.models.assessment import (
+    ASSESSMENT_COMPLETED,
+    ASSESSMENT_DEGRADED,
+    AssessmentKind,
+)
 from traust_core.v1.models.common import RecordBudget
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services.artifact_publishing import AssessmentLog
+from traust_core.v1.services.assessment import AssessmentService
 
 
 @pytest.mark.parametrize("with_version", [False, True])
@@ -136,6 +142,37 @@ def test_the_baseline_audit_across_a_repositorys_refs_uses_the_covering_index(
         )
     (statement,) = explained(lambda uow: uow.assessments.latest_for_refs(ids, row.kind, row.status))
     fast(statement, "idx_assessment_ref_kind_occurred", 5)
+
+
+@pytest.mark.parametrize("kind", [AssessmentKind.REPO_STATE, AssessmentKind.REPO_STATE_CANONICAL])
+def test_latest_recorded_returns_one_nonempty_scoped_row_by_index(
+    engine: sa.Engine, explained: Profile, kind: AssessmentKind
+) -> None:
+    with SqlTraustUnitOfWork(engine) as unit:
+        refs, assessments = unit.repository_refs.table, unit.assessments.table
+        row = unit.connection.execute(
+            sa.select(assessments.c.id, assessments.c.repository_ref_id, refs.c.repository_id)
+            .join(assessments, assessments.c.repository_ref_id == refs.c.id)
+            .where(
+                assessments.c.kind.in_(
+                    (AssessmentKind.REPO_STATE, AssessmentKind.REPO_STATE_CANONICAL)
+                ),
+                assessments.c.status.in_((ASSESSMENT_COMPLETED, ASSESSMENT_DEGRADED)),
+            )
+            .order_by(assessments.c.occurred_at.desc(), assessments.c.id.desc())
+            .limit(1)
+        ).one()
+
+    def read(unit: SqlTraustUnitOfWork) -> None:
+        found = AssessmentService(unit).latest_recorded(row.repository_id, kind)
+        assert found.id == row.id
+        assert found.repository_ref_id == row.repository_ref_id
+        assert found.kind == AssessmentKind.REPO_STATE_CANONICAL
+        assert found.status in (ASSESSMENT_COMPLETED, ASSESSMENT_DEGRADED)
+
+    repository, latest = explained(read)
+    assert repository.execution_ms < 5, repository.plan
+    assert latest.execution_ms < 5, latest.plan
 
 
 @pytest.mark.parametrize("since", ["an hour ago", "the start"])

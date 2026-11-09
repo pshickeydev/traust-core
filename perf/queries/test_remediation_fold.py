@@ -4,13 +4,14 @@ order lookup and the decisions bulk read the fold is built on (contracts#117 gav
 
 from __future__ import annotations
 
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 import sqlalchemy as sa
 
 from perf.harness import Profile
 from perf.queries.test_ledger import fast
+from traust_core.v1.models.findings import FindingExternalRef
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 
 EFFORTS = 500  # a year of scheduled efforts on one repository's findings
@@ -127,3 +128,34 @@ def test_decisions_for_assessments_use_the_assessment_index(
 
     (statement,) = explained(read)
     fast(statement, "idx_decision_assessment", 50)
+
+
+def test_attempt_tracker_reads_keep_exact_scope_at_volume(
+    engine: sa.Engine, explained: Profile, scheduled: dict[str, object]
+) -> None:
+    item = UUID(str(scheduled["one"]))
+    with SqlTraustUnitOfWork(engine) as uow:
+        decision = uow.decisions.list_for_assessments((item,))[0]
+        url = f"https://forge.example/service/pull/{item}"
+        links = uow.finding_external_refs.list_for_ref("perf-attempt", url)
+        if not links:
+            links = [
+                uow.finding_external_refs.add(
+                    FindingExternalRef(
+                        finding_id=decision.finding_id,
+                        assessment_id=item,
+                        system="perf-attempt",
+                        ref=url,
+                    )
+                )
+            ]
+            uow.commit()
+        expected = links[0]
+
+    def read(uow: SqlTraustUnitOfWork) -> None:
+        assert expected in uow.finding_external_refs.list_for_assessments((item,))
+        assert uow.finding_external_refs.list_for_assessments((uuid4(),)) == []
+
+    present, missing = explained(read)
+    assert present.execution_ms < 5, present.plan
+    assert missing.execution_ms < 5, missing.plan

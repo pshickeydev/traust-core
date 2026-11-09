@@ -27,6 +27,8 @@ All modules live under `traust_core.v1` (see [Versioning](#versioning)).
 | **Explicit recording starts** | `rest.ops`, `services.operations` | `POST /v1/orders/start`: `StartRecordingRequest` (`order`, `lease_seconds`) → `OpsService.start_recording` → existing `OpsService.start` → native leased `RunOrder`; verified machine identity and server-owned principal/asset/repository capabilities, no request-supplied worker | a second queue, machine approval, caller-promised recording permissions |
 | **Authored secure-code records** | `rest.assessments`, `services.assessment` | `POST /v1/assessment-records`: `AssessmentRecordRequest` → `AssessmentService.record_secure_code` → exact canonical report, native assessment/artifact IDs and unjudged `IntakeResult` from existing finding intake | scanner relabeling, report-authored validity decisions, changing plain `record` |
 | **Assessment intake bindings** | `rest.assessments`, `services.assessment`, `services.findings.decisions` | Authenticated `GET /v1/assessments/{assessment_id}/intake` → mapping-only `AssessmentIntakeBindings`; digest-verified secure-code report labels or triage row labels resolve only through their owner and assessment/baseline occurrence scope | receipt-trusted UUIDs, manufactured creation history, source-title matching |
+| **Latest recorded assessment** | `rest.assessments`, `services.assessment` | Authenticated `GET /v1/repositories/{repository_id}/assessments/latest?kind=…` → `AssessmentService.latest_recorded` → one typed `Assessment`: newest completed or degraded result across all refs and kind aliases; required kind, 404 for no match or unknown repository | consumer-side assessment-history walks, pending or failed results replacing recorded evidence |
+| **Exact finding identity read** | `rest.findings`, `services.findings` | Authenticated `GET /v1/repositories/{repository_id}/findings/by-fingerprint?fingerprint=…&fingerprint_algo=…` → `FindingService.get_by_fingerprint` → typed `FindingView`; opaque exact fingerprint required, algorithm optional; 404 for an absent match or unknown repository, 409 when an omitted algorithm is ambiguous | consumer-side finding-history walks, title/ordinal matches, silently picking one algorithm |
 | **Artifact reads** | `rest.artifacts`, `services.artifact_publishing` | Authenticated `GET /v1/artifacts/{artifact_id}` → native `Artifact` metadata; `GET /v1/artifacts/{artifact_id}/content` → digest-verified original bytes through `ArtifactPublisher.metadata` / `payload` | consumer report reserialization, obsolete SDK schema revalidation, direct object/database access |
 | **Verification records** | `rest.remediation` | `POST /v1/verification-records`: exact UTF-8 report text, native `Provenance`, and `run_order_id` → `VerificationService.record_order` → native `Verification`; a verified machine must own a live lease for the report repository and a server-allowed verification asset | event envelopes, caller-supplied actor/signer, human countersigns |
 | **Remediation records** | `rest.remediation`, `services.remediation` | `POST /v1/remediation-records`: exact report bytes, provenance and a live `remediate_finding` lease; the order's named work item scopes recording and replay | accepting a different attempt or a triage lease as remediation authority |
@@ -48,6 +50,32 @@ All modules live under `traust_core.v1` (see [Versioning](#versioning)).
 | **IaC, secrets, malware scanners** | `providers.tools.cloud_config`, `providers.tools.k8s_hardening`, `providers.tools.gitleaks`, `providers.tools.yara` | registered tools `checkov` (`CheckovProvider`: the pinned Checkov, offline, as `CloudConfigFacts`), `gitleaks` / `gitleaks-history` (`Gitleaks`: secret-free candidates over the rules `locations.gitleaks_config` names) and `yara` (`Yara`: known-malware-family facts over a pinned rule pack); `k8s_hardening.Scanner` (the KHS-* manifest checks and tenancy signals); `adapter_result` builds any adapter's `AdapterResultArtifact` | traust-engine `adapters/cloud_config.py`, `checkov.py`, `gitleaks.py`, `yara.py`, `_contract_bridge.py` |
 | **Deps and SBOM scanners** | `providers.tools.osv`, `providers.tools.osv_sbom`, `providers.tools.grype` | registered by `scanner_tools`: `grype` over a checkout or SBOM path, database frozen by default; `osv`, a checkout's declared packages looked up through `ctx.advisories` with coverage reported, `osv.scan_api(..., resolver=ctx.deps_dev)` for the full candidates document; `osv_sbom`, an image's syft JSON language packages not installed by an OS package, with `mark_grype_duplicates` / `grype_os_installed_matches` and the air-gapped osv-scanner path; CVSS through `models.dependencies.cvss_base_score` | `adapters/{osv,osv_sbom,grype}.py`, `osv/` (client: reuses `providers.osv`) |
 | **Config + Context** | `context`, `context.documents` (the YAML codec: `yaml_documents`, `yaml_documents_with_lines`, `yaml_text`, passed to providers, which don't import yaml), `context.preflight` | one `traust.yaml`; `Context` builds everything ([ledger and identity sections](docs/configuration.md)). The deployment config home: `resolve_config_home(explicit)` (`$TRAUST_CONFIG_HOME`, else `~/.traust/config` when it exists), `config_path(name)` (`DeploymentConfigMissing` naming the file and its template), `optional_config_path(name)`, `config_completeness_audit()` (`(errors, warnings)` for `install_traust --doctor`). `Context.preflight(requirements)` (`context.preflight`): one readiness door the engine's start gate, the platform doors and `traust doctor` call — a `Requirement` (`models.operations`, the pack schema's `requires:` vocabulary: tools, config keys, recorded facts, feed sources, secrets) is checked against `Toolchain.preflight`, the traust.yaml keys `Config.provided` records, the recorded facts, the enabled feed sources, the environment and the config home audit, raising `PreflightError` with every gap and its fix; `schema_dir()` / `schema_path(name)` / `validate_config(name, document)` and the ops types consumers annotate with (`OpsService`, `SpendService`, `FeedQuery`, `Router`, `Clock`) re-exported for consumers | `os.environ`, scattered config files, `traust_contracts.config` |
+
+Repository authority reads stay server-owned:
+`GET /v1/repositories/{repository_id}/refs/current-default` (OpenAPI
+`get_current_default_ref`, generated client `GetCurrentDefaultRef`) returns the
+exact `RepositoryRef` chosen by `PortfolioService.current_default_ref`, or 404.
+Immutable historical default flags do not independently identify the current head:
+the existing observation/default-naming order chooses its ID and SHA.
+
+The latest-recorded assessment read joins repository ownership in SQL and returns
+at most one assessment without loading or binding the repository's ref history.
+Algorithm-free fingerprint reads use the contracts-owned
+`(repository_id, fingerprint)` index, retaining exact opaque identity and ambiguity
+across algorithms. Local stores receive its additive index upgrade; configured
+databases must apply `contracts.finding_fingerprint_index_upgrade(dialect)` first.
+
+`POST /v1/remediations/{work_item_id}/pull-request` (`record_remediation_pull_request`,
+generated `RecordRemediationPullRequest`) accepts an `ExternalRef` (`system`, actual
+HTTPS PR URL in `ref`) and returns `WorkItem`. A verified person records this
+manual action; machine and unverified identities are refused. The attempt's
+tracker and `pr_opened` progress commit together. Replaying the same PR is a no-op,
+including after merge; a different PR conflicts. Finding-wide Jira tickets retain
+their existing semantics, while PR trackers are scoped by assessment ID and never
+spread to other attempts over the same findings. Immutable worker reports are not
+rewritten. Existing local stores gain the nullable scope automatically; configured
+databases apply `contracts.finding_external_ref_assessment_upgrade(dialect)` when
+`finding_external_ref.assessment_id` is absent. Historical links remain unscoped.
 
 ## Historical reads and reporting correctness
 
@@ -792,6 +820,15 @@ Repositories are real; services are mostly stubs. Every stub raises `NotImplemen
 
 Insight (dashboards) has no repository: views read services and render.
 
+`AssessmentService.latest_recorded(repository_id, kind)` returns the newest completed or
+degraded assessment across the repository's refs, normalizing historical kind aliases.
+`GET /v1/repositories/{repository_id}/assessments/latest?kind=<AssessmentKind>` exposes the
+same typed `Assessment` (`get_latest_recorded_assessment` / SDK `GetLatestRecordedAssessment`).
+The kind is required; an unknown repository or no recorded match returns 404, and reads
+require the usual authenticated caller. Pending, failed and unknown statuses are excluded.
+The scoped assessment query returns at most one row, ordered by `occurred_at`, `created_at`
+and `id` descending; consumers need not fetch or walk assessment history.
+
 Direct human judgements use `services.findings.decisions.decide(RecordDecision(...), principal)`.
 Authenticate with `services.identity.authenticate(Credential(token=...))`; the service requires a
 verified human, derives the actor from that principal and supplies the clock time when omitted.
@@ -816,6 +853,15 @@ Unrated or unreported findings have `effective_severity=None`; only a reported o
 rating supplies a severity. `review_surfaces(repository_id, as_of=None)` merges the latest
 audit with later scans and keeps a surface open until its findings are affirmatively closed.
 Closing one review item does not bypass the finding's evidence-strength or independent-review gates.
+
+`FindingService.get_by_fingerprint(repository_id, fingerprint, fingerprint_algo=None)` resolves
+opaque fingerprints exactly, without trimming, recomputing identity or matching titles.
+`GET /v1/repositories/{repository_id}/findings/by-fingerprint` exposes the same `FindingView`
+through `get_finding_by_fingerprint` / SDK `GetFindingByFingerprint`. The identity query reads
+at most two matching rows and refuses ambiguous algorithms with 409. Supplying the algorithm
+uses the complete existing identity key; omitting it can examine more entries within the
+repository's index scope. Hydrating the selected view retains the normal per-finding
+history and context reads, rather than bounding all related records to two.
 
 `summary` and `timeline` retain unknown open findings in the registered `unrated`
 bucket of `open_by_severity` (including JSON output), while their individual effective

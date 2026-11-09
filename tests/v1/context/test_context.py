@@ -186,3 +186,73 @@ def test_a_store_whose_run_order_predates_the_fork_columns_is_refused(tmp_path: 
         conn.exec_driver_sql("ALTER TABLE ops_run_order DROP COLUMN fork_url")
     with pytest.raises(ConfigError, match="apply the additive statements"):
         Context(Config(home=home)).services()
+
+
+def test_local_fingerprint_index_upgrade_preserves_finding_identity(tmp_path: Path) -> None:
+    from tests.v1.repositories.tables.conftest import Seed
+    from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
+
+    engine = Context(Config(home=tmp_path)).database
+    with SqlTraustUnitOfWork(engine) as uow:
+        finding = Seed(uow).finding()
+        uow.connection.exec_driver_sql("DROP INDEX idx_finding_repository_fingerprint")
+        uow.commit()
+    engine.dispose()
+    upgraded = Context(Config(home=tmp_path)).database
+    with SqlTraustUnitOfWork(upgraded) as uow:
+        assert (
+            uow.findings.find_by_fingerprint(finding.repository_id, None, finding.fingerprint)
+            == finding
+        )
+    assert any(
+        index["column_names"] == ["repository_id", "fingerprint"]
+        for index in sa.inspect(upgraded).get_indexes("finding")
+    )
+
+
+def test_configured_database_missing_fingerprint_index_requires_owner_upgrade(
+    tmp_path: Path,
+) -> None:
+    engine = Context(Config(home=tmp_path)).database
+    with engine.begin() as connection:
+        connection.exec_driver_sql("DROP INDEX idx_finding_repository_fingerprint")
+    engine.dispose()
+    configured = Config(
+        home=tmp_path / "elsewhere",
+        database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'traust.db'}"),
+    )
+    with pytest.raises(ConfigError, match="finding_fingerprint_index_upgrade"):
+        _ = Context(configured).database
+
+
+def test_local_external_reference_attempt_upgrade_does_not_attribute_old_links(
+    tmp_path: Path,
+) -> None:
+    from tests.v1.repositories.tables.conftest import Seed
+    from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
+
+    engine = Context(Config(home=tmp_path)).database
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        link = seed.finding_external_ref()
+        uow.connection.exec_driver_sql("DROP INDEX idx_finding_external_ref_assessment")
+        uow.connection.exec_driver_sql("ALTER TABLE finding_external_ref DROP COLUMN assessment_id")
+        uow.commit()
+    engine.dispose()
+    upgraded = Context(Config(home=tmp_path)).database
+    with SqlTraustUnitOfWork(upgraded) as uow:
+        assert uow.finding_external_refs.get(link.id).assessment_id is None
+
+
+def test_configured_external_reference_attempt_upgrade_is_explicit(tmp_path: Path) -> None:
+    engine = Context(Config(home=tmp_path)).database
+    with engine.begin() as connection:
+        connection.exec_driver_sql("DROP INDEX idx_finding_external_ref_assessment")
+        connection.exec_driver_sql("ALTER TABLE finding_external_ref DROP COLUMN assessment_id")
+    engine.dispose()
+    configured = Config(
+        home=tmp_path / "elsewhere",
+        database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'traust.db'}"),
+    )
+    with pytest.raises(ConfigError, match="finding_external_ref_assessment_upgrade"):
+        _ = Context(configured).database

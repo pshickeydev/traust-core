@@ -24,6 +24,7 @@ from traust_core.v1.context.config import ProcessConfig
 from traust_core.v1.errors import (
     ConfigError,
     ConflictError,
+    ForbiddenError,
     IntegrityError,
     NotFoundError,
     ValidationError,
@@ -32,13 +33,16 @@ from traust_core.v1.models.artifacts import RemediationArtifact, ReportArtifact,
 from traust_core.v1.models.assessment import AssessmentKind
 from traust_core.v1.models.common import ArtifactRef, PageRequest, Provenance
 from traust_core.v1.models.findings import Finding, FindingCandidate, Label
+from traust_core.v1.models.identity import IdentitySource, Principal
 from traust_core.v1.models.insight import ViewFilter, ViewName
 from traust_core.v1.models.inventory import RepositoryRef
 from traust_core.v1.models.remediation import (
     Check,
     CheckOutcome,
     EvidenceItem,
+    ExternalRef,
     PatchNarrative,
+    WorkItem,
     WorkItemFilter,
     checks_status,
 )
@@ -47,7 +51,12 @@ from traust_core.v1.models.validation import (
     ValidationRecordInput,
     ValidationSourceBinding,
 )
-from traust_core.v1.models.vocabulary import RemediationStatus, SourceType, ValidationVerdict
+from traust_core.v1.models.vocabulary import (
+    ActorKind,
+    RemediationStatus,
+    SourceType,
+    ValidationVerdict,
+)
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services.ledger import LedgerConfig
 from traust_core.v1.services.remediation import (
@@ -62,6 +71,12 @@ WHEN = datetime(2026, 10, 23, 9, tzinfo=UTC)
 FORGES = {"github.com": "github", "gitlab.com": "gitlab"}
 GIT = ProcessConfig(allowed_binaries=("git",))
 PRIVATE = RemediationConfig(fork_org="mirror-org", private_forge_hosts=("forge.example.internal",))
+PERSON = Principal(
+    identity="remediator@example.com",
+    kind=ActorKind.HUMAN,
+    display="Remediator",
+    verified_by=IdentitySource.OIDC,
+)
 
 
 # forks (pure)
@@ -902,3 +917,78 @@ def test_a_work_item_whose_findings_were_never_recorded_says_not_found(
         uow.commit()
     with pytest.raises(NotFoundError):
         service.get(scan.id)
+
+
+def test_pull_request_recording_is_attempt_scoped_idempotent_and_keeps_report(
+    service: RemediationService, engine: Engine
+) -> None:
+    ref, found = seeded(engine)
+    previous = service.open(ids(found), ref.id)
+    service.record_progress(previous.work_item_id, RemediationStatus.ABANDONED)
+    current = service.open(ids(found), ref.id)
+    recorded = service.record(report(ids(found)), provenance(), work_item_id=current.work_item_id)
+    payload = service._publisher.read(recorded.report.id, RemediationArtifact).payload
+    tracker = ExternalRef(system="github", ref="https://github.com/example/svc/pull/101")
+    attached = service.record_pull_request(current.work_item_id, tracker, PERSON)
+    assert attached.status == "pr_opened" and attached.tracker == tracker
+    assert attached.report == recorded.report
+    assert service._publisher.read(recorded.report.id, RemediationArtifact).payload == payload
+    before = decisions(engine, found[0])
+    assert service.record_pull_request(current.work_item_id, tracker, PERSON) == attached
+    assert decisions(engine, found[0]) == before
+    old = service.get(previous.work_item_id)
+    assert old.status == "abandoned" and old.tracker != tracker
+    with pytest.raises(ConflictError, match="another PR"):
+        service.record_pull_request(
+            current.work_item_id,
+            ExternalRef(system="github", ref="https://github.com/example/svc/pull/102"),
+            PERSON,
+        )
+    service.record_progress(current.work_item_id, RemediationStatus.MERGED)
+    assert service.record_pull_request(current.work_item_id, tracker, PERSON).status == "merged"
+    with SqlTraustUnitOfWork(engine) as uow:
+        links = uow.finding_external_refs.list_for_assessments((current.work_item_id,))
+        assert len(links) == 1 and links[0].assessment_id == current.work_item_id
+        assert uow.finding_external_refs.list_for_assessments((previous.work_item_id,)) == []
+
+
+def test_pull_request_tracker_and_progress_roll_back_together(
+    service: RemediationService, engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ref, found = seeded(engine)
+    item = service.open(ids(found), ref.id)
+    original = service.record_progress
+
+    def fail_after_progress(work_item_id: UUID, status: RemediationStatus) -> WorkItem:
+        original(work_item_id, status)
+        raise RuntimeError("injected failure before outer commit")
+
+    monkeypatch.setattr(service, "record_progress", fail_after_progress)
+    with pytest.raises(RuntimeError, match="injected failure"):
+        service.record_pull_request(
+            item.work_item_id,
+            ExternalRef(system="github", ref="https://github.com/example/svc/pull/101"),
+            PERSON,
+        )
+    unchanged = service.get(item.work_item_id)
+    assert unchanged.status == "candidate" and unchanged.tracker is None
+    with SqlTraustUnitOfWork(engine) as uow:
+        assert uow.finding_external_refs.list_for_assessments((item.work_item_id,)) == []
+
+
+@pytest.mark.parametrize("kind,verified", [(ActorKind.MACHINE, True), (ActorKind.HUMAN, False)])
+def test_pull_request_recording_requires_a_verified_person(
+    service: RemediationService, engine: Engine, kind: ActorKind, verified: bool
+) -> None:
+    ref, found = seeded(engine)
+    item = service.open(ids(found), ref.id)
+    principal = PERSON.model_copy(
+        update={"kind": kind, "verified_by": IdentitySource.OIDC if verified else None}
+    )
+    with pytest.raises(ForbiddenError):
+        service.record_pull_request(
+            item.work_item_id,
+            ExternalRef(system="github", ref="https://github.com/example/svc/pull/101"),
+            principal,
+        )
+    assert service.get(item.work_item_id) == item
