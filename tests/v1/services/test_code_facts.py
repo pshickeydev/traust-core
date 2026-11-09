@@ -735,6 +735,25 @@ def test_an_uncovered_entry_point_names_the_framework_its_pre_scan_could_not_enu
     assert (gap.source, gap.entry_point) == (CoverageSource.PRE_SCAN, "express")
 
 
+def test_an_ownership_gap_on_enumerated_routes_leaves_them_covered() -> None:
+    routes = RouteGuardFact(
+        routes=(_route(),),
+        coverage_gaps=(
+            CoverageGap(system="go-http ownership", reason="ownership UNCLASSIFIED on 1 route"),
+        ),
+    )
+    llm = LlmAppFact(
+        llm_application=False, stats=LlmAppStats(source_files_read=0, manifests_read=0)
+    )
+    check = entry_point_coverage(
+        [_ep("REST API", "http-api")], routes, GrpcGuardFact(), llm, ConfigFact()
+    )
+    assert [(e.entry_point, e.status) for e in check.entries] == [
+        ("REST API", CoverageStatus.COVERED),
+        ("go-http routes", CoverageStatus.COVERED),
+    ]
+
+
 def test_coverage_without_a_threat_model_reports_only_the_pre_scans(tmp_path: Path) -> None:
     (tmp_path / "server.go").write_text(ROUTES)
     (tmp_path / "agent.py").write_text("from openai import OpenAI\n")

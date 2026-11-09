@@ -1370,7 +1370,7 @@ def _ownership_gaps(result: dict) -> list[dict]:
     return [g for g in result["coverage_gaps"] if g["system"].endswith(" ownership")]
 
 
-def test_unclassified_ownership_is_named_per_framework_never_blank(flask_asym_repo):
+def test_unclassified_ownership_is_named_per_framework_never_blank(flask_asym_repo: Path) -> None:
     """Flask has no ownership reader yet: its authenticated id route is a named gap, not a
     blank `ownership` that reads as nothing to flag."""
     result = _enum(flask_asym_repo)
@@ -1385,7 +1385,7 @@ def test_unclassified_ownership_is_named_per_framework_never_blank(flask_asym_re
     assert "UNCLASSIFIED" in gap["reason"] and "CWE-639" in gap["reason"]
 
 
-def test_privileged_and_unguarded_id_routes_are_no_ownership_gap(tmp_path):
+def test_privileged_and_unguarded_id_routes_are_no_ownership_gap(tmp_path: Path) -> None:
     _write(
         tmp_path,
         "app/views.py",
@@ -1401,3 +1401,55 @@ def test_privileged_and_unguarded_id_routes_are_no_ownership_gap(tmp_path):
         "    return ''\n",
     )
     assert _ownership_gaps(_enum(tmp_path)) == []
+
+
+def test_a_test_path_id_route_is_no_ownership_gap(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "tests/app.py",
+        "from flask import Blueprint\n"
+        "from .auth import login_required\n\n"
+        "bp = Blueprint('items', __name__)\n\n"
+        "@bp.route('/items/<id>', methods=['DELETE'])\n"
+        "@login_required\n"
+        "def delete_item(id):\n"
+        "    return ''\n",
+    )
+    result = _enum(tmp_path)
+    assert [r["test_path"] for r in _flask(result)] == [True]
+    assert _ownership_gaps(result) == []
+
+
+def test_session_middleware_alone_is_no_authenticated_ownership_gap(tmp_path: Path) -> None:
+    (tmp_path / "router.go").write_text(
+        "package api\n"
+        "func routes(r chi.Router, a chi.Router) {\n"
+        "\tr.Use(sessionMiddleware)\n"
+        '\tr.Get("/notes/{id}", getNote)\n'
+        "\ta.Use(authMiddleware)\n"
+        '\ta.Get("/items/{id}", getItem)\n'
+        "}\n"
+    )
+    result = _enum(tmp_path)
+    [gap] = _ownership_gaps(result)
+    assert (gap["system"], gap["count"]) == ("go-http ownership", 1)  # only the auth one
+    assert "no ownership reader for this framework yet" in gap["reason"]
+
+
+def test_a_django_re_path_named_group_is_an_id_route(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "app/urls.py",
+        "from django.urls import re_path\n"
+        "from . import views\n"
+        'urlpatterns = [re_path(r"^items/(?P<id>[0-9]+)/$", views.item)]\n',
+    )
+    _write(
+        tmp_path,
+        "app/views.py",
+        "from django.contrib.auth.decorators import login_required\n\n"
+        "@login_required\n"
+        "def item(request, id): ...\n",
+    )
+    [gap] = _ownership_gaps(_enum(tmp_path))
+    assert (gap["system"], gap["count"]) == ("django-drf ownership", 1)

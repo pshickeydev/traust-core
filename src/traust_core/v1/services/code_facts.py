@@ -63,6 +63,7 @@ from traust_core.v1.providers.base import Readiness
 from traust_core.v1.providers.clock import Clock, SystemClock
 from traust_core.v1.providers.crypto_cluster import ClusterCryptoProbe
 from traust_core.v1.providers.crypto_image import ImageCryptoProbe
+from traust_core.v1.providers.route_guards import ownership_gap
 from traust_core.v1.providers.syntax import grammar_readiness
 from traust_core.v1.providers.tools import FactEnumerator, ToolRequest
 from traust_core.v1.services.artifact_publishing import ArtifactPublisher
@@ -107,7 +108,8 @@ def entry_point_coverage(
         CodeFactKind.CONFIG: len(config.triples),
     }
     gaps: dict[CodeFactKind, tuple[CoverageGap, ...]] = {
-        CodeFactKind.ROUTE_GUARD: routes.coverage_gaps,
+        # an ownership gap is about enumerated routes: they are covered
+        CodeFactKind.ROUTE_GUARD: tuple(g for g in routes.coverage_gaps if not ownership_gap(g)),
         CodeFactKind.GRPC_GUARD: grpc.coverage_gaps,
         CodeFactKind.CONFIG: config.coverage_gaps,
     }
