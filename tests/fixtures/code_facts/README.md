@@ -18,3 +18,7 @@ markers, samples, a helm template, vendored and unparseable files). `priv_profil
 is the profile `CodeFactsService.priv_profile` writes for it; on 2026-10-25 it matched
 traust `build_priv_profile.py` (`b48ff14`) field for field, up to list order. Since then a `groups=""`
 marker counts as the core group (controller-gen's reading), so `secrets` get/list are no longer surplus.
+
+`django_flask_matrix_review.json` holds invented Django, DRF and Flask apps (no estate data) from
+blind reviews of the route matrix: routes once missing, guards once shown that don't protect,
+prefixes once wrong, each with the rows it must list now.

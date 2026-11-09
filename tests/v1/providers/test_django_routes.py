@@ -3,7 +3,11 @@ viewsets they register, each view's methods and guards, and what can't be placed
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
+from textwrap import dedent
+
+import pytest
 
 from traust_core.v1.providers.route_guards import route_guards
 from traust_core.v1.providers.tree import tree_files
@@ -426,3 +430,31 @@ def test_settings_are_code_and_guard_only_their_own_project(tmp_path: Path) -> N
     assert rows[("any", "me/")]["scope_guards"] == ["LoginRequiredMiddleware"]
     assert rows[("any", "health/")]["unguard_markers"] == ["login_not_required"]
     assert rows[("any", "invoices/")]["scope_guards"] == []
+
+
+# Invented apps from independent blind reviews of the Django and Flask matrix: routes once
+# missing, guards once shown that don't protect, prefixes once wrong; each with the rows it
+# lists now (family, method, pattern, guards, judged, pattern computed).
+_REVIEW = Path(__file__).parents[2] / "fixtures/code_facts/django_flask_matrix_review.json"
+_CASES = json.loads(_REVIEW.read_text())
+
+
+@pytest.mark.parametrize("case", _CASES, ids=[c["case"] for c in _CASES])
+def test_matrix_holes_a_review_found_stay_closed(tmp_path: Path, case: dict) -> None:
+    for rel, text in case["files"].items():
+        path = tmp_path / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(dedent(text))
+    rows = sorted(
+        [
+            r["family"],
+            r["method"],
+            r["pattern"],
+            sorted({*r["guards"], *r["scope_guards"]}),
+            r["judgement_required"],
+            r["pattern_dynamic"],
+        ]
+        for r in route_guards(tree_files(tmp_path)).model_dump(mode="json")["routes"]
+        if r["family"] in ("django-drf", "flask")
+    )
+    assert rows == case["rows"]
