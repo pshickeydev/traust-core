@@ -235,6 +235,7 @@ def test_local_external_reference_attempt_upgrade_does_not_attribute_old_links(
     with SqlTraustUnitOfWork(engine) as uow:
         seed = Seed(uow)
         link = seed.finding_external_ref()
+        _drop_external_scope_guards(uow.connection)
         uow.connection.exec_driver_sql("DROP INDEX idx_finding_external_ref_assessment")
         uow.connection.exec_driver_sql("ALTER TABLE finding_external_ref DROP COLUMN assessment_id")
         uow.commit()
@@ -247,6 +248,7 @@ def test_local_external_reference_attempt_upgrade_does_not_attribute_old_links(
 def test_configured_external_reference_attempt_upgrade_is_explicit(tmp_path: Path) -> None:
     engine = Context(Config(home=tmp_path)).database
     with engine.begin() as connection:
+        _drop_external_scope_guards(connection)
         connection.exec_driver_sql("DROP INDEX idx_finding_external_ref_assessment")
         connection.exec_driver_sql("ALTER TABLE finding_external_ref DROP COLUMN assessment_id")
     engine.dispose()
@@ -268,13 +270,14 @@ def legacy_attribution_store(request: pytest.FixtureRequest, tmp_path: Path):
     with SqlTraustUnitOfWork(engine) as uow:
         seed = Seed(uow)
         saved = (
-            seed.artifact(assessment_id=None, kind="feed")
+            seed.artifact(assessment_id=None, kind="feed", publication_revision=1)
             if request.param == "publication"
             else seed.spend_event()
         )
         uow.commit()
     with engine.begin() as connection:
         if request.param == "publication":
+            connection.exec_driver_sql("DROP TRIGGER artifact_imported_revision_required")
             connection.exec_driver_sql("DROP INDEX idx_artifact_imported_kind")
             connection.exec_driver_sql("ALTER TABLE artifact DROP COLUMN publication_revision")
             connection.exec_driver_sql(
@@ -332,3 +335,48 @@ def test_partial_spend_upgrade_is_not_silently_accepted(tmp_path: Path) -> None:
     engine.dispose()
     with pytest.raises(ConfigError, match="partial spend metadata"):
         Context(Config(home=tmp_path)).services()
+
+
+def _drop_external_scope_guards(connection: sa.Connection) -> None:
+    for name in (
+        "finding_external_ref_scope_insert",
+        "finding_external_ref_scope_update",
+        "finding_external_ref_finding_scope_update",
+        "finding_external_ref_repository_ref_scope_update",
+    ):
+        connection.exec_driver_sql(f"DROP TRIGGER IF EXISTS {name}")
+
+
+@pytest.mark.parametrize("configured", [False, True])
+@pytest.mark.parametrize("missing", ["index", "guards"])
+def test_partial_tracker_upgrade_is_repaired_locally_or_refused(
+    tmp_path: Path, configured: bool, missing: str
+) -> None:
+    from tests.v1.repositories.tables.conftest import Seed
+    from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
+
+    original = Config(home=tmp_path)
+    engine = Context(original).database
+    with SqlTraustUnitOfWork(engine) as uow:
+        link = Seed(uow).finding_external_ref()
+        if missing == "index":
+            uow.connection.exec_driver_sql("DROP INDEX idx_finding_external_ref_assessment")
+        else:
+            _drop_external_scope_guards(uow.connection)
+        uow.commit()
+    engine.dispose()
+    if configured:
+        selected = Config(
+            home=tmp_path / "elsewhere",
+            database=DatabaseConfig(url=str(original.record_store_url())),
+        )
+        with pytest.raises(ConfigError, match="finding_external_ref_scope_upgrade"):
+            Context(selected).services()
+    else:
+        reopened = Context(original).database
+        with SqlTraustUnitOfWork(reopened) as uow:
+            assert uow.finding_external_refs.get(link.id) == link
+        assert any(
+            index["name"] == "idx_finding_external_ref_assessment"
+            for index in sa.inspect(reopened).get_indexes("finding_external_ref")
+        )

@@ -129,7 +129,8 @@ def test_labels_and_external_refs(seed: Seed) -> None:
 
 def test_external_references_are_scoped_to_exact_assessment(seed: Seed) -> None:
     finding = seed.finding()
-    first, second = seed.assessment(), seed.assessment()
+    repository_ref = seed.repository_ref(seed.uow.repositories.get(finding.repository_id))
+    first, second = seed.assessment(repository_ref), seed.assessment(repository_ref)
     link = seed.finding_external_ref(
         finding,
         system="github",

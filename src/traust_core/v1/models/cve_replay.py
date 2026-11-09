@@ -34,6 +34,7 @@ class CveReplayCandidate(CveReplayAudit):
     advisory_id: str
     aliases: tuple[str, ...] = ()
     published_at: AwareDatetime | None = None
+    withdrawn: bool = Field(default=False, strict=True)
     checked_at: AwareDatetime
     severity: ScannerSeverity
     summary: str
@@ -64,6 +65,16 @@ class CveReplayCandidate(CveReplayAudit):
             raise ValueError("CVE replay presence evidence requires an explicit presence verdict")
         if self.audit_verdict == CveReplayVerdict.MISSED and self.present_at_audit is not True:
             raise ValueError("CVE replay miss requires human-confirmed presence at the audit")
+        if self.audit_verdict == CveReplayVerdict.DETECTED and self.present_at_audit is False:
+            raise ValueError(
+                "CVE replay detection contradicts human-confirmed absence at the audit"
+            )
+        if (
+            self.audit_verdict == CveReplayVerdict.NOT_APPLICABLE
+            and self.present_at_audit is not False
+            and not self.withdrawn
+        ):
+            raise ValueError("CVE replay exclusion requires human-confirmed absence or withdrawal")
         return self
 
     @property
@@ -126,6 +137,7 @@ class CveReplayCandidate(CveReplayAudit):
             advisory_id=str(advisory.display_id),
             aliases=tuple(sorted(identifiers - {str(advisory.display_id)})),
             published_at=advisory.published_at,
+            withdrawn=advisory.withdrawn,
             checked_at=checked_at,
             severity=advisory.severity,
             summary=advisory.summary or advisory.details[:200],

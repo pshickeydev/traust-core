@@ -325,3 +325,8 @@ def database_ddl(dialect: Dialect) -> list[str]:
 def finding_external_ref_assessment_upgrade(dialect: Dialect) -> list[str]:
     """Add nullable attempt scope to external refs without attributing historical links."""
     return storage_sql.finding_external_ref_assessment_upgrade(dialect)
+
+
+def finding_external_ref_scope_upgrade(dialect: Dialect) -> list[str]:
+    """Guard existing assessment-scoped links and repair their missing index."""
+    return storage_sql.finding_external_ref_scope_upgrade(dialect)

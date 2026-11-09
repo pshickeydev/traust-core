@@ -3,16 +3,18 @@ from __future__ import annotations
 from collections.abc import Collection
 from uuid import UUID
 
-from traust_core.v1.errors import ConflictError
+from traust_core.v1.errors import ConflictError, ValidationError
 from traust_core.v1.models.dependencies import AdvisoryMatch
 from traust_core.v1.models.findings import Decision, Finding, FindingExternalRef
 from traust_core.v1.repositories.contract import TraustUnitOfWork
+from traust_core.v1.services.artifact_publishing import AssessmentLog
+from traust_core.v1.services.portfolio import Inventory
 
 
 class FindingRecords:
-    """A finding and its links to other systems, as stored (no fold), on the caller's unit of work:
-    the door services outside findings read and link them through. Needs only the findings uow, so
-    any service can be built with it (attestation and exposure are built without FindingService)."""
+    """A finding and its links to other systems, as stored (no fold), on the caller's unit of work.
+    Unscoped links need only findings; assessment-scoped links also resolve their repository
+    through the assessment and inventory owners."""
 
     def __init__(self, uow: TraustUnitOfWork) -> None:
         self._uow = uow
@@ -57,6 +59,13 @@ class FindingRecords:
     ) -> bool:
         """Link the finding to `system`'s `ref` in the caller's work; False if already linked."""
         with self._uow as uow:
+            if assessment_id is not None:
+                assessment = AssessmentLog(self._uow).get(assessment_id)
+                repository_ref = Inventory(self._uow).get_ref(assessment.repository_ref_id)
+                if repository_ref.repository_id != uow.findings.get(finding_id).repository_id:
+                    raise ValidationError(
+                        "tracker assessment and finding must belong to the same repository"
+                    )
             known = uow.finding_external_refs.list_for_ref(system, ref)
             if same := next((r for r in known if r.finding_id == finding_id), None):
                 if same.assessment_id != assessment_id:

@@ -69,6 +69,57 @@ def test_missing_report_evidence_never_establishes_presence_or_a_miss() -> None:
     assert state.trends().rows == ()
 
 
+def test_named_advisory_can_be_detected_without_human_presence_adjudication() -> None:
+    check = classify("CVE-2026-99901 affects extraction")
+    assert check.audit_verdict == CveReplayVerdict.DETECTED
+    assert check.present_at_audit is None
+    assert check.reviewer is check.presence_identity_source is check.presence_evidence is None
+    assert check.matched_advisory_ids == ("CVE-2026-99901",)
+
+
+@pytest.mark.parametrize("withdrawn", [False, True])
+@pytest.mark.parametrize(
+    ("verdict", "presence", "valid"),
+    [
+        (CveReplayVerdict.DETECTED, None, True),
+        (CveReplayVerdict.DETECTED, True, True),
+        (CveReplayVerdict.DETECTED, False, False),
+        (CveReplayVerdict.UNCLEAR, None, True),
+        (CveReplayVerdict.UNCLEAR, True, True),
+        (CveReplayVerdict.UNCLEAR, False, True),
+        (CveReplayVerdict.MISSED, None, False),
+        (CveReplayVerdict.MISSED, True, True),
+        (CveReplayVerdict.MISSED, False, False),
+        (CveReplayVerdict.NOT_APPLICABLE, None, False),
+        (CveReplayVerdict.NOT_APPLICABLE, True, False),
+        (CveReplayVerdict.NOT_APPLICABLE, False, True),
+    ],
+)
+def test_raw_replay_verdict_presence_combinations(
+    verdict: CveReplayVerdict, presence: bool | None, valid: bool, withdrawn: bool
+) -> None:
+    values = classify().model_dump()
+    values["withdrawn"] = withdrawn
+    if verdict == CveReplayVerdict.NOT_APPLICABLE and withdrawn:
+        valid = True
+    values.update(audit_verdict=verdict, present_at_audit=presence)
+    if presence is not None:
+        values.update({key: value for key, value in PRESENCE.items() if key != "present_at_audit"})
+    if valid:
+        check = CveReplayCandidate.model_validate(values)
+        assert check.present_at_audit is presence
+        assert check.audit_verdict == verdict
+    else:
+        with pytest.raises(ValidationError):
+            CveReplayCandidate.model_validate(values)
+
+
+def test_confirmed_absence_takes_precedence_over_a_named_advisory() -> None:
+    check = classify("CVE-2026-99901 affects extraction", **{**PRESENCE, "present_at_audit": False})
+    assert check.audit_verdict == CveReplayVerdict.NOT_APPLICABLE
+    assert check.present_at_audit is False
+
+
 @pytest.mark.parametrize("presence", [True, False])
 def test_presence_verdict_requires_both_human_identity_and_evidence(presence: bool) -> None:
     for fields in ({}, {"reviewer": "human:reviewer"}, {"presence_evidence": "source evidence"}):
@@ -87,7 +138,37 @@ def test_human_absence_and_withdrawn_advisories_never_enter_queue_or_trends() ->
     )
     state = CveReplayState(checks=(absent, withdrawn))
     assert absent.audit_verdict == withdrawn.audit_verdict == CveReplayVerdict.NOT_APPLICABLE
+    assert withdrawn.withdrawn is True
+    assert absent.withdrawn is False
     assert state.candidates().candidates == state.trends().rows == ()
+
+
+@pytest.mark.parametrize("presence", [None, True, False])
+def test_source_withdrawal_preserves_unknown_and_human_adjudicated_presence(
+    presence: bool | None,
+) -> None:
+    fields = {} if presence is None else {**PRESENCE, "present_at_audit": presence}
+    check = CveReplayCandidate.classify(
+        AUDIT,
+        "",
+        parse_osv(json.dumps(advisory(withdrawn="2026-11-03T00:00:00Z")).encode(), "osv"),
+        NOW,
+        **fields,
+    )
+    assert check.audit_verdict == CveReplayVerdict.NOT_APPLICABLE
+    assert check.present_at_audit is presence
+    assert check.withdrawn is True
+    assert CveReplayCandidate.model_validate_json(check.model_dump_json()) == check
+    assert not check.queue_eligible
+    assert not check.trend_eligible
+
+
+@pytest.mark.parametrize("withdrawn", [None, "true", 1])
+def test_withdrawal_provenance_rejects_non_boolean_values(withdrawn: object) -> None:
+    values = classify().model_dump()
+    values["withdrawn"] = withdrawn
+    with pytest.raises(ValidationError):
+        CveReplayCandidate.model_validate(values)
 
 
 def test_alias_republication_is_idempotent_and_human_adjudication_can_correct_presence() -> None:
