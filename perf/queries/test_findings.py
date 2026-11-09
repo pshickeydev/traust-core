@@ -231,6 +231,7 @@ def test_review_cases_batch_current_context_and_history_by_index(
     engine: sa.Engine, explained: Profile
 ) -> None:
     observed = {}
+
     def queue(uow: SqlTraustUnitOfWork) -> None:
         policy = ReviewPolicy()
         decisions = FindingDecisions(
@@ -263,12 +264,8 @@ def test_review_cases_batch_current_context_and_history_by_index(
     with SqlTraustUnitOfWork(engine) as unit:
         expected = unit.decisions.list_for_findings(list(observed))
     assert {
-        finding_id: {item.id for item in history}
-        for finding_id, history in observed.items()
-    } == {
-        finding_id: {item.id for item in history}
-        for finding_id, history in expected.items()
-    }
+        (finding_id, item.id) for finding_id, history in observed.items() for item in history
+    } == {(item.finding_id, item.id) for item in expected}
     fast(on(got, "review_item"), "idx_review_item_pending", 20)
     fast(on(got, "finding"), "finding_pkey", 10)
     fast(on(got, "decision"), None, 10)
