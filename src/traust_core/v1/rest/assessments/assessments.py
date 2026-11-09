@@ -66,6 +66,15 @@ def list_repository_assessments(
     return assessments.list_for_repository(repository_id, kind)
 
 
+@router.get(
+    "/v1/repositories/{repository_id}/assessments/latest", responses=PROBLEMS(401, 404, 422)
+)
+def get_latest_recorded_assessment(
+    repository_id: UUID, kind: AssessmentKind, assessments: Assessments, _: Caller
+) -> Assessment:
+    return assessments.latest_recorded(repository_id, kind)
+
+
 @router.get("/v1/orders/{order_id}/assessments", responses=PROBLEMS(401))
 def list_order_assessments(order_id: UUID, assessments: Assessments, _: Caller) -> list[Assessment]:
     """What a run order recorded, oldest first: how a consumer finds a finished order's results."""

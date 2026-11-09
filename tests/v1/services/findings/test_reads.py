@@ -15,7 +15,7 @@ from sqlalchemy.engine import Engine
 
 from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import Seed
-from traust_core.v1.errors import NotFoundError
+from traust_core.v1.errors import ConflictError, NotFoundError
 from traust_core.v1.models.findings import Finding, FindingState, RecordDecision
 from traust_core.v1.models.identity import IdentitySource, Principal
 from traust_core.v1.models.inventory import Repository, RepositoryRef
@@ -139,6 +139,70 @@ def test_get_undecided_finding_is_rated_by_its_report_with_a_deadline(engine: En
 def test_get_unknown_finding_is_not_found(engine: Engine) -> None:
     with pytest.raises(NotFoundError):
         service(engine).get(uuid4())
+
+
+@pytest.mark.parametrize("with_algorithm", [False, True])
+def test_get_by_fingerprint_returns_the_same_rich_view_without_changing_opaque_identity(
+    engine: Engine, with_algorithm: bool
+) -> None:
+    a = audited(engine, severity="critical")
+    opaque = " legacy:/A+B?x=%2F &Ω "
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        finding = uow.findings.update(a.finding.model_copy(update={"fingerprint": opaque}))
+        other = seed.repository(url="https://forge.example/other-fingerprint-repository")
+        seed.finding(other, fingerprint=opaque, fingerprint_algo=finding.fingerprint_algo)
+        seed.finding(a.repository, fingerprint=opaque.strip())
+        seed.finding(a.repository, fingerprint=opaque.lower())
+        seed.finding_cwe(finding, seed.cwe(identifier="CWE-89"))
+        seed.finding_label(finding, taxonomy="attack", label="T1190")
+        uow.commit()
+    svc = service(engine)
+    algorithm = finding.fingerprint_algo if with_algorithm else None
+    found = svc.get_by_fingerprint(a.repository.id, opaque, algorithm)
+    assert found == svc.get(finding.id)
+    assert found.finding.fingerprint == opaque
+    assert found.effective_severity is Severity.CRITICAL
+    assert found.occurrence is not None
+    assert found.cwes == ("CWE-89",)
+    assert found.labels
+
+
+def test_get_by_fingerprint_refuses_ambiguity_but_an_explicit_algorithm_resolves_it(
+    engine: Engine,
+) -> None:
+    a = audited(engine)
+    with SqlTraustUnitOfWork(engine) as uow:
+        other = Seed(uow).finding(
+            a.repository, fingerprint=a.finding.fingerprint, fingerprint_algo="other"
+        )
+        uow.commit()
+    svc = service(engine)
+    with pytest.raises(ConflictError):
+        svc.get_by_fingerprint(a.repository.id, a.finding.fingerprint)
+    assert svc.get_by_fingerprint(
+        a.repository.id, a.finding.fingerprint, a.finding.fingerprint_algo
+    ) == svc.get(a.finding.id)
+    assert svc.get_by_fingerprint(
+        a.repository.id, a.finding.fingerprint, other.fingerprint_algo
+    ) == svc.get(other.id)
+
+
+@pytest.mark.parametrize("missing", ["repository", "fingerprint", "algorithm", "other-repository"])
+def test_get_by_fingerprint_reports_missing_exact_identity(engine: Engine, missing: str) -> None:
+    a = audited(engine)
+    with SqlTraustUnitOfWork(engine) as uow:
+        empty = Seed(uow).repository(url="https://forge.example/empty-fingerprint-repository")
+        uow.commit()
+    repository_id = a.repository.id
+    if missing == "repository":
+        repository_id = uuid4()
+    elif missing == "other-repository":
+        repository_id = empty.id
+    fingerprint = "missing" if missing == "fingerprint" else a.finding.fingerprint
+    algorithm = "missing" if missing == "algorithm" else None
+    with pytest.raises(NotFoundError):
+        service(engine).get_by_fingerprint(repository_id, fingerprint, algorithm)
 
 
 def test_latest_report_rates_it_and_the_first_starts_the_clock(engine: Engine) -> None:

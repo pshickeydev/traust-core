@@ -64,6 +64,41 @@ def test_latest_of_a_kind_and_status_across_refs(seed: Seed) -> None:
     assert u.assessments.latest_for_refs([other.id], "triage", "completed") is None
 
 
+def test_latest_across_refs_matches_any_requested_kind_and_status(seed: Seed) -> None:
+    repo = seed.uow.assessments
+    first, second, other = (seed.repository_ref() for _ in range(3))
+    scope = [first.id, second.id]
+    kinds, statuses = ["audit", "audit-legacy"], ["completed", "degraded"]
+    assert repo.latest_for_refs(scope, kinds, statuses) is None
+    seed.assessment(first, kind="audit", occurred_at=T0)
+    newest = seed.assessment(
+        second, kind="audit-legacy", status="degraded", occurred_at=T0 + timedelta(days=1)
+    )
+    for status in ("pending", "failed", "future-status"):
+        seed.assessment(first, status=status, occurred_at=T0 + timedelta(days=2))
+    seed.assessment(first, kind="threat_model", occurred_at=T0 + timedelta(days=3))
+    seed.assessment(other, occurred_at=T0 + timedelta(days=4))
+    assert repo.latest_for_refs(scope, kinds, statuses) == newest
+    assert repo.latest_for_refs([], kinds, statuses) is None
+    assert repo.latest_for_refs(scope, [], statuses) is None
+    assert repo.latest_for_refs(scope, kinds, []) is None
+
+
+def test_latest_across_refs_breaks_time_ties_by_created_at_then_id(seed: Seed) -> None:
+    ref = seed.repository_ref()
+    assert ref.id is not None
+    recorded_at(seed, ref.id, T0 + timedelta(seconds=1), count=3)
+    recorded_at(seed, ref.id, T0, count=3)
+    rows = seed.uow.assessments.list_for_ref(ref.id)
+    expected = max(rows, key=lambda row: (row.created_at, row.id))
+    assert (
+        seed.uow.assessments.latest_for_refs(
+            [ref.id], ["audit", "audit-legacy"], ["completed", "degraded"]
+        )
+        == expected
+    )
+
+
 def test_latest_per_ref_of_kinds_and_status(seed: Seed) -> None:
     u = seed.uow
     a, b, quiet = seed.repository_ref(), seed.repository_ref(), seed.repository_ref()

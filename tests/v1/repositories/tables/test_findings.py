@@ -8,6 +8,7 @@ from uuid import uuid4
 import pytest
 
 from tests.v1.repositories.tables.conftest import T0, Seed, apart, same_rows
+from traust_core.v1.errors import ConflictError
 from traust_core.v1.models.findings import Finding
 from traust_core.v1.models.vocabulary import Validity
 
@@ -21,6 +22,34 @@ def test_finding_identity_is_per_repository_and_recipe(seed: Seed) -> None:
     assert u.findings.find_by_fingerprint(repo.id, "v3", "abc") == finding
     assert u.findings.find_by_fingerprint(repo.id, "v2", "abc") is None
     assert len(u.findings.list_for_repository(repo.id)) == 2
+
+
+def test_fingerprint_lookup_without_an_algorithm_preserves_opaque_identity(seed: Seed) -> None:
+    repo, other = seed.repository(), seed.repository()
+    opaque = " legacy:/A+B?x=%2F &Ω "
+    finding = seed.finding(repo, fingerprint=opaque, fingerprint_algo="legacy")
+    seed.finding(other, fingerprint=opaque, fingerprint_algo="other")
+    seed.finding(repo, fingerprint=opaque.strip(), fingerprint_algo="legacy")
+    seed.finding(repo, fingerprint=opaque.lower(), fingerprint_algo="legacy")
+    lookup = seed.uow.findings.find_by_fingerprint
+    assert lookup(repo.id, None, opaque) == finding
+    assert lookup(repo.id, "legacy", opaque) == finding
+    assert lookup(repo.id, "other", opaque) is None
+    assert lookup(repo.id, None, "missing") is None
+    assert lookup(uuid4(), None, opaque) is None
+
+
+def test_fingerprint_lookup_refuses_cross_algorithm_ambiguity(seed: Seed) -> None:
+    repo = seed.repository()
+    matches = [
+        seed.finding(repo, fingerprint="shared", fingerprint_algo=algorithm)
+        for algorithm in ("v1", "v2", "v3")
+    ]
+    lookup = seed.uow.findings.find_by_fingerprint
+    with pytest.raises(ConflictError):
+        lookup(repo.id, None, "shared")
+    for finding in matches:
+        assert lookup(repo.id, finding.fingerprint_algo, finding.fingerprint) == finding
 
 
 def test_findings_known_as_an_advisory(seed: Seed) -> None:

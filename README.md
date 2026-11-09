@@ -27,6 +27,8 @@ All modules live under `traust_core.v1` (see [Versioning](#versioning)).
 | **Explicit recording starts** | `rest.ops`, `services.operations` | `POST /v1/orders/start`: `StartRecordingRequest` (`order`, `lease_seconds`) → `OpsService.start_recording` → existing `OpsService.start` → native leased `RunOrder`; verified machine identity and server-owned principal/asset/repository capabilities, no request-supplied worker | a second queue, machine approval, caller-promised recording permissions |
 | **Authored secure-code records** | `rest.assessments`, `services.assessment` | `POST /v1/assessment-records`: `AssessmentRecordRequest` → `AssessmentService.record_secure_code` → exact canonical report, native assessment/artifact IDs and unjudged `IntakeResult` from existing finding intake | scanner relabeling, report-authored validity decisions, changing plain `record` |
 | **Assessment intake bindings** | `rest.assessments`, `services.assessment`, `services.findings.decisions` | Authenticated `GET /v1/assessments/{assessment_id}/intake` → mapping-only `AssessmentIntakeBindings`; digest-verified secure-code report labels or triage row labels resolve only through their owner and assessment/baseline occurrence scope | receipt-trusted UUIDs, manufactured creation history, source-title matching |
+| **Latest recorded assessment** | `rest.assessments`, `services.assessment` | Authenticated `GET /v1/repositories/{repository_id}/assessments/latest?kind=…` → `AssessmentService.latest_recorded` → one typed `Assessment`: newest completed or degraded result across all refs and kind aliases; required kind, 404 for no match or unknown repository | consumer-side assessment-history walks, pending or failed results replacing recorded evidence |
+| **Exact finding identity read** | `rest.findings`, `services.findings` | Authenticated `GET /v1/repositories/{repository_id}/findings/by-fingerprint?fingerprint=…&fingerprint_algo=…` → `FindingService.get_by_fingerprint` → typed `FindingView`; opaque exact fingerprint required, algorithm optional; 404 for an absent match or unknown repository, 409 when an omitted algorithm is ambiguous | consumer-side finding-history walks, title/ordinal matches, silently picking one algorithm |
 | **Artifact reads** | `rest.artifacts`, `services.artifact_publishing` | Authenticated `GET /v1/artifacts/{artifact_id}` → native `Artifact` metadata; `GET /v1/artifacts/{artifact_id}/content` → digest-verified original bytes through `ArtifactPublisher.metadata` / `payload` | consumer report reserialization, obsolete SDK schema revalidation, direct object/database access |
 | **Verification records** | `rest.remediation` | `POST /v1/verification-records`: exact UTF-8 report text, native `Provenance`, and `run_order_id` → `VerificationService.record_order` → native `Verification`; a verified machine must own a live lease for the report repository and a server-allowed verification asset | event envelopes, caller-supplied actor/signer, human countersigns |
 | **Remediation records** | `rest.remediation`, `services.remediation` | `POST /v1/remediation-records`: exact report bytes, provenance and a live `remediate_finding` lease; the order's named work item scopes recording and replay | accepting a different attempt or a triage lease as remediation authority |
@@ -792,6 +794,15 @@ Repositories are real; services are mostly stubs. Every stub raises `NotImplemen
 
 Insight (dashboards) has no repository: views read services and render.
 
+`AssessmentService.latest_recorded(repository_id, kind)` returns the newest completed or
+degraded assessment across the repository's refs, normalizing historical kind aliases.
+`GET /v1/repositories/{repository_id}/assessments/latest?kind=<AssessmentKind>` exposes the
+same typed `Assessment` (`get_latest_recorded_assessment` / SDK `GetLatestRecordedAssessment`).
+The kind is required; an unknown repository or no recorded match returns 404, and reads
+require the usual authenticated caller. Pending, failed and unknown statuses are excluded.
+The scoped assessment query returns at most one row, ordered by `occurred_at`, `created_at`
+and `id` descending; consumers need not fetch or walk assessment history.
+
 Direct human judgements use `services.findings.decisions.decide(RecordDecision(...), principal)`.
 Authenticate with `services.identity.authenticate(Credential(token=...))`; the service requires a
 verified human, derives the actor from that principal and supplies the clock time when omitted.
@@ -816,6 +827,15 @@ Unrated or unreported findings have `effective_severity=None`; only a reported o
 rating supplies a severity. `review_surfaces(repository_id, as_of=None)` merges the latest
 audit with later scans and keeps a surface open until its findings are affirmatively closed.
 Closing one review item does not bypass the finding's evidence-strength or independent-review gates.
+
+`FindingService.get_by_fingerprint(repository_id, fingerprint, fingerprint_algo=None)` resolves
+opaque fingerprints exactly, without trimming, recomputing identity or matching titles.
+`GET /v1/repositories/{repository_id}/findings/by-fingerprint` exposes the same `FindingView`
+through `get_finding_by_fingerprint` / SDK `GetFindingByFingerprint`. The identity query reads
+at most two matching rows and refuses ambiguous algorithms with 409. Supplying the algorithm
+uses the complete existing identity key; omitting it can examine more entries within the
+repository's index scope. Hydrating the selected view retains the normal per-finding
+history and context reads, rather than bounding all related records to two.
 
 `summary` and `timeline` retain unknown open findings in the registered `unrated`
 bucket of `open_by_severity` (including JSON output), while their individual effective

@@ -11,7 +11,7 @@ import sqlalchemy as sa
 from perf.conftest import Clocked
 from perf.harness import Explained, Profile
 from perf.seed import DECISIONS, HOT_REPOSITORY, REPOSITORIES, TYPICAL_REPOSITORY
-from traust_core.v1.errors import NotFoundError
+from traust_core.v1.errors import ConflictError, NotFoundError
 from traust_core.v1.models.common import PageRequest
 from traust_core.v1.models.findings import (
     Decision,
@@ -54,6 +54,65 @@ ADMIN = Principal(
     roles=frozenset({Role.RESTATE}),
 )
 N = DECISIONS // 2 + 1  # a typical repository's finding (every 25th is the hot one's)
+
+
+@pytest.mark.parametrize("repository_url", [TYPICAL_REPOSITORY, HOT_REPOSITORY])
+@pytest.mark.parametrize("with_algorithm", [False, True])
+def test_exact_fingerprint_lookup_is_nonempty_and_index_scoped_at_volume(
+    engine: sa.Engine,
+    explained: Profile,
+    repository_url: str,
+    with_algorithm: bool,
+) -> None:
+    with SqlTraustUnitOfWork(engine) as unit:
+        repository = unit.repositories.find_by_url(repository_url)
+        assert repository is not None and repository.id is not None
+        table = unit.findings.table
+        expected = unit.connection.execute(
+            sa.select(table.c.id, table.c.fingerprint, table.c.fingerprint_algo)
+            .where(table.c.repository_id == repository.id)
+            .limit(1)
+        ).one()
+
+    def lookup(unit: SqlTraustUnitOfWork) -> None:
+        found = unit.findings.find_by_fingerprint(
+            repository.id,
+            expected.fingerprint_algo if with_algorithm else None,
+            expected.fingerprint,
+        )
+        assert found is not None and found.id == expected.id
+        assert found.fingerprint == expected.fingerprint
+        assert found.fingerprint_algo == expected.fingerprint_algo
+
+    (statement,) = explained(lookup)
+    fast(statement, "finding_repository_id_fingerprint_algo_fingerprint_key", 25)
+    assert statement.plan[0].startswith("Limit "), statement.plan
+
+
+def test_ambiguous_fingerprint_lookup_reads_only_two_matches_at_volume(
+    engine: sa.Engine, explained: Profile
+) -> None:
+    with SqlTraustUnitOfWork(engine) as unit:
+        original = _finding(unit)
+
+    def lookup(unit: SqlTraustUnitOfWork) -> None:
+        for algorithm in ("perf-alternate-1", "perf-alternate-2"):
+            unit.findings.add(
+                original.model_copy(
+                    update={
+                        "id": None,
+                        "created_at": None,
+                        "updated_at": None,
+                        "fingerprint_algo": algorithm,
+                    }
+                )
+            )
+        with pytest.raises(ConflictError):
+            unit.findings.find_by_fingerprint(original.repository_id, None, original.fingerprint)
+
+    _, _, statement = explained(lookup)
+    fast(statement, "finding_repository_id_fingerprint_algo_fingerprint_key", 25)
+    assert statement.plan[0].startswith("Limit "), statement.plan
 
 
 def test_statement_resend_is_idempotent_at_volume(explained: Profile) -> None:

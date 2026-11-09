@@ -143,6 +143,20 @@ class FindingService:
             (view,) = self._views.views(uow, [uow.findings.get(finding_id)])
         return view
 
+    def get_by_fingerprint(
+        self, repository_id: UUID, fingerprint: str, fingerprint_algo: str | None = None
+    ) -> FindingView:
+        """Resolve an exact fingerprint, refusing ambiguity when its algorithm is omitted."""
+        self._inventory.get_repository(repository_id)
+        with self._uow as uow:
+            found = uow.findings.find_by_fingerprint(repository_id, fingerprint_algo, fingerprint)
+            if found is None:
+                raise NotFoundError(
+                    f"finding with fingerprint {fingerprint!r} for repository {repository_id}"
+                )
+            (view,) = self._views.views(uow, [found])
+        return view
+
     def list_by_ids(
         self, finding_ids: Collection[UUID], *, read_budget: RecordBudget | None = None
     ) -> list[FindingView]:

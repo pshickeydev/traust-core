@@ -52,7 +52,10 @@ class AssessmentRepository(RecordRepository[Assessment], Protocol):
         as_of: datetime | None = None,
     ) -> Assessment | None: ...
     def latest_for_refs(
-        self, repository_ref_ids: Collection[UUID], kind: str, status: str
+        self,
+        repository_ref_ids: Collection[UUID],
+        kind: str | Collection[str],
+        status: str | Collection[str],
     ) -> Assessment | None: ...
     def latest_per_ref(
         self, repository_ref_ids: Collection[UUID], kinds: Collection[str], status: str
@@ -148,7 +151,10 @@ class SqlAssessmentRepository(SqlAppendOnlyRepository[Assessment]):
         return None if row is None else self._to_record(row)
 
     def latest_for_refs(
-        self, repository_ref_ids: Collection[UUID], kind: str, status: str
+        self,
+        repository_ref_ids: Collection[UUID],
+        kind: str | Collection[str],
+        status: str | Collection[str],
     ) -> Assessment | None:
         if not repository_ref_ids:
             return None
@@ -157,8 +163,8 @@ class SqlAssessmentRepository(SqlAppendOnlyRepository[Assessment]):
             self._select()
             .where(
                 c.repository_ref_id.in_(list(repository_ref_ids)),
-                c.kind == kind,
-                c.status == status,
+                c.kind.in_([kind] if isinstance(kind, str) else kind),
+                c.status.in_([status] if isinstance(status, str) else status),
             )
             .order_by(c.occurred_at.desc(), c.created_at.desc(), c.id.desc())
             .limit(1)
