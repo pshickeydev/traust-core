@@ -227,7 +227,10 @@ def test_pending_review_cursor_pages_through_tied_timestamps(explained: Profile)
     fast(second, "idx_review_item_pending", 20)
 
 
-def test_review_cases_batch_current_context_and_history_by_index(explained: Profile) -> None:
+def test_review_cases_batch_current_context_and_history_by_index(
+    engine: sa.Engine, explained: Profile
+) -> None:
+    observed = {}
     def queue(uow: SqlTraustUnitOfWork) -> None:
         policy = ReviewPolicy()
         decisions = FindingDecisions(
@@ -247,15 +250,25 @@ def test_review_cases_batch_current_context_and_history_by_index(explained: Prof
         )
         assert len(page.items) == 100 and page.next is not None
         assert all(
-            len(case.history) == 1
-            and case.review_item.finding_id == case.finding.finding.id == case.history[0].finding_id
+            case.review_item.finding_id == case.finding.finding.id
+            and all(item.finding_id == case.finding.finding.id for item in case.history)
             for case in page.items
         )
+        observed.update({case.finding.finding.id: case.history for case in page.items})
         reported = [case for case in page.items if case.finding.occurrence is not None]
         assert reported
         assert all(case.finding.locations and case.finding.cwes for case in reported)
 
     got = explained(queue)
+    with SqlTraustUnitOfWork(engine) as unit:
+        expected = unit.decisions.list_for_findings(list(observed))
+    assert {
+        finding_id: {item.id for item in history}
+        for finding_id, history in observed.items()
+    } == {
+        finding_id: {item.id for item in history}
+        for finding_id, history in expected.items()
+    }
     fast(on(got, "review_item"), "idx_review_item_pending", 20)
     fast(on(got, "finding"), "finding_pkey", 10)
     fast(on(got, "decision"), None, 10)
