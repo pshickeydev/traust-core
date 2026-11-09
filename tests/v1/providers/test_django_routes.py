@@ -110,6 +110,7 @@ def test_a_router_expands_to_list_detail_and_action_routes(tmp_path: Path) -> No
     )
     rows = _rows(tmp_path)
     assert set(rows) == {
+        ("GET", "api/"),  # DefaultRouter's API root view
         ("GET", "api/notes/"),
         ("GET", "api/notes/<slug>/"),
         ("POST", "api/notes/<slug>/share/"),
@@ -313,3 +314,114 @@ def test_viewset_mappings_and_nested_routers(tmp_path: Path) -> None:
     }
     assert rows[("GET", "mine/<int:pk>/")]["guards"] == ["IsAuthenticated"]
     assert rows[("DELETE", "notes/<note_pk>/comments/<pk>/")]["guards"] == []
+
+
+def test_permissions_are_read_per_method_and_in_method_resolution_order(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        {
+            "app/urls.py": (
+                "from django.urls import path\nfrom . import views\n"
+                "urlpatterns = [\n"
+                '    path("a/", views.A.as_view()),\n'
+                '    path("b/", views.B.as_view()),\n'
+                '    path("c/", views.C.as_view()),\n'
+                '    path("d/", views.D.as_view(permission_classes=[AllowAny])),\n'
+                '    path("e/", views.E.as_view()),\n'
+                "]\n"
+            ),
+            "app/views.py": (
+                "from django.contrib.auth.mixins import LoginRequiredMixin\n"
+                "from django.views import View\n"
+                "from rest_framework.views import APIView\n"
+                "class A(APIView):\n"
+                "    permission_classes = [IsAuthenticatedOrReadOnly]\n"
+                "    def get(self, request): ...\n"
+                "    def post(self, request): ...\n"
+                "class B(APIView):\n"
+                "    permission_classes = [IsAuthenticated | ReadOnly]\n"
+                "    def get(self, request): ...\n"
+                "class C(View, LoginRequiredMixin):\n"  # View.dispatch runs first
+                "    def get(self, request): ...\n"
+                "class D(APIView):\n"
+                "    permission_classes = [IsAuthenticated]\n"
+                "    def get(self, request): ...\n"
+                "class E(APIView):\n"
+                "    permission_classes = [IsAuthenticated]\n"
+                "    def get_permissions(self): ...\n"
+                "    def get(self, request): ...\n"
+            ),
+        },
+    )
+    rows = _rows(tmp_path)
+    assert rows[("GET", "a/")]["unguard_markers"] == ["IsAuthenticatedOrReadOnly"]
+    assert rows[("POST", "a/")]["guards"] == ["IsAuthenticatedOrReadOnly"]
+    assert rows[("GET", "b/")]["judgement_required"]
+    assert rows[("GET", "c/")]["guards"] == [] and rows[("GET", "c/")]["judgement_required"]
+    assert rows[("GET", "d/")]["unguard_markers"] == ["AllowAny"]  # as_view initkwargs
+    assert rows[("GET", "e/")]["unguard_markers"] == ["get_permissions"]
+
+
+def test_drf_policy_decorators_count_only_below_api_view(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        {
+            "app/urls.py": (
+                "from django.urls import path\nfrom . import views\n"
+                'urlpatterns = [path("a/", views.a), path("b/", views.b), path("c/", views.c)]\n'
+            ),
+            "app/views.py": (
+                "from rest_framework.decorators import api_view, permission_classes\n"
+                "@permission_classes([IsAuthenticated])\n"
+                '@api_view(["GET"])\n'
+                "def a(request): ...\n"
+                '@api_view(["GET"])\n'
+                "@permission_classes([IsAuthenticated])\n"
+                "def b(request): ...\n"
+                '@api_view(["POST"])\n'
+                "@permission_classes([])\n"
+                "@extend_schema(request=LoginSerializer)\n"
+                "def c(request): ...\n"
+            ),
+        },
+    )
+    rows = _rows(tmp_path)
+    assert rows[("GET", "a/")]["guards"] == [] and rows[("GET", "a/")]["judgement_required"]
+    assert rows[("GET", "b/")]["guards"] == ["IsAuthenticated"]
+    assert rows[("POST", "c/")]["guards"] == [] and rows[("POST", "c/")]["judgement_required"]
+
+
+def test_settings_are_code_and_guard_only_their_own_project(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        {
+            "accounts/settings.py": (
+                'ROOT_URLCONF = "accounts.urls"\n'
+                "MIDDLEWARE = ['django.contrib.auth.middleware.LoginRequiredMiddleware']\n"
+            ),
+            "accounts/urls.py": (
+                "from django.urls import path\nfrom . import views\n"
+                'urlpatterns = [path("me/", views.me), path("health/", views.health)]\n'
+            ),
+            "accounts/views.py": (
+                "from django.contrib.auth.decorators import login_not_required\n"
+                "def me(request): ...\n"
+                "@login_not_required\n"
+                "def health(request): ...\n"
+            ),
+            "billing/settings.py": (
+                'ROOT_URLCONF = "billing.urls"\n'
+                "# MIDDLEWARE = ['django.contrib.auth.middleware.LoginRequiredMiddleware']\n"
+                "MIDDLEWARE = []\n"
+            ),
+            "billing/urls.py": (
+                "from django.urls import path\nfrom . import views\n"
+                'urlpatterns = [path("invoices/", views.invoices)]\n'
+            ),
+            "billing/views.py": "def invoices(request): ...\n",
+        },
+    )
+    rows = _rows(tmp_path)
+    assert rows[("any", "me/")]["scope_guards"] == ["LoginRequiredMiddleware"]
+    assert rows[("any", "health/")]["unguard_markers"] == ["login_not_required"]
+    assert rows[("any", "invoices/")]["scope_guards"] == []

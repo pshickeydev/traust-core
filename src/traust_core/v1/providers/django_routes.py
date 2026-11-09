@@ -11,12 +11,12 @@ from dataclasses import dataclass, field, replace
 
 from traust_core.v1.models.code_facts import RouteFamily
 from traust_core.v1.providers.route_guards import (
-    _DRF_DEFAULTS,
     _const_str,
     _dotted,
     _guards_in,
     _mark,
     _PyIndex,
+    _resolve_import,
     _Row,
     _row,
     _unguards_in,
@@ -55,6 +55,9 @@ _VIEWSET_ACTIONS = {
     "DestroyModelMixin": ("destroy",),
 }
 _LIST_ACTIONS = {"list": "GET", "create": "POST"}
+_ALL_ACTIONS = _VIEWSET_ACTIONS["ModelViewSet"]
+# library bases that answer no action of their own
+_NO_ACTIONS = {"GenericViewSet", "ViewSet", "ViewSetMixin", "GenericAPIView", "APIView", "object"}
 _DETAIL_ACTIONS = {
     "retrieve": "GET",
     "update": "PUT",
@@ -72,6 +75,24 @@ _DRF_BASES = re.compile(r"APIView|ViewSet")
 # CSRF protection (and its exemption) is about forged browser requests, and the method decorators
 # about verbs: neither says who the caller is
 _NOT_GUARDS = re.compile(r"(?i)csrf|^require_(GET|POST|safe|http_methods)$")
+# decorators that set how a view runs, not who may call it
+_INERT_DECORATORS = re.compile(
+    r"^(api_view|action|detail_route|list_route|cache_page|cache_control|never_cache|vary_on_\w+|"
+    r"condition|etag|last_modified|sensitive_\w+|xframe_options_\w+|gzip_page|atomic|"
+    r"non_atomic_requests|extend_schema\w*|swagger_auto_schema|ensure_csrf_cookie)$"
+)
+# DRF's policy decorators: what they name is read as a permission list, or not at all
+_POLICY_DECORATORS = {
+    "permission_classes", "authentication_classes", "throttle_classes", "renderer_classes",
+    "parser_classes", "schema", "versioning_class", "metadata_class",
+}  # fmt: skip
+_PERMISSION_METHODS = {"get_permissions", "check_permissions"}
+# a library view: its `dispatch` runs before any mixin after it in the method order
+_LIBRARY_VIEW = re.compile(r"(View|ViewSet)$")
+# permissions that admit any caller, or any caller to read
+_ANONYMOUS = re.compile(r"^(AllowAny|IsAnonymous\w*)$")
+_READ_ONLY = re.compile(r"(^|Or)(Anon)?ReadOnly$")
+_SAFE = {"GET", "HEAD", "OPTIONS", "any"}
 
 
 @dataclass
@@ -81,7 +102,8 @@ class _View:
     methods: list[tuple[str, str, ast.AST | None]]
     guards: list[str]
     unguards: list[str]
-    has_permissions: bool
+    # its permission classes, each read per method; None: DRF's defaults apply to a DRF view
+    permissions: list[ast.AST] | None
     drf: bool = False
     # the methods whose own decorators guard them: a class view's, not a function view's
     methods_of: set[str] = field(default_factory=set)
@@ -90,31 +112,106 @@ class _View:
 
 
 @dataclass
+class _Router:
+    """A DRF router: what is registered on it, and where it sits."""
+
+    registered: list[tuple[str, ast.Call]] = field(default_factory=list)
+    extends: list[tuple[str, str]] = field(default_factory=list)
+    # a nested router's parent and the part of its routes the parent adds
+    parent: tuple[tuple[str, str] | None, str] | None = None
+    default: bool = False
+    slash: str = "/"
+    dynamic: bool = False
+
+
+@dataclass
 class _Django:
     index: _PyIndex
     consts: dict[str, str]
-    defaults: list[str] = field(default_factory=list)
-    middleware: list[str] = field(default_factory=list)
-    root: str | None = None
+    # the settings guards of the root urlconf being mounted
+    current: tuple[list[str], list[ast.AST]] = ([], [])
     rows: list[_Row] = field(default_factory=list)
     included: set[str] = field(default_factory=set)
     mounted: set[str] = field(default_factory=set)
     seen: set[int] = field(default_factory=set)
     trees: dict[str, ast.Module] = field(default_factory=dict)
     _lists: dict[str, dict[str, list[ast.AST]]] = field(default_factory=dict)
+    _routers: dict[tuple[str, str], _Router] | None = None
 
     def __post_init__(self) -> None:
         self.trees = {s.file.rel: s.tree for s in self.index.sources}
-        for src in self.index.sources:
-            text = src.file.text
-            if "ROOT_URLCONF" in text and (
-                m := re.search(r"ROOT_URLCONF\s*=\s*['\"]([\w.]+)['\"]", text)
-            ):
-                self.root = self.root or self.index.modules.file(m.group(1))
-            if "DEFAULT_PERMISSION_CLASSES" in text and (m := _DRF_DEFAULTS.search(text)):
-                self.defaults = self.defaults or _guards(m["perms"])
-            if "LoginRequiredMiddleware" in text and re.search(r"MIDDLEWARE\s*=", text):
-                self.middleware = ["LoginRequiredMiddleware"]
+        self.projects = self.settings()
+
+    def file(self, module: str, rel: str) -> str | None:
+        return self.index.modules.near(module, rel)
+
+    # ---- settings
+    def settings(self) -> dict[str, tuple[list[str], list[ast.AST]]]:
+        """Each root urlconf's project-wide guards (`LoginRequiredMiddleware`, DRF's
+        `DEFAULT_PERMISSION_CLASSES`) from the settings that name it: read as code, only where
+        set unconditionally, and only those every settings module of the project agrees on."""
+        found: dict[str, list[tuple[list[str], list[ast.AST]]]] = {}
+        for rel in self.trees:
+            values = self.setting_values(rel, frozenset())
+            if not values.keys() & {"ROOT_URLCONF", "MIDDLEWARE", "REST_FRAMEWORK"}:
+                continue
+            middleware = [
+                "LoginRequiredMiddleware"
+                for v in _strings(values.get("MIDDLEWARE"))
+                if v.endswith("LoginRequiredMiddleware")
+            ]
+            drf = values.get("REST_FRAMEWORK")
+            permissions = (
+                next(
+                    (
+                        v
+                        for k, v in zip(drf.keys, drf.values, strict=False)
+                        if _const_str(k) == "DEFAULT_PERMISSION_CLASSES"
+                    ),
+                    None,
+                )
+                if isinstance(drf, ast.Dict)
+                else None
+            )
+            entry = (middleware, _elements(permissions) if permissions is not None else [])
+            root = _const_str(values.get("ROOT_URLCONF"))
+            where = self.file(root, rel) if root else None
+            if where is not None:
+                found.setdefault(where, []).append(entry)
+            elif root is None:
+                # no ROOT_URLCONF: the urlconfs beside the settings
+                home = rel.rsplit("/", 1)[0] + "/" if "/" in rel else ""
+                for conf in self.trees:
+                    if conf.startswith(home) and "urlpatterns" in self.lists(conf):
+                        found.setdefault(conf, []).append(entry)
+        return {
+            root: (
+                [m for m in entries[0][0] if all(m in e[0] for e in entries)],
+                [
+                    d
+                    for d in entries[0][1]
+                    if all(_label(d) in {_label(x) for x in e[1]} for e in entries)
+                ],
+            )
+            for root, entries in found.items()
+        }
+
+    def setting_values(self, rel: str, seen: frozenset[str]) -> dict[str, ast.AST]:
+        """A settings module's unconditional top-level values, over the ones it star-imports."""
+        tree = self.trees.get(rel)
+        if tree is None or rel in seen:
+            return {}
+        values: dict[str, ast.AST] = {}
+        for n in tree.body:
+            if isinstance(n, ast.ImportFrom) and any(a.name == "*" for a in n.names):
+                module = _resolve_import(rel, n.module, n.level)
+                if (where := self.file(module, rel)) is not None:
+                    values.update(self.setting_values(where, seen | {rel}))
+            elif isinstance(n, ast.Assign | ast.AnnAssign) and n.value is not None:
+                for t in _targets(n):
+                    if isinstance(t, ast.Name) and t.id.isupper():
+                        values[t.id] = n.value
+        return values
 
     # ---- urlconfs
     def run(self) -> list[_Row]:
@@ -126,11 +223,11 @@ class _Django:
                     target = self.include_target(rel, n)
                     if isinstance(target, str):
                         self.included.add(target)
-        roots = [r for r in confs if r not in self.included]
-        if self.root in confs and self.root not in roots:
-            roots.append(self.root)
+        roots = [r for r in confs if r not in self.included or r in self.projects]
         for rel in roots:
+            self.current = self.projects.get(rel, ([], []))
             self.mount(rel, "", False, frozenset())
+        self.current = ([], [])  # what can't be placed takes no project's settings
         # what the walk couldn't place (a urlconf mounted from code it can't read, a route list
         # built by a function) is listed with its prefix unknown, never dropped
         for rel in confs:
@@ -152,9 +249,14 @@ class _Django:
         (`opt_slash_path("_health", health)`)."""
         if not isinstance(node, ast.Call):
             return False
-        if _name(node) in _PATH_CALLS:
+        origin = self.index.modules.imported.get(rel, {}).get(_dotted(node.func), "")
+        if _name(node) in _PATH_CALLS or (
+            # `from django.urls import path as dj_path`
+            origin.startswith(("django.urls.", "django.conf.urls."))
+            and origin.rsplit(".", 1)[-1] in _PATH_CALLS
+        ):
             return True
-        if len(node.args) < 2:
+        if _route_args(node) == (None, None):
             return False
         fn = self.index.callee(_dotted(node.func), rel)
         return (
@@ -172,8 +274,11 @@ class _Django:
         for n, conditional in _module_statements(self.trees[rel].body, False):
             if isinstance(n, ast.Assign | ast.AnnAssign) and n.value is not None:
                 for t in _targets(n):
-                    kept = out.get(_dotted(t), []) if conditional else []
-                    out[_dotted(t)] = [*kept, n.value]
+                    name = _dotted(t)
+                    # `urlpatterns = format_suffix_patterns(urlpatterns)` keeps what it held
+                    again = any(isinstance(x, ast.Name) and x.id == name for x in ast.walk(n.value))
+                    kept = out.get(name, []) if conditional or again else []
+                    out[name] = [*kept, n.value]
             elif isinstance(n, ast.AugAssign) and isinstance(n.target, ast.Name):
                 out.setdefault(n.target.id, []).append(n.value)
             elif (
@@ -211,32 +316,51 @@ class _Django:
             ]
         if isinstance(node, ast.Attribute) and node.attr == "urls":
             return [node]  # `router.urls`
+        if isinstance(node, ast.Call) and _name(node) == "i18n_patterns":
+            # its routes sit under the language code: `[language]/about/`
+            inner = ast.List(elts=self.flatten(rel, ast.List(elts=node.args), stack))
+            prefix = ast.JoinedStr(
+                values=[
+                    ast.FormattedValue(value=ast.Name(id="language"), conversion=-1),
+                    ast.Constant("/"),
+                ]
+            )
+            mounted = ast.Call(
+                func=ast.Name(id="path"),
+                args=[prefix, ast.Call(func=ast.Name(id="include"), args=[inner], keywords=[])],
+                keywords=[],
+            )
+            return [ast.fix_missing_locations(ast.copy_location(mounted, node))]
         if isinstance(node, ast.Call) and _name(node) in _LIST_CALLS:
             # `reduce(add, groups)` folds its second argument
             args = node.args[1:] if _name(node) == "reduce" else node.args
             return [e for a in args for e in self.flatten(rel, a, stack)]
         return []
 
-    def include_target(self, rel: str, call: ast.Call) -> str | ast.AST | None:
+    def include_target(
+        self, rel: str, call: ast.Call
+    ) -> str | ast.Attribute | tuple[str, ast.AST] | None:
         """What a path() includes: a urlconf's file, `router.urls`, or a list of entries."""
-        view = call.args[1] if len(call.args) > 1 else None
+        view = _route_args(call)[1]
         if not (isinstance(view, ast.Call) and _name(view) == "include" and view.args):
             return None
         arg = view.args[0]
         if isinstance(arg, ast.Tuple) and arg.elts:
             arg = arg.elts[0]  # `include(("app.urls", "app"))`
         if (module := _const_str(arg)) is not None:
-            return self.index.modules.file(module) or ""
+            return self.file(module, rel) or ""
         if isinstance(arg, ast.Attribute) and arg.attr == "urls":
             return arg
         name = _dotted(arg)
         target = self.index.modules.imported.get(rel, {}).get(name.split(".")[0])
         if target is not None and not isinstance(arg, ast.Call):
             module = ".".join([target, *name.split(".")[1:]])
-            return (
-                self.index.modules.file(module) or self.index.modules.file(f"{module}.urls") or ""
-            )
-        return arg  # a list, or a name bound in this module
+            home, _, local = module.rpartition(".")
+            where = self.file(home, rel) if home else None
+            if where is not None and local in self.lists(where):
+                return where, ast.Name(id=local)  # a list another module builds
+            return self.file(module, rel) or self.file(f"{module}.urls", rel) or ""
+        return rel, arg  # a list, or a name bound in this module
 
     # ---- mounting
     def mount(self, rel: str, prefix: str, dynamic: bool, stack: frozenset[str]) -> None:
@@ -255,13 +379,16 @@ class _Django:
             return
         if not (isinstance(entry, ast.Call) and self.is_path(rel, entry)):
             return
-        part, computed = self.part(entry.args[0])
+        route, view = _route_args(entry)
+        if route is None:
+            return
+        part, computed = self.part(route)
         pattern, dynamic = _join(prefix, part), dynamic or computed
         target = self.include_target(rel, entry)
         if target == "":
             # a library's urlconf: its routes and guards aren't in the checkout
-            view = ast.unparse(entry.args[1])[:200]
-            self.emit(rel, entry.lineno, dynamic, _UNREAD, [("any", pattern, view, None)])
+            text = ast.unparse(view)[:200] if view is not None else ""
+            self.emit(rel, entry.lineno, dynamic, _UNREAD, [("any", pattern, text, None)])
             return
         if isinstance(target, str):
             self.mount(target, pattern, dynamic, stack)
@@ -270,10 +397,10 @@ class _Django:
             self.router(rel, target, pattern, dynamic)
             return
         if target is not None:
-            for e in self.flatten(rel, target, frozenset()):
-                self.entry(rel, e, pattern, dynamic, stack)
+            where, entries = target
+            for e in self.flatten(where, entries, frozenset()):
+                self.entry(where, e, pattern, dynamic, stack)
             return
-        view = entry.args[1] if len(entry.args) > 1 else None
         self.view_rows(rel, view, pattern, dynamic, entry.lineno)
 
     def part(self, node: ast.AST) -> tuple[str, bool]:
@@ -311,8 +438,9 @@ class _Django:
         else:
             routes = [(m, pattern, h, n) for m, h, n in info.methods]
         for w in wrappers:
-            info.guards = _unique([*info.guards, *_guards(_code(w))])
-            info.unguards = sorted({*info.unguards, *_unguards_in(_code(w))})
+            guards, unguards = _decorator_guards(w)
+            info.guards = _unique([*info.guards, *guards])
+            info.unguards = sorted({*info.unguards, *unguards})
         self.emit(rel, line, dynamic, info, routes)
 
     def emit(
@@ -323,13 +451,17 @@ class _Django:
         info: _View,
         routes: list[tuple[str, str, str, ast.AST | None]],
     ) -> None:
+        middleware, defaults = self.current
         for verb, pattern, handler, node in routes:
-            guards, unguards, has_permissions = self.method_guards(node, info)
+            guards, unguards, permissions = self.method_guards(node, info)
             named_guards, named_unguards = info.named.get(handler.rsplit(".", 1)[-1], ([], []))
-            guards, unguards = (
-                _unique([*guards, *named_guards]),
-                sorted({*unguards, *named_unguards}),
+            guards, unguards = [*guards, *named_guards], [*unguards, *named_unguards]
+            inherited = permissions is None
+            granted, open_ = _permitted(
+                (defaults if inherited else permissions) if info.drf else [], verb
             )
+            # `login_not_required` exempts a view from `LoginRequiredMiddleware`
+            scope = [] if "login_not_required" in unguards else list(middleware)
             row = _row(
                 RouteFamily.DJANGO_DRF,
                 verb,
@@ -337,27 +469,25 @@ class _Django:
                 handler,
                 rel,
                 line,
-                guards,
-                self.scope(has_permissions, info.drf),
-                unguards,
+                _unique([*guards, *([] if inherited else granted)]),
+                _unique([*scope, *(granted if inherited else [])]),
+                sorted({*unguards, *open_}),
             )
             if node is not None:
                 self.index.locate(row, node)
             self.rows.append(_mark(row, None, dynamic, rel))
 
-    def method_guards(self, node: ast.AST | None, info: _View) -> tuple[list[str], list[str], bool]:
+    def method_guards(
+        self, node: ast.AST | None, info: _View
+    ) -> tuple[list[str], list[str], list[ast.AST] | None]:
         """A view's guards with its method's decorators; an `@action(permission_classes=..)`
         replaces the viewset's permissions."""
-        guards, unguards, has_permissions = (
-            list(info.guards),
-            list(info.unguards),
-            info.has_permissions,
-        )
+        guards, unguards, permissions = list(info.guards), list(info.unguards), info.permissions
         if (
             not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
             or node.name not in info.methods_of
         ):
-            return guards, unguards, has_permissions
+            return guards, unguards, permissions
         for d in node.decorator_list:
             override = (
                 next((k.value for k in d.keywords if k.arg == "permission_classes"), None)
@@ -365,19 +495,11 @@ class _Django:
                 else None
             )
             if override is not None:
-                guards, unguards, has_permissions = (
-                    _guards(_code(override)),
-                    _unguards_in(_code(override)),
-                    True,
-                )
-            guards += _guards(_code(d)) if override is None else []
-            unguards += _unguards_in(_code(d)) if override is None else []
-        return _unique(guards), sorted(set(unguards)), has_permissions
-
-    def scope(self, has_permissions: bool, drf: bool) -> list[str]:
-        """The project-wide guards a view inherits: DRF's default permissions (a DRF view that
-        names none), Django's `LoginRequiredMiddleware`."""
-        return [*self.middleware, *([] if has_permissions or not drf else self.defaults)]
+                permissions = _elements(override)
+                continue
+            more, fewer = _decorator_guards(d)
+            guards, unguards = [*guards, *more], [*unguards, *fewer]
+        return _unique(guards), sorted(set(unguards)), permissions
 
     # ---- views
     def view(self, rel: str, node: ast.AST | None) -> _View | None:
@@ -385,6 +507,7 @@ class _Django:
         if node is None:
             return None
         mapping: dict[str, str] | None = None
+        init: dict[str | None, ast.AST] = {}
         if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
@@ -396,14 +519,19 @@ class _Django:
                     for k, v in zip(node.args[0].keys, node.args[0].values, strict=False)
                     if isinstance(k, ast.Constant) and isinstance(v, ast.Constant)
                 }
+            init = {k.arg: k.value for k in node.keywords}
             node = node.func.value
         found = self.definition(_dotted(node), rel)
         if found is None:
             return None
         def_rel, definition = found
-        if isinstance(definition, ast.ClassDef):
-            return self.class_view(def_rel, definition, mapping)
-        return self.function_view(definition)
+        if not isinstance(definition, ast.ClassDef):
+            return self.function_view(definition)
+        info = self.class_view(def_rel, definition, mapping)
+        if "permission_classes" in init:
+            # `as_view(permission_classes=[AllowAny])` replaces the class attribute
+            info.permissions = _elements(init["permission_classes"])
+        return info
 
     def definition(
         self, dotted: str, rel: str
@@ -417,7 +545,7 @@ class _Django:
         candidates: list[str] = []
         if target is not None:
             full = ".".join([target, *dotted.split(".")[1:]])
-            where = index.modules.file(full.rpartition(".")[0]) or index.modules.file(full)
+            where = self.file(full.rpartition(".")[0], rel) or self.file(full, rel)
             if where is not None:
                 candidates.append(where)
         candidates.append(rel)
@@ -441,18 +569,55 @@ class _Django:
         ]
         return found[0] if len(found) == 1 else None
 
-    def mro(
-        self, rel: str, cls: ast.ClassDef, depth: int = 0
-    ) -> list[tuple[str, ast.ClassDef | str]]:
-        """A class and its bases, the checkout's resolved, a library's by name."""
-        out: list[tuple[str, ast.ClassDef | str]] = [(rel, cls)]
-        if depth > _MAX_DEPTH:
-            return out
+    def mro(self, rel: str, cls: ast.ClassDef) -> list[tuple[str, ast.ClassDef | str]]:
+        """A class's method resolution order (C3), the checkout's classes resolved, a library's
+        by name; depth-first where C3 can't be built."""
+        return self.linearize(rel, cls, frozenset()) or self.depth_first(rel, cls, 0)
+
+    def linearize(
+        self, rel: str, cls: ast.ClassDef, seen: frozenset[int]
+    ) -> list[tuple[str, ast.ClassDef | str]] | None:
+        if id(cls) in seen or len(seen) > _MAX_DEPTH:
+            return None
+        lines: list[list[tuple[str, ast.ClassDef | str]]] = []
         for base in cls.bases:
             name = _dotted(base)
             found = self.definition(name, rel)
             if found is not None and isinstance(found[1], ast.ClassDef) and found[1] is not cls:
-                out += self.mro(found[0], found[1], depth + 1)
+                line = self.linearize(found[0], found[1], seen | {id(cls)})
+                if line is None:
+                    return None
+                lines.append(line)
+            else:
+                lines.append([(rel, name.split(".")[-1])])
+        lines.append([line[0] for line in lines])
+        out: list[tuple[str, ast.ClassDef | str]] = [(rel, cls)]
+        key = _class_key
+        while any(lines):
+            head = next(
+                (
+                    line[0]
+                    for line in lines
+                    if line
+                    and not any(key(line[0]) in {key(x) for x in other[1:]} for other in lines)
+                ),
+                None,
+            )
+            if head is None:
+                return None  # an order Python would refuse too
+            out.append(head)
+            lines = [[x for x in line if key(x) != key(head)] for line in lines]
+        return out
+
+    def depth_first(
+        self, rel: str, cls: ast.ClassDef, depth: int
+    ) -> list[tuple[str, ast.ClassDef | str]]:
+        out: list[tuple[str, ast.ClassDef | str]] = [(rel, cls)]
+        for base in cls.bases if depth <= _MAX_DEPTH else []:
+            name = _dotted(base)
+            found = self.definition(name, rel)
+            if found is not None and isinstance(found[1], ast.ClassDef) and found[1] is not cls:
+                out += self.depth_first(found[0], found[1], depth + 1)
             else:
                 out.append((rel, name.split(".")[-1]))
         return out
@@ -461,168 +626,248 @@ class _Django:
         mro = self.mro(rel, cls)
         names = [c if isinstance(c, str) else c.name for _, c in mro]
         defined: dict[str, tuple[str, ast.AST]] = {}
+        aliases: dict[str, str] = {}
         for where, c in mro:
             if isinstance(c, ast.ClassDef):
                 for n in c.body:
                     if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef):
                         defined.setdefault(n.name, (where, n))
-        guards, unguards, has_permissions, named = self.class_guards(mro)
+                    elif isinstance(n, ast.Assign) and isinstance(n.value, ast.Name):
+                        for t in n.targets:  # `post = get`
+                            aliases.setdefault(_dotted(t), n.value.id)
+        for alias, name in aliases.items():
+            if alias not in defined and name in defined:
+                defined[alias] = defined[name]
+        policy = self.class_policy(mro)
         methods: list[tuple[str, str, ast.AST | None]] = []
         if mapping is not None:
             for verb, action in mapping.items():
                 node = defined.get(action, (None, cls))[1]
                 methods.append((verb, f"{cls.name}.{action}", node))
         else:
+            # what the checkout defines, and what a library generic still answers for itself
+            generic = next((_GENERIC_METHODS[n] for n in names if n in _GENERIC_METHODS), ())
             for http in _HTTP:
                 if http in defined:
                     methods.append((http.upper(), f"{cls.name}.{http}", defined[http][1]))
-            if not methods:
-                for name in names:
-                    if name in _GENERIC_METHODS:
-                        methods = [
-                            (m, f"{cls.name}.{m.lower()}", cls) for m in _GENERIC_METHODS[name]
-                        ]
-                        break
+                elif http.upper() in generic:
+                    methods.append((http.upper(), f"{cls.name}.{http}", cls))
             if not methods:
                 methods = [("any", cls.name, cls)]
-        methods_of = {
+        policy.methods = methods
+        policy.methods_of = {
             n.name for _, _, n in methods if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef)
         }
-        drf = any(_DRF_BASES.search(n) for n in names)
-        return _View(methods, guards, unguards, has_permissions, drf, methods_of, named)
+        policy.drf = any(_DRF_BASES.search(n) for n in names)
+        return policy
 
-    def class_guards(
-        self, mro: list[tuple[str, ast.ClassDef | str]]
-    ) -> tuple[list[str], list[str], bool, dict[str, tuple[list[str], list[str]]]]:
-        """`permission_classes` (the nearest), auth mixins among the bases, and decorators like
-        `@method_decorator(login_required, name="dispatch")`; one naming another method guards
-        only that method."""
+    def class_policy(self, mro: list[tuple[str, ast.ClassDef | str]]) -> _View:
+        """A class view's guards, in method resolution order: auth mixins only ahead of the
+        library view whose `dispatch` would run first; the nearest `permission_classes`, unless
+        a library DRF view (whose default it is) comes first; `get_permissions` read as code we
+        don't follow; `method_decorator(name=)` only where no earlier class defines the method."""
         guards: list[str] = []
         unguards: list[str] = []
         named: dict[str, tuple[list[str], list[str]]] = {}
-        has_permissions = False
+        permissions: list[ast.AST] | None = None
+        settled = viewed = False
+        earlier: set[str] = set()  # the methods a class earlier in the order defines
         for _, c in mro:
             if isinstance(c, str):
-                # a library's auth mixin (`LoginRequiredMixin`); a view (`LoginView`) isn't one
-                if c.endswith("Mixin"):
-                    guards += _guards(c)
-                unguards += _unguards_in(c)
+                if _LIBRARY_VIEW.search(c):
+                    viewed = True
+                    settled = settled or bool(_DRF_BASES.search(c))
+                elif c.endswith("Mixin") and not viewed:
+                    more, fewer = _decorator_guards(ast.Name(id=c))
+                    guards, unguards = [*guards, *more], [*unguards, *fewer]
                 continue
+            own = {n.name for n in c.body if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef)}
             for d in c.decorator_list:
                 method = (
                     _const_str(next((k.value for k in d.keywords if k.arg == "name"), None))
                     if isinstance(d, ast.Call) and _name(d) == "method_decorator"
                     else None
                 )
+                more, fewer = _decorator_guards(d)
                 if method is not None and method != "dispatch":
-                    held = named.setdefault(method, ([], []))
-                    held[0].extend(_guards(_code(d)))
-                    held[1].extend(_unguards_in(_code(d)))
-                    continue
-                guards += _guards(_code(d))
-                unguards += _unguards_in(_code(d))
-            if not has_permissions:
-                # `authentication_classes` only says how a caller is read: it refuses no one
+                    if method not in earlier:
+                        held = named.setdefault(method, ([], []))
+                        held[0].extend(more)
+                        held[1].extend(fewer)
+                elif "dispatch" not in earlier:
+                    guards, unguards = [*guards, *more], [*unguards, *fewer]
+            if not settled and own & _PERMISSION_METHODS:
+                # which permissions apply is decided by code: never shown as a guard
+                unguards.append(sorted(own & _PERMISSION_METHODS)[0])
+                permissions, settled = [], True
+            if not settled:
                 for n in c.body:
-                    if isinstance(n, ast.Assign) and any(
-                        _dotted(t) == "permission_classes" for t in n.targets
+                    if (
+                        isinstance(n, ast.Assign | ast.AnnAssign)
+                        and n.value is not None
+                        and any(_dotted(t) == "permission_classes" for t in _targets(n))
                     ):
-                        has_permissions = True
-                        guards += _guards(_code(n.value))
-                        unguards += _unguards_in(_code(n.value))
-        return _unique(guards), sorted(set(unguards)), has_permissions, named
+                        permissions, settled = _elements(n.value), True
+            earlier |= own
+        return _View([], _unique(guards), sorted(set(unguards)), permissions, named=named)
 
     def function_view(self, fn: ast.FunctionDef | ast.AsyncFunctionDef) -> _View:
-        decorators = [_code(d) for d in fn.decorator_list]
         methods: tuple[str, ...] = ("any",)
-        for d in fn.decorator_list:
-            name = _dotted(d).split(".")[-1]
+        guards: list[str] = []
+        unguards: list[str] = []
+        permissions: list[ast.AST] | None = None
+        names = [_dotted(d).split(".")[-1] for d in fn.decorator_list]
+        # DRF's policy decorators only count below `@api_view`, which reads what they set
+        api_view = names.index("api_view") if "api_view" in names else None
+        for i, (d, name) in enumerate(zip(fn.decorator_list, names, strict=True)):
             if name in _DECORATOR_METHODS:
                 methods = _DECORATOR_METHODS[name]
             elif (
                 name in ("require_http_methods", "api_view") and isinstance(d, ast.Call) and d.args
             ):
-                listed = [
-                    e.value.upper()
-                    for e in getattr(d.args[0], "elts", [])
-                    if isinstance(e, ast.Constant) and isinstance(e.value, str)
-                ]
-                methods = tuple(listed) or methods
-        text = " ".join(decorators)
-        drf = "api_view" in text
+                methods = tuple(m.upper() for m in _strings(d.args[0])) or methods
+            if name in _POLICY_DECORATORS:
+                if (
+                    name == "permission_classes"
+                    and api_view is not None
+                    and i > api_view
+                    and isinstance(d, ast.Call)
+                    and d.args
+                ):
+                    permissions = _elements(d.args[0])
+                continue
+            more, fewer = _decorator_guards(d)
+            guards, unguards = [*guards, *more], [*unguards, *fewer]
         return _View(
             [(m, fn.name, fn) for m in methods],
-            _guards(text),
-            _unguards_in(text),
-            "permission_classes" in text,
-            drf=drf,
+            _unique(guards),
+            sorted(set(unguards)),
+            permissions,
+            drf=api_view is not None,
         )
 
     # ---- DRF routers
+    def routers(self) -> dict[tuple[str, str], _Router]:
+        """Every module-level DRF router (`DefaultRouter()`, drf-nested-routers' nested ones),
+        with the viewsets registered on it from any module."""
+        if self._routers is not None:
+            return self._routers
+        found: dict[tuple[str, str], _Router] = {}
+        for rel, tree in self.trees.items():
+            for n, _ in _module_statements(tree.body, False):
+                value = n.value if isinstance(n, ast.Assign | ast.AnnAssign) else None
+                if isinstance(value, ast.IfExp):  # `DefaultRouter() if DEBUG else SimpleRouter()`
+                    value = value.body
+                if not (isinstance(value, ast.Call) and _name(value).endswith("Router")):
+                    continue
+                kw = {k.arg: k.value for k in value.keywords}
+                slash = kw.get("trailing_slash")
+                router = found.setdefault((rel, _dotted(_targets(n)[0])), _Router())
+                router.default |= "Default" in _name(value)
+                router.slash = (
+                    "" if isinstance(slash, ast.Constant) and slash.value is False else "/"
+                )
+                router.dynamic |= slash is not None and not isinstance(slash, ast.Constant)
+                if _name(value).startswith("Nested") and len(value.args) >= 2:
+                    # `NestedSimpleRouter(parent, r"notes", lookup="note")`
+                    parent = self.router_key(rel, _dotted(value.args[0]))
+                    route, computed = self.part(value.args[1])
+                    lookup = _const_str(kw.get("lookup")) or "parent"
+                    router.parent = (parent, f"{route.strip('^$').strip('/')}/<{lookup}_pk>/")
+                    router.dynamic |= computed or parent is None
+        self._routers = found
+        for rel, tree in self.trees.items():
+            for n in ast.walk(tree):
+                if not (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)):
+                    continue
+                if n.func.attr == "register" and len(n.args) >= 2:
+                    key = self.router_key(rel, _dotted(n.func.value))
+                    if key in found:
+                        found[key].registered.append((rel, n))
+                elif (
+                    n.func.attr == "extend"
+                    and isinstance(n.func.value, ast.Attribute)
+                    and n.func.value.attr == "registry"
+                    and n.args
+                ):
+                    # `router.registry.extend(other.registry)`
+                    key = self.router_key(rel, _dotted(n.func.value.value))
+                    other = self.router_key(rel, _dotted(n.args[0]).removesuffix(".registry"))
+                    if key in found and other in found:
+                        found[key].extends.append(other)
+        return found
+
+    def router_key(self, rel: str, name: str) -> tuple[str, str] | None:
+        """The (module, name) a router named in `rel` is bound at, through its imports."""
+        if (rel, name) in (self._routers or {}) or (
+            "." not in name
+            and any(
+                isinstance(n, ast.Assign | ast.AnnAssign)
+                and name in {_dotted(t) for t in _targets(n)}
+                for n, _ in _module_statements(self.trees.get(rel, ast.Module([], [])).body, False)
+            )
+        ):
+            return rel, name
+        target = self.index.modules.imported.get(rel, {}).get(name.split(".")[0])
+        if target is None:
+            return None
+        full = ".".join([target, *name.split(".")[1:]])
+        module, _, local = full.rpartition(".")
+        where = self.file(module, rel)
+        return (where, local) if where else None
+
     def router(self, rel: str, urls: ast.Attribute, prefix: str, dynamic: bool) -> None:
         """The routes `router.urls` stands for: each registered viewset's list and detail routes
         and its `@action`s."""
-        found = self.router_module(rel, _dotted(urls.value))
-        if found is None:  # `admin.site.urls`, a library's router
+        key = self.router_key(rel, _dotted(urls.value))
+        routers = self.routers()
+        if key not in routers:  # `admin.site.urls`, a library's router
             self.emit(
                 rel, urls.lineno, dynamic, _UNREAD, [("any", prefix, ast.unparse(urls), None)]
             )
             return
-        where, tree, local = found
-        nested: dict[str, str] = {}
-        for n in tree.body:
-            # drf-nested-routers: `NestedSimpleRouter(parent, r"notes", lookup="note")`
-            if (
-                isinstance(n, ast.Assign)
-                and isinstance(n.value, ast.Call)
-                and _name(n.value).startswith("Nested")
-                and len(n.value.args) >= 2
-            ):
-                parent_prefix = _const_str(n.value.args[1]) or ""
-                lookup = next(
-                    (_const_str(k.value) for k in n.value.keywords if k.arg == "lookup"),
-                    "parent",
-                )
-                for t in n.targets:
-                    nested[_dotted(t)] = f"{parent_prefix.strip('/')}/<{lookup}_pk>/"
-        for n in ast.walk(tree):
-            if not (
-                isinstance(n, ast.Call)
-                and isinstance(n.func, ast.Attribute)
-                and n.func.attr == "register"
-                and _dotted(n.func.value) in {local, *nested}
-                and len(n.args) >= 2
-            ):
-                continue
-            base = nested.get(_dotted(n.func.value), "")
-            route, computed = self.part(n.args[0])
-            route = route.strip("^$").strip("/")
-            self.viewset_rows(
-                where, n.args[1], _join(prefix, base + route), dynamic or computed, n.lineno
+        router = routers[key]
+        base, base_dynamic = self.router_base(key, frozenset())
+        dynamic = dynamic or base_dynamic or router.dynamic
+        if router.default:
+            # DefaultRouter's API root view
+            self.emit(
+                rel,
+                urls.lineno,
+                dynamic,
+                _View([], [], [], None, True),
+                [("GET", prefix or "/", "APIRootView", None)],
             )
+        for k in [key, *router.extends]:
+            for where, n in routers[k].registered:
+                route, computed = self.part(n.args[0])
+                route = route.strip("^$").strip("/")
+                self.viewset_rows(
+                    where,
+                    n.args[1],
+                    _join(prefix, base + route),
+                    dynamic or computed,
+                    n.lineno,
+                    router.slash,
+                )
 
-    def router_module(self, rel: str, name: str) -> tuple[str, ast.Module, str] | None:
-        tree = self.trees.get(rel)
-        if tree is not None and any(
-            isinstance(n, ast.Assign) and name in {_dotted(t) for t in n.targets} for n in tree.body
-        ):
-            return rel, tree, name
-        target = self.index.modules.imported.get(rel, {}).get(name.split(".")[0])
-        if target is None:
-            return None
-        module, _, local = (
-            ".".join([target, *name.split(".")[1:]]).rpartition(".")
-            if "." in target or "." in name
-            else (target, "", name)
-        )
-        where = self.index.modules.file(module)
-        tree = self.trees.get(where) if where else None
-        return (where, tree, local) if where and tree is not None else None
+    def router_base(
+        self, key: tuple[str, str] | None, seen: frozenset[tuple[str, str]]
+    ) -> tuple[str, bool]:
+        """A nested router's routes sit under its parents': `notes/<note_pk>/comments/..`."""
+        router = self.routers().get(key) if key is not None else None
+        if router is None or router.parent is None or key in seen or key is None:
+            return "", key in seen
+        parent, own = router.parent
+        above, dynamic = self.router_base(parent, seen | {key})
+        return above + own, dynamic
 
-    def viewset_rows(self, rel: str, node: ast.AST, prefix: str, dynamic: bool, line: int) -> None:
+    def viewset_rows(
+        self, rel: str, node: ast.AST, prefix: str, dynamic: bool, line: int, slash: str = "/"
+    ) -> None:
         found = self.definition(_dotted(node), rel)
         if found is None or not isinstance(found[1], ast.ClassDef):
-            self.view_rows(rel, node, prefix + "/", dynamic, line)
+            self.view_rows(rel, node, prefix + slash, dynamic, line)
             return
         where, cls = found
         mro = self.mro(where, cls)
@@ -630,51 +875,71 @@ class _Django:
         extra: list[tuple[str, str, ast.AST, bool, list[str]]] = []
         for _, c in reversed(mro):
             if isinstance(c, str):
-                for a in _VIEWSET_ACTIONS.get(c, ()):
+                # a library base whose actions we don't know may answer any of them
+                known = _VIEWSET_ACTIONS.get(c)
+                for a in known if known is not None else (() if c in _NO_ACTIONS else _ALL_ACTIONS):
                     actions.setdefault(a, cls)
                 continue
+            mapped: dict[str, list[tuple[str, ast.AST]]] = {}
             for n in c.body:
                 if not isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef):
                     continue
                 if n.name in _LIST_ACTIONS or n.name in _DETAIL_ACTIONS:
                     actions[n.name] = n
+                for d in n.decorator_list:
+                    # `@share.mapping.delete`: another verb of the `share` action
+                    if (
+                        isinstance(d, ast.Attribute)
+                        and isinstance(d.value, ast.Attribute)
+                        and d.value.attr == "mapping"
+                    ):
+                        mapped.setdefault(_dotted(d.value.value), []).append((d.attr.upper(), n))
                 deco = next(
                     (
                         d
                         for d in n.decorator_list
-                        if isinstance(d, ast.Call) and _name(d) == "action"
+                        if _dotted(d).split(".")[-1] in ("action", "detail_route", "list_route")
                     ),
                     None,
                 )
-                if deco is not None:
-                    kw = {k.arg: k.value for k in deco.keywords}
-                    detail = (
-                        isinstance(kw.get("detail"), ast.Constant) and kw["detail"].value is True
-                    )
-                    methods = [
-                        e.value.upper()
-                        for e in getattr(kw.get("methods"), "elts", [])
-                        if isinstance(e, ast.Constant) and isinstance(e.value, str)
-                    ] or ["GET"]
-                    url_path = _const_str(kw.get("url_path")) or n.name
-                    extra.append((n.name, url_path, n, detail, methods))
-        guards, unguards, has_permissions, named = self.class_guards(mro)
+                if deco is None:
+                    continue
+                kw = {k.arg: k.value for k in deco.keywords} if isinstance(deco, ast.Call) else {}
+                detail = _dotted(deco).endswith("detail_route") or (
+                    isinstance(kw.get("detail"), ast.Constant) and kw["detail"].value is True
+                )
+                methods = [
+                    e.value.upper()
+                    for e in getattr(kw.get("methods"), "elts", [])
+                    if isinstance(e, ast.Constant) and isinstance(e.value, str)
+                ] or ["GET"]
+                url_path = _const_str(kw.get("url_path")) or n.name
+                extra.append((n.name, url_path, n, detail, methods))
+            extra += [
+                (fn.name, url_path, fn, detail, [verb])
+                for action, url_path, _, detail, _ in list(extra)
+                for verb, fn in mapped.get(action, [])
+            ]
+        policy = self.class_policy(mro)
         detail_prefix = f"{prefix}/<{self.lookup(mro)}>"
         routes = [
-            (verb, f"{prefix}/", f"{cls.name}.{action}", actions[action])
+            (verb, f"{prefix}{slash}", f"{cls.name}.{action}", actions[action])
             for action, verb in _LIST_ACTIONS.items()
             if action in actions
         ]
         routes += [
-            (verb, f"{detail_prefix}/", f"{cls.name}.{action}", actions[action])
+            (verb, f"{detail_prefix}{slash}", f"{cls.name}.{action}", actions[action])
             for action, verb in _DETAIL_ACTIONS.items()
             if action in actions
         ]
         for name, url_path, n, detail, methods in extra:
             base = detail_prefix if detail else prefix
             routes += [
-                (m, f"{base}/{url_path.strip('/')}/", f"{cls.name}.{name}", n) for m in methods
+                (m, f"{base}/{url_path.strip('/')}{slash}", f"{cls.name}.{name}", n)
+                for m in methods
             ]
+        if not routes:
+            routes = [("any", f"{prefix}{slash}", cls.name, cls)]
         methods_of = {
             n.name for _, _, _, n in routes if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef)
         }
@@ -682,7 +947,15 @@ class _Django:
             rel,
             line,
             dynamic,
-            _View([], guards, unguards, has_permissions, True, methods_of, named),
+            _View(
+                [],
+                policy.guards,
+                policy.unguards,
+                policy.permissions,
+                True,
+                methods_of,
+                policy.named,
+            ),
             routes,
         )
 
@@ -701,7 +974,7 @@ class _Django:
         return "pk"
 
 
-_UNREAD = _View([], [], [], False)
+_UNREAD = _View([], [], [], None)
 
 
 def _forwarded(tree: ast.Module) -> set[int]:
@@ -741,6 +1014,14 @@ def _targets(node: ast.Assign | ast.AugAssign | ast.AnnAssign) -> list[ast.AST]:
     return [node.target]
 
 
+def _route_args(call: ast.Call) -> tuple[ast.AST | None, ast.AST | None]:
+    """A path() call's route and view, positional or by keyword (`path(route=.., view=..)`)."""
+    kw = {k.arg: k.value for k in call.keywords}
+    route = call.args[0] if call.args else kw.get("route", kw.get("regex"))
+    view = call.args[1] if len(call.args) > 1 else kw.get("view")
+    return route, view
+
+
 def _name(call: ast.Call) -> str:
     return _dotted(call.func).split(".")[-1]
 
@@ -751,6 +1032,84 @@ def _join(prefix: str, pattern: str) -> str:
     if not prefix:
         return pattern
     return prefix.rstrip("$") + pattern.lstrip("^")
+
+
+def _decorator_guards(d: ast.AST) -> tuple[list[str], list[str]]:
+    """The guards and unguards a decorator (or an auth mixin) is, by what it does: the name of
+    the decorator itself, never its module's or its arguments' (`extend_schema(request=..)`)."""
+    name = _dotted(d).split(".")[-1]
+    if name == "method_decorator" and isinstance(d, ast.Call) and d.args:
+        inner = d.args[0]
+        out = [_decorator_guards(x) for x in _elements(inner)]
+        return _unique([g for x, _ in out for g in x]), sorted({u for _, x in out for u in x})
+    if name == "login_not_required":
+        return [], [name]
+    if _INERT_DECORATORS.match(name) or name in _POLICY_DECORATORS or _NOT_GUARDS.search(name):
+        return [], []
+    label = _dotted(d)
+    if _unguards_in(name):
+        return [], [label]
+    if isinstance(d, ast.Call) and any(
+        k.arg == "optional" and isinstance(k.value, ast.Constant) and k.value.value is True
+        for k in d.keywords
+    ):
+        return [], [f"optional:{label}"]  # `login_required(optional=True)` lets anyone through
+    return ([label] if _guards_in(name) else []), []
+
+
+def _elements(node: ast.AST) -> list[ast.AST]:
+    if isinstance(node, ast.List | ast.Tuple | ast.Set):
+        return [
+            ast.Name(id=e.value) if isinstance(e, ast.Constant) and isinstance(e.value, str) else e
+            for e in node.elts
+        ]
+    return [node]
+
+
+def _label(node: ast.AST) -> str:
+    return node.id if isinstance(node, ast.Name) else ast.unparse(node)[:120]
+
+
+def _allows(node: ast.AST, verb: str) -> str:
+    """Whether a permission class refuses an anonymous caller of `verb`: `guard`, `open`, or
+    `none` for one whose name says neither. `A | B` is as weak as its weakest side, `A & B` as
+    strong as its strongest; `~A` may admit anyone."""
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr | ast.BitAnd):
+        sides = {_allows(node.left, verb), _allows(node.right, verb)}
+        order = (
+            ("open", "none", "guard")
+            if isinstance(node.op, ast.BitOr)
+            else ("guard", "none", "open")
+        )
+        return next(k for k in order if k in sides)
+    if isinstance(node, ast.UnaryOp):
+        return "open"
+    name = _label(node).split(".")[-1].split("(")[0]
+    if _ANONYMOUS.match(name) or _unguards_in(name):
+        return "open"
+    if _READ_ONLY.search(name):
+        return "open" if verb in _SAFE else "guard"
+    return "guard" if _guards_in(name) else "none"
+
+
+def _permitted(permissions: list[ast.AST], verb: str) -> tuple[list[str], list[str]]:
+    """(guards, unguards) of a permission list for one method: DRF requires every class."""
+    kinds = [(_label(p), _allows(p, verb)) for p in permissions]
+    if any(k == "guard" for _, k in kinds):
+        return [label for label, k in kinds if k == "guard"], []
+    return [], [label for label, k in kinds if k == "open"]
+
+
+def _class_key(entry: tuple[str, ast.ClassDef | str]) -> object:
+    return id(entry[1]) if isinstance(entry[1], ast.ClassDef) else entry[1]
+
+
+def _strings(node: ast.AST | None) -> list[str]:
+    return [
+        e.value
+        for e in getattr(node, "elts", [])
+        if isinstance(e, ast.Constant) and isinstance(e.value, str)
+    ]
 
 
 def _guards(expr: str) -> list[str]:

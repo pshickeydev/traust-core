@@ -5,11 +5,13 @@ target code is parsed, never imported. Other frameworks found are coverage gaps.
 from __future__ import annotations
 
 import ast
+import os
 import re
 import sys
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from pathlib import PurePosixPath
+from typing import TYPE_CHECKING, Any
 
 from traust_core.v1.models.code_facts import (
     CodeFactDetail,
@@ -113,18 +115,6 @@ _DB_SESSION_RX = re.compile(
 _FASTAPI_IMPORT = re.compile(r"^\s*(?:from\s+fastapi\b|import\s+fastapi\b)", re.M)
 _PY_WEB_IMPORT = re.compile(
     r"^\s*(?:from|import)\s+(?:fastapi|starlette|django|rest_framework|aiohttp)\b", re.M
-)
-_FLASK_HINTS = (
-    "route",
-    "add_url_rule",
-    "add_resource",
-    "before_request",
-    "before_app_request",
-    "Blueprint",
-    "Flask",
-    "Namespace",
-    "View",
-    "Resource",
 )
 FLASK_RECEIVER_CTORS = {
     "Flask": "app",
@@ -348,7 +338,7 @@ def _flask_split(names: Iterable[str]) -> tuple[list[str], list[str]]:
             continue
         if _DB_SESSION_RX.search(n):
             continue  # a database session is plumbing, not an auth guard
-        if UNGUARD_RX.search(n) or _FLASK_UNGUARD_EXTRA.search(n):
+        if n.startswith(_OPTIONAL) or UNGUARD_RX.search(n) or _FLASK_UNGUARD_EXTRA.search(n):
             unguards.append(n)
         elif GUARD_RX.search(n) or _FLASK_GUARD_EXTRA.search(n):
             guards.append(n)
@@ -415,11 +405,35 @@ def _own_nodes(fn: ast.AST):
 def _can_reject(fn: ast.AST) -> bool:
     """A before_request hook guards only if it can end the request: raise, abort() or return."""
     for n in ast.walk(fn):
-        if isinstance(n, ast.Raise) or (isinstance(n, ast.Return) and n.value is not None):
+        if isinstance(n, ast.Raise) or (
+            isinstance(n, ast.Return)
+            and n.value is not None
+            and not (isinstance(n.value, ast.Constant) and n.value.value is None)
+        ):
             return True
         if isinstance(n, ast.Call) and _last(_dotted(n.func)) == "abort":
             return True
     return False
+
+
+def _selective(fn: ast.AST) -> bool:
+    """A hook that looks at which route or method it runs for: it may let some through."""
+    return any(
+        isinstance(n, ast.Attribute)
+        and n.attr in ("endpoint", "path", "url_rule", "method", "blueprint", "url", "base_url")
+        and _dotted(n.value).split(".")[-1] == "request"
+        for n in ast.walk(fn)
+    )
+
+
+def _deco_name(d: ast.AST) -> str:
+    """A decorator's name; `optional:` when it lets an anonymous caller through
+    (`jwt_required(optional=True)`)."""
+    optional = isinstance(d, ast.Call) and any(
+        k.arg == "optional" and not (isinstance(k.value, ast.Constant) and not k.value.value)
+        for k in d.keywords
+    )
+    return f"{_OPTIONAL}{_dotted(d)}" if optional else _dotted(d)
 
 
 def _mentions_guard(fn: ast.AST, name: str) -> bool:
@@ -444,7 +458,8 @@ class _Source:
 def _flask_sources(files: list[TreeFile]) -> list[_Source]:
     sources = []
     for f in files:
-        if not f.text or not any(h in f.text for h in _FLASK_HINTS):
+        # every file: a blueprint a factory makes may be routed where no flask word appears
+        if not f.text:
             continue
         try:
             sources.append(_Source(f, ast.parse(f.text, filename=f.rel)))
@@ -472,6 +487,9 @@ class _Class:
     method_all: list[str] = field(default_factory=list)
     method_per: dict[str, list[str]] = field(default_factory=dict)
     methods: dict[str, _Function] = field(default_factory=dict)
+    # whether the class sets `decorators` / `method_decorators` itself (an empty list too)
+    sets_decorators: bool = False
+    sets_method_decorators: bool = False
 
 
 @dataclass(frozen=True)
@@ -499,22 +517,42 @@ class _FlaskIndex:
     hooks: list[_Hook] = field(default_factory=list)
     registered: dict[str, set[str]] = field(default_factory=dict)
     imported: dict[str, dict[str, str]] = field(default_factory=dict)
+    renamed: dict[str, dict[str, str]] = field(default_factory=dict)  # `import X as Y`: Y -> X
+    class_defs: dict[str, list[_Class]] = field(default_factory=dict)
+
+    def pick(self, found: list[Any], name: str, rel: str) -> Any | None:
+        """Of the definitions a name may be, the one `rel` means: its own file's, the module it
+        imports the name (or the name's module) from, else the only one; None when unsure."""
+        head = name.split(".")[0]
+        here = [c for c in found if c.path == rel]
+        if here and "." not in name:
+            return here[0]
+        module = self.imported.get(rel, {}).get(head)
+        if module is not None:
+            target = f"{module}.{head}" if "." in name else module
+            mine = [
+                c for c in found if _same_module(c.path, target) or _same_module(c.path, module)
+            ]
+            if len(mine) == 1:
+                return mine[0]
+        return found[0] if len(found) == 1 else None
 
     def resolve_fn(self, name: str, rel: str) -> _Function | None:
-        found = self.functions.get(_last(name), [])
-        return next((c for c in found if c.path == rel), found[0] if found else None)
+        bare = self.renamed.get(rel, {}).get(_last(name), _last(name))
+        return self.pick(self.functions.get(bare, []), name, rel)
 
-    def chain(self, name: str, seen: set[str] | None = None) -> list[_Class]:
+    def class_named(self, name: str, rel: str) -> _Class | None:
+        bare = self.renamed.get(rel, {}).get(_last(name), _last(name))
+        return self.pick(self.class_defs.get(bare, []), name, rel)
+
+    def chain(self, name: str, rel: str, seen: set[int] | None = None) -> list[_Class]:
         """The class and its in-repo bases, nearest first, cycle-safe."""
         seen = seen if seen is not None else set()
-        info = self.classes.get(name)
-        if info is None or name in seen:
+        info = self.class_named(name, rel)
+        if info is None or id(info) in seen:
             return []
-        seen.add(name)
-        return [info, *(c for b in info.bases for c in self.chain(_last(b), seen))]
-
-    def is_view(self, name: str) -> bool:
-        return any(c.view_like or c.methods for c in self.chain(name))
+        seen.add(id(info))
+        return [info, *(c for b in info.bases for c in self.chain(b, info.path, seen))]
 
     def baseline(self, receiver: str | None, reg_path: str) -> list[str]:
         """Hooks covering a route on `receiver` in `reg_path`: a blueprint hook its blueprint's
@@ -524,7 +562,16 @@ class _FlaskIndex:
         out = []
         for h in self.hooks:
             if not h.app_level:
-                if receiver and receiver == h.recv:
+                # the hook's own blueprint: same name, registered in the hook's file or one that
+                # imports the blueprint from it
+                if (
+                    receiver
+                    and receiver == h.recv
+                    and (
+                        reg_path == h.path
+                        or _same_module(h.path, self.imported.get(reg_path, {}).get(h.recv, ""))
+                    )
+                ):
                     out.append(h.label)
                 continue
             same_app = receiver == h.recv and (
@@ -568,6 +615,8 @@ def _flask_index(sources: list[_Source]) -> _FlaskIndex:
                 mod = _resolve_import(rel, node.module, node.level)
                 for alias in node.names:
                     index.imported.setdefault(rel, {})[alias.asname or alias.name] = mod
+                    if alias.asname:
+                        index.renamed.setdefault(rel, {})[alias.asname] = alias.name
             if imports_flask and isinstance(node, ast.Assign) and isinstance(node.value, ast.Call):
                 ctor = _last(_dotted(node.value.func))
                 kind = FLASK_RECEIVER_CTORS.get(ctor) or (
@@ -602,7 +651,19 @@ def _flask_index(sources: list[_Source]) -> _FlaskIndex:
                         recv = _last(d.rsplit(".", 1)[0])
                         hooks.append(_Hook(recv, node.name, _last(d) == _HOOKS[1], rel, node))
             elif isinstance(node, ast.ClassDef):
-                index.classes[node.name] = _class_info(node, rel)
+                info = _class_info(node, rel)
+                index.classes[node.name] = info
+                index.class_defs.setdefault(node.name, []).append(info)
+    # a receiver a checkout factory returns: `bp = make_blueprint("notes")`
+    for src in sources:
+        for node in ast.walk(src.tree):
+            if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call):
+                made = index.resolve_fn(_dotted(node.value.func), src.file.rel)
+                text = ast.unparse(made.node) if made is not None and made.node else ""
+                kind = "blueprint" if "Blueprint(" in text else "app" if "Flask(" in text else None
+                for t in node.targets if kind else ():
+                    if isinstance(t, ast.Name) and t.id not in index.receivers:
+                        index.receivers[t.id] = kind
     for recv, fname, app_hook, rel in pending:
         fn_info = index.resolve_fn(fname, rel)
         if fn_info is not None and fn_info.node is not None:
@@ -617,7 +678,7 @@ def _flask_index(sources: list[_Source]) -> _FlaskIndex:
             h.app_hook or index.receivers.get(h.recv) == "app",
         )
         for h in hooks
-        if _can_reject(h.node) and _mentions_guard(h.node, h.fname)
+        if _can_reject(h.node) and _mentions_guard(h.node, h.fname) and not _selective(h.node)
     ]
     return index
 
@@ -635,14 +696,15 @@ def _class_info(node: ast.ClassDef, rel: str) -> _Class:
         if isinstance(stmt, ast.Assign):
             for t in stmt.targets:
                 if isinstance(t, ast.Name) and t.id == "decorators":
-                    info.decorators = _names_in(stmt.value)
+                    info.decorators, info.sets_decorators = _names_in(stmt.value), True
                 elif isinstance(t, ast.Name) and t.id == "method_decorators":
                     info.method_all, info.method_per = _method_decorators(stmt.value)
+                    info.sets_method_decorators = True
         elif isinstance(stmt, ast.FunctionDef | ast.AsyncFunctionDef) and (
             stmt.name in FLASK_VERBS or stmt.name == "dispatch_request"
         ):
             info.methods[stmt.name] = _Function(
-                rel, stmt.lineno, [_dotted(d) for d in stmt.decorator_list]
+                rel, stmt.lineno, [_deco_name(d) for d in stmt.decorator_list]
             )
     return info
 
@@ -686,18 +748,28 @@ def _class_rows(
     reg_line: int,
     index: _FlaskIndex,
 ) -> list[_Row]:
-    chain = index.chain(cls_name)
+    chain = index.chain(cls_name, reg_path)
     if not chain:
-        return []
+        # a library's view class (`GraphQLView`): its methods and guards aren't in the checkout
+        return [
+            _mark(
+                _row(RouteFamily.FLASK, "ANY", p, cls_name, reg_path, reg_line, [], [], []),
+                receiver,
+                dynamic,
+                reg_path,
+            )
+            for p, dynamic in patterns
+        ]
     methods: dict[str, _Function] = {}
     for c in reversed(chain):
         methods.update(c.methods)
-    class_level: list[str] = []
-    per_verb: dict[str, list[str]] = {}
-    for c in chain:
-        class_level += c.class_decos + c.decorators + c.method_all
-        for verb, names in c.method_per.items():
-            per_verb.setdefault(verb, []).extend(names)
+    # `decorators` and `method_decorators` are class attributes: the nearest class's list wins
+    decorators = next((c for c in chain if c.sets_decorators), None)
+    method_decorators = next((c for c in chain if c.sets_method_decorators), None)
+    class_level: list[str] = [d for c in chain for d in c.class_decos]
+    class_level += decorators.decorators if decorators else []
+    class_level += method_decorators.method_all if method_decorators else []
+    per_verb: dict[str, list[str]] = dict(method_decorators.method_per) if method_decorators else {}
     cls_guards, cls_unguards = _flask_split(class_level)
     base_guards = index.baseline(receiver, reg_path)
     verbs = [v for v in methods if v != "dispatch_request"] or (
@@ -804,7 +876,7 @@ class _FlaskFile:
 
     def _decorated(self, node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef) -> list[_Row]:
         rows: list[_Row] = []
-        for d in node.decorator_list:
+        for i, d in enumerate(node.decorator_list):
             if not isinstance(d, ast.Call):
                 continue
             dn = _dotted(d.func)
@@ -813,26 +885,57 @@ class _FlaskFile:
                 continue
             if attr != "route" and (self.mixed or recv not in self.index.receivers):
                 continue
-            pattern, dynamic = _pattern(d.args[0] if d.args else _kwarg(d, "rule"), self.consts)
-            if pattern is None:
+            # flask-restx's `@ns.route("/", "/<int:id>")` takes several URLs
+            rules = (d.args if isinstance(node, ast.ClassDef) else d.args[:1]) or [
+                _kwarg(d, "rule")
+            ]
+            patterns = [
+                (p, dynamic)
+                for p, dynamic in (_pattern(r, self.consts) for r in rules)
+                if p is not None
+            ]
+            if not patterns:
                 continue
             if isinstance(node, ast.ClassDef):
-                rows += _class_rows(
-                    node.name, [(pattern, dynamic)], recv, self.rel, d.lineno, self.index
-                )
+                rows += _class_rows(node.name, patterns, recv, self.rel, d.lineno, self.index)
                 continue
-            methods = (
-                [attr.upper()]
-                if attr != "route"
-                else [m.upper() for m in _str_list(_kwarg(d, "methods"))]
-            )
-            fn = _Function(self.rel, node.lineno, [_dotted(x) for x in node.decorator_list])
-            rows.append(
+            methods = [attr.upper()] if attr != "route" else self.methods(_kwarg(d, "methods"))
+            # the route registers the function as the decorators below it leave it
+            below = [_deco_name(x) for x in node.decorator_list[i + 1 :]]
+            fn = _Function(self.rel, node.lineno, below)
+            rows += [
                 _function_row(
                     node.name, fn, pattern, dynamic, methods, recv, self.rel, d.lineno, self.index
                 )
-            )
+                for pattern, dynamic in patterns
+            ]
         return rows
+
+    def methods(self, value: ast.AST | None) -> list[str]:
+        """A route's `methods=`: a literal list, a module constant, else unknown (`ANY`)."""
+        if value is None:
+            return []
+        if isinstance(value, ast.Name):
+            value = next(
+                (
+                    n.value
+                    for n in self.src.tree.body
+                    if isinstance(n, ast.Assign) and value.id in {_dotted(t) for t in n.targets}
+                ),
+                value,
+            )
+        if isinstance(value, ast.List | ast.Tuple | ast.Set):
+            return [m.upper() for m in _str_list(value)] or ["ANY"]
+        return ["ANY"]
+
+    def bound(self, name: str) -> ast.AST | None:
+        """What a name in this file is bound to, when that is one value: `view = X.as_view()`."""
+        values = [
+            n.value
+            for n in ast.walk(self.src.tree)
+            if isinstance(n, ast.Assign) and name in {_dotted(t) for t in n.targets}
+        ]
+        return values[0] if len(values) == 1 else None
 
     def _call(self, node: ast.Call) -> list[_Row]:
         fn = _dotted(node.func)
@@ -843,41 +946,74 @@ class _FlaskFile:
         if attr == "add_resource":
             if not node.args:
                 return []
-            cls = _last(_dotted(node.args[0]))
+            cls = _dotted(node.args[0])
             patterns = [
                 (p, dynamic)
                 for p, dynamic in (_pattern(a, self.consts) for a in node.args[1:])
                 if p
             ]
-            if cls and patterns and cls in self.index.classes:
-                return _class_rows(cls, patterns, recv, self.rel, node.lineno, self.index)
-            return []
+            return (
+                _class_rows(cls, patterns, recv, self.rel, node.lineno, self.index) if cls else []
+            )
         pattern, dynamic = _pattern(
             node.args[0] if node.args else _kwarg(node, "rule"), self.consts
         )
+        if pattern is None:
+            return []
         view = _kwarg(node, "view_func")
         if view is None and len(node.args) >= 3:
             view = node.args[2]
-        if pattern is None or view is None:
-            return []
+        methods = self.methods(_kwarg(node, "methods"))
+        if view is None:
+            # `add_url_rule("/x", "export")` with the view bound by `@app.endpoint("export")`
+            endpoint = _const_str(node.args[1] if len(node.args) > 1 else _kwarg(node, "endpoint"))
+            found = next(
+                (
+                    n
+                    for n in ast.walk(self.src.tree)
+                    if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef)
+                    and any(
+                        isinstance(d, ast.Call)
+                        and _last(_dotted(d.func)) == "endpoint"
+                        and d.args
+                        and _const_str(d.args[0]) == endpoint
+                        for d in n.decorator_list
+                    )
+                ),
+                None,
+            )
+            decos = [_deco_name(d) for d in found.decorator_list] if found else []
+            fn_info = _Function(self.rel, found.lineno, decos) if found else None
+            name = found.name if found else endpoint or "<view>"
+            return [
+                _function_row(
+                    name,
+                    fn_info,
+                    pattern,
+                    dynamic,
+                    methods,
+                    recv,
+                    self.rel,
+                    node.lineno,
+                    self.index,
+                )
+            ]
+        if isinstance(view, ast.Name) and (value := self.bound(view.id)) is not None:
+            view = value  # the register_api pattern: `view = ItemAPI.as_view("item")`
         if (
             isinstance(view, ast.Call)
             and isinstance(view.func, ast.Attribute)
             and view.func.attr == "as_view"
         ):
-            cls = _last(_dotted(view.func.value))
-            if self.index.is_view(cls):
-                return _class_rows(
-                    cls, [(pattern, dynamic)], recv, self.rel, node.lineno, self.index
-                )
-            return []
+            cls = _dotted(view.func.value)
+            return _class_rows(cls, [(pattern, dynamic)], recv, self.rel, node.lineno, self.index)
         target, wraps = _view_target(view)
         row = _function_row(
             target or "<view>",
             self.index.resolve_fn(target, self.rel) if target else None,
             pattern,
             dynamic,
-            [m.upper() for m in _str_list(_kwarg(node, "methods"))],
+            methods,
             recv,
             self.rel,
             node.lineno,
@@ -912,7 +1048,7 @@ def _flask_join(prefix: str, rule: str) -> str:
     """Flask's join of a mount's prefix and a rule: one `/` between them."""
     if not prefix:
         return rule
-    return f"{prefix.rstrip('/')}/{rule.lstrip('/')}" if rule.strip("/") else prefix.rstrip("/")
+    return f"{prefix.rstrip('/')}/{rule.lstrip('/')}" if rule else prefix
 
 
 def _flask_prefixes(sources: list[_Source], consts: dict[str, str]) -> dict[str, tuple[str, bool]]:
@@ -927,7 +1063,15 @@ def _flask_prefixes(sources: list[_Source], consts: dict[str, str]) -> dict[str,
     def text(node: ast.AST | None) -> tuple[str | None, bool]:
         return _pattern(node, consts) if node is not None else (None, False)
 
+    unplaced = False  # a registration whose blueprint we can't name
     for src in sources:
+        loops = {
+            _dotted(n.target): [_dotted(e) for e in n.iter.elts]
+            for n in ast.walk(src.tree)
+            if isinstance(n, ast.For)
+            and isinstance(n.target, ast.Name)
+            and isinstance(n.iter, ast.List | ast.Tuple | ast.Set)
+        }
         assigned = {
             id(n.value): [_last(_dotted(t)) for t in n.targets]
             for n in ast.walk(src.tree)
@@ -970,8 +1114,14 @@ def _flask_prefixes(sources: list[_Source], consts: dict[str, str]) -> dict[str,
                 if path_node is None and ctor == "add_namespace" and len(node.args) > 1:
                     path_node = node.args[1]
                 path, dynamic = text(path_node)
-                child = _last(_dotted(node.args[0]))
-                mounts.setdefault(child, set()).add((_last(fn.rsplit(".", 1)[0]), path, dynamic))
+                child = _dotted(node.args[0])
+                # `for bp in (users, orders): app.register_blueprint(bp, ..)`
+                children = loops.get(child, [child]) if isinstance(node.args[0], ast.Name) else []
+                unplaced |= not children
+                for c in children:
+                    mounts.setdefault(_last(c), set()).add(
+                        (_last(fn.rsplit(".", 1)[0]), path, dynamic)
+                    )
             elif ctor == "init_app" and "." in fn and node.args:
                 api = _last(fn.rsplit(".", 1)[0])
                 mounts.setdefault(api, set()).add((_last(_dotted(node.args[0])), None, False))
@@ -979,11 +1129,12 @@ def _flask_prefixes(sources: list[_Source], consts: dict[str, str]) -> dict[str,
     def resolve(name: str, seen: frozenset[str]) -> tuple[str, bool]:
         up = mounts.get(name, set())
         mine = own.get(name) or (namespaces.get(name) if up else None) or {("", False)}
-        prefix, dynamic = next(iter(mine))
+        prefix, dynamic = min(mine)
         dynamic = dynamic or len(mine) > 1
         if not up or name in seen:
-            return prefix, dynamic or name in seen
-        parent, path, path_dynamic = next(iter(up))
+            # a blueprint some registration we can't read may mount
+            return prefix, dynamic or name in seen or (unplaced and name in own)
+        parent, path, path_dynamic = min(up, key=repr)
         above, above_dynamic = resolve(parent, seen | {name})
         # `register_blueprint(bp, url_prefix=..)` replaces the blueprint's own prefix
         joined = _flask_join(above, path if path is not None else prefix) or ""
@@ -1096,12 +1247,24 @@ class _Modules:
     imported: dict[str, dict[str, str]] = field(default_factory=dict)
 
     suffixes: dict[str, str] = field(default_factory=dict)
+    candidates: dict[str, list[str]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         for mod, rel in sorted(self.by_module.items()):
             parts = mod.split(".")
             for i in range(len(parts)):
                 self.suffixes.setdefault(".".join(parts[i:]), rel)
+                self.candidates.setdefault(".".join(parts[i:]), []).append(rel)
+
+    def near(self, module: str, rel: str) -> str | None:
+        """The file `module` names from `rel`: of the files it may be (`api.views` in two
+        projects), the one sharing the most of `rel`'s path; None when two do equally."""
+        if module in self.by_module:
+            return self.by_module[module]
+        found = self.candidates.get(module, [])
+        shared = [len(PurePosixPath(os.path.commonpath([f, rel])).parts) for f in found]
+        best = [f for f, n in zip(found, shared, strict=True) if n == max(shared, default=0)]
+        return best[0] if len(best) == 1 else None
 
     def add_import(self, rel: str, node: ast.Import | ast.ImportFrom) -> None:
         names = self.imported.setdefault(rel, {})
@@ -2346,7 +2509,9 @@ def _other_frameworks(files: list[TreeFile]) -> list[CoverageGap]:
 
 def route_guards(files: list[TreeFile]) -> RouteGuardFact:
     """The matrix over a checkout's (non-test) files, judged and asymmetric rows first."""
-    files = [f for f in files if not _TEST_NAME.search(f.name.lower())]
+    # a Python file named like a test (`ab_test.py`) may still serve routes: kept, flagged
+    tests = {f.rel for f in files if _TEST_NAME.search(f.name.lower())}
+    files = [f for f in files if f.rel not in tests or f.path.suffix == ".py"]
     py = [f for f in files if f.path.suffix == ".py"]
     flask_rows, uses_flask = _flask(py)
     sources, unparsed = _parsed(py)
@@ -2373,6 +2538,8 @@ def route_guards(files: list[TreeFile]) -> RouteGuardFact:
         *rust.rows,
         *ruby.rows,
     ]
+    for r in rows:
+        r.test_path = r.test_path or r.path in tests
     labelled = [r for r in rows if r.family in _METHOD_LABELS]
     asymmetries = [
         *_asymmetries(rows),

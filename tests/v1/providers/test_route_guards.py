@@ -1512,3 +1512,36 @@ def test_a_flask_receiver_mounted_two_ways_has_a_dynamic_pattern(tmp_path: Path)
     )
     [row] = _enum(tmp_path)["routes"]
     assert row["pattern_dynamic"] and row["pattern"].endswith("/<int:item_id>")
+
+
+def test_flask_decorators_count_only_below_the_route_and_hooks_by_their_effect(
+    tmp_path: Path,
+) -> None:
+    _write(
+        tmp_path,
+        "svc/app.py",
+        "from flask import Flask, request\n"
+        "from flask_jwt_extended import jwt_required\n"
+        "app = Flask(__name__)\n"
+        "@login_required\n"
+        "@app.route('/admin')\n"
+        "def admin(): ...\n"
+        "@app.route('/settings')\n"
+        "@login_required\n"
+        "def settings(): ...\n"
+        "@app.route('/feed')\n"
+        "@jwt_required(optional=True)\n"
+        "def feed(): ...\n"
+        "@app.before_request\n"
+        "def load_user():\n"
+        "    if request.endpoint in ('login',):\n"
+        "        return None\n"
+        "    if not current_user():\n"
+        "        abort(401)\n",
+    )
+    rows = {r["pattern"]: r for r in _enum(tmp_path)["routes"]}
+    assert rows["/admin"]["guards"] == [] and rows["/admin"]["judgement_required"]
+    assert rows["/settings"]["guards"] == ["login_required"]
+    assert rows["/feed"]["unguard_markers"] == ["optional:jwt_required"]
+    # a hook that looks at which endpoint it runs for may let some through: no guard
+    assert all("before_request:load_user" not in r["scope_guards"] for r in rows.values())
