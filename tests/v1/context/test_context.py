@@ -256,3 +256,79 @@ def test_configured_external_reference_attempt_upgrade_is_explicit(tmp_path: Pat
     )
     with pytest.raises(ConfigError, match="finding_external_ref_assessment_upgrade"):
         _ = Context(configured).database
+
+
+@pytest.fixture(params=["publication", "spend"])
+def legacy_attribution_store(request: pytest.FixtureRequest, tmp_path: Path):
+    from tests.v1.repositories.tables.conftest import Seed
+    from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
+
+    config = Config(home=tmp_path)
+    engine = Context(config).database
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        saved = (
+            seed.artifact(assessment_id=None, kind="feed")
+            if request.param == "publication"
+            else seed.spend_event()
+        )
+        uow.commit()
+    with engine.begin() as connection:
+        if request.param == "publication":
+            connection.exec_driver_sql("DROP INDEX idx_artifact_imported_kind")
+            connection.exec_driver_sql("ALTER TABLE artifact DROP COLUMN publication_revision")
+            connection.exec_driver_sql(
+                "CREATE INDEX idx_artifact_imported_kind ON artifact "
+                "(kind, created_at DESC, id DESC) WHERE assessment_id IS NULL"
+            )
+        else:
+            connection.exec_driver_sql("DROP INDEX idx_ops_spend_event_repository_occurred")
+            for column in ("repository_id", "repository_label", "loc", "batch", "note"):
+                connection.exec_driver_sql(f"ALTER TABLE ops_spend_event DROP COLUMN {column}")
+    engine.dispose()
+    return request.param, config, saved
+
+
+def test_local_store_upgrades_preserve_original_history(legacy_attribution_store) -> None:
+    from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
+
+    kind, config, original = legacy_attribution_store
+    with SqlTraustUnitOfWork(Context(config).database) as uow:
+        if kind == "publication":
+            restored = uow.artifacts.latest_imported("feed")
+            assert restored.publication_revision == 1
+            assert restored.model_dump(exclude={"publication_revision"}) == original.model_dump(
+                exclude={"publication_revision"}
+            )
+        else:
+            restored = uow.spend_events.get(original.id)
+            assert restored == original
+            assert (restored.repository_id, restored.repository_label, restored.loc) == (
+                None,
+                None,
+                None,
+            )
+
+
+def test_configured_legacy_store_refuses_before_first_read(legacy_attribution_store) -> None:
+    kind, config, _ = legacy_attribution_store
+    configured = Config(
+        home=config.home / "elsewhere",
+        database=DatabaseConfig(url=str(config.record_store_url())),
+    )
+    upgrade = (
+        "artifact_publication_revision_upgrade"
+        if kind == "publication"
+        else "spend_event_metadata_upgrade"
+    )
+    with pytest.raises(ConfigError, match=upgrade):
+        Context(configured).services()
+
+
+def test_partial_spend_upgrade_is_not_silently_accepted(tmp_path: Path) -> None:
+    engine = Context(Config(home=tmp_path)).database
+    with engine.begin() as connection:
+        connection.exec_driver_sql("ALTER TABLE ops_spend_event DROP COLUMN note")
+    engine.dispose()
+    with pytest.raises(ConfigError, match="partial spend metadata"):
+        Context(Config(home=tmp_path)).services()

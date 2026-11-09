@@ -488,7 +488,7 @@ def on(statements: list[Explained], table: str) -> Explained:
 def test_baseline_of_a_typical_repository_reads_by_index(explained: Profile) -> None:
     got = explained(baseline(TYPICAL_REPOSITORY))
     fast(on(got, "finding"), None, 5)
-    fast(on(got, "decision"), "decision_finding_id_statement_key_key", 5)
+    fast(on(got, "decision"), None, 5)
     fast(on(got, "occurrence"), "occurrence_finding_id_assessment_id_key", 5)
     fast(on(got, "assessment"), "assessment_pkey", 5)
     fast(on(got, "location"), "uq_location_range", 5)
@@ -581,3 +581,11 @@ def test_review_sources_batch_uses_the_finding_index(explained: Profile) -> None
 
     *_, refs = explained(sources)
     fast(refs, "idx_finding_external_ref_finding", 5)
+
+
+def test_retained_claim_candidate_query_at_volume(explained: Profile) -> None:
+    def lookup(unit: SqlTraustUnitOfWork) -> None:
+        assert unit.decisions.list_finding_ids_with_claims() == []
+
+    (statement,) = explained(lookup)
+    assert statement.execution_ms < 100, statement.plan

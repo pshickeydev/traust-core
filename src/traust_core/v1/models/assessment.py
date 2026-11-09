@@ -329,6 +329,7 @@ class Artifact(AppendOnly):
 
     assessment_id: UUID | None = None
     run_order_id: UUID | None = None  # the order whose run recorded it
+    publication_revision: int | None = Field(default=None, ge=1)
     digest: str
     kind: str
     uri: str

@@ -1,7 +1,9 @@
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Event, current_thread
 from uuid import uuid4
 
 import pytest
@@ -14,6 +16,7 @@ from tests.v1.repositories.tables.conftest import Seed
 from traust_core.v1.context import Config, Context
 from traust_core.v1.errors import (
     ConfigError,
+    ConflictError,
     DocumentError,
     IntegrityError,
     NotFoundError,
@@ -31,7 +34,12 @@ from traust_core.v1.repositories import InMemoryObjectStore
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.repositories.objects.store import ObjectKey, ObjectRef
 from traust_core.v1.repositories.traust.assessments import SqlArtifactRepository
-from traust_core.v1.services.artifact_publishing import ArtifactPublisher, PublishSpec, PublishSpecs
+from traust_core.v1.services.artifact_publishing import (
+    ArtifactPublisher,
+    PublishResult,
+    PublishSpec,
+    PublishSpecs,
+)
 
 engine = table_fixtures.engine
 FINDING = {
@@ -222,6 +230,122 @@ def test_a_later_publish_does_not_overwrite_earlier_evidence(setup: Publishing) 
     assert setup.service.get(later.artifact_id).findings == ()
 
 
+def test_plain_and_successor_publications_share_a_durable_ordered_stream(setup: Publishing) -> None:
+    original = TriageArtifact.parse(triage_with())
+    changed = TriageArtifact.parse(triage_with(FINDING))
+    first = setup.service.publish_artifact(original)
+    second = setup.service.publish_successor(changed, first.artifact_id)
+    assert setup.service.publish_successor(changed, second.artifact_id) == second
+    assert setup.service.publish_artifact(original) == first
+    with pytest.raises(IntegrityError, match="not the newest version"):
+        setup.service.publish_successor(original, second.artifact_id)
+    history = setup.service.history(TriageArtifact, limit=10)
+    assert [row.id for row in history] == [second.artifact_id, first.artifact_id]
+    assert [row.publication_revision for row in history] == [2, 1]
+    assert setup.service.latest(TriageArtifact).payload == changed.payload
+    assert setup.service.get(first.artifact_id).payload == original.payload
+    third = setup.service.publish_artifact(
+        TriageArtifact.parse(triage_with(FINDING | {"title": "Third recorded finding"}))
+    )
+    assert setup.service.history(TriageArtifact, limit=1)[0].id == third.artifact_id
+    assert setup.service.metadata(third.artifact_id).publication_revision == 3
+
+
+def test_successor_requires_the_exact_prior_even_for_a_current_digest_retry(
+    setup: Publishing,
+) -> None:
+    original = TriageArtifact.parse(triage_with())
+    changed = TriageArtifact.parse(triage_with(FINDING))
+    with pytest.raises(ConflictError, match="another writer published"):
+        setup.service.publish_successor(original, uuid4())
+    first = setup.service.publish_successor(original, None)
+    with pytest.raises(ConflictError, match="another writer published"):
+        setup.service.publish_successor(original, None)
+    second = setup.service.publish_successor(changed, first.artifact_id)
+    with pytest.raises(ConflictError, match="another writer published"):
+        setup.service.publish_successor(changed, first.artifact_id)
+    assert setup.service.latest_imported(TriageArtifact).artifact_id == second.artifact_id
+    assert len(setup.service.history(TriageArtifact, limit=10)) == 2
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_concurrent_successors_serialize_prior_checks_and_keep_every_committed_snapshot(
+    setup: Publishing, engine: sa.Engine, existing: bool
+) -> None:
+    prior = setup.service.publish("triage", triage_with()).artifact_id if existing else None
+    inserted, competing, release = Event(), Event(), Event()
+    first_thread: str | None = None
+
+    def after_execute(
+        _connection: object,
+        _cursor: object,
+        statement: str,
+        _parameters: object,
+        _context: object,
+        _many: object,
+    ) -> None:
+        if (
+            statement.lstrip().upper().startswith("INSERT INTO")
+            and "artifact" in statement
+            and not inserted.is_set()
+        ):
+            inserted.set()
+            assert release.wait(timeout=10)
+
+    def before_execute(
+        _connection: object,
+        _cursor: object,
+        statement: str,
+        _parameters: object,
+        _context: object,
+        _many: object,
+    ) -> None:
+        if current_thread().name != first_thread and (
+            statement == "BEGIN IMMEDIATE" or "pg_advisory_xact_lock" in statement
+        ):
+            competing.set()
+
+    first_doc = TriageArtifact.parse(triage_with(FINDING))
+    second_doc = TriageArtifact.parse(
+        triage_with(FINDING | {"title": "Competing recorded finding"})
+    )
+
+    def first_writer() -> PublishResult:
+        nonlocal first_thread
+        first_thread = current_thread().name
+        return setup.service.publish_successor(first_doc, prior)
+
+    other = ArtifactPublisher(default_specs(), setup.store, SqlTraustUnitOfWork(engine))
+    sa.event.listen(engine, "after_cursor_execute", after_execute)
+    sa.event.listen(engine, "before_cursor_execute", before_execute)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(first_writer)
+            try:
+                assert inserted.wait(timeout=10)
+                second = pool.submit(other.publish_successor, second_doc, prior)
+                assert competing.wait(timeout=10)
+                assert not second.done()
+            finally:
+                release.set()
+            committed = first.result(timeout=10)
+            with pytest.raises(ConflictError, match="another writer published"):
+                second.result(timeout=10)
+    finally:
+        release.set()
+        sa.event.remove(engine, "after_cursor_execute", after_execute)
+        sa.event.remove(engine, "before_cursor_execute", before_execute)
+
+    assert other.latest_imported(TriageArtifact).artifact_id == committed.artifact_id
+    retried = other.publish_successor(second_doc, committed.artifact_id)
+    history = other.history(TriageArtifact, limit=10)
+    expected = [retried.artifact_id, committed.artifact_id] + ([prior] if existing else [])
+    assert [row.id for row in history] == expected
+    assert [row.publication_revision for row in history] == list(range(len(expected), 0, -1))
+    assert other.get(committed.artifact_id).payload == first_doc.payload
+    assert other.latest(TriageArtifact).payload == second_doc.payload
+
+
 def test_missing_row_raises_not_found(setup: Publishing) -> None:
     with pytest.raises(NotFoundError):
         setup.service.get(uuid4())
@@ -270,6 +394,40 @@ def test_read_does_not_hold_a_transaction_during_object_io(
     setup.store.get = checked
     try:
         setup.service.get(result.artifact_id)
+    finally:
+        sa.event.remove(engine, "checkout", checkout)
+        sa.event.remove(engine, "checkin", checkin)
+
+
+@pytest.mark.parametrize("successor", [False, True])
+def test_object_publication_finishes_before_acquiring_database_write_intent(
+    setup: Publishing, engine: sa.Engine, successor: bool
+) -> None:
+    active = 0
+
+    def checkout(*_: object) -> None:
+        nonlocal active
+        active += 1
+
+    def checkin(*_: object) -> None:
+        nonlocal active
+        active -= 1
+
+    original = setup.store.put
+
+    def checked(key: ObjectKey, data: bytes) -> ObjectRef:
+        assert active == 0
+        return original(key, data)
+
+    setup.store.put = checked
+    sa.event.listen(engine, "checkout", checkout)
+    sa.event.listen(engine, "checkin", checkin)
+    try:
+        artifact = TriageArtifact.parse(triage_with(FINDING))
+        if successor:
+            setup.service.publish_successor(artifact, None)
+        else:
+            setup.service.publish_artifact(artifact)
     finally:
         sa.event.remove(engine, "checkout", checkout)
         sa.event.remove(engine, "checkin", checkin)

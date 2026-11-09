@@ -289,10 +289,20 @@ def run_order_fork_scheduled_upgrade(dialect: Dialect) -> list[str]:
     return ops_sql.run_order_fork_scheduled_upgrade(dialect)
 
 
+def spend_event_metadata_upgrade(dialect: Dialect) -> list[str]:
+    """Add nullable spend attribution only when all five metadata columns are absent."""
+    return ops_sql.spend_event_metadata_upgrade(dialect)
+
+
 def artifact_run_order_upgrade(dialect: Dialect) -> list[str]:
     """The additive upgrade for a database whose `artifact` predates the recording order;
     apply it only when that column is absent. Old artifacts name no order."""
     return storage_sql.artifact_run_order_upgrade(dialect)
+
+
+def artifact_publication_revision_upgrade(dialect: Dialect) -> list[str]:
+    """Version imported history when the column is absent; refuse ambiguous timestamp ties."""
+    return storage_sql.artifact_publication_revision_upgrade(dialect)
 
 
 def default_named_at_upgrade(dialect: Dialect) -> list[str]:

@@ -10,8 +10,8 @@ from uuid import UUID, uuid4
 import pytest
 import sqlalchemy as sa
 
-from tests.v1.repositories.tables.conftest import T0, Seed, apart, repository_for, same_rows
-from traust_core.v1.errors import ValidationError
+from tests.v1.repositories.tables.conftest import T0, Seed, repository_for, same_rows
+from traust_core.v1.errors import IntegrityError, NotFoundError, ValidationError
 from traust_core.v1.models.common import RecordBudget
 from traust_core.v1.services.artifact_publishing import AssessmentLog
 
@@ -324,9 +324,8 @@ def test_latest_imported_artifact_of_a_kind(seed: Seed) -> None:
     assert artifacts.latest_imported("corpus-registry") is None
     seed.artifact(kind="corpus-registry")
     seed.artifact(assessment_id=None, kind="report")
-    older = seed.artifact(assessment_id=None, kind="corpus-registry")
-    apart()
-    newer = seed.artifact(assessment_id=None, kind="corpus-registry")
+    older = seed.artifact(assessment_id=None, kind="corpus-registry", publication_revision=1)
+    newer = seed.artifact(assessment_id=None, kind="corpus-registry", publication_revision=2)
     assert artifacts.latest_imported("corpus-registry") == newer != older
 
 
@@ -335,11 +334,49 @@ def test_list_imported_is_newest_first_bounded_and_skips_produced_documents(seed
     assert artifacts.list_imported("compliance-scope", limit=10) == []
     seed.artifact(kind="compliance-scope")
     seed.artifact(assessment_id=None, kind="report")
-    older = seed.artifact(assessment_id=None, kind="compliance-scope")
-    apart()
-    newer = seed.artifact(assessment_id=None, kind="compliance-scope")
+    older = seed.artifact(assessment_id=None, kind="compliance-scope", publication_revision=1)
+    newer = seed.artifact(assessment_id=None, kind="compliance-scope", publication_revision=2)
     assert artifacts.list_imported("compliance-scope", limit=10) == [newer, older]
     assert artifacts.list_imported("compliance-scope", limit=1) == [newer]
+
+
+def test_imported_revision_orders_equal_database_timestamps_without_uuid_tiebreaks(
+    seed: Seed,
+) -> None:
+    artifacts = seed.uow.artifacts
+    rows = seed.uow.connection.execute(
+        artifacts.table.insert().returning(artifacts.table),
+        [
+            {
+                "digest": f"revision-{revision}",
+                "kind": "corpus-registry",
+                "uri": f"artifacts/{revision}.json",
+                "publication_revision": revision,
+            }
+            for revision in range(1, 4)
+        ],
+    ).mappings()
+    saved = [artifacts.record.model_validate(dict(row)) for row in rows]
+    assert len({row.created_at for row in saved}) == 1
+    assert artifacts.latest_imported("corpus-registry") == saved[-1]
+    assert artifacts.latest_imported("corpus-registry", saved[0].created_at) == saved[-1]
+    assert (
+        artifacts.latest_imported(
+            "corpus-registry", saved[0].created_at - timedelta(microseconds=1)
+        )
+        is None
+    )
+    assert artifacts.list_imported("corpus-registry", limit=3) == saved[::-1]
+
+
+def test_unversioned_import_does_not_become_invisible_behind_versioned_stream(seed: Seed) -> None:
+    artifacts = seed.uow.artifacts
+    seed.artifact(assessment_id=None, kind="corpus-registry", publication_revision=1)
+    seed.artifact(assessment_id=None, kind="corpus-registry")
+    with pytest.raises(IntegrityError, match="no publication revision"):
+        artifacts.latest_imported("corpus-registry")
+    with pytest.raises(IntegrityError, match="no publication revision"):
+        artifacts.list_imported("corpus-registry", limit=1)
 
 
 def test_occurrences_a_detector_rule_matched(seed: Seed) -> None:
@@ -432,3 +469,11 @@ def test_feed_after_reads_assessments_by_record_time_and_resumes_after_ties(seed
     for i, row in enumerate(rows):
         assert row.created_at is not None and row.id is not None
         assert u.assessments.feed_after((row.created_at, row.id), 10) == rows[i + 1 :]
+
+
+def test_assessment_lock_returns_the_exact_record_and_refuses_unknown_identity(seed: Seed) -> None:
+    assessment = seed.assessment()
+    assert seed.uow.assessments.get_for_update(assessment.id) == assessment
+    assert AssessmentLog(seed.uow).lock(assessment.id) == assessment
+    with pytest.raises(NotFoundError):
+        seed.uow.assessments.get_for_update(UUID(int=999))

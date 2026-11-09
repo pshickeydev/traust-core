@@ -18,6 +18,7 @@ from traust_core.v1.models import candidate_formats
 from traust_core.v1.models.base import AppendOnly, Entity, Model
 from traust_core.v1.models.candidate_formats import SuppressionStatus
 from traust_core.v1.models.common import CodeHash, CodeSpan, RepoPath
+from traust_core.v1.models.finding_claims import ClaimLocation
 from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.integrity import canonical_json, sha256_hex
 from traust_core.v1.models.vocabulary import (
@@ -720,6 +721,9 @@ def statement_key(decision: Decision) -> StatementKey:
     """Hash normalized judged values without rewriting historical statement keys."""
     decision = Decision.model_validate(dict(decision))
     judged = {k: str(v) if (v := getattr(decision, k)) is not None else None for k in _JUDGED}
+    if decision.reason == DecisionReason.BASELINE_REWRITE:
+        judged["artifact_id"] = str(decision.artifact_id) if decision.artifact_id else None
+        judged["ticket"] = decision.ticket
     judged["classifiers"] = sorted(
         {
             (pair.enum, pair.value)
@@ -849,7 +853,11 @@ def folded_resolutions(
 
 
 def _statements(decisions: Sequence[Decision]) -> list[_Statement]:
-    return [_Statement(d) for d in effective_decisions(decisions)]
+    return [
+        _Statement(d)
+        for d in effective_decisions(decisions)
+        if any(getattr(d, field) is not None for field in _JUDGEMENTS)
+    ]
 
 
 def _strongest(statements: Sequence[_Statement], field: str) -> _Statement | None:
@@ -1021,7 +1029,7 @@ class FindingView(Model):
     disposition: Disposition | None = None
     effective_severity: Severity | None = None
     sla_due: datetime | None = None
-    locations: tuple[Location, ...] = ()
+    locations: tuple[Location | ClaimLocation, ...] = ()
     cwes: tuple[str, ...] = ()
     labels: tuple[FindingLabel, ...] = ()
 

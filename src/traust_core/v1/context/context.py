@@ -66,7 +66,9 @@ from traust_core.v1.models.artifacts import (
     ComplianceMappingArtifact,
     ComplianceScopeArtifact,
     CorpusRegistryArtifact,
+    CveReplayArtifact,
     DocVarianceArtifact,
+    FindingIntakeArtifact,
     FleetFixArtifact,
     FuzzReportArtifact,
     IsolationReviewArtifact,
@@ -77,6 +79,7 @@ from traust_core.v1.models.artifacts import (
     PrivProfileArtifact,
     ProductDefinitionsMapArtifact,
     RemediationArtifact,
+    RepoLivenessArtifact,
     ReportArtifact,
     RepoStateArtifact,
     RunManifestArtifact,
@@ -739,6 +742,13 @@ class Context:
             _default_named_at(engine, upgrade=local)
             _run_order_fork_columns(engine)  # artifact_run_order's upgrade needs these first
             _artifact_run_order(engine, upgrade=local)
+            _additive_column(
+                engine,
+                ("traust", "artifact", "publication_revision"),
+                "artifact_publication_revision_upgrade",
+                upgrade=local,
+            )
+            _spend_event_metadata(engine, upgrade=local)
             _run_order_fork_scheduled(engine, upgrade=local)
             _finding_fingerprint_index(engine, upgrade=local)
             _additive_column(
@@ -771,10 +781,16 @@ class Context:
     def _wire(self, uow: SqlTraustUnitOfWork, policy: PortfolioPolicy) -> Services:
         hosts = self.config.forge_hosts
         sources = command_source(hosts, clock=self.clock, api=self.forge_api)
-        intake = FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy())
+        intake = FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy(), objects=self.object_store)
         ledger = None if self.config.ledger is None else LedgerService(uow, self.config.ledger)
         identity = self.config.identity
-        spend = SpendService(uow, self.clock, self.config.budgets, self.model_catalog)
+        spend = SpendService(
+            uow,
+            self.clock,
+            self.config.budgets,
+            self.model_catalog,
+            inventory=Inventory(uow, hosts),
+        )
         ops = OpsService(
             uow,
             self.clock,
@@ -818,7 +834,7 @@ class Context:
             recording=ops,
         )
         rating = RatingPolicy(self.config.rating)
-        views = FindingViewQuery(rating)
+        views = FindingViewQuery(rating, self.object_store)
         findings = FindingService(
             uow,
             intake,
@@ -846,6 +862,7 @@ class Context:
                     PublishSpec(PrivProfileArtifact),
                     PublishSpec(CodeFactsArtifact),
                     PublishSpec(FuzzReportArtifact),
+                    PublishSpec(FindingIntakeArtifact),
                 ),
                 self.object_store,
                 uow,
@@ -864,12 +881,14 @@ class Context:
             clock=self.clock,
             hosts=hosts,
             tools=self.tools,
+            ops=ops,
             product_definitions=self.product_definitions(),
             publisher=ArtifactPublisher(
                 PublishSpecs(
                     PublishSpec(CorpusRegistryArtifact),
                     PublishSpec(ProductDefinitionsMapArtifact),
                     PublishSpec(RepoStateArtifact),
+                    PublishSpec(RepoLivenessArtifact),
                 ),
                 self.object_store,
                 uow,
@@ -1004,6 +1023,7 @@ class Context:
                     PublishSpec(BenchmarkTargetArtifact),
                     PublishSpec(ReportArtifact),
                     PublishSpec(ComplianceAssessmentArtifact),
+                    PublishSpec(CveReplayArtifact),
                 ),
                 self.object_store,
                 uow,
@@ -1017,6 +1037,7 @@ class Context:
             sweeper=self.rule_sweeper,
             git=self.git,
             checkouts=self.checkouts,
+            exposure=exposure,
         )
         freshness = FreshnessQuery(catalog, exposure, self.clock)
         trend = FindingsTrendView(findings, portfolio, self.clock)
@@ -1284,6 +1305,28 @@ def _run_order_fork_scheduled(engine: Engine, *, upgrade: bool) -> None:
         engine,
         ("traust_ops", "run_order", "fork_scheduled_at"),
         "run_order_fork_scheduled_upgrade",
+        upgrade=upgrade,
+    )
+
+
+def _spend_event_metadata(engine: Engine, *, upgrade: bool) -> None:
+    dialect = Dialect.of(engine)
+    schema = "traust_ops" if dialect == Dialect.POSTGRES else None
+    table = "spend_event" if schema else "ops_spend_event"
+    inspector = sa.inspect(engine)
+    if not inspector.has_table(table, schema=schema):
+        return
+    expected = {"repository_id", "repository_label", "loc", "batch", "note"}
+    present = expected & {column["name"] for column in inspector.get_columns(table, schema=schema)}
+    if present and present != expected:
+        raise ConfigError(
+            f"{table} has partial spend metadata; reconcile missing columns "
+            f"{sorted(expected - present)} before opening the database"
+        )
+    _additive_column(
+        engine,
+        ("traust_ops", "spend_event", "repository_id"),
+        "spend_event_metadata_upgrade",
         upgrade=upgrade,
     )
 

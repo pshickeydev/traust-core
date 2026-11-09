@@ -179,7 +179,8 @@ def test_spend_by_repository_joins_the_month_to_its_orders_by_key(explained: Pro
     (by_repository,) = explained(
         lambda uow: uow.spend_events.sum_by(SpendFilter(window=MONTH), SpendDimension.REPOSITORY)
     )
-    fast(by_repository, "idx_ops_spend_event_occurred", 500)
+    assert by_repository.uses_index("idx_ops_spend_event_occurred"), by_repository.plan
+    assert by_repository.execution_ms < 500, by_repository.plan
 
 
 @pytest.mark.parametrize("since", ["a minute ago", "a day ago", "the start"])

@@ -85,6 +85,11 @@ def test_latest_imported_document_of_a_kind_uses_the_kind_index(explained: Profi
     fast(latest, "idx_artifact_imported_kind", 5)
 
 
+def test_imported_history_uses_the_revision_ordered_kind_index(explained: Profile) -> None:
+    (history,) = explained(lambda unit: unit.artifacts.list_imported("code-facts", limit=100))
+    fast(history, "idx_artifact_imported_kind", 5)
+
+
 def test_batch_review_evidence_reads_all_companions_by_assessment_index(
     engine: sa.Engine, explained: Profile
 ) -> None:

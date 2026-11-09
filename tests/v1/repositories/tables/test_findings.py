@@ -381,3 +381,13 @@ def test_decisions_for_many_assessments_are_read_in_batches(seed: Seed) -> None:
     ]
     found = seed.uow.decisions.list_for_assessments({w.id for w in works})
     assert [d.id for d in found] == [d.id for d in made]  # every one, in judgement order
+
+
+def test_claim_candidate_query_is_distinct_and_requires_retained_artifact(seed: Seed) -> None:
+    first, second = seed.finding(), seed.finding()
+    artifact = seed.artifact()
+    seed.decision(first, reason="baseline_rewrite", artifact_id=artifact.id)
+    seed.decision(first, reason="baseline_rewrite", artifact_id=artifact.id)
+    seed.decision(second, reason="baseline_rewrite")
+    seed.decision(second, artifact_id=artifact.id)
+    assert seed.uow.decisions.list_finding_ids_with_claims() == [first.id]

@@ -30,6 +30,7 @@ from traust_core.v1.models.operations import (
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services.operations import SpendService
+from traust_core.v1.services.portfolio import Inventory
 
 OCTOBER = TimeWindow.month_of(T0)
 
@@ -164,3 +165,92 @@ def test_a_day_collected_without_skills_is_not_attributed_twice(engine: Engine) 
         (T0 + DAY, "claude-opus", "triage"),
         (T0 + DAY, "claude-sonnet", None),
     ]
+
+
+@pytest.mark.parametrize("reference", ["url", "id"])
+def test_declared_spend_retains_metadata_and_resolves_only_registered_identity(
+    engine: Engine, reference: str
+) -> None:
+    with SqlTraustUnitOfWork(engine) as uow:
+        repo = Seed(uow).repository()
+        event = Seed(uow).new_spend_event(
+            repository_label=str(repo.url if reference == "url" else repo.id),
+            loc=0,
+            batch="calibration-1",
+            note="measured target",
+        )
+        uow.commit()
+    service = SpendService(
+        SqlTraustUnitOfWork(engine),
+        FixedClock(T0),
+        (),
+        inventory=Inventory(SqlTraustUnitOfWork(engine)),
+    )
+    saved = service.record(event)
+    with SqlTraustUnitOfWork(engine) as uow:
+        stored = uow.spend_events.get(saved.id)
+    assert (
+        stored.repository_id,
+        stored.repository_label,
+        stored.loc,
+        stored.batch,
+        stored.note,
+    ) == (repo.id, event.repository_label, 0, "calibration-1", "measured target")
+    assert stored.lane is None and stored.run_order_id is None
+    assert service.summary(SpendFilter(window=OCTOBER), SpendDimension.REPOSITORY) == [
+        rollup(1, 100, 20, "0.25", str(repo.id))
+    ]
+
+
+def test_ambiguous_repository_label_preserves_cost_without_guessing(engine: Engine) -> None:
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        seed.repository(url="https://github.com/team-a/project")
+        seed.repository(url="https://github.com/team-b/project")
+        event = seed.new_spend_event(repository_label="project", loc=1234, note="calibration")
+        uow.commit()
+    service = SpendService(
+        SqlTraustUnitOfWork(engine),
+        FixedClock(T0),
+        (),
+        inventory=Inventory(SqlTraustUnitOfWork(engine)),
+    )
+    saved = service.record(event)
+    assert saved.repository_id is None
+    with SqlTraustUnitOfWork(engine) as uow:
+        stored = uow.spend_events.get(saved.id)
+    assert (stored.repository_label, stored.loc, stored.note) == ("project", 1234, "calibration")
+    assert service.summary(SpendFilter(window=OCTOBER), SpendDimension.REPOSITORY) == [
+        rollup(1, 100, 20, "0.25")
+    ]
+
+
+def test_order_spend_cannot_be_reattributed_to_another_repository(engine: Engine) -> None:
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        repo, other = seed.repository(), seed.repository()
+        order = seed.run_order(repository_id=repo.id, lane="audit")
+        event = seed.new_spend_event(run_order_id=order.id)
+        uow.commit()
+    service = spend(engine)
+    inferred = service.record(event)
+    assert (inferred.repository_id, inferred.lane) == (repo.id, "audit")
+    with pytest.raises(ValidationError, match="disagrees"):
+        service.record(event.model_copy(update={"repository_id": other.id}))
+    assert service.summary(SpendFilter(window=OCTOBER), SpendDimension.REPOSITORY) == [
+        rollup(1, 100, 20, "0.25", str(repo.id))
+    ]
+
+
+@pytest.mark.parametrize("loc", [-1, 1.5, True, "1"])
+def test_declared_size_rejects_negative_or_noninteger_values(loc: object) -> None:
+    with pytest.raises(ValueError, match="loc"):
+        SpendEvent(
+            provider="anthropic",
+            model="m",
+            tokens_in=0,
+            tokens_out=0,
+            cost_usd=Decimal(0),
+            occurred_at=T0,
+            loc=loc,
+        )

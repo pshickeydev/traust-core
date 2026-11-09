@@ -301,12 +301,15 @@ class OrderManifest(Model):
     config: tuple[ConfigDigest, ...] = ()
     approval: OrderApproval | None = None
     sessions: tuple[SessionRecord, ...] = ()
+    degraded: Mapping[str, int] = Field(default_factory=dict)
 
     @model_serializer(mode="wrap")
     def serialize(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
         document = handler(self)
         if not self.sessions:
             document.pop("sessions", None)
+        if not self.degraded:
+            document.pop("degraded", None)
         return document
 
 
@@ -593,6 +596,11 @@ class FeedEvent(Model):
 
 class SpendEvent(AppendOnly):
     run_order_id: UUID | None = None
+    repository_id: UUID | None = None
+    repository_label: str | None = None
+    loc: int | None = Field(default=None, ge=0, strict=True)
+    batch: str | None = None
+    note: str | None = None
     provider: str
     model: str
     skill: str | None = None

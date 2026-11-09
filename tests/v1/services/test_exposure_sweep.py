@@ -95,6 +95,15 @@ class SweepLookup:
             raise ServiceError(f"{identifier}: gave up")
         return Result(self.records.get(identifier), Acquisition(provider="osv", acquired_at=AT))
 
+    def related(self, record: AdvisoryRecord) -> Result[tuple[AdvisoryRecord, ...]]:
+        names = {record.identifier, *record.aliases}
+        related = tuple(
+            other
+            for other in self.records.values()
+            if other != record and names.intersection((other.identifier, *other.aliases))
+        )
+        return Result(related, Acquisition(provider="osv", acquired_at=AT))
+
     def affecting(self, queries: Sequence[PackageVersion]) -> Result[AdvisoryHits]:
         self.asked += queries
         ids = tuple(
@@ -220,11 +229,11 @@ def test_records_of_one_cve_are_one_row_at_their_highest_severity(engine: Engine
         (osv("GHSA-a", "lodash", database_specific={"severity": "HIGH"}), "critical", False),
         (osv("GHSA-a", "lodash", database_specific={"severity": "HIGH"}), "high", True),
         (osv("GHSA-a", "lodash"), "low", False),  # unrated ranks below low
-        (osv("GHSA-a", "lodash", fixed=None, database_specific={"severity": "HIGH"}), "low", False),
+        (osv("GHSA-a", "lodash", fixed=None, database_specific={"severity": "HIGH"}), "low", True),
         (osv("MAL-2025-1", "lodash", fixed=None), "critical", True),
     ],
 )
-def test_the_floor_and_a_stated_fix_decide_what_is_listed(
+def test_the_severity_floor_decides_what_is_listed_even_without_a_stated_fix(
     engine: Engine, record: AdvisoryRecord, floor: str, kept: bool
 ) -> None:
     commits(engine, CDX)
@@ -618,3 +627,26 @@ def test_a_gomods_requires_mark_go_dependencies_direct(engine: Engine, tmp_path:
         ("flask", "3.0.0", True),  # requirements.txt holds direct dependencies only
         ("jinja2", "3.1.2", False),
     }
+
+
+@pytest.mark.parametrize(
+    ("name", "fixed", "available"),
+    [("lodash", "4.17.21", True), ("lodash", None, False), ("other-package", "4.17.21", None)],
+)
+def test_sweep_fix_availability_distinguishes_stated_absent_and_unknown_package_details(
+    engine: Engine, name: str, fixed: str | None, available: bool | None
+) -> None:
+    commits(engine, CDX)
+    record = osv(
+        "GHSA-fix0-0000-0000",
+        name,
+        fixed=fixed,
+        database_specific={"severity": "HIGH"},
+    )
+    [row] = (
+        service(engine, SweepLookup({"lodash": (record.identifier,)}, record))
+        .sweep(ScannerSeverity.HIGH)
+        .advisories
+    )
+    assert row.fix_available is available
+    assert row.packages == ("npm/lodash",)

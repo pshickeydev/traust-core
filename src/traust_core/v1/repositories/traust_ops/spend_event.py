@@ -26,6 +26,11 @@ SPEND_EVENT = TableSpec(
     "spend_event",
     lambda: (
         uuid_column("run_order_id", nullable=True),
+        uuid_column("repository_id", nullable=True),
+        text_column("repository_label", nullable=True),
+        sa.Column("loc", sa.BigInteger),
+        text_column("batch", nullable=True),
+        text_column("note", nullable=True),
         text_column("provider"),
         text_column("model"),
         text_column("skill", nullable=True),
@@ -50,8 +55,8 @@ class SpendEventRepository(RecordRepository[SpendEvent], Protocol):
     def sum_by(
         self, filter: SpendFilter, group_by: SpendDimension | None = None
     ) -> list[SpendRollup]:
-        """Spend in the filter's window, one rollup per group (one total when ungrouped); by
-        repository, the key is the run order's repository id (None: no order or no repository)."""
+        """Windowed spend grouped by the requested dimension; repositories use explicit event
+        attribution, or the associated order for historical events."""
         ...
 
 
@@ -114,7 +119,7 @@ class SqlSpendEventRepository(SqlAppendOnlyRepository[SpendEvent]):
         if group_by is SpendDimension.REPOSITORY:
             orders = TableFactory.for_bind(self._connection).table(RUN_ORDER)
             source = self.table.outerjoin(orders, orders.c.id == c.run_order_id)
-            keys[group_by] = orders.c.repository_id
+            keys[group_by] = sa.func.coalesce(c.repository_id, orders.c.repository_id)
         grouped = () if group_by is None else (keys[group_by],)
         stmt = (
             sa.select(
