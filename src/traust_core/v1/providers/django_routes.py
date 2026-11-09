@@ -194,7 +194,11 @@ class _Django:
         `DEFAULT_PERMISSION_CLASSES`) from the settings that name it: read as code, only where
         set unconditionally, and only those every settings module of the project agrees on."""
         found: dict[str, list[tuple[list[str], list[ast.AST]]]] = {}
+        texts = {src.file.rel: src.file.text for src in self.index.sources}
         for rel in self.trees:
+            # a module that names no setting adds nothing to the ones it star-imports
+            if not any(k in texts[rel] for k in ("ROOT_URLCONF", "MIDDLEWARE", "REST_FRAMEWORK")):
+                continue
             values = self.setting_values(rel, frozenset())
             if not values.keys() & {"ROOT_URLCONF", "MIDDLEWARE", "REST_FRAMEWORK"}:
                 continue
@@ -297,7 +301,7 @@ class _Django:
                 for m in self.index.modules.imported.get(rel, {}).values()
             ):
                 forwarded = _forwarded(tree)
-                for n in ast.walk(tree):
+                for n, _ in self.index.calls.get(rel, []):
                     if self.is_path(rel, n) and id(n) not in self.seen | forwarded:
                         self.entry(rel, n, "", True, frozenset())
         return self.rows
@@ -984,9 +988,9 @@ class _Django:
                     router.parent = (parent, route.strip("^$").strip("/"), lookup)
                     router.dynamic |= computed or parent is None
         self._routers = found
-        for rel, tree in self.trees.items():
-            for n in ast.walk(tree):
-                if not (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)):
+        for rel in self.trees:
+            for n, _ in self.index.calls.get(rel, []):
+                if not isinstance(n.func, ast.Attribute):
                     continue
                 if n.func.attr == "register" and len(n.args) >= 2:
                     key = self.router_key(rel, _dotted(n.func.value))
@@ -1008,34 +1012,38 @@ class _Django:
 
     def helper_registrations(self, found: dict[tuple[str, str], _Router]) -> None:
         """`def register_routes(router): router.register(..)`, called with a router."""
-        for rel, tree in self.trees.items():
-            for fn in tree.body:
-                if not isinstance(fn, ast.FunctionDef):
-                    continue
-                params = [a.arg for a in fn.args.args]
-                calls = [
-                    n
-                    for n in ast.walk(fn)
-                    if isinstance(n, ast.Call)
+        helpers: dict[str, list[tuple[str, ast.FunctionDef, list[ast.Call]]]] = {}
+        for rel in self.trees:
+            by_fn: dict[int, tuple[ast.FunctionDef, list[ast.Call]]] = {}
+            for n, fn in self.index.calls.get(rel, []):
+                if (
+                    isinstance(fn, ast.FunctionDef)
                     and isinstance(n.func, ast.Attribute)
                     and n.func.attr == "register"
                     and isinstance(n.func.value, ast.Name)
-                    and n.func.value.id in params
+                    and n.func.value.id in {a.arg for a in fn.args.args}
                     and len(n.args) >= 2
-                ]
-                for where, other in self.trees.items():
-                    for site in ast.walk(other) if calls else ():
-                        if not (isinstance(site, ast.Call) and site.args):
-                            continue
-                        target = self.definition(_dotted(site.func), where)
-                        if target is None or target[1] is not fn:
-                            continue
-                        for c in calls:
-                            i = params.index(c.func.value.id)  # type: ignore[attr-defined]
-                            arg = site.args[i] if i < len(site.args) else None
-                            key = self.router_key(where, _dotted(arg)) if arg is not None else None
-                            if key in found:
-                                found[key].registered.append((rel, c))
+                ):
+                    by_fn.setdefault(id(fn), (fn, []))[1].append(n)
+            for fn, calls in by_fn.values():
+                helpers.setdefault(fn.name, []).append((rel, fn, calls))
+        if not helpers:
+            return
+        for where in self.trees:
+            for site, _ in self.index.calls.get(where, []):
+                if not site.args:
+                    continue
+                for rel, fn, calls in helpers.get(_dotted(site.func).split(".")[-1], []):
+                    target = self.definition(_dotted(site.func), where)
+                    if target is None or target[1] is not fn:
+                        continue
+                    params = [a.arg for a in fn.args.args]
+                    for c in calls:
+                        i = params.index(c.func.value.id)  # type: ignore[attr-defined]
+                        arg = site.args[i] if i < len(site.args) else None
+                        key = self.router_key(where, _dotted(arg)) if arg is not None else None
+                        if key in found:
+                            found[key].registered.append((rel, c))
 
     def router_key(self, rel: str, name: str) -> tuple[str, str] | None:
         """The (module, name) a router named in `rel` is bound at, through its imports."""
