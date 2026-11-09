@@ -182,8 +182,7 @@ def _requires_identity(method: ast.FunctionDef) -> bool:
         value.values if isinstance(value, ast.BoolOp) and isinstance(value.op, ast.And) else [value]
     )
     return any(
-        not (isinstance(t, ast.UnaryOp) and isinstance(t.op, ast.Not))
-        and re.search(r"\.(is_authenticated|is_staff|is_superuser)\b", ast.unparse(t))
+        isinstance(t, ast.Attribute) and t.attr in ("is_authenticated", "is_staff", "is_superuser")
         for t in terms
     )
 
