@@ -967,3 +967,32 @@ def test_holes_qodo_found_in_the_fixes_stay_closed(
         },
     )
     assert _row(result, method, pattern)["ownership"] == ownership
+
+
+def test_a_framework_with_an_ownership_reader_names_no_ownership_gap(app: dict) -> None:
+    assert [g for g in app["coverage_gaps"] if g["system"].endswith(" ownership")] == []
+    assert all(r["ownership"] is not None for r in app["routes"] if r["family"] == "fastapi")
+
+
+def test_an_unresolved_handler_is_a_gap_the_reader_names(tmp_path: Path) -> None:
+    result = _tree(
+        tmp_path,
+        {
+            "app/__init__.py": "",
+            "app/auth.py": AUTH,
+            "app/main.py": """
+                from fastapi import Depends, FastAPI
+                from app.auth import get_current_user
+
+                app = FastAPI()
+                app.add_api_route(
+                    "/things/{thing_id}",
+                    lambda thing_id: thing_id,
+                    dependencies=[Depends(get_current_user)],
+                )
+            """,
+        },
+    )
+    [gap] = [g for g in result["coverage_gaps"] if g["system"] == "fastapi ownership"]
+    assert gap["count"] == 1
+    assert "whose handler the ownership reader couldn't resolve" in gap["reason"]

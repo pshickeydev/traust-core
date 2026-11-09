@@ -33,6 +33,7 @@ from traust_core.v1.providers.route_ownership import (
     HandlerFacts,
     classify,
     path_params,
+    privileged_only,
     rank,
 )
 from traust_core.v1.providers.syntax import grammar_missing
@@ -2479,6 +2480,7 @@ def route_guards(files: list[TreeFile]) -> RouteGuardFact:
                     evidence=RepoPath(evidence) if evidence else None,
                 )
             )
+    gaps += _unclassified_ownership(rows)
     rows.sort(
         key=lambda r: (
             not r.judgement_required,
@@ -2493,6 +2495,57 @@ def route_guards(files: list[TreeFile]) -> RouteGuardFact:
         asymmetries=tuple(asymmetries),
         coverage_gaps=tuple(gaps),
     )
+
+
+# Frameworks with an ownership reader: an unclassified route there is a handler it couldn't read.
+_OWNERSHIP_READ = frozenset(
+    {RouteFamily.SPRING, RouteFamily.JAX_RS, RouteFamily.FASTAPI, RouteFamily.EXPRESS,
+     RouteFamily.RAILS}
+)  # fmt: skip
+_OWNERSHIP_GAP = " ownership"
+
+
+def ownership_gap(gap: CoverageGap) -> bool:
+    """A gap in classifying the ownership of enumerated routes, not in enumerating them."""
+    return gap.system.endswith(_OWNERSHIP_GAP)
+
+
+def _authenticates(guard: str) -> bool:
+    """A guard name that still names a guard once state-only words (session, cookie) are gone."""
+    return bool(GUARD_RX.search(NON_ENFORCING_RX.sub("", guard)))
+
+
+def _unclassified_ownership(rows: Sequence[_Row]) -> list[CoverageGap]:
+    """Live authenticated id routes no ownership reader classified, named per family:
+    unclassified is a gap, never a blank that reads as nothing to flag."""
+    by_family: dict[str, list[_Row]] = {}
+    for r in rows:
+        guards = [] if r.unguards else [*r.guards, *r.scope_guards]
+        if (
+            r.ownership is None
+            and not r.test_path
+            and any(_authenticates(g) for g in guards)
+            and not any(privileged_only(g) for g in guards)
+            and path_params(r.pattern)
+        ):
+            by_family.setdefault(r.family, []).append(r)
+    return [
+        CoverageGap(
+            system=f"{family}{_OWNERSHIP_GAP}",
+            reason=f"{family}: object ownership is UNCLASSIFIED on {len(unread)} authenticated "
+            "id route(s), "
+            + (
+                "whose handler the ownership reader couldn't resolve"
+                if family in _OWNERSHIP_READ
+                else "with no ownership reader for this framework yet"
+            )
+            + "; check by hand that each ties the object it acts on to the caller (CWE-639)",
+            count=len(unread),
+            paths=tuple(dict.fromkeys(RepoPath(r.path) for r in unread))[:20],
+            evidence=RepoPath(unread[0].path),
+        )
+        for family, unread in by_family.items()
+    ]
 
 
 class RouteGuardMatrix:
