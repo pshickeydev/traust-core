@@ -72,7 +72,12 @@ def test_atomic_artifact_retry_reads_the_winner_by_digest(
         row = unit.artifacts.get(existing)
     write, read = explained(
         lambda unit: unit.artifacts.get_or_add(
-            Artifact(digest=row.digest, kind=row.kind, uri=row.uri)
+            Artifact(
+                digest=row.digest,
+                kind=row.kind,
+                uri=row.uri,
+                publication_revision=row.publication_revision,
+            )
         )
     )
     assert not write.seq_scans(), write.plan
