@@ -51,6 +51,32 @@ All modules live under `traust_core.v1` (see [Versioning](#versioning)).
 | **Deps and SBOM scanners** | `providers.tools.osv`, `providers.tools.osv_sbom`, `providers.tools.grype` | registered by `scanner_tools`: `grype` over a checkout or SBOM path, database frozen by default; `osv`, a checkout's declared packages looked up through `ctx.advisories` with coverage reported, `osv.scan_api(..., resolver=ctx.deps_dev)` for the full candidates document; `osv_sbom`, an image's syft JSON language packages not installed by an OS package, with `mark_grype_duplicates` / `grype_os_installed_matches` and the air-gapped osv-scanner path; CVSS through `models.dependencies.cvss_base_score` | `adapters/{osv,osv_sbom,grype}.py`, `osv/` (client: reuses `providers.osv`) |
 | **Config + Context** | `context`, `context.documents` (the YAML codec: `yaml_documents`, `yaml_documents_with_lines`, `yaml_text`, passed to providers, which don't import yaml), `context.preflight` | one `traust.yaml`; `Context` builds everything ([ledger and identity sections](docs/configuration.md)). The deployment config home: `resolve_config_home(explicit)` (`$TRAUST_CONFIG_HOME`, else `~/.traust/config` when it exists), `config_path(name)` (`DeploymentConfigMissing` naming the file and its template), `optional_config_path(name)`, `config_completeness_audit()` (`(errors, warnings)` for `install_traust --doctor`). `Context.preflight(requirements)` (`context.preflight`): one readiness door the engine's start gate, the platform doors and `traust doctor` call — a `Requirement` (`models.operations`, the pack schema's `requires:` vocabulary: tools, config keys, recorded facts, feed sources, secrets) is checked against `Toolchain.preflight`, the traust.yaml keys `Config.provided` records, the recorded facts, the enabled feed sources, the environment and the config home audit, raising `PreflightError` with every gap and its fix; `schema_dir()` / `schema_path(name)` / `validate_config(name, document)` and the ops types consumers annotate with (`OpsService`, `SpendService`, `FeedQuery`, `Router`, `Clock`) re-exported for consumers | `os.environ`, scattered config files, `traust_contracts.config` |
 
+Repository authority reads stay server-owned:
+`GET /v1/repositories/{repository_id}/refs/current-default` (OpenAPI
+`get_current_default_ref`, generated client `GetCurrentDefaultRef`) returns the
+exact `RepositoryRef` chosen by `PortfolioService.current_default_ref`, or 404.
+Immutable historical default flags do not independently identify the current head:
+the existing observation/default-naming order chooses its ID and SHA.
+
+The latest-recorded assessment read joins repository ownership in SQL and returns
+at most one assessment without loading or binding the repository's ref history.
+Algorithm-free fingerprint reads use the contracts-owned
+`(repository_id, fingerprint)` index, retaining exact opaque identity and ambiguity
+across algorithms. Local stores receive its additive index upgrade; configured
+databases must apply `contracts.finding_fingerprint_index_upgrade(dialect)` first.
+
+`POST /v1/remediations/{work_item_id}/pull-request` (`record_remediation_pull_request`,
+generated `RecordRemediationPullRequest`) accepts an `ExternalRef` (`system`, actual
+HTTPS PR URL in `ref`) and returns `WorkItem`. A verified person records this
+manual action; machine and unverified identities are refused. The attempt's
+tracker and `pr_opened` progress commit together. Replaying the same PR is a no-op,
+including after merge; a different PR conflicts. Finding-wide Jira tickets retain
+their existing semantics, while PR trackers are scoped by assessment ID and never
+spread to other attempts over the same findings. Immutable worker reports are not
+rewritten. Existing local stores gain the nullable scope automatically; configured
+databases apply `contracts.finding_external_ref_assessment_upgrade(dialect)` when
+`finding_external_ref.assessment_id` is absent. Historical links remain unscoped.
+
 ## Historical reads and reporting correctness
 
 The native consumer doors above remain owned by their existing services and models.

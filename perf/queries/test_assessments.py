@@ -170,11 +170,9 @@ def test_latest_recorded_returns_one_nonempty_scoped_row_by_index(
         assert found.kind == AssessmentKind.REPO_STATE_CANONICAL
         assert found.status in (ASSESSMENT_COMPLETED, ASSESSMENT_DEGRADED)
 
-    repository, refs, latest = explained(read)
+    repository, latest = explained(read)
     assert repository.execution_ms < 5, repository.plan
-    assert refs.execution_ms < 5, refs.plan
-    fast(latest, "idx_assessment_ref_kind_occurred", 5)
-    assert latest.plan[0].startswith("Limit "), latest.plan
+    assert latest.execution_ms < 5, latest.plan
 
 
 @pytest.mark.parametrize("since", ["an hour ago", "the start"])

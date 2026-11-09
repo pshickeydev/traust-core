@@ -910,10 +910,11 @@ class AssessmentService:
     def latest_recorded(self, repository_id: UUID, kind: AssessmentKind) -> Assessment:
         """The repository's newest completed or degraded assessment across all its refs."""
         self._inventory.get_repository(repository_id)
-        refs = [ref.id for ref in self._inventory.list_refs(repository_id) if ref.id]
         with self._uow as uow:
-            found = uow.assessments.latest_for_refs(
-                refs, self._kind_spellings(kind), (ASSESSMENT_COMPLETED, ASSESSMENT_DEGRADED)
+            found = uow.assessment_reads.latest_for_repository(
+                repository_id,
+                self._kind_spellings(kind),
+                (ASSESSMENT_COMPLETED, ASSESSMENT_DEGRADED),
             )
         if found is None:
             raise NotFoundError(f"no recorded {kind} assessment for repository {repository_id}")

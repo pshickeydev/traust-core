@@ -740,6 +740,13 @@ class Context:
             _run_order_fork_columns(engine)  # artifact_run_order's upgrade needs these first
             _artifact_run_order(engine, upgrade=local)
             _run_order_fork_scheduled(engine, upgrade=local)
+            _finding_fingerprint_index(engine, upgrade=local)
+            _additive_column(
+                engine,
+                ("traust", "finding_external_ref", "assessment_id"),
+                "finding_external_ref_assessment_upgrade",
+                upgrade=local,
+            )
         return engine
 
     @cached_property
@@ -1311,3 +1318,22 @@ def _additive_column(
     except RepositoryError:
         if not present():  # else another process opening the same store upgraded it first
             raise
+
+
+def _finding_fingerprint_index(engine: Engine, *, upgrade: bool) -> None:
+    dialect = Dialect.of(engine)
+    schema = "traust" if dialect == Dialect.POSTGRES else None
+    inspector = sa.inspect(engine)
+    if not inspector.has_table("finding", schema=schema):
+        return
+    if any(
+        index["column_names"][:2] == ["repository_id", "fingerprint"]
+        for index in inspector.get_indexes("finding", schema=schema)
+    ):
+        return
+    if not upgrade:
+        raise ConfigError(
+            "the database's finding table lacks the repository/fingerprint index: apply "
+            "traust_core.v1.contracts.finding_fingerprint_index_upgrade(dialect) to it"
+        )
+    apply_schema(engine, contracts.finding_fingerprint_index_upgrade(dialect))

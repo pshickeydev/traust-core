@@ -585,6 +585,7 @@ class FindingLabel(Entity):
 
 class FindingExternalRef(Entity):
     finding_id: UUID
+    assessment_id: UUID | None = None
     system: str
     ref: str
 

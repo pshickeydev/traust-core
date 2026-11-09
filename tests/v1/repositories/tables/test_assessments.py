@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 from datetime import datetime, timedelta
 from decimal import Decimal
 from uuid import UUID, uuid4
@@ -97,6 +98,55 @@ def test_latest_across_refs_breaks_time_ties_by_created_at_then_id(seed: Seed) -
         )
         == expected
     )
+
+
+def test_latest_repository_assessment_keeps_scope_aliases_status_and_time_ties(seed: Seed) -> None:
+    repository = seed.repository()
+    first = seed.repository_ref(repository, sha="a" * 40)
+    second = seed.repository_ref(repository, sha="b" * 40)
+    read = seed.uow.assessment_reads.latest_for_repository
+    kinds, statuses = ("audit", "audit-legacy"), ("completed", "degraded")
+    assert read(repository.id, kinds, statuses) is None
+    seed.assessment(first, occurred_at=T0)
+    tied = [
+        seed.assessment(ref, kind=kind, status=status, occurred_at=T0 + timedelta(days=1))
+        for ref, kind, status in (
+            (first, "audit", "completed"),
+            (second, "audit-legacy", "degraded"),
+        )
+    ]
+    for status in ("pending", "failed", "future-status"):
+        seed.assessment(first, status=status, occurred_at=T0 + timedelta(days=2))
+    seed.assessment(first, kind="other", occurred_at=T0 + timedelta(days=3))
+    seed.assessment(occurred_at=T0 + timedelta(days=4))
+    assert read(repository.id, kinds, statuses) == max(
+        tied, key=lambda row: (row.occurred_at, row.created_at, row.id)
+    )
+    assert read(uuid4(), kinds, statuses) is None
+    assert read(repository.id, (), statuses) is None
+    assert read(repository.id, kinds, ()) is None
+
+
+def test_latest_repository_read_does_not_bind_reference_ids(seed: Seed) -> None:
+    repository = seed.repository()
+    for index in range(1100):
+        ref = seed.repository_ref(repository, sha=f"{index:040x}")
+    newest = seed.assessment(ref)
+    connection = seed.uow.connection
+    driver = connection.connection.driver_connection
+    previous = None
+    if connection.dialect.name == "sqlite":
+        previous = driver.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 64)
+    try:
+        assert (
+            seed.uow.assessment_reads.latest_for_repository(
+                repository.id, ("audit",), ("completed",)
+            )
+            == newest
+        )
+    finally:
+        if previous is not None:
+            driver.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, previous)
 
 
 def test_latest_per_ref_of_kinds_and_status(seed: Seed) -> None:

@@ -52,6 +52,34 @@ def test_fingerprint_lookup_refuses_cross_algorithm_ambiguity(seed: Seed) -> Non
         assert lookup(repo.id, finding.fingerprint_algo, finding.fingerprint) == finding
 
 
+@pytest.mark.parametrize("missing", [False, True])
+def test_algorithm_free_fingerprint_read_has_bounded_sqlite_work(seed: Seed, missing: bool) -> None:
+    connection = seed.uow.connection
+    if connection.dialect.name != "sqlite":
+        pytest.skip("SQLite VM instruction bound; Postgres volume covered by perf suite")
+    repository = seed.repository()
+    for index in range(2000):
+        seed.finding(repository, fingerprint=f"{index:08d}")
+    last = seed.finding(repository, fingerprint="zzzz-late-match")
+    driver = connection.connection.driver_connection
+    calls = 0
+
+    def step() -> int:
+        nonlocal calls
+        calls += 1
+        return int(calls > 10)
+
+    driver.set_progress_handler(step, 100)
+    try:
+        found = seed.uow.findings.find_by_fingerprint(
+            repository.id, None, "zzzz-missing" if missing else last.fingerprint
+        )
+    finally:
+        driver.set_progress_handler(None, 0)
+    assert found == (None if missing else last)
+    assert calls <= 10
+
+
 def test_findings_known_as_an_advisory(seed: Seed) -> None:
     advisory = seed.advisory()
     known = seed.finding(advisory_id=advisory.id, advisory_match="confirmed")
@@ -97,6 +125,21 @@ def test_labels_and_external_refs(seed: Seed) -> None:
     assert u.finding_labels.list_with("attack", "T1190") == [attack]
     assert u.finding_external_refs.list_for_finding(finding.id) == [ticket]
     assert same_rows(u.finding_external_refs.list_for_ref("jira", "SEC-1"), [ticket, shared])
+
+
+def test_external_references_are_scoped_to_exact_assessment(seed: Seed) -> None:
+    finding = seed.finding()
+    first, second = seed.assessment(), seed.assessment()
+    link = seed.finding_external_ref(
+        finding,
+        system="github",
+        ref="https://github.com/example/service/pull/1",
+        assessment_id=first.id,
+    )
+    seed.finding_external_ref(finding, system="jira", ref="SEC-1")
+    assert seed.uow.finding_external_refs.list_for_assessments((first.id,)) == [link]
+    assert seed.uow.finding_external_refs.list_for_assessments((second.id,)) == []
+    assert seed.uow.finding_external_refs.list_for_assessments(()) == []
 
 
 def test_decision_by_statement_key(seed: Seed) -> None:

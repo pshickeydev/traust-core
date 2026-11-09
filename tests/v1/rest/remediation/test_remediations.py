@@ -162,3 +162,49 @@ def test_a_verification_recorded_through_the_door_revalidates_the_effort(
     assert recorded.status_code == 200, recorded.text
     detail = client.get(f"{URL}/{handle}", headers=bearer(context))
     assert detail.json()["status"] == "revalidated_fixed"
+
+
+def test_pull_request_record_matches_owner_and_replays_without_duplicate_progress(
+    context: Context, client: TestClient, engine: Engine
+) -> None:
+    repository_id, finding_ids = seeded(engine)
+    made = client.post(
+        URL, json=schedule(engine, repository_id, finding_ids), headers=bearer(context)
+    )
+    work_item_id = made.json()["work_item"]["work_item_id"]
+    route = f"{URL}/{work_item_id}/pull-request"
+    body = {"system": "github", "ref": "https://github.com/example-org/service/pull/101"}
+    response = client.post(route, json=body, headers=bearer(context))
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "pr_opened"
+    assert response.json()["tracker"] == body
+    same_as_in_process(response.json(), context.services().remediation.get(UUID(work_item_id)))
+    assert client.post(route, json=body, headers=bearer(context)).json() == response.json()
+    effort = client.get(f"{URL}/{work_item_id}", headers=bearer(context)).json()
+    assert effort["work_item"]["tracker"] == body
+    assert effort["status"] == "pr_opened"
+    conflict = client.post(route, json={**body, "ref": body["ref"] + "2"}, headers=bearer(context))
+    assert conflict.status_code == 409
+    assert conflict.headers["content-type"] == "application/problem+json"
+
+
+def test_pull_request_record_requires_manual_identity_and_valid_existing_item(
+    context: Context, client: TestClient, engine: Engine
+) -> None:
+    repository_id, finding_ids = seeded(engine)
+    made = client.post(
+        URL, json=schedule(engine, repository_id, finding_ids), headers=bearer(context)
+    )
+    work_item_id = made.json()["work_item"]["work_item_id"]
+    route = f"{URL}/{work_item_id}/pull-request"
+    body = {"system": "github", "ref": "https://github.com/example-org/service/pull/101"}
+    assert client.post(route, json=body).status_code == 401
+    assert client.post(route, json=body, headers=runner(context)).status_code == 403
+    assert (
+        client.post(f"{URL}/{uuid4()}/pull-request", json=body, headers=bearer(context)).status_code
+        == 404
+    )
+    for invalid in ({**body, "system": " "}, {**body, "ref": "http://example.org/pull/1"}):
+        response = client.post(route, json=invalid, headers=bearer(context))
+        assert response.status_code == 422, response.text
+    assert context.services().remediation.get(UUID(work_item_id)).status == "candidate"

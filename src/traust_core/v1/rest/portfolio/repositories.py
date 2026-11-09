@@ -6,6 +6,7 @@ from uuid import UUID
 from fastapi import APIRouter, Query
 from pydantic import Field
 
+from traust_core.v1.errors import NotFoundError
 from traust_core.v1.models.base import Model
 from traust_core.v1.models.common import Cursor, Page, PageRequest
 from traust_core.v1.models.inventory import (
@@ -64,6 +65,14 @@ def list_refs(
 ) -> list[RepositoryRef]:
     """The repository's refs; with `sha`, only that commit's."""
     return portfolio.inventory.list_refs(repository_id, sha)
+
+
+@router.get("/v1/repositories/{repository_id}/refs/current-default", responses=PROBLEMS(401, 404))
+def get_current_default_ref(repository_id: UUID, portfolio: Portfolio, _: Caller) -> RepositoryRef:
+    ref = portfolio.current_default_ref(repository_id)
+    if ref is None:
+        raise NotFoundError(f"no current default ref for repository {repository_id}")
+    return ref
 
 
 @router.post("/v1/repositories/{repository_id}/refs", responses=PROBLEMS(401, 404, 422))

@@ -46,14 +46,26 @@ class FindingRecords:
                 ]
             return uow.finding_external_refs.list_for_findings(finding_ids, system)
 
-    def link_external(self, finding_id: UUID, system: str, ref: str) -> bool:
+    def external_refs_for_assessments(
+        self, assessment_ids: Collection[UUID]
+    ) -> list[FindingExternalRef]:
+        with self._uow as uow:
+            return uow.finding_external_refs.list_for_assessments(assessment_ids)
+
+    def link_external(
+        self, finding_id: UUID, system: str, ref: str, *, assessment_id: UUID | None = None
+    ) -> bool:
         """Link the finding to `system`'s `ref` in the caller's work; False if already linked."""
         with self._uow as uow:
             known = uow.finding_external_refs.list_for_ref(system, ref)
-            if any(r.finding_id == finding_id for r in known):
+            if same := next((r for r in known if r.finding_id == finding_id), None):
+                if same.assessment_id != assessment_id:
+                    raise ConflictError(f"{system}:{ref} already belongs to another scope")
                 return False
             uow.finding_external_refs.add(
-                FindingExternalRef(finding_id=finding_id, system=system, ref=ref)
+                FindingExternalRef(
+                    finding_id=finding_id, assessment_id=assessment_id, system=system, ref=ref
+                )
             )
             return True
 

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from traust_core.v1.repositories.traust.assessments.artifact import (
     ARTIFACT,
@@ -26,11 +26,15 @@ from traust_core.v1.repositories.traust.assessments.occurrence import (
 )
 from traust_core.v1.repositories.unit_of_work import UnitOfWork
 
+if TYPE_CHECKING:
+    from traust_core.v1.repositories.contract import AssessmentReads
+
 TABLES = (ASSESSMENT, ARTIFACT, OCCURRENCE, LOCATION)
 
 
 class AssessmentsUnitOfWork(UnitOfWork, Protocol):
     assessments: AssessmentRepository
+    assessment_reads: AssessmentReads
     artifacts: ArtifactRepository
     occurrences: OccurrenceRepository
     locations: LocationRepository

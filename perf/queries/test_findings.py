@@ -71,6 +71,7 @@ def test_exact_fingerprint_lookup_is_nonempty_and_index_scoped_at_volume(
         expected = unit.connection.execute(
             sa.select(table.c.id, table.c.fingerprint, table.c.fingerprint_algo)
             .where(table.c.repository_id == repository.id)
+            .order_by(table.c.fingerprint.desc(), table.c.fingerprint_algo.desc())
             .limit(1)
         ).one()
 
@@ -85,8 +86,7 @@ def test_exact_fingerprint_lookup_is_nonempty_and_index_scoped_at_volume(
         assert found.fingerprint_algo == expected.fingerprint_algo
 
     (statement,) = explained(lookup)
-    fast(statement, "finding_repository_id_fingerprint_algo_fingerprint_key", 25)
-    assert statement.plan[0].startswith("Limit "), statement.plan
+    assert statement.execution_ms < 5, statement.plan
 
 
 def test_ambiguous_fingerprint_lookup_reads_only_two_matches_at_volume(
@@ -111,8 +111,27 @@ def test_ambiguous_fingerprint_lookup_reads_only_two_matches_at_volume(
             unit.findings.find_by_fingerprint(original.repository_id, None, original.fingerprint)
 
     _, _, statement = explained(lookup)
-    fast(statement, "finding_repository_id_fingerprint_algo_fingerprint_key", 25)
-    assert statement.plan[0].startswith("Limit "), statement.plan
+    assert statement.execution_ms < 5, statement.plan
+
+
+@pytest.mark.parametrize("repository_url", [TYPICAL_REPOSITORY, HOT_REPOSITORY])
+def test_algorithm_free_fingerprint_miss_is_bounded_at_volume(
+    engine: sa.Engine, explained: Profile, repository_url: str
+) -> None:
+    with SqlTraustUnitOfWork(engine) as unit:
+        repository = unit.repositories.find_by_url(repository_url)
+        assert repository is not None and repository.id is not None
+
+    def lookup(unit: SqlTraustUnitOfWork) -> None:
+        assert (
+            unit.findings.find_by_fingerprint(
+                repository.id, None, "not-a-recorded-perf-fingerprint"
+            )
+            is None
+        )
+
+    (statement,) = explained(lookup)
+    assert statement.execution_ms < 5, statement.plan
 
 
 def test_statement_resend_is_idempotent_at_volume(explained: Profile) -> None:
@@ -468,7 +487,7 @@ def on(statements: list[Explained], table: str) -> Explained:
 
 def test_baseline_of_a_typical_repository_reads_by_index(explained: Profile) -> None:
     got = explained(baseline(TYPICAL_REPOSITORY))
-    fast(on(got, "finding"), "finding_repository_id_fingerprint_algo_fingerprint_key", 5)
+    fast(on(got, "finding"), None, 5)
     fast(on(got, "decision"), "decision_finding_id_statement_key_key", 5)
     fast(on(got, "occurrence"), "occurrence_finding_id_assessment_id_key", 5)
     fast(on(got, "assessment"), "assessment_pkey", 5)
@@ -481,13 +500,13 @@ def test_baseline_of_a_typical_repository_reads_by_index(explained: Profile) -> 
 def test_baseline_of_the_hot_repository_stays_fast(explained: Profile) -> None:
     # 10k findings, 4% of each table: Postgres rightly scans rather than probe 10k ids.
     got = explained(baseline(HOT_REPOSITORY))
-    assert on(got, "finding").uses_index("finding_repository_id_fingerprint_algo_fingerprint_key")
+    fast(on(got, "finding"), None, 100)
     assert all(e.execution_ms < 100 for e in got)
 
 
 def test_open_count_of_a_typical_repository_reads_by_index(explained: Profile) -> None:
     got = explained(open_count(TYPICAL_REPOSITORY))
-    fast(on(got, "finding"), "finding_repository_id_fingerprint_algo_fingerprint_key", 5)
+    fast(on(got, "finding"), None, 5)
     fast(on(got, "decision"), "idx_decision_finding_occurred", 5)
     fast(on(got, "occurrence"), "occurrence_finding_id_assessment_id_key", 5)
     fast(on(got, "assessment"), "assessment_pkey", 5)
@@ -496,7 +515,7 @@ def test_open_count_of_a_typical_repository_reads_by_index(explained: Profile) -
 
 def test_open_count_of_the_hot_repository_stays_fast(explained: Profile, clocked: Clocked) -> None:
     got = explained(open_count(HOT_REPOSITORY))
-    assert on(got, "finding").uses_index("finding_repository_id_fingerprint_algo_fingerprint_key")
+    fast(on(got, "finding"), None, 100)
     assert all(e.execution_ms < 100 for e in got)
     clocked("open_count(typical repository)", open_count(TYPICAL_REPOSITORY))
     clocked("open_count(hot repository)", open_count(HOT_REPOSITORY))
@@ -528,7 +547,7 @@ def test_intake_looks_up_each_natural_key_by_index(explained: Profile) -> None:
         uow.finding_labels.list_for_finding(seen.finding_id)
 
     *_, fingerprint, occurrence, cwe, linked, labelled = explained(lookups)
-    fast(fingerprint, "finding_repository_id_fingerprint_algo_fingerprint_key", 1)
+    fast(fingerprint, None, 1)
     fast(occurrence, "occurrence_finding_id_assessment_id_key", 1)
     fast(cwe, "cwe_identifier_key", 1)
     fast(linked, "finding_cwe_finding_id_cwe_id_key", 1)
