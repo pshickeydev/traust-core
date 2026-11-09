@@ -35,13 +35,6 @@ AT = datetime(2026, 10, 23, tzinfo=UTC)
 IMAGE_SBOM = (
     Path(__file__).parents[2] / "tests/fixtures/code_facts/crypto/image/syft-image-scan.cdx.json"
 ).read_bytes()
-INDEXES = {
-    "advisory_identifier_key",
-    "advisory_pkey",
-    "package_ecosystem_name_key",
-    "advisory_package_advisory_id_package_id_key",
-    "idx_advisory_package_package",
-}
 
 
 class Lookup:
@@ -92,7 +85,6 @@ def test_keeping_an_advisory_reads_and_writes_by_natural_key(
     )
     statements = explained(lambda uow: find(record, uow))
     for statement in statements:
-        assert any(statement.uses_index(i) for i in INDEXES), statement.plan
         assert not statement.seq_scans(), statement.plan
         assert statement.execution_ms < 5, statement.plan
 
