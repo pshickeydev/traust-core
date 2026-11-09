@@ -295,7 +295,34 @@ def test_flask_before_request_that_cannot_reject_is_not_a_guard(tmp_path):
     assert row["judgement_required"] is True
 
 
+_AUTH = (
+    "from functools import wraps\n"
+    "from flask import abort\n"
+    "from flask_login import current_user\n\n"
+    "def _refusing(f):\n"
+    "    @wraps(f)\n"
+    "    def inner(*args, **kwargs):\n"
+    "        if not current_user.is_authenticated:\n"
+    "            abort(401)\n"
+    "        return f(*args, **kwargs)\n"
+    "    return inner\n\n"
+    "def token_required(f):\n    return _refusing(f)\n\n"
+    "def require_auth(f):\n    return _refusing(f)\n\n"
+    "def admin_required(f):\n    return _refusing(f)\n\n"
+    "def require_scope(scope):\n"
+    "    def deco(f):\n"
+    "        @wraps(f)\n"
+    "        def inner(*args, **kwargs):\n"
+    "            if not current_user.is_authenticated or scope not in current_user.scopes:\n"
+    "                abort(403)\n"
+    "            return f(*args, **kwargs)\n"
+    "        return inner\n"
+    "    return deco\n"
+)
+
+
 def test_flask_methodview_one_row_per_method(tmp_path):
+    _write(tmp_path, "svc/auth.py", _AUTH)
     _write(
         tmp_path,
         "svc/views.py",
@@ -327,6 +354,7 @@ def test_flask_methodview_one_row_per_method(tmp_path):
 
 
 def test_flask_restx_method_decorators_and_inheritance(tmp_path):
+    _write(tmp_path, "svc/auth.py", _AUTH)
     _write(
         tmp_path,
         "svc/base.py",
@@ -376,6 +404,7 @@ def test_flask_restx_method_decorators_and_inheritance(tmp_path):
 
 
 def test_flask_restful_method_decorators_dict(tmp_path):
+    _write(tmp_path, "svc/auth.py", _AUTH)
     _write(
         tmp_path,
         "svc/api.py",
@@ -439,7 +468,7 @@ def test_flask_app_hook_scoped_to_its_app_and_registered_blueprints(tmp_path):
         "from .views import bp\n\n"
         "app = Flask(__name__)\n\n"
         "def check_token():\n"
-        "    if not request.headers.get('Authorization'):\n"
+        "    if not current_user.is_authenticated:\n"
         "        abort(401)\n\n"
         "app.before_request(check_token)\n"
         "app.register_blueprint(bp)\n\n"

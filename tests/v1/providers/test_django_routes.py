@@ -151,7 +151,7 @@ def test_drf_defaults_guard_only_drf_views(tmp_path: Path) -> None:
     assert rows[("GET", "api/")]["scope_guards"] == ["IsAuthenticated"]
 
 
-def test_csrf_method_and_setting_decorators_are_not_guards(tmp_path: Path) -> None:
+def test_csrf_method_and_lookalike_decorators_are_not_guards(tmp_path: Path) -> None:
     _write(
         tmp_path,
         {
@@ -172,7 +172,8 @@ def test_csrf_method_and_setting_decorators_are_not_guards(tmp_path: Path) -> No
         },
     )
     rows = _rows(tmp_path)
-    assert rows[("POST", "hook/")]["guards"] == ["require_setting"]
+    # a name that only looks like a guard (`require_setting`) is none (D36)
+    assert rows[("POST", "hook/")]["guards"] == [] and rows[("POST", "hook/")]["judgement_required"]
     assert rows[("any", "me/")]["guards"] == ["login_required"]
 
 
