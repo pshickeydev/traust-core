@@ -9,7 +9,6 @@ import re
 import sys
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
-from pathlib import PurePosixPath
 from typing import TYPE_CHECKING
 
 from traust_core.v1.models.code_facts import (
@@ -89,15 +88,6 @@ _GO_VERB = re.compile(
 _GO_USE = re.compile(r"(?P<recv>[\w.]+)\.Use\(\s*(?P<mws>[^)]+?)\s*\)")
 _GO_TEST_RECEIVERS = ("t", "b", "suite")
 
-_PY_URL = re.compile(
-    r'(?:path|re_path|url)\(\s*r?["\'](?P<pattern>[^"\']*)["\']\s*,\s*'
-    r"(?P<view>[\w.]+(?:\.as_view\(\))?)"
-)
-_PY_PERM = re.compile(r"permission_classes\s*=\s*[\[\(](?P<perms>[^\]\)]*)[\]\)]")
-_PY_CLASS = re.compile(r"^class\s+(?P<name>\w+)\s*\((?P<bases>[^)]*)\)\s*:", re.M)
-_PY_DECORATED_DEF = re.compile(
-    r"(?P<decos>(?:^\s*@[\w.()'\", =\[\]]+\n)+)^\s*def\s+(?P<name>\w+)\s*\(", re.M
-)
 _DRF_DEFAULTS = re.compile(r"DEFAULT_PERMISSION_CLASSES.*?[\[\(](?P<perms>[^\]\)]*)[\]\)]", re.S)
 
 # Detected but not enumerated: Java routes are (java_routes), Kotlin's and these are not.
@@ -317,77 +307,6 @@ def _go(files: list[TreeFile]) -> list[_Row]:
                         _unguards_in(handler) + unguard_scope.get(recv, []),
                     )
                 )
-    return rows
-
-
-@dataclass(frozen=True)
-class _ViewGuards:
-    guards: list[str]
-    unguards: list[str]
-    path: str
-    line: int
-    has_perm_attr: bool
-
-
-def _view_guard_index(files: list[TreeFile]) -> dict[str, _ViewGuards]:
-    index: dict[str, _ViewGuards] = {}
-    for f in files:
-        text = f.text
-        for m in _PY_CLASS.finditer(text):
-            rest = text[m.end() :]
-            end = re.search(r"^\S", rest, re.M)
-            perms = _PY_PERM.search(rest[: end.start()] if end else rest)
-            index[m["name"]] = _ViewGuards(
-                _guards_in(perms["perms"]) if perms else [],
-                _unguards_in(perms["perms"]) if perms else [],
-                f.rel,
-                _line(text, m.start()),
-                bool(perms),
-            )
-        for m in _PY_DECORATED_DEF.finditer(text):
-            guards, unguards = _guards_in(m["decos"]), _unguards_in(m["decos"])
-            if guards or unguards:
-                index[m["name"]] = _ViewGuards(
-                    guards, unguards, f.rel, _line(text, m.start()), True
-                )
-    return index
-
-
-def _drf_default_guards(files: list[TreeFile]) -> list[str]:
-    for f in files:
-        if "settings" in f.name.lower() or "settings" in str(PurePosixPath(f.rel).parent).lower():
-            m = _DRF_DEFAULTS.search(f.text)
-            if m:
-                return _guards_in(m["perms"])
-    return []
-
-
-def _django(files: list[TreeFile]) -> list[_Row]:
-    url_files = [f for f in files if "url" in f.name.lower()]
-    if not url_files:
-        return []
-    views = _view_guard_index(files)
-    defaults = _drf_default_guards(files)
-    rows = []
-    for f in url_files:
-        for m in _PY_URL.finditer(f.text):
-            view = m["view"]
-            info = views.get(view.split(".")[0].replace(".as_view()", "")) or views.get(
-                view.replace(".as_view()", "").split(".")[-1]
-            )
-            rows.append(
-                _row(
-                    RouteFamily.DJANGO_DRF,
-                    "any",
-                    m["pattern"] or "/",
-                    view,
-                    info.path if info else f.rel,
-                    info.line if info else _line(f.text, m.start()),
-                    info.guards if info else [],
-                    [] if info and info.has_perm_attr else defaults,
-                    info.unguards if info else [],
-                )
-            )
     return rows
 
 
@@ -979,7 +898,98 @@ def _flask(files: list[TreeFile]) -> tuple[list[_Row], bool]:
         return [], False
     index = _flask_index(sources)
     consts = _string_constants(files)
-    return [r for s in sources for r in _FlaskFile(s, index, consts).rows()], True
+    rows = [r for s in sources for r in _FlaskFile(s, index, consts).rows()]
+    prefixes = _flask_prefixes(sources, consts)
+    for row in rows:
+        if row.receiver in prefixes:
+            prefix, dynamic = prefixes[row.receiver]
+            row.pattern = _flask_join(prefix, row.pattern)
+            row.dynamic = row.dynamic or dynamic
+    return rows, True
+
+
+def _flask_join(prefix: str, rule: str) -> str:
+    """Flask's join of a mount's prefix and a rule: one `/` between them."""
+    if not prefix:
+        return rule
+    return f"{prefix.rstrip('/')}/{rule.lstrip('/')}" if rule.strip("/") else prefix.rstrip("/")
+
+
+def _flask_prefixes(sources: list[_Source], consts: dict[str, str]) -> dict[str, tuple[str, bool]]:
+    """The prefix each blueprint, flask-restful `Api` and flask-restx `Namespace` mounts its
+    routes under (`url_prefix=`, `register_blueprint`, `Api(bp, prefix=)`, `add_namespace`), and
+    whether it's computed. A receiver name bound or mounted more than one way has none known."""
+    own: dict[str, set[tuple[str, bool]]] = {}
+    mounts: dict[str, set[tuple[str, str | None, bool]]] = {}
+    # a namespace's own path, which applies only once an `Api` adds it
+    namespaces: dict[str, set[tuple[str, bool]]] = {}
+
+    def text(node: ast.AST | None) -> tuple[str | None, bool]:
+        return _pattern(node, consts) if node is not None else (None, False)
+
+    for src in sources:
+        assigned = {
+            id(n.value): [_last(_dotted(t)) for t in n.targets]
+            for n in ast.walk(src.tree)
+            if isinstance(n, ast.Assign)
+        }
+        # `from flask_restful import Api as RestfulApi`
+        renamed = {
+            a.asname: a.name
+            for n in ast.walk(src.tree)
+            if isinstance(n, ast.ImportFrom)
+            for a in n.names
+            if a.asname
+        }
+        for node in ast.walk(src.tree):
+            if not isinstance(node, ast.Call):
+                continue
+            fn = _dotted(node.func)
+            ctor = renamed.get(_last(fn), _last(fn))
+            targets = assigned.get(id(node), [])
+            if ctor == "Blueprint" and targets:
+                prefix, dynamic = text(_kwarg(node, "url_prefix"))
+                for t in targets:
+                    own.setdefault(t, set()).add((prefix or "", dynamic))
+            elif ctor == "Namespace" and targets and node.args:
+                path, dynamic = text(_kwarg(node, "path"))
+                name, name_dynamic = text(node.args[0])
+                for t in targets:
+                    namespaces.setdefault(t, set()).add(
+                        (path if path is not None else f"/{name or ''}", dynamic or name_dynamic)
+                    )
+            elif ctor == "Api" and targets:
+                prefix, dynamic = text(_kwarg(node, "prefix"))
+                app = node.args[0] if node.args else _kwarg(node, "app")
+                for t in targets:
+                    own.setdefault(t, set()).add((prefix or "", dynamic))
+                    if app is not None:
+                        mounts.setdefault(t, set()).add((_last(_dotted(app)), None, False))
+            elif ctor in ("register_blueprint", "add_namespace") and "." in fn and node.args:
+                path_node = _kwarg(node, "url_prefix" if ctor == "register_blueprint" else "path")
+                if path_node is None and ctor == "add_namespace" and len(node.args) > 1:
+                    path_node = node.args[1]
+                path, dynamic = text(path_node)
+                child = _last(_dotted(node.args[0]))
+                mounts.setdefault(child, set()).add((_last(fn.rsplit(".", 1)[0]), path, dynamic))
+            elif ctor == "init_app" and "." in fn and node.args:
+                api = _last(fn.rsplit(".", 1)[0])
+                mounts.setdefault(api, set()).add((_last(_dotted(node.args[0])), None, False))
+
+    def resolve(name: str, seen: frozenset[str]) -> tuple[str, bool]:
+        up = mounts.get(name, set())
+        mine = own.get(name) or (namespaces.get(name) if up else None) or {("", False)}
+        prefix, dynamic = next(iter(mine))
+        dynamic = dynamic or len(mine) > 1
+        if not up or name in seen:
+            return prefix, dynamic or name in seen
+        parent, path, path_dynamic = next(iter(up))
+        above, above_dynamic = resolve(parent, seen | {name})
+        # `register_blueprint(bp, url_prefix=..)` replaces the blueprint's own prefix
+        joined = _flask_join(above, path if path is not None else prefix) or ""
+        return joined, dynamic or path_dynamic or above_dynamic or len(up) > 1
+
+    return {name: resolve(name, frozenset()) for name in {*own, *mounts}}
 
 
 # The server package only: a client-only `import aiohttp` registers no routes.
@@ -2344,6 +2354,7 @@ def route_guards(files: list[TreeFile]) -> RouteGuardFact:
     fastapi_rows, uses_fastapi = _fastapi(index, consts)
     aiohttp_rows, uses_aiohttp = _aiohttp(index, consts)
     # they build on this module
+    from traust_core.v1.providers.django_routes import django_rows
     from traust_core.v1.providers.express_routes import express_rows
     from traust_core.v1.providers.java_routes import java_rows
     from traust_core.v1.providers.ruby_routes import callback_asymmetries, ruby_rows
@@ -2353,7 +2364,7 @@ def route_guards(files: list[TreeFile]) -> RouteGuardFact:
     java, rust, ruby = java_rows(files), rust_rows(files), ruby_rows(files)
     rows = [
         *_go(files),
-        *_django(py),
+        *django_rows(index, consts),
         *flask_rows,
         *fastapi_rows,
         *aiohttp_rows,

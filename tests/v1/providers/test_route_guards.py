@@ -1453,3 +1453,62 @@ def test_a_django_re_path_named_group_is_an_id_route(tmp_path: Path) -> None:
     )
     [gap] = _ownership_gaps(_enum(tmp_path))
     assert (gap["system"], gap["count"]) == ("django-drf ownership", 1)
+
+
+def test_flask_routes_carry_the_prefixes_they_are_mounted_under(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "svc/app.py",
+        "from flask import Blueprint, Flask\n"
+        "from flask_restful import Api as RestfulApi\n"
+        "from flask_restx import Api, Namespace, Resource\n"
+        "app = Flask(__name__)\n"
+        "notes = Blueprint('notes', __name__, url_prefix='/ignored')\n"
+        "admin = Blueprint('admin', __name__, url_prefix='/admin')\n"
+        "nested = Blueprint('nested', __name__, url_prefix='/n')\n"
+        "api_bp = Blueprint('api', __name__, url_prefix='/api/v1')\n"
+        "api = Api(api_bp)\n"
+        "teams = Namespace('teams')\n"
+        "files = Namespace('files', path='/storage')\n"
+        "legacy = RestfulApi(app, prefix='/legacy')\n"
+        "@notes.route('/<int:note_id>')\n"
+        "def note(note_id): ...\n"
+        "@nested.route('/x')\n"
+        "def x(): ...\n"
+        "@teams.route('/<int:team_id>')\n"
+        "class Team(Resource):\n    def get(self, team_id): ...\n"
+        "@files.route('')\n"
+        "class Files(Resource):\n    def get(self): ...\n"
+        "class Old(Resource):\n    def get(self, old_id): ...\n"
+        "api.add_namespace(teams)\n"
+        "api.add_namespace(files)\n"
+        "legacy.add_resource(Old, '/old/<int:old_id>')\n"
+        "admin.register_blueprint(nested)\n"
+        "app.register_blueprint(notes, url_prefix='/notes')\n"
+        "app.register_blueprint(admin)\n"
+        "app.register_blueprint(api_bp)\n",
+    )
+    patterns = {(r["method"], r["pattern"]) for r in _enum(tmp_path)["routes"]}
+    assert patterns == {
+        ("GET", "/notes/<int:note_id>"),  # the registration's url_prefix replaces the blueprint's
+        ("GET", "/admin/n/x"),
+        ("GET", "/api/v1/teams/<int:team_id>"),
+        ("GET", "/api/v1/storage"),
+        ("GET", "/legacy/old/<int:old_id>"),
+    }
+
+
+def test_a_flask_receiver_mounted_two_ways_has_a_dynamic_pattern(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "svc/app.py",
+        "from flask import Blueprint, Flask\n"
+        "app = Flask(__name__)\n"
+        "bp = Blueprint('bp', __name__)\n"
+        "@bp.route('/<int:item_id>')\n"
+        "def item(item_id): ...\n"
+        "app.register_blueprint(bp, url_prefix='/a')\n"
+        "app.register_blueprint(bp, url_prefix='/b')\n",
+    )
+    [row] = _enum(tmp_path)["routes"]
+    assert row["pattern_dynamic"] and row["pattern"].endswith("/<int:item_id>")
