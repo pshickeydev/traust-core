@@ -1746,7 +1746,7 @@ requires-dist = [
     { name = "referencing", specifier = ">=0.30" },
     { name = "sqlalchemy", specifier = ">=2.0" },
     { name = "traust-contracts", git = "https://github.com/traust-security/traust-contracts.git?rev=83d90e75a562532845eaf4d13636e95f51c69134" },
-    { name = "traust-ledger", git = "https://github.com/traust-security/traust-ledger.git?rev=c0e7f4560132414d48958dc38655259f7d1b189c" },
+    { name = "traust-ledger", git = "https://github.com/traust-security/traust-ledger.git?rev=95fd75ed9b7f548322f528f1fd99263ed6733960" },
     { name = "tree-sitter", specifier = "==0.26.0" },
     { name = "tree-sitter-java", specifier = "==0.23.5" },
     { name = "tree-sitter-javascript", specifier = "==0.25.0" },
@@ -1773,8 +1773,8 @@ dev = [
 
 [[package]]
 name = "traust-ledger"
-version = "0.0.0"
-source = { git = "https://github.com/traust-security/traust-ledger.git?rev=c0e7f4560132414d48958dc38655259f7d1b189c#c0e7f4560132414d48958dc38655259f7d1b189c" }
+version = "0.1.0"
+source = { git = "https://github.com/traust-security/traust-ledger.git?rev=95fd75ed9b7f548322f528f1fd99263ed6733960#95fd75ed9b7f548322f528f1fd99263ed6733960" }
 
 [[package]]
 name = "tree-sitter"
