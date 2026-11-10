@@ -973,6 +973,9 @@ class _Django:
                     methods.append((http.upper(), f"{cls.name}.{http}", cls))
             if not methods:
                 methods = [("any", cls.name, cls)]
+        if (allowed := _http_method_names(mro)) is not None:
+            # `View.dispatch` answers any other verb with 405
+            methods = [m for m in methods if m[0] == "any" or m[0].lower() in allowed]
         policy.methods = methods
         policy.methods_of = {
             n.name for _, _, n in methods if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef)
@@ -1682,6 +1685,21 @@ def _permitted(
 
 def _class_key(entry: tuple[str, ast.ClassDef | str]) -> object:
     return id(entry[1]) if isinstance(entry[1], ast.ClassDef) else entry[1]
+
+
+def _http_method_names(mro: list[tuple[str, ast.ClassDef | str]]) -> set[str] | None:
+    """The verbs the nearest checkout `http_method_names` allows; None when no checkout class
+    sets it to a literal list (a library's default allows every verb)."""
+    for _, c in mro:
+        for n in c.body if isinstance(c, ast.ClassDef) else []:
+            if isinstance(n, ast.Assign) and any(
+                isinstance(x, ast.Name) and x.id == "http_method_names" for x in n.targets
+            ):
+                literal = isinstance(n.value, ast.List | ast.Tuple | ast.Set) and all(
+                    isinstance(e, ast.Constant) and isinstance(e.value, str) for e in n.value.elts
+                )
+                return {s.lower() for s in _strings(n.value)} if literal else None
+    return None
 
 
 def _drf(origin: str, name: str) -> bool:

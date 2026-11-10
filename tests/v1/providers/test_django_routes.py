@@ -1139,3 +1139,35 @@ def test_guards_read_through_aliases_and_only_from_auth_libraries(tmp_path: Path
     assert rows[("any", "a/")]["guards"] == ["require_login"]
     assert rows[("any", "b/")]["guards"] == [] and rows[("any", "b/")]["judgement_required"]
     assert rows[("GET", "c/")]["guards"] == ["Authenticated"]
+
+
+@pytest.mark.parametrize(
+    ("names", "methods"),
+    [
+        ("['get']", {"GET"}),
+        ("('get', 'delete')", {"GET", "DELETE"}),
+        ("ALLOWED", {"GET", "POST", "DELETE"}),  # not a literal: not read
+    ],
+)
+def test_a_class_view_lists_only_the_verbs_its_http_method_names_allow(
+    tmp_path: Path, names: str, methods: set[str]
+) -> None:
+    _write(
+        tmp_path,
+        {
+            "app/urls.py": (
+                "from django.urls import path\nfrom .views import NoteView\n"
+                "urlpatterns = [path('notes/', NoteView.as_view())]\n"
+            ),
+            "app/views.py": (
+                "from django.views import View\n"
+                "class Base(View):\n"
+                f"    http_method_names = {names}\n"
+                "class NoteView(Base):\n"
+                "    def get(self, request): ...\n"
+                "    def post(self, request): ...\n"
+                "    def delete(self, request): ...\n"
+            ),
+        },
+    )
+    assert {m for m, _ in _rows(tmp_path)} == methods

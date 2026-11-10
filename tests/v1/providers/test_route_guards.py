@@ -1628,3 +1628,85 @@ def test_flask_options_split_off_a_guarded_route_is_no_asymmetry(tmp_path: Path)
     assert options["guards"] == [] and not options["asymmetry"]
     assert get["guards"] == ["login_required"]
     assert result["asymmetries"] == []
+
+
+_LOGIN_VIEW = (
+    "from flask import Flask\nfrom flask_login import login_required\napp = Flask(__name__)\n"
+    "@app.route('/a')\n@login_required\ndef a(): ...\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("rel", "setting", "guards"),
+    [
+        ("app/config.py", "# LOGIN_DISABLED = True\n", ["login_required"]),
+        ("app/config.py", "LOGIN_DISABLED = False\n", ["login_required"]),
+        ("app/config.py", "LOGIN_DISABLED = True\n", []),
+        # a value read at run time may turn it on
+        ("app/config.py", "import os\nLOGIN_DISABLED = os.getenv('X')\n", []),
+        ("app/config.py", "def f(app):\n    app.config.update(LOGIN_DISABLED=True)\n", []),
+        ("settings.cfg", "# LOGIN_DISABLED = True\n", ["login_required"]),
+        ("settings.cfg", "LOGIN_DISABLED = True\n", []),
+    ],
+)
+def test_flask_login_disabled_is_read_as_a_setting_not_text(
+    tmp_path: Path, rel: str, setting: str, guards: list[str]
+) -> None:
+    _write(tmp_path, "app/views.py", _LOGIN_VIEW)
+    _write(tmp_path, rel, setting)
+    assert _row(_enum(tmp_path), "GET", "/a")["guards"] == guards
+
+
+@pytest.mark.parametrize(
+    ("mount", "pattern"),
+    [
+        ("bp = Blueprint('v', __name__, None, None, None, '/v1')", "/v1/a"),
+        ("bp = Blueprint('v', __name__, url_prefix='/v2')", "/v2/a"),
+    ],
+)
+def test_flask_a_positional_url_prefix_mounts_its_routes(
+    tmp_path: Path, mount: str, pattern: str
+) -> None:
+    _write(
+        tmp_path,
+        "app/views.py",
+        f"from flask import Blueprint\n{mount}\n@bp.route('/a')\ndef a(): ...\n",
+    )
+    assert [r["pattern"] for r in _flask(_enum(tmp_path))] == [pattern]
+
+
+def test_flask_a_positional_restful_api_prefix_mounts_its_resources(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "app/api.py",
+        "from flask import Flask\nfrom flask_restful import Api, Resource\n"
+        "app = Flask(__name__)\napi = Api(app, '/api')\n"
+        "class Items(Resource):\n    def get(self): ...\n"
+        "api.add_resource(Items, '/items')\n",
+    )
+    assert [r["pattern"] for r in _flask(_enum(tmp_path))] == ["/api/items"]
+
+
+@pytest.mark.parametrize(("called", "dynamic"), [(True, False), (False, True)])
+def test_flask_routes_a_helper_registers_are_unplaced_when_nothing_calls_it(
+    tmp_path: Path, called: bool, dynamic: bool
+) -> None:
+    _write(
+        tmp_path,
+        "app/routes.py",
+        "def register(application):\n    @application.route('/a')\n    def a(): ...\n",
+    )
+    _write(
+        tmp_path,
+        "app/main.py",
+        "from flask import Flask\nfrom app.routes import register\napp = Flask(__name__)\n"
+        + ("register(app)\n" if called else ""),
+    )
+    [row] = _flask(_enum(tmp_path))
+    assert row["pattern_dynamic"] is dynamic
+
+
+def test_flask_a_library_import_is_never_a_checkout_definition_elsewhere(tmp_path: Path) -> None:
+    _write(tmp_path, "app/views.py", _LOGIN_VIEW)
+    _write(tmp_path, "app/legacy.py", "def login_required(f):\n    return f\n")
+    assert _row(_enum(tmp_path), "GET", "/a")["guards"] == ["login_required"]

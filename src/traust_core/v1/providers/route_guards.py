@@ -553,6 +553,8 @@ class _FlaskIndex:
     unparsed: list[str] = field(default_factory=list)  # checkout modules this Python can't parse
     _chains: dict[tuple[str, str], list[_Class]] = field(default_factory=dict)
     methods: dict[str, list[_Function]] = field(default_factory=dict)  # reached as `obj.name`
+    referenced: set[str] = field(default_factory=set)  # every name the checkout reads
+    starred: set[str] = field(default_factory=set)  # files star-importing a checkout module
     modules: _Modules | None = None
 
     def pick(self, found: list[_D], name: str, rel: str) -> _D | None:
@@ -589,6 +591,7 @@ class _FlaskIndex:
     def reader(self, rel: str) -> GuardReader:
         """Guards read from `rel`: a decorator or class resolves to the checkout's definition."""
         if rel not in self._readers:
+            modules = self.modules or _Modules()
 
             def resolve(name: str) -> ast.AST | None:
                 written = _last(name)
@@ -601,6 +604,11 @@ class _FlaskIndex:
                 ]
                 if "." in name:
                     kinds.append(self.methods)  # `auth.login_required` on a checkout class
+                here = any(c.path == rel for b in names for k in kinds for c in k.get(b, []))
+                full = modules.full(name, rel)
+                if full and not here and not modules.local(full) and rel not in self.starred:
+                    # imported from a library: its own, whatever the checkout defines elsewhere
+                    return UNREADABLE if self.unparsed_import(name, rel) else None
                 for bare in names:
                     for found in kinds:
                         if not _visible(found.get(bare, []), rel):
@@ -610,7 +618,6 @@ class _FlaskIndex:
                         return picked.node if picked is not None and picked.node else UNREADABLE
                 return UNREADABLE if self.unparsed_import(name, rel) else None
 
-            modules = self.modules or _Modules()
             # flask-login's `LOGIN_DISABLED` lets every caller past its guards
             self._readers[rel] = GuardReader(
                 resolve,
@@ -693,13 +700,63 @@ def _c3(lines: list[list[_T]], key: Callable[[_T], object]) -> list[_T] | None:
     return out
 
 
+# where a library constructor takes its prefix positionally: `Blueprint(name, import_name,
+# static_folder, static_url_path, template_folder, url_prefix)`, flask-restful `Api(app, prefix)`
+_PREFIX_AT = {
+    ("flask", "Blueprint"): 5,
+    ("apiflask", "APIBlueprint"): 7,
+    ("flask_restful", "Api"): 1,
+    ("flask_restx", "Namespace"): 2,
+}
+
+
+def _prefix_arg(call: ast.Call, keyword: str, at: int | None) -> ast.AST | None:
+    """A constructor's prefix argument, by keyword or at its position in the library's."""
+    if (found := _kwarg(call, keyword)) is not None or at is None:
+        return found
+    return call.args[at] if len(call.args) > at else None
+
+
+_LOGIN_SWITCHES = {"LOGIN_DISABLED", "_login_disabled"}
+
+
+def _login_disabled(f: TreeFile, tree: ast.AST | None) -> bool:
+    """A file may set flask-login's `LOGIN_DISABLED`: Python read as code (a literal false
+    doesn't, a computed value may), other config line by line outside comments."""
+    if tree is None:
+        lines = (
+            line for line in f.text.splitlines() if not line.lstrip().startswith(("#", ";", "//"))
+        )
+        return any(_LOGIN_DISABLED.search(line) for line in lines)
+    values: list[ast.AST] = []
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Assign | ast.AnnAssign) and n.value is not None:
+            if any(
+                (isinstance(x, ast.Name) and x.id in _LOGIN_SWITCHES)
+                or (isinstance(x, ast.Attribute) and x.attr in _LOGIN_SWITCHES)
+                or (isinstance(x, ast.Subscript) and _const_str(x.slice) in _LOGIN_SWITCHES)
+                for x in _targets(n)
+            ):
+                values.append(n.value)
+        elif isinstance(n, ast.Call):
+            values += [k.value for k in n.keywords if k.arg in _LOGIN_SWITCHES]
+            if len(n.args) > 1 and _const_str(n.args[0]) in _LOGIN_SWITCHES:
+                values.append(n.args[1])  # `config.setdefault("LOGIN_DISABLED", True)`
+        elif isinstance(n, ast.Dict):
+            values += [
+                v for k, v in zip(n.keys, n.values, strict=True) if _const_str(k) in _LOGIN_SWITCHES
+            ]
+    return any(not isinstance(v, ast.Constant) or bool(v.value) for v in values)
+
+
 def _flask_index(
     sources: list[_Source], files: list[TreeFile], modules: _Modules | None = None
 ) -> _FlaskIndex:
     index = _FlaskIndex(modules=modules)
+    trees = {s.file.rel: s.tree for s in sources}
     # a test module's switch (`app.config["LOGIN_DISABLED"] = True`) runs only under its tests
     index.login_disabled = any(
-        _LOGIN_DISABLED.search(f.text)
+        _login_disabled(f, trees.get(f.rel))
         for f in files
         if (f.path.suffix in _CONFIG_SUFFIXES or f.name.startswith(".env"))
         and not _test_module(f.rel)
@@ -714,6 +771,10 @@ def _flask_index(
         for node in ast.walk(src.tree):
             if isinstance(node, ast.ImportFrom):
                 mod = _resolve_import(rel, node.module, node.level)
+                if any(a.name == "*" for a in node.names) and (
+                    node.level or (modules is not None and modules.local(mod))
+                ):
+                    index.starred.add(rel)  # it may rebind what an earlier import bound
                 for alias in node.names:
                     index.imported.setdefault(rel, {})[alias.asname or alias.name] = mod
                     if alias.asname:
@@ -744,6 +805,10 @@ def _flask_index(
                         index.receivers[t.id] = kind  # type: ignore[assignment]
                     elif isinstance(t, ast.Attribute):
                         index.receivers[t.attr] = kind  # type: ignore[assignment]
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+                index.referenced.add(node.id)
+            elif isinstance(node, ast.Attribute):
+                index.referenced.add(node.attr)
             if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
                 decos = [_deco_name(d, renamed) for d in node.decorator_list]
                 # a method is reached through its class, never by a bare name
@@ -1021,12 +1086,12 @@ class _FlaskFile:
         self.src, self.index, self.consts = src, index, consts
         self.rel = src.file.rel
         self.deco = partial(_deco_name, renamed=index.renamed.get(self.rel, {}))
-        self.params = {
-            a.arg
-            for n in ast.walk(src.tree)
-            if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef)
-            for a in n.args.args
-        }
+        self.helpers: dict[str, set[str]] = {}  # a parameter -> the functions taking it
+        for n in ast.walk(src.tree):
+            if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef):
+                for a in n.args.args:
+                    self.helpers.setdefault(a.arg, set()).add(n.name)
+        self.unconfirmed: set[str] = set()  # receivers handed to helpers nothing calls
         self.mixed = bool(_FASTAPI_IMPORT.search(src.file.text))
         self.other = {
             t.id
@@ -1046,7 +1111,13 @@ class _FlaskFile:
         if self.mixed:
             return recv if recv in self.index.receivers else None
         # `def register(application): @application.route(..)`: an app handed to a helper
-        handed = _last(dotted) in ("route", "add_url_rule") and recv in self.params
+        handed = _last(dotted) in ("route", "add_url_rule") and recv in self.helpers
+        if (
+            handed
+            and recv not in self.index.receivers
+            and not self.helpers[recv] & self.index.referenced
+        ):
+            self.unconfirmed.add(recv)  # a helper nothing calls: where it mounts is unknown
         return recv if (recv in self.index.receivers or self.src.imports_flask or handed) else None
 
     def rows(self) -> list[_Row]:
@@ -1056,6 +1127,8 @@ class _FlaskFile:
                 rows += self._decorated(node)
             if isinstance(node, ast.Call):
                 rows += self._call(node)
+        for r in rows:
+            r.dynamic = r.dynamic or r.receiver in self.unconfirmed
         return rows
 
     def _decorated(self, node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef) -> list[_Row]:
@@ -1427,12 +1500,15 @@ def _flask_prefixes(
             if not isinstance(node, ast.Call):
                 continue
             fn = _dotted(node.func)
-            ctor = renamed.get(_last(fn), _last(fn))
+            ctor = written = renamed.get(_last(fn), _last(fn))
             ctor = {"blueprint": "Blueprint", "app": "Flask"}.get(index.kind(fn, rel) or "", ctor)
+            library = (index.modules.full(fn, rel) if index.modules else "").split(".")[0]
+            at = _PREFIX_AT.get((library, written))
+
             targets = [(rel, t) for t in assigned.get(id(node), [])]
             if ctor == "namespace" and "." in fn and targets and node.args:
                 # flask-restx's `ns = api.namespace("todos")`: added to that Api
-                path, dynamic = text(_kwarg(node, "path"))
+                path, dynamic = text(_kwarg(node, "path") or (node.args[2:3] or [None])[0])
                 name, name_dynamic = text(node.args[0])
                 for t in targets:
                     namespaces.setdefault(t, set()).add(
@@ -1441,18 +1517,18 @@ def _flask_prefixes(
                 calls.append((rel, node, "namespace", loops))
                 continue
             if ctor == "Blueprint" and targets:
-                prefix, dynamic = text(_kwarg(node, "url_prefix"))
+                prefix, dynamic = text(_prefix_arg(node, "url_prefix", at))
                 for t in targets:
                     own.setdefault(t, set()).add((prefix or "", dynamic))
             elif ctor == "Namespace" and targets and node.args:
-                path, dynamic = text(_kwarg(node, "path"))
+                path, dynamic = text(_prefix_arg(node, "path", at))
                 name, name_dynamic = text(node.args[0])
                 for t in targets:
                     namespaces.setdefault(t, set()).add(
                         (path if path is not None else f"/{name or ''}", dynamic or name_dynamic)
                     )
             elif ctor == "Api" and targets:
-                prefix, dynamic = text(_kwarg(node, "prefix"))
+                prefix, dynamic = text(_prefix_arg(node, "prefix", at))
                 for t in targets:
                     own.setdefault(t, set()).add((prefix or "", dynamic))
                 calls.append((rel, node, "Api", loops))
