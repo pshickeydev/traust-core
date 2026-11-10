@@ -11,7 +11,7 @@ from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, TypeVar
+from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 from uuid import UUID
 
 from pydantic import ValidationError as ModelValidationError
@@ -2490,9 +2490,7 @@ class RemediationIndexView:
             raise ValidationError("the remediation index reads work items as they stand; no as_of")
         products, shipped, repositories = _scope(self._portfolio, filter)
         urls = {r.id: r.url for r in repositories}
-        # one batched read over the whole scope — an index joined a repository per row would
-        # walk one listing per repository (thousands of statements at an estate's scale)
-        items = self._remediation.items_in(list(urls))
+        items = self._remediation.items_of_all(urls)
         groups = (
             [(p.slug, sorted(shipped[p.id], key=urls.__getitem__)) for p in products]
             if products
@@ -2502,7 +2500,7 @@ class RemediationIndexView:
             _remediation_row(slug, urls[r], item)
             for slug, repository_ids in groups
             for r in repository_ids
-            for item in items.get(r, ())
+            for item in items.get(r, ())  # type: ignore[union-attr]
         )
         model = RemediationIndex(rows=rows, by_status=dict(Counter(r.status for r in rows)))
         contracts.validate_view(self.name, model.model_dump(mode="json"))
