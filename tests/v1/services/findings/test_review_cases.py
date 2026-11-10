@@ -224,7 +224,6 @@ def test_review_evidence_collects_historical_current_and_direct_artifact_provena
                 digest="a" * 64,
                 kind="triage",
                 uri="artifacts/direct-triage.json",
-                publication_revision=1,
             )
         )
         excluded = seed.artifact(other, kind="validation")

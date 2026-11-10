@@ -61,7 +61,6 @@ def test_record_creates_assessment_and_links_a_new_artifact_row(
         kind="repo-state",
         uri="file:///a.json",
         digest=sha256_hex(DOC.payload),
-        publication_revision=1,
     )
 
     assessment = service.record(
@@ -94,7 +93,6 @@ def test_record_rejects_a_deprecated_kind_without_writing(
         assessment_id=None,
         kind="repo-state",
         digest=sha256_hex(DOC.payload),
-        publication_revision=1,
     )
     with pytest.raises(DocumentError):
         service.record(
@@ -131,9 +129,7 @@ def test_record_rejects_a_reference_whose_bytes_dont_match_doc(
     service: AssessmentService, seed: Seed
 ) -> None:
     ref = seed.repository_ref()
-    stale = seed.artifact(
-        assessment_id=None, kind="repo-state", digest="sha256:unrelated", publication_revision=1
-    )
+    stale = seed.artifact(assessment_id=None, kind="repo-state", digest="sha256:unrelated")
     with pytest.raises(IntegrityError):
         service.record(
             DOC, ref.id, AssessmentKind.REPO_STATE_CANONICAL, "tool:x", "1.0", provenance(stale.id)
@@ -157,7 +153,6 @@ def test_record_rolls_back_the_assessment_if_the_artifact_write_fails(
             kind="repo-state",
             uri="file:///a.json",
             digest=sha256_hex(DOC.payload),
-            publication_revision=1,
         )
         unit.commit()
     failing_add = Mock(side_effect=RepositoryError("artifact write failed"))

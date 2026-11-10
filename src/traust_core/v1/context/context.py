@@ -160,7 +160,7 @@ from traust_core.v1.repositories import (
 )
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.repositories.objects.analysis_results import AnalysisResultsRepository
-from traust_core.v1.repositories.sql import Dialect, SqlUnitOfWork
+from traust_core.v1.repositories.sql import Dialect
 from traust_core.v1.repositories.tables import TableFactory
 from traust_core.v1.services.artifact_publishing import (
     ArtifactPublisher,
@@ -742,16 +742,7 @@ class Context:
             _default_named_at(engine, upgrade=local)
             _run_order_fork_columns(engine)  # artifact_run_order's upgrade needs these first
             _artifact_run_order(engine, upgrade=local)
-            _additive_column(
-                engine,
-                ("traust", "artifact", "publication_revision"),
-                "artifact_publication_revision_upgrade",
-                upgrade=local,
-            )
-            _spend_event_metadata(engine, upgrade=local)
             _run_order_fork_scheduled(engine, upgrade=local)
-            _finding_fingerprint_index(engine, upgrade=local)
-            _finding_external_ref_scope(engine, upgrade=local)
         return engine
 
     @cached_property
@@ -1304,71 +1295,6 @@ def _run_order_fork_scheduled(engine: Engine, *, upgrade: bool) -> None:
     )
 
 
-def _spend_event_metadata(engine: Engine, *, upgrade: bool) -> None:
-    dialect = Dialect.of(engine)
-    schema = "traust_ops" if dialect == Dialect.POSTGRES else None
-    table = "spend_event" if schema else "ops_spend_event"
-    inspector = sa.inspect(engine)
-    if not inspector.has_table(table, schema=schema):
-        return
-    expected = {"repository_id", "repository_label", "loc", "batch", "note"}
-    present = expected & {column["name"] for column in inspector.get_columns(table, schema=schema)}
-    if present and present != expected:
-        raise ConfigError(
-            f"{table} has partial spend metadata; reconcile missing columns "
-            f"{sorted(expected - present)} before opening the database"
-        )
-    _additive_column(
-        engine,
-        ("traust_ops", "spend_event", "repository_id"),
-        "spend_event_metadata_upgrade",
-        upgrade=upgrade,
-    )
-
-
-def _finding_external_ref_scope(engine: Engine, *, upgrade: bool) -> None:
-    _additive_column(
-        engine,
-        ("traust", "finding_external_ref", "assessment_id"),
-        "finding_external_ref_assessment_upgrade",
-        upgrade=upgrade,
-    )
-    dialect = Dialect.of(engine)
-    schema = "traust" if dialect == Dialect.POSTGRES else None
-    inspector = sa.inspect(engine)
-    if not inspector.has_table("finding_external_ref", schema=schema):
-        return
-    indexed = any(
-        index["name"] == "idx_finding_external_ref_assessment"
-        for index in inspector.get_indexes("finding_external_ref", schema=schema)
-    )
-    with SqlUnitOfWork(engine) as unit:
-        triggers = set(
-            unit.connection.exec_driver_sql(
-                "SELECT t.tgname FROM pg_trigger t "
-                "JOIN pg_class c ON c.oid = t.tgrelid "
-                "JOIN pg_namespace n ON n.oid = c.relnamespace "
-                "WHERE NOT t.tgisinternal AND n.nspname = 'traust'"
-                if schema
-                else "SELECT name FROM sqlite_master WHERE type = 'trigger'"
-            ).scalars()
-        )
-    required = {
-        "finding_external_ref_scope_insert",
-        "finding_external_ref_scope_update",
-        "finding_external_ref_finding_scope_update",
-        "finding_external_ref_repository_ref_scope_update",
-    }
-    if indexed and required <= triggers:
-        return
-    if not upgrade:
-        raise ConfigError(
-            "the database's finding_external_ref assessment scope lacks index or guards: apply "
-            "traust_core.v1.contracts.finding_external_ref_scope_upgrade(dialect)"
-        )
-    apply_schema(engine, contracts.finding_external_ref_scope_upgrade(dialect))
-
-
 def _additive_column(
     engine: Engine, where: tuple[str, str, str], upgrade_door: str, *, upgrade: bool
 ) -> None:
@@ -1399,22 +1325,3 @@ def _additive_column(
     except RepositoryError:
         if not present():  # else another process opening the same store upgraded it first
             raise
-
-
-def _finding_fingerprint_index(engine: Engine, *, upgrade: bool) -> None:
-    dialect = Dialect.of(engine)
-    schema = "traust" if dialect == Dialect.POSTGRES else None
-    inspector = sa.inspect(engine)
-    if not inspector.has_table("finding", schema=schema):
-        return
-    if any(
-        index["column_names"][:2] == ["repository_id", "fingerprint"]
-        for index in inspector.get_indexes("finding", schema=schema)
-    ):
-        return
-    if not upgrade:
-        raise ConfigError(
-            "the database's finding table lacks the repository/fingerprint index: apply "
-            "traust_core.v1.contracts.finding_fingerprint_index_upgrade(dialect) to it"
-        )
-    apply_schema(engine, contracts.finding_fingerprint_index_upgrade(dialect))

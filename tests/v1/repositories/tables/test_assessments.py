@@ -10,8 +10,8 @@ from uuid import UUID, uuid4
 import pytest
 import sqlalchemy as sa
 
-from tests.v1.repositories.tables.conftest import T0, Seed, repository_for, same_rows
-from traust_core.v1.errors import IntegrityError, NotFoundError, ValidationError
+from tests.v1.repositories.tables.conftest import T0, Seed, apart, repository_for, same_rows
+from traust_core.v1.errors import NotFoundError, ValidationError
 from traust_core.v1.models.common import RecordBudget
 from traust_core.v1.services.artifact_publishing import AssessmentLog
 
@@ -267,7 +267,7 @@ def test_artifacts_of_an_assessment_and_imported_ones(seed: Seed) -> None:
     a = seed.assessment()
     report = seed.artifact(a, digest="sha256:report")
     sarif = seed.artifact(a, digest="sha256:sarif", kind="sarif")
-    imported = seed.artifact(assessment_id=None, digest="sha256:report", publication_revision=1)
+    imported = seed.artifact(assessment_id=None, digest="sha256:report")
     assert same_rows(u.artifacts.list_for_assessment(a.id), [report, sarif])
     assert u.artifacts.find(a.id, "sha256:report") == report
     assert u.artifacts.find(None, "sha256:report") == imported
@@ -323,9 +323,10 @@ def test_latest_imported_artifact_of_a_kind(seed: Seed) -> None:
     artifacts = seed.uow.artifacts
     assert artifacts.latest_imported("corpus-registry") is None
     seed.artifact(kind="corpus-registry")
-    seed.artifact(assessment_id=None, kind="report", publication_revision=1)
-    older = seed.artifact(assessment_id=None, kind="corpus-registry", publication_revision=1)
-    newer = seed.artifact(assessment_id=None, kind="corpus-registry", publication_revision=2)
+    seed.artifact(assessment_id=None, kind="report")
+    older = seed.artifact(assessment_id=None, kind="corpus-registry")
+    apart()
+    newer = seed.artifact(assessment_id=None, kind="corpus-registry")
     assert artifacts.latest_imported("corpus-registry") == newer != older
 
 
@@ -333,59 +334,12 @@ def test_list_imported_is_newest_first_bounded_and_skips_produced_documents(seed
     artifacts = seed.uow.artifacts
     assert artifacts.list_imported("compliance-scope", limit=10) == []
     seed.artifact(kind="compliance-scope")
-    seed.artifact(assessment_id=None, kind="report", publication_revision=1)
-    older = seed.artifact(assessment_id=None, kind="compliance-scope", publication_revision=1)
-    newer = seed.artifact(assessment_id=None, kind="compliance-scope", publication_revision=2)
+    seed.artifact(assessment_id=None, kind="report")
+    older = seed.artifact(assessment_id=None, kind="compliance-scope")
+    apart()
+    newer = seed.artifact(assessment_id=None, kind="compliance-scope")
     assert artifacts.list_imported("compliance-scope", limit=10) == [newer, older]
     assert artifacts.list_imported("compliance-scope", limit=1) == [newer]
-
-
-def test_imported_revision_orders_equal_database_timestamps_without_uuid_tiebreaks(
-    seed: Seed,
-) -> None:
-    artifacts = seed.uow.artifacts
-    rows = seed.uow.connection.execute(
-        artifacts.table.insert().returning(artifacts.table),
-        [
-            {
-                "digest": f"revision-{revision}",
-                "kind": "corpus-registry",
-                "uri": f"artifacts/{revision}.json",
-                "publication_revision": revision,
-            }
-            for revision in range(1, 4)
-        ],
-    ).mappings()
-    saved = [artifacts.record.model_validate(dict(row)) for row in rows]
-    assert len({row.created_at for row in saved}) == 1
-    assert artifacts.latest_imported("corpus-registry") == saved[-1]
-    assert artifacts.latest_imported("corpus-registry", saved[0].created_at) == saved[-1]
-    assert (
-        artifacts.latest_imported(
-            "corpus-registry", saved[0].created_at - timedelta(microseconds=1)
-        )
-        is None
-    )
-    assert artifacts.list_imported("corpus-registry", limit=3) == saved[::-1]
-
-
-def test_unversioned_import_does_not_become_invisible_behind_versioned_stream(seed: Seed) -> None:
-    artifacts = seed.uow.artifacts
-    # Recreate the earlier nullable-revision schema, not an invalid new write
-    # into the guarded schema. Such historical rows must still fail closed.
-    connection = seed.uow.connection
-    if connection.dialect.name == "sqlite":
-        connection.exec_driver_sql("DROP TRIGGER artifact_imported_revision_required")
-    else:
-        connection.exec_driver_sql(
-            "ALTER TABLE traust.artifact DROP CONSTRAINT artifact_imported_revision_required"
-        )
-    seed.artifact(assessment_id=None, kind="corpus-registry", publication_revision=1)
-    seed.artifact(assessment_id=None, kind="corpus-registry", publication_revision=None)
-    with pytest.raises(IntegrityError, match="no publication revision"):
-        artifacts.latest_imported("corpus-registry")
-    with pytest.raises(IntegrityError, match="no publication revision"):
-        artifacts.list_imported("corpus-registry", limit=1)
 
 
 def test_occurrences_a_detector_rule_matched(seed: Seed) -> None:

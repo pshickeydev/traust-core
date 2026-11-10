@@ -7,7 +7,6 @@ from uuid import UUID
 
 import sqlalchemy as sa
 
-from traust_core.v1.errors import IntegrityError
 from traust_core.v1.models.assessment import Artifact
 from traust_core.v1.models.common import RecordBudget
 from traust_core.v1.repositories.tables import (
@@ -25,7 +24,6 @@ ARTIFACT = TableSpec(
     lambda: (
         uuid_column("assessment_id", nullable=True),
         uuid_column("run_order_id", nullable=True),
-        sa.Column("publication_revision", sa.BigInteger, nullable=True),
         text_column("digest"),
         text_column("kind"),
         text_column("uri"),
@@ -110,36 +108,22 @@ class SqlArtifactRepository(SqlAppendOnlyRepository[Artifact]):
         stmt = (
             self._select()
             .where(c.assessment_id.is_(None), c.kind == kind, *bound)
-            .order_by(c.publication_revision.desc().nulls_first())
+            .order_by(c.created_at.desc(), c.id.desc())
             .limit(1)
         )
         row = self._execute(f"latest imported {kind}", stmt).mappings().first()
-        found = None if row is None else self._to_record(row)
-        if found is not None:
-            self._require_revision(found)
-        return found
+        return None if row is None else self._to_record(row)
 
     def list_imported(self, kind: str, *, limit: int) -> list[Artifact]:
         c = self.table.c
         stmt = (
             self._select()
             .where(c.assessment_id.is_(None), c.kind == kind)
-            .order_by(c.publication_revision.desc().nulls_first())
+            .order_by(c.created_at.desc(), c.id.desc())
             .limit(limit)
         )
         rows = self._execute(f"list imported {kind}", stmt).mappings()
-        found = [self._to_record(r) for r in rows]
-        for row in found:
-            self._require_revision(row)
-        return found
-
-    @staticmethod
-    def _require_revision(row: Artifact) -> None:
-        if row.publication_revision is None:
-            raise IntegrityError(
-                f"{row.kind}: imported artifact {row.id} has no publication revision; "
-                "apply the explicit artifact publication revision upgrade or use ArtifactPublisher"
-            )
+        return [self._to_record(r) for r in rows]
 
     def latest_for_assessment(self, assessment_id: UUID, kind: str) -> Artifact | None:
         """The assessment's newest document of `kind`; None when it holds none."""

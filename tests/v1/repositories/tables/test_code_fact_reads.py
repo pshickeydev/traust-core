@@ -6,7 +6,7 @@ from threading import Event
 import pytest
 import sqlalchemy as sa
 
-from tests.v1.repositories.tables.conftest import T0, Seed
+from tests.v1.repositories.tables.conftest import T0, Seed, apart
 from traust_core.v1.errors import IntegrityError, ValidationError
 from traust_core.v1.models.assessment import Artifact
 from traust_core.v1.models.common import RecordBudget
@@ -83,14 +83,14 @@ def test_artifact_digest_does_not_silently_change_document_kind(seed: Seed) -> N
 
 
 @pytest.mark.parametrize("kind", ["feed", "sbom"])
-def test_raw_import_metadata_uses_the_same_revisioned_stream_owner(
+def test_raw_import_metadata_uses_the_same_stream_owner(
     uow: SqlTraustUnitOfWork, kind: str
 ) -> None:
     original = Artifact(digest="first", kind=kind, uri="first.json")
     first = record_artifact(uow, original)
+    apart()
     second = record_artifact(uow, Artifact(digest="second", kind=kind, uri="second.json"))
     assert record_artifact(uow, original) == first
-    assert [row.publication_revision for row in (first, second)] == [1, 2]
     assert uow.artifacts.latest_imported(kind) == second
     assert uow.artifacts.list_imported(kind, limit=10) == [second, first]
 

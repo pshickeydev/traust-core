@@ -289,20 +289,10 @@ def run_order_fork_scheduled_upgrade(dialect: Dialect) -> list[str]:
     return ops_sql.run_order_fork_scheduled_upgrade(dialect)
 
 
-def spend_event_metadata_upgrade(dialect: Dialect) -> list[str]:
-    """Add nullable spend attribution only when all five metadata columns are absent."""
-    return ops_sql.spend_event_metadata_upgrade(dialect)
-
-
 def artifact_run_order_upgrade(dialect: Dialect) -> list[str]:
     """The additive upgrade for a database whose `artifact` predates the recording order;
     apply it only when that column is absent. Old artifacts name no order."""
     return storage_sql.artifact_run_order_upgrade(dialect)
-
-
-def artifact_publication_revision_upgrade(dialect: Dialect) -> list[str]:
-    """Version imported history when the column is absent; refuse ambiguous timestamp ties."""
-    return storage_sql.artifact_publication_revision_upgrade(dialect)
 
 
 def default_named_at_upgrade(dialect: Dialect) -> list[str]:
@@ -312,21 +302,6 @@ def default_named_at_upgrade(dialect: Dialect) -> list[str]:
     return storage_sql.default_named_at_upgrade(dialect)
 
 
-def finding_fingerprint_index_upgrade(dialect: Dialect) -> list[str]:
-    """The additive index upgrade for exact identity reads without an algorithm."""
-    return storage_sql.finding_fingerprint_index_upgrade(dialect)
-
-
 def database_ddl(dialect: Dialect) -> list[str]:
     """Every namespace, in bootstrap order: the whole db contract."""
     return [s for area in AREAS for s in ddl(area, dialect)]
-
-
-def finding_external_ref_assessment_upgrade(dialect: Dialect) -> list[str]:
-    """Add nullable attempt scope to external refs without attributing historical links."""
-    return storage_sql.finding_external_ref_assessment_upgrade(dialect)
-
-
-def finding_external_ref_scope_upgrade(dialect: Dialect) -> list[str]:
-    """Guard existing assessment-scoped links and repair their missing index."""
-    return storage_sql.finding_external_ref_scope_upgrade(dialect)

@@ -241,14 +241,13 @@ def test_plain_and_successor_publications_share_a_durable_ordered_stream(setup: 
         setup.service.publish_successor(original, second.artifact_id)
     history = setup.service.history(TriageArtifact, limit=10)
     assert [row.id for row in history] == [second.artifact_id, first.artifact_id]
-    assert [row.publication_revision for row in history] == [2, 1]
+    assert len({row.created_at for row in history}) == len(history)
     assert setup.service.latest(TriageArtifact).payload == changed.payload
     assert setup.service.get(first.artifact_id).payload == original.payload
     third = setup.service.publish_artifact(
         TriageArtifact.parse(triage_with(FINDING | {"title": "Third recorded finding"}))
     )
     assert setup.service.history(TriageArtifact, limit=1)[0].id == third.artifact_id
-    assert setup.service.metadata(third.artifact_id).publication_revision == 3
 
 
 def test_successor_requires_the_exact_prior_even_for_a_current_digest_retry(
@@ -341,7 +340,6 @@ def test_concurrent_successors_serialize_prior_checks_and_keep_every_committed_s
     history = other.history(TriageArtifact, limit=10)
     expected = [retried.artifact_id, committed.artifact_id] + ([prior] if existing else [])
     assert [row.id for row in history] == expected
-    assert [row.publication_revision for row in history] == list(range(len(expected), 0, -1))
     assert other.get(committed.artifact_id).payload == first_doc.payload
     assert other.latest(TriageArtifact).payload == second_doc.payload
 

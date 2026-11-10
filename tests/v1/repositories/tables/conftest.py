@@ -417,9 +417,7 @@ class Seed:
         return self._add("spend_event", self.new_spend_event(**kw))
 
     def new_feed_snapshot(self, **kw: Any) -> FeedSnapshot:
-        previous = self.uow.artifacts.latest_imported("feed")
-        revision = 1 if previous is None else previous.publication_revision + 1
-        doc = self.artifact(assessment_id=None, kind="feed", publication_revision=revision)
+        doc = self.artifact(assessment_id=None, kind="feed")
         values = {"artifact_id": saved_id(doc), "feed": "osv", "retrieved_at": T0}
         return FeedSnapshot(**{**values, **kw})
 
