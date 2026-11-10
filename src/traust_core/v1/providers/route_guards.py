@@ -553,8 +553,9 @@ class _FlaskIndex:
     unparsed: list[str] = field(default_factory=list)  # checkout modules this Python can't parse
     _chains: dict[tuple[str, str], list[_Class]] = field(default_factory=dict)
     methods: dict[str, list[_Function]] = field(default_factory=dict)  # reached as `obj.name`
-    referenced: set[str] = field(default_factory=set)  # every name the checkout reads
-    starred: set[str] = field(default_factory=set)  # files star-importing a checkout module
+    called: set[str] = field(default_factory=set)  # every function name the checkout calls
+    # the checkout modules each file star-imports
+    starred: dict[str, list[str]] = field(default_factory=dict)
     modules: _Modules | None = None
 
     def pick(self, found: list[_D], name: str, rel: str) -> _D | None:
@@ -606,7 +607,11 @@ class _FlaskIndex:
                     kinds.append(self.methods)  # `auth.login_required` on a checkout class
                 here = any(c.path == rel for b in names for k in kinds for c in k.get(b, []))
                 full = modules.full(name, rel)
-                if full and not here and not modules.local(full) and rel not in self.starred:
+                if (
+                    full
+                    and not (here or self.star_binds(rel, names, kinds))
+                    and not modules.local(full)
+                ):
                     # imported from a library: its own, whatever the checkout defines elsewhere
                     return UNREADABLE if self.unparsed_import(name, rel) else None
                 for bare in names:
@@ -626,6 +631,18 @@ class _FlaskIndex:
                 local=modules.local,
             )
         return self._readers[rel]
+
+    def star_binds(
+        self, rel: str, names: Iterable[str], kinds: Sequence[Mapping[str, Sequence[_D]]]
+    ) -> bool:
+        """A checkout module `rel` star-imports binds one of the names (defines or imports it),
+        and may rebind what an earlier import bound."""
+        return any(
+            any(_same_module(c.path, m) for k in kinds for c in k.get(b, []))
+            or any(_same_module(r, m) and b in self.imported.get(r, {}) for r in self.imported)
+            for m in self.starred.get(rel, [])
+            for b in names
+        )
 
     def resolve_fn(self, name: str, rel: str) -> _Function | None:
         bare = self.renamed.get(rel, {}).get(_last(name), _last(name))
@@ -728,17 +745,9 @@ def _login_disabled(f: TreeFile, tree: ast.AST | None) -> bool:
             line for line in f.text.splitlines() if not line.lstrip().startswith(("#", ";", "//"))
         )
         return any(_LOGIN_DISABLED.search(line) for line in lines)
-    values: list[ast.AST] = []
+    values = _switch_values(getattr(tree, "body", []))
     for n in ast.walk(tree):
-        if isinstance(n, ast.Assign | ast.AnnAssign) and n.value is not None:
-            if any(
-                (isinstance(x, ast.Name) and x.id in _LOGIN_SWITCHES)
-                or (isinstance(x, ast.Attribute) and x.attr in _LOGIN_SWITCHES)
-                or (isinstance(x, ast.Subscript) and _const_str(x.slice) in _LOGIN_SWITCHES)
-                for x in _targets(n)
-            ):
-                values.append(n.value)
-        elif isinstance(n, ast.Call):
+        if isinstance(n, ast.Call):
             values += [k.value for k in n.keywords if k.arg in _LOGIN_SWITCHES]
             if len(n.args) > 1 and _const_str(n.args[0]) in _LOGIN_SWITCHES:
                 values.append(n.args[1])  # `config.setdefault("LOGIN_DISABLED", True)`
@@ -747,6 +756,37 @@ def _login_disabled(f: TreeFile, tree: ast.AST | None) -> bool:
                 v for k, v in zip(n.keys, n.values, strict=True) if _const_str(k) in _LOGIN_SWITCHES
             ]
     return any(not isinstance(v, ast.Constant) or bool(v.value) for v in values)
+
+
+def _switch_values(body: list[ast.stmt]) -> list[ast.AST]:
+    """What a statement list may leave `LOGIN_DISABLED` bound to: its last assignment there,
+    what a block after it may assign, and what class and function bodies assign."""
+    last: list[ast.AST] = []
+    after: list[ast.AST] = []  # assigned in blocks since the last assignment
+    scopes: list[ast.AST] = []
+    for s in body:
+        if (
+            isinstance(s, ast.Assign | ast.AnnAssign)
+            and s.value is not None
+            and any(
+                (isinstance(x, ast.Name) and x.id in _LOGIN_SWITCHES)
+                or (isinstance(x, ast.Attribute) and x.attr in _LOGIN_SWITCHES)
+                or (isinstance(x, ast.Subscript) and _const_str(x.slice) in _LOGIN_SWITCHES)
+                for x in _targets(s)
+            )
+        ):
+            last, after = [s.value], []
+        elif isinstance(s, ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef):
+            scopes += _switch_values(s.body)
+        else:
+            for _, value in ast.iter_fields(s):  # `if`/`else`, `try`, `for`, `with`, `match`
+                if isinstance(value, list) and value and isinstance(value[0], ast.stmt):
+                    after += _switch_values(value)
+                elif isinstance(value, list):
+                    for h in value:
+                        if isinstance(h, ast.excepthandler | ast.match_case):
+                            after += _switch_values(h.body)
+    return [*last, *after, *scopes]
 
 
 def _flask_index(
@@ -774,7 +814,7 @@ def _flask_index(
                 if any(a.name == "*" for a in node.names) and (
                     node.level or (modules is not None and modules.local(mod))
                 ):
-                    index.starred.add(rel)  # it may rebind what an earlier import bound
+                    index.starred.setdefault(rel, []).append(mod)
                 for alias in node.names:
                     index.imported.setdefault(rel, {})[alias.asname or alias.name] = mod
                     if alias.asname:
@@ -805,10 +845,6 @@ def _flask_index(
                         index.receivers[t.id] = kind  # type: ignore[assignment]
                     elif isinstance(t, ast.Attribute):
                         index.receivers[t.attr] = kind  # type: ignore[assignment]
-            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
-                index.referenced.add(node.id)
-            elif isinstance(node, ast.Attribute):
-                index.referenced.add(node.attr)
             if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
                 decos = [_deco_name(d, renamed) for d in node.decorator_list]
                 # a method is reached through its class, never by a bare name
@@ -827,6 +863,7 @@ def _flask_index(
                 continue
             fn = _dotted(node.func)
             last = _last(fn)
+            index.called.add(last)
             if last == "register_blueprint" and node.args and "." in fn:
                 index.registered.setdefault(rel, set()).add(
                     (_last(fn.rsplit(".", 1)[0]), _last(_dotted(node.args[0])))
@@ -1086,12 +1123,8 @@ class _FlaskFile:
         self.src, self.index, self.consts = src, index, consts
         self.rel = src.file.rel
         self.deco = partial(_deco_name, renamed=index.renamed.get(self.rel, {}))
-        self.helpers: dict[str, set[str]] = {}  # a parameter -> the functions taking it
-        for n in ast.walk(src.tree):
-            if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef):
-                for a in n.args.args:
-                    self.helpers.setdefault(a.arg, set()).add(n.name)
-        self.unconfirmed: set[str] = set()  # receivers handed to helpers nothing calls
+        self.chain: tuple[ast.AST, ...] = ()  # the functions the node being read sits in
+        self.unplaced = False  # it registers on a receiver handed to a helper nothing calls
         self.mixed = bool(_FASTAPI_IMPORT.search(src.file.text))
         self.other = {
             t.id
@@ -1111,24 +1144,42 @@ class _FlaskFile:
         if self.mixed:
             return recv if recv in self.index.receivers else None
         # `def register(application): @application.route(..)`: an app handed to a helper
-        handed = _last(dotted) in ("route", "add_url_rule") and recv in self.helpers
-        if (
-            handed
-            and recv not in self.index.receivers
-            and not self.helpers[recv] & self.index.referenced
-        ):
-            self.unconfirmed.add(recv)  # a helper nothing calls: where it mounts is unknown
+        owner = next((f for f in reversed(self.chain) if recv in _param_names(f)), None)
+        handed = owner is not None and _last(dotted) in ("route", "add_url_rule")
+        if handed and not self._called(owner):
+            self.unplaced = True  # where a helper nothing calls mounts is unknown
         return recv if (recv in self.index.receivers or self.src.imports_flask or handed) else None
+
+    def _called(self, fn: ast.AST | None) -> bool:
+        """Something calls the function: the checkout, or pytest (a test or a fixture)."""
+        name = getattr(fn, "name", "")
+        tested = _test_module(self.rel) and (
+            name.startswith("test")
+            or any(_last(_dotted(d)).endswith("fixture") for d in getattr(fn, "decorator_list", []))
+        )
+        return tested or name in self.index.called
 
     def rows(self) -> list[_Row]:
         rows: list[_Row] = []
-        for node in ast.walk(self.src.tree):
+        # `ast.walk`'s order, with the functions each node sits in
+        todo: deque[tuple[ast.AST, tuple[ast.AST, ...]]] = deque([(self.src.tree, ())])
+        while todo:
+            node, self.chain = todo.popleft()
+            self.unplaced = False
+            found: list[_Row] = []
             if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
-                rows += self._decorated(node)
+                found += self._decorated(node)
             if isinstance(node, ast.Call):
-                rows += self._call(node)
-        for r in rows:
-            r.dynamic = r.dynamic or r.receiver in self.unconfirmed
+                found += self._call(node)
+            for r in found:
+                r.dynamic = r.dynamic or self.unplaced
+            rows += found
+            inner = (
+                (*self.chain, node)
+                if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+                else self.chain
+            )
+            todo.extend((child, inner) for child in ast.iter_child_nodes(node))
         return rows
 
     def _decorated(self, node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef) -> list[_Row]:

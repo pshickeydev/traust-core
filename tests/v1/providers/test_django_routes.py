@@ -1147,6 +1147,8 @@ def test_guards_read_through_aliases_and_only_from_auth_libraries(tmp_path: Path
         ("['get']", {"GET"}),
         ("('get', 'delete')", {"GET", "DELETE"}),
         ("ALLOWED", {"GET", "POST", "DELETE"}),  # not a literal: not read
+        ("['get']\n    http_method_names: list[str] = ['post']", {"POST"}),  # the last binding
+        ("['head']", {"HEAD"}),  # `get` serves HEAD
     ],
 )
 def test_a_class_view_lists_only_the_verbs_its_http_method_names_allow(

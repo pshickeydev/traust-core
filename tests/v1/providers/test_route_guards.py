@@ -1645,6 +1645,9 @@ _LOGIN_VIEW = (
         # a value read at run time may turn it on
         ("app/config.py", "import os\nLOGIN_DISABLED = os.getenv('X')\n", []),
         ("app/config.py", "def f(app):\n    app.config.update(LOGIN_DISABLED=True)\n", []),
+        ("app/config.py", "LOGIN_DISABLED = True\nLOGIN_DISABLED = False\n", ["login_required"]),
+        # a block after the last assignment may still turn it on
+        ("app/config.py", "LOGIN_DISABLED = False\nif X:\n    LOGIN_DISABLED = 1\n", []),
         ("settings.cfg", "# LOGIN_DISABLED = True\n", ["login_required"]),
         ("settings.cfg", "LOGIN_DISABLED = True\n", []),
     ],
@@ -1687,9 +1690,12 @@ def test_flask_a_positional_restful_api_prefix_mounts_its_resources(tmp_path: Pa
     assert [r["pattern"] for r in _flask(_enum(tmp_path))] == ["/api/items"]
 
 
-@pytest.mark.parametrize(("called", "dynamic"), [(True, False), (False, True)])
+@pytest.mark.parametrize(
+    ("called", "dynamic"),
+    [("register(app)\n", False), ("", True), ("saved = register\n", True)],
+)
 def test_flask_routes_a_helper_registers_are_unplaced_when_nothing_calls_it(
-    tmp_path: Path, called: bool, dynamic: bool
+    tmp_path: Path, called: str, dynamic: bool
 ) -> None:
     _write(
         tmp_path,
@@ -1700,7 +1706,7 @@ def test_flask_routes_a_helper_registers_are_unplaced_when_nothing_calls_it(
         tmp_path,
         "app/main.py",
         "from flask import Flask\nfrom app.routes import register\napp = Flask(__name__)\n"
-        + ("register(app)\n" if called else ""),
+        + called,
     )
     [row] = _flask(_enum(tmp_path))
     assert row["pattern_dynamic"] is dynamic
@@ -1710,3 +1716,45 @@ def test_flask_a_library_import_is_never_a_checkout_definition_elsewhere(tmp_pat
     _write(tmp_path, "app/views.py", _LOGIN_VIEW)
     _write(tmp_path, "app/legacy.py", "def login_required(f):\n    return f\n")
     assert _row(_enum(tmp_path), "GET", "/a")["guards"] == ["login_required"]
+
+
+def test_flask_a_helper_parameter_is_its_own_receiver_whatever_else_shares_its_name(
+    tmp_path: Path,
+) -> None:
+    _write(
+        tmp_path,
+        "app/main.py",
+        "from flask import Flask\napp = Flask(__name__)\n"
+        "@app.route('/main')\ndef main(): ...\n"
+        "def register(app):\n    @app.route('/a')\n    def a(): ...\n",
+    )
+    rows = {r["pattern"]: r for r in _flask(_enum(tmp_path))}
+    assert rows["/a"]["pattern_dynamic"] and not rows["/main"]["pattern_dynamic"]
+
+
+@pytest.mark.parametrize(("star", "guards"), [("app.other", ["login_required"]), ("app.auth", [])])
+def test_flask_only_a_star_import_binding_the_name_rebinds_a_library_guard(
+    tmp_path: Path, star: str, guards: list[str]
+) -> None:
+    _write(
+        tmp_path,
+        "app/views.py",
+        f"from flask import Flask\nfrom flask_login import login_required\nfrom {star} import *\n"
+        "app = Flask(__name__)\n@app.route('/a')\n@login_required\ndef a(): ...\n",
+    )
+    _write(tmp_path, "app/other.py", "def unrelated(): ...\n")
+    _write(tmp_path, "app/auth.py", "def login_required(f):\n    return f\n")
+    assert _row(_enum(tmp_path), "GET", "/a")["guards"] == guards
+
+
+def test_flask_routes_a_pytest_test_or_fixture_registers_are_placed(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "tests/test_views.py",
+        "import flask\nimport pytest\n"
+        "@pytest.fixture\ndef client(app):\n    @app.route('/f')\n    def f(): ...\n"
+        "def test_index(app):\n    @app.route('/t')\n    def t(): ...\n",
+    )
+    rows = _flask(_enum(tmp_path))
+    assert sorted(r["pattern"] for r in rows) == ["/f", "/t"]
+    assert not any(r["pattern_dynamic"] for r in rows)

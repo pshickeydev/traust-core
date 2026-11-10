@@ -974,6 +974,9 @@ class _Django:
             if not methods:
                 methods = [("any", cls.name, cls)]
         if (allowed := _http_method_names(mro)) is not None:
+            get = next((m for m in methods if m[0] == "GET"), None)
+            if get is not None and "head" in allowed and all(m[0] != "HEAD" for m in methods):
+                methods.append(("HEAD", get[1], get[2]))  # `View.setup` serves HEAD with `get`
             # `View.dispatch` answers any other verb with 405
             methods = [m for m in methods if m[0] == "any" or m[0].lower() in allowed]
         policy.methods = methods
@@ -1691,14 +1694,23 @@ def _http_method_names(mro: list[tuple[str, ast.ClassDef | str]]) -> set[str] | 
     """The verbs the nearest checkout `http_method_names` allows; None when no checkout class
     sets it to a literal list (a library's default allows every verb)."""
     for _, c in mro:
-        for n in c.body if isinstance(c, ast.ClassDef) else []:
-            if isinstance(n, ast.Assign) and any(
-                isinstance(x, ast.Name) and x.id == "http_method_names" for x in n.targets
-            ):
-                literal = isinstance(n.value, ast.List | ast.Tuple | ast.Set) and all(
-                    isinstance(e, ast.Constant) and isinstance(e.value, str) for e in n.value.elts
+        # the class body's last binding of it, annotated or not
+        value = next(
+            (
+                n.value
+                for n in reversed(c.body if isinstance(c, ast.ClassDef) else [])
+                if isinstance(n, ast.Assign | ast.AnnAssign)
+                and any(
+                    isinstance(x, ast.Name) and x.id == "http_method_names" for x in _targets(n)
                 )
-                return {s.lower() for s in _strings(n.value)} if literal else None
+            ),
+            None,
+        )
+        if value is not None:
+            literal = isinstance(value, ast.List | ast.Tuple | ast.Set) and all(
+                isinstance(e, ast.Constant) and isinstance(e.value, str) for e in value.elts
+            )
+            return {s.lower() for s in _strings(value)} if literal else None
     return None
 
 
