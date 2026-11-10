@@ -1,4 +1,4 @@
-"""Tracker scope is checked at the service door, even without an occurrence."""
+"""Tracker writes enforce repository scope, even without an occurrence."""
 
 from __future__ import annotations
 

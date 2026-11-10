@@ -119,12 +119,7 @@ def _record_artifact_with_status(
 def _record_imported_with_status(
     uow: AssessmentsUnitOfWork, artifact: Artifact, successor: _Successor | None = None
 ) -> tuple[Artifact, bool]:
-    """Insert imported metadata inside a write transaction; the caller commits.
-
-    The advisory lock serializes a kind's writers, so `latest_imported` reads the true
-    newest row and the successor checks decide against it; ordering itself is
-    (created_at, id) with one row per INSERT statement.
-    """
+    """Serialize a kind's prior check and time-gated insert; the caller commits."""
     with uow.write():
         uow.artifacts.lock_imported(artifact.kind)
         latest = uow.artifacts.latest_imported(artifact.kind)

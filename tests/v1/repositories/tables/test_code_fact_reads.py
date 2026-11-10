@@ -6,7 +6,7 @@ from threading import Event
 import pytest
 import sqlalchemy as sa
 
-from tests.v1.repositories.tables.conftest import T0, Seed, apart
+from tests.v1.repositories.tables.conftest import T0, Seed
 from traust_core.v1.errors import IntegrityError, ValidationError
 from traust_core.v1.models.assessment import Artifact
 from traust_core.v1.models.common import RecordBudget
@@ -88,7 +88,6 @@ def test_raw_import_metadata_uses_the_same_stream_owner(
 ) -> None:
     original = Artifact(digest="first", kind=kind, uri="first.json")
     first = record_artifact(uow, original)
-    apart()
     second = record_artifact(uow, Artifact(digest="second", kind=kind, uri="second.json"))
     assert record_artifact(uow, original) == first
     assert uow.artifacts.latest_imported(kind) == second

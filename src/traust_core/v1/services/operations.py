@@ -1162,13 +1162,18 @@ class SpendService:
 
     def record(self, event: SpendEvent) -> SpendEvent:
         # NEED(model-registry): check provider and model against ModelCatalog once it lands.
-        repository_id = self._repository_id(event)
         with self._uow as uow:
             order = None if event.run_order_id is None else uow.run_orders.get(event.run_order_id)
-            if order is not None and order.repository_id is not None:
-                if repository_id is not None and repository_id != order.repository_id:
+            repository_id = None
+            if order is None:
+                repository_id = self._repository_id(event)
+            elif order.repository_id is not None:
+                supplied_repository_id = self._repository_id(event)
+                if (
+                    supplied_repository_id is not None
+                    and supplied_repository_id != order.repository_id
+                ):
                     raise ValidationError("spend repository disagrees with its run order")
-                repository_id = order.repository_id
             saved = uow.spend_events.add(
                 event.model_copy(
                     update={"lane": order and order.lane, "repository_id": repository_id}

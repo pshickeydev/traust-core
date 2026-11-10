@@ -55,8 +55,7 @@ class SpendEventRepository(RecordRepository[SpendEvent], Protocol):
     def sum_by(
         self, filter: SpendFilter, group_by: SpendDimension | None = None
     ) -> list[SpendRollup]:
-        """Windowed spend grouped by the requested dimension; repositories use explicit event
-        attribution, or the associated order for historical events."""
+        """Windowed spend; repository attribution comes from orders, or order-less declarations."""
         ...
 
 
@@ -119,7 +118,9 @@ class SqlSpendEventRepository(SqlAppendOnlyRepository[SpendEvent]):
         if group_by is SpendDimension.REPOSITORY:
             orders = TableFactory.for_bind(self._connection).table(RUN_ORDER)
             source = self.table.outerjoin(orders, orders.c.id == c.run_order_id)
-            keys[group_by] = sa.func.coalesce(c.repository_id, orders.c.repository_id)
+            keys[group_by] = sa.case(
+                (c.run_order_id.is_not(None), orders.c.repository_id), else_=c.repository_id
+            )
         grouped = () if group_by is None else (keys[group_by],)
         stmt = (
             sa.select(

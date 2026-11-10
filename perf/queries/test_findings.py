@@ -16,6 +16,7 @@ from traust_core.v1.models.common import PageRequest
 from traust_core.v1.models.findings import (
     Decision,
     Finding,
+    FindingExternalRef,
     RecordDecision,
     Restatement,
     ReviewFilter,
@@ -317,6 +318,28 @@ def test_finding_admission_lock_is_a_primary_key_lookup(explained: Profile, miss
     _, _, locked = explained(lock)
     assert any("LockRows" in line for line in locked.plan), locked.plan
     fast(locked, "finding_pkey", 5)
+
+
+def test_scoped_tracker_write_admission_stays_bounded_at_volume(
+    engine: sa.Engine, explained: Profile
+) -> None:
+    with SqlTraustUnitOfWork(engine) as uow:
+        assessment_id = uow.connection.scalar(sa.select(uow.assessments.table.c.id).limit(1))
+        assert assessment_id is not None
+        assessment = uow.assessments.get(assessment_id)
+        repository_ref = uow.repository_refs.get(assessment.repository_ref_id)
+        finding = uow.findings.list_for_repository(repository_ref.repository_id)[0]
+        assert finding.id is not None
+        tracker = FindingExternalRef(
+            finding_id=finding.id,
+            assessment_id=assessment_id,
+            system="perf-pairing",
+            ref="SEC-PAIRING",
+        )
+
+    statements = explained(lambda uow: uow.finding_external_refs.add(tracker))
+    for table in ("finding", "assessment", "repository_ref"):
+        fast(on(statements, table), None, 5)
 
 
 @pytest.mark.parametrize("missing", [False, True])

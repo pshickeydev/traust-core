@@ -62,8 +62,8 @@ The latest-recorded assessment read joins repository ownership in SQL and return
 at most one assessment without loading or binding the repository's ref history.
 Algorithm-free fingerprint reads use the contracts-owned
 `(repository_id, fingerprint)` index, retaining exact opaque identity and ambiguity
-across algorithms. Local stores receive its additive index upgrade; configured
-databases must apply `contracts.finding_fingerprint_index_upgrade(dialect)` first.
+across algorithms. The index is part of the static bootstrap schema; existing
+databases require the separately designed upgrade feature.
 
 `POST /v1/remediations/{work_item_id}/pull-request` (`record_remediation_pull_request`,
 generated `RecordRemediationPullRequest`) accepts an `ExternalRef` (`system`, actual
@@ -73,9 +73,9 @@ tracker and `pr_opened` progress commit together. Replaying the same PR is a no-
 including after merge; a different PR conflicts. Finding-wide Jira tickets retain
 their existing semantics, while PR trackers are scoped by assessment ID and never
 spread to other attempts over the same findings. Immutable worker reports are not
-rewritten. Existing local stores gain the nullable scope automatically; configured
-databases apply `contracts.finding_external_ref_assessment_upgrade(dialect)` when
-`finding_external_ref.assessment_id` is absent. Historical links remain unscoped.
+rewritten. Historical links remain unscoped. Core validates pairing on tracker
+inserts and scope changes and keeps finding repository identity immutable;
+the schema retains one guard for repository-ref moves.
 
 ## Historical reads and reporting correctness
 
@@ -1077,21 +1077,24 @@ severity and disposition do not. `claim(finding_id, as_of=...)` supports histori
 Ledger proof and the finding/review projections share one transaction.
 
 Spend identity resolves only a registered exact URL/UUID or the associated order; ambiguous
-labels remain supplied text, with cost retained and canonical identity unknown. Order-linked
-events cannot claim a different repository. Existing events group through their order when
-they predate explicit attribution. Declared/measured token double counting is unchanged.
+labels remain supplied text, with cost retained and canonical identity unknown. Ordered
+events store no independent repository ID: every rollup derives it from the order, including
+an unknown order repository. Only order-less declarations store canonical repository identity.
+Declared/measured token double counting is unchanged.
 
 Availability is `active`, `archived`, `moved`, `missing`, `disabled` or `unknown`.
 Credential/network failures remain unknown, not missing or reachable. Unqueried repositories
 have no invented observation time and are absent from stored snapshots; unchanged status
 keeps its original `status_since`. Availability is separate from successful commit observations.
 
-Imported artifact publication uses serialized per-kind revisions. `latest_imported` returns
-the retained document and its prior ID; `publish_successor` rejects a stale prior and older
-digest reverts. Local SQLite stores apply eligible additive upgrades on open;
-configured databases refuse startup until their owner applies
-`contracts.artifact_publication_revision_upgrade` and `contracts.spend_event_metadata_upgrade`.
-The contracts README defines transaction boundaries and ambiguous-history refusal.
+Imported artifact publication serializes each kind and admits a new row only when database
+statement time advances beyond its latest publication. Clock ties retry within a bounded
+window; a frozen/backward clock raises `RepositoryError` without changing history.
+SQLite's millisecond resolution limits same-kind publication throughput.
+`latest_imported` returns the retained document and prior ID; `publish_successor` rejects
+stale priors and older-digest reverts. No publication-revision column or historical backfill
+is used. New schema changes are bootstrap-only: existing databases are not upgraded by
+conditional scripts or automatic reconciliation.
 
 `ArtifactPublisher.stage` validates and uploads immutable bytes before write/lease locks;
 `publish_staged` publishes their metadata within the caller's atomic transaction.
