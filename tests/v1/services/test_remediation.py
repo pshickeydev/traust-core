@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
+import pydantic
 import pytest
 import sqlalchemy as sa
 from sqlalchemy.engine import Engine
@@ -89,11 +90,33 @@ def fork(url: str, config: RemediationConfig = PRIVATE, mirror: str | None = Non
 def test_a_github_repo_maps_into_the_configured_mirror_org() -> None:
     f = fork("https://github.com/some-org/some-repo.git")
     assert (str(f.url), f.owner, f.host, f.visibility) == (
-        "https://github.com/mirror-org/some-repo",
+        "https://github.com/mirror-org/patch-some-repo",
         "mirror-org",
         "github",
         "private",
     )
+
+
+@pytest.mark.parametrize("prefix", ["patch-", "sci-patch-"])
+def test_the_convention_names_the_provisioners_candidates_in_order(prefix: str) -> None:
+    # SCI's provisioner (internal/filing/provision.go) takes the plain {prefix}<name>
+    # first, then the owner-qualified {prefix}<owner>-<name> when another upstream holds
+    # the plain name; the policy mirrors the candidate order, the deployment the prefix
+    # (the bare default, or ours: sci-patch-)
+    plain, qualified = ForkPolicy(
+        RemediationConfig(fork_org="mirror-org", patch_prefix=prefix), FORGES
+    ).convention("https://github.com/some-org/svc")
+    assert [str(f.url) for f in (plain, qualified)] == [
+        f"https://github.com/mirror-org/{prefix}svc",
+        f"https://github.com/mirror-org/{prefix}some-org-svc",
+    ]
+    assert all(f.owner == "mirror-org" and f.visibility == "private" for f in (plain, qualified))
+
+
+def test_a_patch_prefix_is_name_characters_only() -> None:
+    for bad in ("patch prefix", "-patch"):  # a space; a leading hyphen names no repository
+        with pytest.raises(pydantic.ValidationError):
+            RemediationConfig(fork_org="o", patch_prefix=bad)
 
 
 def test_a_github_repo_without_a_fork_org_is_a_config_error() -> None:
@@ -382,9 +405,32 @@ def test_resolve_fork_prefers_the_inventory_mirror(
         seed.repository(url="https://gitlab.com/mirrors/svc", upstream_id=upstream.id, public=False)
         uow.commit()
     assert str(service.resolve_fork(upstream.id).url) == "https://gitlab.com/mirrors/svc"  # type: ignore[arg-type]
-    assert str(service.resolve_fork(bare.id).url) == "https://github.com/mirror-org/bare"  # type: ignore[arg-type]
+    assert str(service.resolve_fork(bare.id).url) == "https://github.com/mirror-org/patch-bare"  # type: ignore[arg-type]
     with pytest.raises(NotFoundError):
         service.resolve_fork(uuid4())
+
+
+def test_resolve_forks_offers_the_conventions_candidates_until_a_mirror_registers(
+    service: RemediationService, engine: Engine
+) -> None:
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        upstream = seed.repository(url="https://github.com/example-org/svc")
+        uow.commit()
+    assert [str(f.url) for f in service.resolve_forks(upstream.id)] == [  # type: ignore[arg-type]
+        "https://github.com/mirror-org/patch-svc",
+        "https://github.com/mirror-org/patch-example-org-svc",
+    ]
+    with SqlTraustUnitOfWork(engine) as uow:  # a registered mirror is the only answer since
+        Seed(uow).repository(
+            url="https://github.com/mirror-org/patch-example-org-svc",
+            upstream_id=upstream.id,
+            public=False,
+        )
+        uow.commit()
+    assert [str(f.url) for f in service.resolve_forks(upstream.id)] == [  # type: ignore[arg-type]
+        "https://github.com/mirror-org/patch-example-org-svc"
+    ]
 
 
 def test_prepare_hands_the_skill_the_findings_the_commit_and_where_to_push(
