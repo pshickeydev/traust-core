@@ -88,6 +88,45 @@ from its report. The ending decisions carry the merge SHA and actor as their
 rationale; replays are no-ops, and a status the forward-only state machine refuses
 answers 409.
 
+## Remediation patch retention
+
+`RemediationService.record(report, provenance, diff=draft.diff)` and the order-bound
+`record_order(..., diff=...)` retain the exact patch as a companion artifact.
+REST runners send optional UTF-8 `diff` text with `POST /v1/remediation-records`.
+The publisher derives its expected digest from the validated report's
+`patch.diff_sha256`; an absent declaration, invalid text, secrets in added
+lines and digest mismatches refuse the call before publication. Secrets only in
+removed/context lines mean the patch is **not retained but the report is still
+recorded**. That recording response has `WorkItem.patch: null` and a non-null
+`patch_refusal` naming the secret categories, never the secret values. The reason
+is response-only: report-only calls and subsequent get/list reads return
+`patch_refusal: null`; resending the refused diff returns the reason again.
+Retained patch and report references attach to the same assessment without adding
+tables. `WorkItem.patch` carries the artifact ID for authenticated
+`GET /v1/artifacts/{artifact_id}/content` reads.
+
+Patch and report uploads are staged before acquiring write intent or findings locks.
+The locked transaction rechecks the held report and records artifact rows, attachments
+and ticket links together. Runner leases are checked before staging and again under
+lock before recording. A conflict or rollback can leave unreferenced content-addressed
+objects, but no losing artifact metadata; retrying the same bytes is idempotent.
+
+**Rendering exception — pending human review (XWING-2355); no human sign-off yet.**
+Only producer-generated git patches
+for `RemediationArtifact`, stored as `ResultKind.REMEDIATION_PATCH` through
+`ArtifactPublisher.publish_companion`, are exempt from rendering over the validated
+primary model. The report contains the patch's digest and path, not its contents,
+so a renderer cannot reconstruct the patch. The exception covers only UTF-8 text
+whose SHA-256 matches the validated report's `patch.diff_sha256`; existing secret
+checks remain mandatory and accepted bytes are unchanged. All other companions
+must be rendered from the validated primary model. This is not general precedent;
+any approval must name the reviewer and link to the approving review or ticket.
+
+Report-only callers remain supported (`patch` is null). Replaying the same report
+with its patch backfills those bytes without changing later progress or resolution;
+historical patches cannot be recovered from a producer-local `diff_path` alone.
+Merged progress does not prove a finding fixed: that remains a resolution decision.
+
 ## Historical reads and reporting correctness
 
 The native consumer doors above remain owned by their existing services and models.
@@ -446,6 +485,12 @@ not the handler's imports.
 
 Publisher output is read by artifact ID. Companion documents are rendered from the validated
 primary and stored by digest, but only the primary is an artifact-row document.
+The sole rendering exception, pending human review (XWING-2355), is the
+[remediation git patch](#remediation-patch-retention), which retains digest-bound
+producer text and has its own artifact row.
+Aggregates use `ArtifactPublisher.stage` / `stage_companion` before acquiring write
+locks, then `publish_staged` / `record_companion` inside their metadata transaction;
+staging performs validation and object I/O only, indexing performs database I/O only.
 Publishing failure raises a typed error; an object left by a failed row write is
 safe to retry because its key is content-addressed.
 

@@ -134,6 +134,45 @@ def test_publish_artifact_reports_insert_status_without_changing_public_result(
     assert first == repeated == setup.service.publish_artifact(doc)
 
 
+def test_staging_uploads_without_database_access_and_indexing_needs_no_object_io(
+    setup: Publishing, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    doc = TriageArtifact.parse(triage_with(FINDING))
+
+    def unexpected(*args: object) -> None:
+        pytest.fail("unexpected I/O during publication phase")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(SqlTraustUnitOfWork, "__enter__", unexpected)
+        staged = setup.service.stage(doc)
+    assert len(staged.objects) == 2
+    assert setup.service.find(sha256_hex(doc.payload)) is None
+    with monkeypatch.context() as patch:
+        for method in ("put", "get", "stat"):
+            patch.setattr(setup.store, method, unexpected)
+        published = setup.service.publish_staged(staged)
+    assert published.artifact_id == setup.service.publish_ref(doc).id
+    assert setup.service.get(published.artifact_id).payload == doc.payload
+
+
+def test_staged_primary_metadata_and_success_log_wait_for_the_outer_commit(
+    setup: Publishing, caplog: pytest.LogCaptureFixture
+) -> None:
+    doc = TriageArtifact.parse(triage_with(FINDING))
+    staged = setup.service.stage(doc)
+    with caplog.at_level(logging.INFO, logger="traust_core.v1.services.artifact_publishing"):
+        with setup.uow:
+            setup.service.publish_staged(staged)
+            assert "artifact published" not in caplog.text
+        assert "artifact published" not in caplog.text
+        assert setup.service.find(sha256_hex(doc.payload)) is None
+        assert len(list(setup.store.list())) == 2
+        retried = setup.service.publish_staged(setup.service.stage(doc))
+    assert "artifact published" in caplog.text
+    assert retried.artifact_id == setup.service.publish_ref(doc).id
+    assert len(list(setup.store.list())) == 2
+
+
 def test_markdown_is_rendered_from_the_validated_document(setup: Publishing) -> None:
     result = setup.service.publish("triage", triage_with(FINDING))
     md = setup.store.get(setup.store.stat(ObjectKey.parse(result.written[1]))).decode()

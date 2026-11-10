@@ -5,6 +5,7 @@ import logging
 import re
 from collections import Counter, defaultdict
 from collections.abc import Collection, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, overload
@@ -19,8 +20,10 @@ from traust_core.v1.errors import (
     ForbiddenError,
     IntegrityError,
     NotFoundError,
+    RemovedSecretError,
     ValidationError,
 )
+from traust_core.v1.models.analysis_results import ResultKind
 from traust_core.v1.models.artifacts import (
     FleetFixArtifact,
     RemediationArtifact,
@@ -112,6 +115,7 @@ from traust_core.v1.models.remediation import (
 from traust_core.v1.models.values import HttpsRepoUrl
 from traust_core.v1.models.vocabulary import (
     ActorKind,
+    DispositionResolution,
     EvidenceGrade,
     FixStrategy,
     FleetFixMatcherKind,
@@ -129,7 +133,11 @@ from traust_core.v1.providers.comments import JIRA
 from traust_core.v1.providers.fleet_fix import FleetFixApplier, GoldenRunner
 from traust_core.v1.rendering.markdown import MarkdownRenderer, Report, Section, Table
 from traust_core.v1.repositories.contract import TraustUnitOfWork
-from traust_core.v1.services.artifact_publishing import ArtifactPublisher, AssessmentLog
+from traust_core.v1.services.artifact_publishing import (
+    ArtifactPublisher,
+    AssessmentLog,
+    StagedArtifact,
+)
 from traust_core.v1.services.assessment import AssessmentService
 from traust_core.v1.services.exposure import ExposureService
 from traust_core.v1.services.findings.service import FindingService
@@ -279,6 +287,15 @@ class GitWorkspace(Protocol):
     def change_types(self, checkout: Path, anchor: str) -> dict[str, str]: ...
 
 
+@dataclass(frozen=True, slots=True)
+class _RemediationRecording:
+    document: RemediationArtifact
+    item: WorkItem
+    report: StagedArtifact | ArtifactRef
+    patch: StagedArtifact | None
+    patch_refusal: str | None
+
+
 class RemediationService:
     def __init__(
         self,
@@ -322,12 +339,8 @@ class RemediationService:
         if not wanted:
             raise ValidationError("a work item needs at least one finding")
         ref = self._inventory.get_ref(repository_ref_id)
-        views = self._findings.list_by_ids(wanted)
+        views = self._findings.list_by_ids(wanted, repository_ref_id=repository_ref_id)
         for v in views:
-            if v.finding.repository_id != ref.repository_id:
-                raise ValidationError(
-                    f"finding {v.finding.id} is not in commit {ref.id}'s repository"
-                )
             if v.disposition is None or v.disposition.validity != Validity.CONFIRMED:
                 raise ValidationError(f"finding {v.finding.id} is not confirmed")
             if not v.is_open():
@@ -694,23 +707,58 @@ class RemediationService:
         """Move the work item to `status` (forward only); the same status again is a no-op.
         A remediation scheduled on the item follows it, in the same transaction."""
         item = self.get(work_item_id)
-        if item.advance(status) is item:
-            return item
+        self._record_progress(item, status, rationale=rationale)
+        return self.get(work_item_id)
+
+    def _record_progress(
+        self,
+        item: WorkItem,
+        status: RemediationStatus,
+        artifact_id: UUID | None = None,
+        *,
+        replay: bool = False,
+        rationale: str | None = None,
+    ) -> RemediationStatus:
         with self._uow.write() as uow:
+            self._findings.lock_findings(item.finding_ids)
+            current = item.model_copy(
+                update={
+                    "status": furthest(
+                        d.reason
+                        for d in self._findings.decisions.for_assessments((item.work_item_id,))
+                        if d.reason
+                    )
+                }
+            )
+            if current.status == status or (
+                replay
+                and (current.status in _FINAL or furthest((current.status, status)) != status)
+            ):
+                return current.status
+            current.advance(status)
+            views = self._findings.list_by_ids(
+                item.finding_ids, repository_ref_id=item.repository_ref_id
+            )
+            resolutions: dict[UUID, DispositionResolution | None] = {}
+            for view in views:
+                assert view.finding.id is not None
+                resolutions[view.finding.id] = resolution_for(status) if view.is_open() else None
             self._findings.decisions.record_resolution(
-                work_item_id,
+                item.work_item_id,
                 item.finding_ids,
-                resolution_for(status),
+                None,
                 status,
+                artifact_id,
+                resolutions=resolutions,
                 rationales=None
                 if rationale is None
                 else {finding_id: rationale for finding_id in item.finding_ids},
             )
             uow.commit()
         self._uow.after_commit(
-            lambda: log.info("work item %s: %s -> %s", work_item_id, item.status, status)
+            lambda: log.info("work item %s: %s -> %s", item.work_item_id, current.status, status)
         )
-        return self.get(work_item_id)
+        return status
 
     def record_outcome(
         self, work_item_id: UUID, outcome: ProgressReport, principal: Principal
@@ -775,11 +823,14 @@ class RemediationService:
         provenance: Provenance,
         run_order_id: UUID,
         principal: Principal,
+        *,
+        diff: bytes | None = None,
     ) -> WorkItem:
         """Record a leased remediation run, bound to its repository and any named work item."""
 
         if self._recording is None:
             raise ConfigError("remediation recording requires operations authorization")
+        doc = RemediationArtifact.parse(doc.payload)
         repository = self._inventory.find_repository(doc.metadata.repository)
         if repository is None or repository.id is None:
             raise NotFoundError(f"repository {doc.metadata.repository}")
@@ -809,13 +860,20 @@ class RemediationService:
                     f"order {run_order_id}: remediation report covers findings of another"
                     " repository"
                 )
-            # an order credits only the work item it runs (contracts#128's guard); one naming
-            # none records as before, uncredited
-            return self.record(
-                doc,
-                provenance,
-                work_item_id=order.work_item_id,
-                run_order_id=order.id if order.work_item_id is not None else None,
+        staged = self._stage_remediation(doc, provenance, order.work_item_id, diff)
+        with self._recording.recording(
+            order_id=run_order_id,
+            principal=principal,
+            kind=RecordKind.REMEDIATION,
+            repository_id=repository.id,
+            provenance=provenance,
+        ) as current:
+            if (current.asset, current.work_item_id) != (order.asset, order.work_item_id):
+                raise ConflictError(
+                    f"order {run_order_id}: remediation scope changed during upload"
+                )
+            return self._record_remediation(
+                staged, order.id if order.work_item_id is not None else None
             )
 
     @overload
@@ -826,6 +884,7 @@ class RemediationService:
         *,
         work_item_id: UUID | None = None,
         run_order_id: UUID | None = None,
+        diff: bytes | None = None,
     ) -> WorkItem: ...
     @overload
     def record(self, doc: FleetFixArtifact, provenance: Provenance) -> FleetFix: ...
@@ -836,13 +895,28 @@ class RemediationService:
         *,
         work_item_id: UUID | None = None,
         run_order_id: UUID | None = None,
+        diff: bytes | None = None,
     ) -> WorkItem | FleetFix:
         """A report on the open work item for exactly its findings (`finding_ref` = finding id),
         the one the run prepared when it names it (`work_item_id`; the report itself doesn't):
         attached by the order whose run recorded it, its Jira keys linked, the item moved to its
         status; re-recording is a no-op."""
         if isinstance(doc, FleetFixArtifact):
+            if diff is not None:
+                raise ValidationError("fleet-fix specs do not take remediation patch bytes")
             return self._record_fleet_fix(doc, provenance)
+        return self._record_remediation(
+            self._stage_remediation(doc, provenance, work_item_id, diff), run_order_id
+        )
+
+    def _stage_remediation(
+        self,
+        doc: RemediationArtifact,
+        provenance: Provenance,
+        work_item_id: UUID | None,
+        diff: bytes | None,
+    ) -> _RemediationRecording:
+        doc = RemediationArtifact.parse(doc.payload)
         if doc.fork.visibility == ForkVisibility.PUBLIC:
             raise ValidationError("remediation report pushes to a public fork")
         if doc.pull_request is not None and doc.pull_request.target == "upstream":
@@ -870,31 +944,83 @@ class RemediationService:
                     f"remediation report pushes to {pushed_to} {doc.fork.fix_branch}, not the "
                     f"scheduled {order.fork_url} {order.fork_branch}"
                 )
+        if item.report is None:
+            item.advance(status)
+        if provenance.artifact is not None:
+            published = self._publisher.metadata(provenance.artifact.id)
+            if published.kind != RemediationArtifact.schema:
+                raise IntegrityError(f"artifact {published.id} is not a remediation document")
+            if published.digest != digest:
+                raise IntegrityError(
+                    f"artifact {published.id}: doc digest {digest} != published {published.digest}"
+                )
+        patch, refusal = None, None
+        if diff is not None:
+            try:
+                patch = self._publisher.stage_companion(doc, ResultKind.REMEDIATION_PATCH, diff)
+            except RemovedSecretError as error:
+                refusal = "; ".join(issue.message for issue in error.issues)
+        report = item.report or provenance.artifact or self._publisher.stage(doc)
+        return _RemediationRecording(doc, item, report, patch, refusal)
+
+    def _record_remediation(
+        self, staged: _RemediationRecording, run_order_id: UUID | None
+    ) -> WorkItem:
+        doc, item = staged.document, staged.item
+        status = RemediationStatus(doc.summary.status)
+        digest = sha256_hex(doc.payload)
         if item.report is not None:  # recorded before; finish a run that stopped part-way
-            if item.status != status:
-                with self._uow.write() as uow:
-                    self._findings.decisions.record_resolution(
-                        item.work_item_id, wanted, resolution_for(status), status, item.report.id
-                    )
-                    uow.commit()
-            return self.get(item.work_item_id)
-        item.advance(status)
-        published = (provenance.artifact or self._publisher.publish_ref(doc)).id
-        with self._uow as uow:
-            report = self._log.attach(item.work_item_id, published, digest, run_order_id)
-            for key in doc.metadata.jira_keys:
-                for finding_id in wanted:
-                    self._findings.records.link_external(finding_id, JIRA, key)
-            uow.commit()
-        with self._uow.write() as uow:
-            self._findings.decisions.record_resolution(
-                item.work_item_id, wanted, resolution_for(status), status, report.id
+            with self._uow.write() as uow:
+                self._findings.lock_findings(item.finding_ids)
+                if staged.patch is not None or staged.patch_refusal is not None:
+                    patch = self._record_patch(staged)
+                    if patch is not None:
+                        self._log.attach(item.work_item_id, patch.id, patch.digest, run_order_id)
+                self._record_progress(item, status, item.report.id, replay=True)
+                uow.commit()
+            return self.get(item.work_item_id).model_copy(
+                update={"patch_refusal": staged.patch_refusal}
             )
+        with self._uow.write() as uow:
+            self._findings.lock_findings(item.finding_ids)
+            held = self._log.documents([self._log.get(item.work_item_id)], (doc.schema,))
+            if any(row.digest != digest for _, row in held):
+                raise ConflictError(f"work item {item.work_item_id} already holds another report")
+            patch = self._record_patch(staged)
+            published = (
+                self._publisher.publish_staged(staged.report).artifact_id
+                if isinstance(staged.report, StagedArtifact)
+                else staged.report.id
+            )
+            report = self._log.attach(item.work_item_id, published, digest, run_order_id)
+            if patch is not None:
+                self._log.attach(item.work_item_id, patch.id, patch.digest, run_order_id)
+            for key in doc.metadata.jira_keys:
+                for finding_id in item.finding_ids:
+                    self._findings.records.link_external(finding_id, JIRA, key)
+            effective_status = self._record_progress(item, status, report.id, replay=True)
             uow.commit()
         self._uow.after_commit(
-            lambda: log.info("work item %s: report %s, %s", item.work_item_id, report.id, status)
+            lambda: log.info(
+                "work item %s: report %s, %s", item.work_item_id, report.id, effective_status
+            )
         )
-        return self.get(item.work_item_id)
+        return self.get(item.work_item_id).model_copy(
+            update={"patch_refusal": staged.patch_refusal}
+        )
+
+    def _record_patch(self, staged: _RemediationRecording) -> ArtifactRef | None:
+        if staged.patch_refusal is not None:
+            self._uow.after_commit(
+                lambda: log.warning(
+                    "work item %s: patch not retained digest=%s; secret gate found secrets "
+                    "only in removed/context lines: %s",
+                    staged.item.work_item_id,
+                    staged.document.patch.diff_sha256,
+                    staged.patch_refusal,
+                )
+            )
+        return None if staged.patch is None else self._publisher.record_companion(staged.patch)
 
     def _record_fleet_fix(self, doc: FleetFixArtifact, provenance: Provenance) -> FleetFix:
         """A transform spec whose golden tests pass, published; the same spec again is the same
@@ -1208,9 +1334,14 @@ class RemediationService:
         """Work items from their assessments and decisions, oldest first; each report document
         read once."""
         with self._uow:
+            documents = self._log.documents(
+                assessments, (RemediationArtifact.schema, ResultKind.REMEDIATION_PATCH)
+            )
             reports = {
-                r.assessment_id: r
-                for _, r in self._log.documents(assessments, (RemediationArtifact.schema,))
+                r.assessment_id: r for _, r in documents if r.kind == RemediationArtifact.schema
+            }
+            patches = {
+                r.assessment_id: r for _, r in documents if r.kind == ResultKind.REMEDIATION_PATCH
             }
             linked = {d.finding_id for ds in said.values() for d in ds}
             earliest_first = self._findings.records.external_refs(linked, JIRA)
@@ -1230,6 +1361,10 @@ class RemediationService:
             status = furthest(d.reason for d in decisions if d.reason)
             ticket = next((tickets[f] for f in covered if f in tickets), None)
             item = self._item(a, covered, status, reports.get(a.id), ticket)
+            if patch := patches.get(a.id):
+                item = item.model_copy(
+                    update={"patch": ArtifactRef(id=patch.id, name=patch.kind, digest=patch.digest)}
+                )
             if a.id in trackers:
                 item = item.model_copy(update={"tracker": trackers[a.id]})
             items.append(item)

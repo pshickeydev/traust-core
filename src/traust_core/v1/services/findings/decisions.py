@@ -760,11 +760,14 @@ class FindingDecisions:
         validity: Validity | None = None,
         fixed_repository_ref_id: UUID | None = None,
         rationales: Mapping[UUID, str] | None = None,
+        resolutions: Mapping[UUID, DispositionResolution | None] | None = None,
         evidence_grade: EvidenceGrade | None = None,
     ) -> list[Decision]:
         """An assessment's statement on where fixing its findings stands (a remediation step, a
         verification verdict), one decision each. Restating the same step changes nothing."""
-        if validity is not None and resolution is not None:
+        if validity is not None and (
+            resolution is not None or any(r is not None for r in (resolutions or {}).values())
+        ):
             raise ValidationError("a statement is a validity or a resolution, never both")
         self.require_signable()
         recorded, repositories = [], set()
@@ -778,7 +781,7 @@ class FindingDecisions:
                     artifact_id=artifact_id,
                     statement_key="pending",
                     validity=validity,
-                    resolution=resolution,
+                    resolution=(resolutions or {}).get(finding_id, resolution),
                     reason=reason,
                     fixed_repository_ref_id=fixed_repository_ref_id,
                     rationale=(rationales or {}).get(finding_id),

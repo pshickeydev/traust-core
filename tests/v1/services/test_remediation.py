@@ -480,6 +480,37 @@ def test_record_attaches_the_report_links_its_tickets_and_moves_the_item(
     assert len(decisions(engine, found)) == before
 
 
+def test_record_logs_the_effective_status_when_progress_advanced_during_recording(
+    service: RemediationService,
+    engine: Engine,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ref, (found,) = seeded(engine)
+    service.open([found.id], ref.id)  # type: ignore[list-item]
+    reported_item = service._reported_item
+
+    def advance_after_read(
+        wanted: tuple[UUID, ...], digest: str, work_item_id: UUID | None
+    ) -> WorkItem:
+        item = reported_item(wanted, digest, work_item_id)
+        service.record_progress(item.work_item_id, RemediationStatus("pr_opened"))
+        return item
+
+    monkeypatch.setattr(service, "_reported_item", advance_after_read)
+    logger = logging.getLogger("traust_core.v1.services.remediation")
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        logger.addHandler(caplog.handler)
+        try:
+            done = service.record(report([found.id], summary__status="checks_passed"), provenance())  # type: ignore[list-item]
+        finally:
+            logger.removeHandler(caplog.handler)
+
+    assert done.status == "pr_opened"
+    assert f"report {done.report.id}, pr_opened" in caplog.text  # type: ignore[union-attr]
+    assert f"report {done.report.id}, checks_passed" not in caplog.text  # type: ignore[union-attr]
+
+
 def test_record_takes_an_already_published_report(
     service: RemediationService, context: Context, engine: Engine
 ) -> None:

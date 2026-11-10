@@ -17,4 +17,5 @@ class ResultKind(StrEnum):
     PRIV_PROFILE = "priv-profile.json"
     VALIDATION = "validation.json"
     REMEDIATION_VERIFICATION = "remediation-verification.json"
+    REMEDIATION_PATCH = "remediation-patch.diff"
     REPO_STATE = "repo-state.json"
