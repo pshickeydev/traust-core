@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import ast
 import re
-from collections.abc import Iterator
 from dataclasses import dataclass, field, replace
 
 from traust_core.v1.models.code_facts import RouteFamily
@@ -23,6 +22,7 @@ from traust_core.v1.providers.route_plumbing import (
     _dotted,
     _guards_in,
     _mark,
+    _module_statements,
     _own_nodes,
     _PyIndex,
     _resolve_import,
@@ -1226,15 +1226,41 @@ class _Django:
         # order across modules is import order, which the walk cannot see.
         assigned: dict[tuple[str, str], list[ast.AST]] = {}
         for rel, tree in self.trees.items():
-            for n, _ in _module_statements(tree.body, False):
-                if not isinstance(n, ast.Assign):
-                    continue
-                for target in n.targets:
+            # the earliest line this module reads the router's URLs at: an
+            # assignment after it cannot change the routes include() already
+            # built (router.urls is evaluated where it is included)
+            mounted_at: dict[tuple[str, str], int] = {}
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Attribute) and node.attr in ("urls", "get_urls"):
+                    key = self.router_key(rel, _dotted(node.value))
+                    if key is not None and key in found:
+                        mounted_at[key] = min(mounted_at.get(key, node.lineno), node.lineno)
+            for n, conditional in _module_statements(tree.body, False):
+                targets = []
+                if isinstance(n, ast.Assign):
+                    targets = n.targets
+                elif isinstance(n, ast.AnnAssign) and n.value is not None:
+                    targets = [n.target]  # `router.trailing_slash: bool = False`
+                for target in targets:
                     if not (isinstance(target, ast.Attribute) and target.attr == "trailing_slash"):
                         continue
                     key = self.router_key(rel, _dotted(target.value))
-                    if key is not None and key in found:
-                        assigned.setdefault(key, []).append(n.value)
+                    if key is None or key not in found:
+                        continue
+                    if conditional:
+                        # inside an if/try/for: it may or may not run
+                        found[key].dynamic = True
+                        continue
+                    if key in mounted_at and mounted_at[key] < n.lineno:
+                        # the URLs were already built above the assignment
+                        continue
+                    if key[0] != rel and key not in mounted_at:
+                        # a module that neither binds the router nor mounts it:
+                        # whether its assignment runs before the include is
+                        # import order, which the walk cannot see
+                        found[key].dynamic = True
+                        continue
+                    assigned.setdefault(key, []).append(n.value)
         for key, values in assigned.items():
             constants = {v.value for v in values if isinstance(v, ast.Constant)}
             if any(not isinstance(v, ast.Constant) for v in values) or len(constants) > 1:
@@ -1597,20 +1623,6 @@ def _changed(tree: ast.Module, read: set[int]) -> set[str]:
         if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute):
             out.add(_dotted(n.func.value))
     return out
-
-
-def _module_statements(body: list[ast.stmt], conditional: bool) -> Iterator[tuple[ast.stmt, bool]]:
-    """A module's statements, through the `if`/`try`/`with`/`for` blocks around them."""
-    for n in body:
-        if isinstance(n, ast.If | ast.Try | ast.For | ast.While):
-            for block in ("body", "orelse", "finalbody"):
-                yield from _module_statements(getattr(n, block, []), True)
-            for h in getattr(n, "handlers", []):
-                yield from _module_statements(h.body, True)
-        elif isinstance(n, ast.With):
-            yield from _module_statements(n.body, conditional)
-        else:
-            yield n, conditional
 
 
 _UNPLACED = "?"  # an include whose target can't be read

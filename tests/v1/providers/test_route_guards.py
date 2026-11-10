@@ -233,6 +233,78 @@ def test_flask_decorator_routes_and_guards(flask_asym_repo):
     assert imp["judgement_required"] is True
 
 
+def test_a_star_import_does_not_shadow_a_guard_the_module_does_not_export(tmp_path):
+    """A checkout module may define a guard's name without exporting it (`__all__` gates
+    what a star import brings in), and the view may import the real guard after the star:
+    the route keeps its flask-login guard instead of reading the checkout's definition."""
+    (tmp_path / "helpers.py").write_text(
+        "from functools import wraps\n"
+        '__all__ = ["something_else"]\n'
+        "def login_required(fn):\n"
+        "    @wraps(fn)\n"
+        "    def wrapped(*args, **kwargs):\n"
+        "        return fn(*args, **kwargs)\n"
+        "    return wrapped\n"
+        "def something_else(): ...\n"
+    )
+    (tmp_path / "app.py").write_text(
+        "from flask import Flask\n"
+        "from helpers import *\n"
+        "from flask_login import login_required\n"
+        "app = Flask(__name__)\n"
+        "@app.route('/items')\n"
+        "@login_required\n"
+        "def list_items(): ...\n"
+    )
+    result = _enum(tmp_path)
+    listing = _row(result, "GET", "/items")
+    assert listing["guards"] == ["login_required"]
+    assert listing["judgement_required"] is False
+
+
+def test_an_explicit_guard_import_after_a_star_import_wins(tmp_path):
+    """A later explicit import rebinds what an earlier star import bound: the route keeps
+    the library guard even when the star source exports a same-named checkout definition."""
+    (tmp_path / "helpers.py").write_text(
+        "from functools import wraps\n"
+        '__all__ = ["login_required"]\n'
+        "def login_required(fn):\n"
+        "    @wraps(fn)\n"
+        "    def wrapped(*args, **kwargs):\n"
+        "        return fn(*args, **kwargs)\n"
+        "    return wrapped\n"
+    )
+    (tmp_path / "app.py").write_text(
+        "from flask import Flask\n"
+        "from helpers import *\n"
+        "from flask_login import login_required\n"
+        "app = Flask(__name__)\n"
+        "@app.route('/items')\n"
+        "@login_required\n"
+        "def list_items(): ...\n"
+    )
+    result = _enum(tmp_path)
+    listing = _row(result, "GET", "/items")
+    assert listing["guards"] == ["login_required"]
+    assert listing["judgement_required"] is False
+
+
+def test_an_uncalled_flask_helper_sharing_a_name_stays_unplaced(tmp_path):
+    """`_called` resolves the definition, not the bare name: an unrelated module calling
+    its own `register()` must not make an uncalled flask route helper look mounted."""
+    (tmp_path / "app.py").write_text(
+        "from flask import Flask\n"
+        "app = Flask(__name__)\n"
+        "def register(application):\n"
+        "    @application.route('/items')\n"
+        "    def list_items(): ...\n"
+    )
+    (tmp_path / "unrelated.py").write_text("def register(thing):\n    return thing\nregister(1)\n")
+    result = _enum(tmp_path)
+    [row] = _by_pattern(result, "/items")
+    assert row["pattern_dynamic"] is True
+
+
 def test_flask_bare_sibling_is_asymmetry(flask_asym_repo):
     result = _enum(flask_asym_repo)
     [asym] = [

@@ -180,6 +180,84 @@ def test_a_trailing_slash_assignment_in_a_module_that_imports_the_router(tmp_pat
     assert ("GET", "api/notes/") not in rows and ("GET", "api/notes/<pk>/") not in rows
 
 
+def test_an_annotated_trailing_slash_assignment_shapes_the_urls(tmp_path: Path) -> None:
+    """`router.trailing_slash: bool = False` is an annotated assignment, not a plain one."""
+    _write(
+        tmp_path,
+        {
+            "site/settings.py": 'ROOT_URLCONF = "site.urls"\n',
+            "site/urls.py": (
+                "from django.urls import include, path\n"
+                "from rest_framework.routers import DefaultRouter\n"
+                "from notes.views import NoteViewSet\n"
+                "router = DefaultRouter()\n"
+                "router.trailing_slash: bool = False\n"
+                "router.register('notes', NoteViewSet)\n"
+                "urlpatterns = [path('api/', include(router.urls))]\n"
+            ),
+            "notes/views.py": (
+                "from rest_framework.viewsets import ModelViewSet\n"
+                "class NoteViewSet(ModelViewSet): ...\n"
+            ),
+        },
+    )
+    rows = _rows(tmp_path)
+    assert ("GET", "api/notes") in rows and ("GET", "api/notes/") not in rows
+
+
+def test_a_conditional_trailing_slash_assignment_leaves_the_rows_dynamic(tmp_path: Path) -> None:
+    """`if DEBUG: router.trailing_slash = ''` may or may not run: the form reads unknown."""
+    _write(
+        tmp_path,
+        {
+            "site/settings.py": 'ROOT_URLCONF = "site.urls"\n',
+            "site/urls.py": (
+                "from django.urls import include, path\n"
+                "from rest_framework.routers import DefaultRouter\n"
+                "from notes.views import NoteViewSet\n"
+                "router = DefaultRouter()\n"
+                "if DEBUG:\n"
+                "    router.trailing_slash = ''\n"
+                "router.register('notes', NoteViewSet)\n"
+                "urlpatterns = [path('api/', include(router.urls))]\n"
+            ),
+            "notes/views.py": (
+                "from rest_framework.viewsets import ModelViewSet\n"
+                "class NoteViewSet(ModelViewSet): ...\n"
+            ),
+        },
+    )
+    rows = _rows(tmp_path)
+    slashless = [r for r in rows.values() if r["pattern"] in ("api/notes", "api/notes/")]
+    assert slashless and all(r["pattern_dynamic"] for r in slashless)
+
+
+def test_a_trailing_slash_assignment_after_the_include_changes_nothing(tmp_path: Path) -> None:
+    """`router.urls` is evaluated where it is included: an assignment below the include
+    cannot change the routes that were already built."""
+    _write(
+        tmp_path,
+        {
+            "site/settings.py": 'ROOT_URLCONF = "site.urls"\n',
+            "site/urls.py": (
+                "from django.urls import include, path\n"
+                "from rest_framework.routers import DefaultRouter\n"
+                "from notes.views import NoteViewSet\n"
+                "router = DefaultRouter()\n"
+                "router.register('notes', NoteViewSet)\n"
+                "urlpatterns = [path('api/', include(router.urls))]\n"
+                "router.trailing_slash = ''\n"
+            ),
+            "notes/views.py": (
+                "from rest_framework.viewsets import ModelViewSet\n"
+                "class NoteViewSet(ModelViewSet): ...\n"
+            ),
+        },
+    )
+    rows = _rows(tmp_path)
+    assert ("GET", "api/notes/") in rows and ("GET", "api/notes") not in rows
+
+
 def test_disagreeing_trailing_slash_assignments_leave_the_rows_dynamic(tmp_path: Path) -> None:
     """Two assignments to one router's trailing_slash, in different modules: their
     order is import order, which the walk cannot see — the form reads unknown."""

@@ -54,6 +54,7 @@ from traust_core.v1.providers.route_plumbing import (
     _last,
     _line,
     _mark,
+    _module_statements,
     _Modules,
     _own_nodes,
     _parsed,
@@ -372,8 +373,14 @@ class _FlaskIndex:
     _chains: dict[tuple[str, str], list[_Class]] = field(default_factory=dict)
     methods: dict[str, list[_Function]] = field(default_factory=dict)  # reached as `obj.name`
     called: set[str] = field(default_factory=set)  # every function name the checkout calls
+    # the function NODES the checkout calls, resolved to their definitions
+    called_defs: set[int] = field(default_factory=set)
     # the checkout modules each file star-imports
     starred: dict[str, list[str]] = field(default_factory=dict)
+    # each module's `__all__`, when it has one: a star import binds only what it exports
+    exports: dict[str, frozenset[str]] = field(default_factory=dict)
+    # each file's from-imports in source order: (line, name — "*" for a star import, module)
+    import_order: dict[str, list[tuple[int, str, str]]] = field(default_factory=dict)
     modules: _Modules | None = None
 
     def pick(self, found: list[_D], name: str, rel: str) -> _D | None:
@@ -453,13 +460,60 @@ class _FlaskIndex:
     def star_binds(
         self, rel: str, names: Iterable[str], kinds: Sequence[Mapping[str, Sequence[_D]]]
     ) -> bool:
-        """A checkout module `rel` star-imports binds one of the names (defines or imports it),
-        and may rebind what an earlier import bound."""
-        return any(
-            any(_same_module(c.path, m) for k in kinds for c in k.get(b, []))
-            or any(_same_module(r, m) and b in self.imported.get(r, {}) for r in self.imported)
-            for m in self.starred.get(rel, [])
-            for b in names
+        """A module `rel` star-imports binds one of the names, and that binding governs:
+        the star source defines or imports the name AND exports it (`__all__` gates what a
+        star import brings in), and no later import in `rel` rebinds the name over it — an
+        explicit import after the star wins, as at runtime."""
+        starred = self.starred.get(rel, [])
+        if not starred:
+            return False
+        for b in names:
+            binding = self._last_binding(rel, b, starred, kinds)
+            if binding is None:
+                continue
+            _, is_star, module = binding
+            if is_star:
+                return True
+            # the last binding names the star source itself: the same checkout definition
+            if any(_same_module(module, m) for m in starred) and self._module_binds(
+                module, b, kinds
+            ):
+                return True
+        return False
+
+    def _last_binding(
+        self,
+        rel: str,
+        name: str,
+        starred: list[str],
+        kinds: Sequence[Mapping[str, Sequence[_D]]],
+    ) -> tuple[int, bool, str] | None:
+        """The last import of `rel` that binds `name`: an explicit import of it, or a star
+        import whose module exports it. None when nothing binds it."""
+        binding = None
+        for line, imported, module in self.import_order.get(rel, ()):
+            if imported == name:
+                binding = (line, False, module)
+            elif (
+                imported == "*"
+                and module in starred
+                and self._module_binds(module, name, kinds)
+                and self._exports(module, name)
+            ):
+                binding = (line, True, module)
+        return binding
+
+    def _exports(self, module: str, name: str) -> bool:
+        """A star import from `module` brings `name` in only when the module exports it."""
+        exports = self.exports.get(module)
+        return exports is None or name in exports
+
+    def _module_binds(
+        self, module: str, name: str, kinds: Sequence[Mapping[str, Sequence[_D]]]
+    ) -> bool:
+        """`module` defines or imports `name` (what a star import of it could bind)."""
+        return any(_same_module(c.path, module) for k in kinds for c in k.get(name, [])) or any(
+            _same_module(r, module) and name in self.imported.get(r, {}) for r in self.imported
         )
 
     def resolve_fn(self, name: str, rel: str) -> _Function | None:
@@ -596,6 +650,34 @@ def _flask_index(
                     index.imported.setdefault(rel, {})[alias.asname or alias.name] = mod
                     if alias.asname:
                         index.renamed.setdefault(rel, {})[alias.asname] = alias.name
+        # module-level from-imports in source order: which binding of a name is the last
+        # one, and where a star import sits beside an explicit import of the same name
+        events: list[tuple[int, str, str]] = []
+        for node, _ in _module_statements(src.tree.body, False):
+            if not isinstance(node, ast.ImportFrom):
+                continue
+            mod = _resolve_import(rel, node.module, node.level)
+            for alias in node.names:
+                events.append((node.lineno, alias.name, mod))
+        index.import_order[rel] = sorted(events)
+        # a module's `__all__` gates what a star import of it binds
+        exported: set[str] = set()
+        for node, _ in _module_statements(src.tree.body, False):
+            if not isinstance(node, ast.Assign | ast.AugAssign | ast.AnnAssign):
+                continue
+            targets = _targets(node)
+            if not any(isinstance(t, ast.Name) and t.id == "__all__" for t in targets):
+                continue
+            value = node.value
+            if isinstance(node, ast.AugAssign) and isinstance(node.value, ast.Call):
+                value = node.value.args[0] if node.value.args else None
+            elements = _str_list(value) if value is not None else None
+            if elements is None:
+                exported.clear()  # not a readable list: treat the module as having no __all__
+                break
+            exported.update(elements)
+        if exported:
+            index.exports[rel] = frozenset(exported)
         renamed = index.renamed.get(rel, {})
         for node, scope in _scoped(src.tree):
             if isinstance(node, ast.Assign | ast.AnnAssign) and node.value is not None:
@@ -645,6 +727,16 @@ def _flask_index(
                 index.registered.setdefault(rel, set()).add(
                     (_last(fn.rsplit(".", 1)[0]), _last(_dotted(node.args[0])))
                 )
+    # which function DEFINITIONS the checkout calls (not bare names: an unrelated module
+    # calling its own `register()` must not make an uncalled flask helper look mounted)
+    for src in sources:
+        for node in ast.walk(src.tree):
+            if not isinstance(node, ast.Call):
+                continue
+            callee = index.resolve_fn(_dotted(node.func), src.file.rel)
+            if callee is not None and callee.node is not None:
+                index.called_defs.add(id(callee.node))
+
     # a checkout subclass of Blueprint or Flask: `bp = VersionedBlueprint("notes", ..)`
     for src in sources:
         for node in ast.walk(src.tree):
@@ -889,13 +981,14 @@ class _FlaskFile:
         return recv if (recv in self.index.receivers or self.src.imports_flask or handed) else None
 
     def _called(self, fn: ast.AST | None) -> bool:
-        """Something calls the function: the checkout, or pytest (a test or a fixture)."""
+        """Something calls THIS function — the resolved definition, not any function sharing
+        its bare name — or pytest does (a test or a fixture)."""
         name = getattr(fn, "name", "")
         tested = _test_module(self.rel) and (
             name.startswith("test")
             or any(_last(_dotted(d)).endswith("fixture") for d in getattr(fn, "decorator_list", []))
         )
-        return tested or name in self.index.called
+        return tested or (fn is not None and id(fn) in self.index.called_defs)
 
     def rows(self) -> list[_Row]:
         rows: list[_Row] = []

@@ -563,3 +563,17 @@ def _annotated_alias(node: ast.Assign | ast.AnnAssign) -> tuple[str, ast.Subscri
     ):
         return target.id, value
     return None
+
+
+def _module_statements(body: list[ast.stmt], conditional: bool) -> Iterator[tuple[ast.stmt, bool]]:
+    """A module's statements, through the `if`/`try`/`with`/`for` blocks around them."""
+    for n in body:
+        if isinstance(n, ast.If | ast.Try | ast.For | ast.While):
+            for block in ("body", "orelse", "finalbody"):
+                yield from _module_statements(getattr(n, block, []), True)
+            for h in getattr(n, "handlers", []):
+                yield from _module_statements(h.body, True)
+        elif isinstance(n, ast.With):
+            yield from _module_statements(n.body, conditional)
+        else:
+            yield n, conditional
