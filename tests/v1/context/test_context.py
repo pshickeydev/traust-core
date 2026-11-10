@@ -186,3 +186,22 @@ def test_a_store_whose_run_order_predates_the_fork_columns_is_refused(tmp_path: 
         conn.exec_driver_sql("ALTER TABLE ops_run_order DROP COLUMN fork_url")
     with pytest.raises(ConfigError, match="apply the additive statements"):
         Context(Config(home=home)).services()
+
+
+def test_a_store_whose_finding_links_predate_the_assessment_scope_is_refused(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    Context(Config(home=home)).services()  # a local store with the current schema
+    with Context(Config(home=home)).database.begin() as conn:
+        for trigger in (
+            "finding_external_ref_repository_ref_scope_update",
+            "finding_external_ref_finding_scope_update",
+            "finding_external_ref_scope_update",
+            "finding_external_ref_scope_insert",
+        ):
+            conn.exec_driver_sql(f"DROP TRIGGER IF EXISTS {trigger}")
+        conn.exec_driver_sql("DROP INDEX IF EXISTS idx_finding_external_ref_assessment")
+        conn.exec_driver_sql("ALTER TABLE finding_external_ref DROP COLUMN assessment_id")
+    with pytest.raises(ConfigError, match="predates assessment_id"):
+        Context(Config(home=home)).services()

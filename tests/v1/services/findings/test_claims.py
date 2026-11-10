@@ -296,6 +296,22 @@ def test_required_independent_approvers_are_recorded_and_retried(claims: Claims)
         ]
 
 
+def test_the_author_cannot_approve_their_own_claim_under_another_spelling(
+    claims: Claims,
+) -> None:
+    claims.findings = service(claims.engine, claims.objects, approvals=1)
+    pending = claims.request()
+    for spelled in (f"human:{ADMIN.identity}", ADMIN.identity.upper()):
+        with pytest.raises(ForbiddenError, match="approvers"):
+            claims.accept(pending.id, approvers=(spelled,))
+    claims.accept(pending.id, approvers=("human:peer@example.com",))
+    with SqlTraustUnitOfWork(claims.engine) as uow:
+        decision = uow.review_items.get(pending.id).resolved_by_decision_id
+        assert [row.approver for row in uow.decision_approvers.list_for_decision(decision)] == [
+            "human:peer@example.com"
+        ]
+
+
 def test_generic_review_cannot_accept_a_retained_claim(claims: Claims) -> None:
     pending = claims.request()
     with pytest.raises(ValidationError, match="correct_claim"):

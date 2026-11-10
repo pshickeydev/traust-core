@@ -4,7 +4,7 @@ ids touching package versions (querybatch)."""
 from __future__ import annotations
 
 import json
-from collections import Counter
+from collections import Counter, defaultdict
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
@@ -243,6 +243,9 @@ class ExportedAdvisoryLookup:
     def __init__(self, paths: Sequence[Path], *, clock: Clock) -> None:
         self._clock = clock
         self._records: list[AdvisoryRecord] = []
+        # identifier/alias (uppercased) -> the records naming it: one index built at load,
+        # so alias-closure expansion visits each record once instead of rescanning the corpus.
+        self._by_name: defaultdict[str, list[AdvisoryRecord]] = defaultdict(list)
         documents: dict[str, tuple[Mapping[str, Any], str]] = {}
         for path in paths:
             uri = Path(path).resolve().as_uri()
@@ -259,6 +262,8 @@ class ExportedAdvisoryLookup:
                 )
             documents[record.identifier.upper()] = (document, uri)
             self._records.append(record)
+            for name in (record.identifier, *record.aliases):
+                self._by_name[str(name).upper()].append(record)
 
     def check(self) -> Readiness:
         return Readiness(ready=bool(self._records), detail="" if self._records else "no records")
@@ -274,26 +279,21 @@ class ExportedAdvisoryLookup:
         return Result(found, acquisition)
 
     def related(self, record: AdvisoryRecord) -> Result[tuple[AdvisoryRecord, ...]]:
-        names = {name.upper() for name in (record.identifier, *record.aliases)}
         selected: list[AdvisoryRecord] = []
-        while True:
-            found = [
-                candidate
-                for candidate in self._records
-                if candidate != record
-                and candidate not in selected
-                and names.intersection(
-                    name.upper() for name in (candidate.identifier, *candidate.aliases)
-                )
-            ]
-            if not found:
-                break
-            selected.extend(found)
-            names.update(
-                name.upper()
-                for candidate in found
-                for name in (candidate.identifier, *candidate.aliases)
-            )
+        seen: set[str] = set()
+        pending = [str(name).upper() for name in (record.identifier, *record.aliases)]
+        while pending:
+            names = set(pending)
+            pending = []
+            for name in names - seen:
+                seen.add(name)
+                for candidate in self._by_name[name]:
+                    if candidate is record or candidate in selected:
+                        continue
+                    selected.append(candidate)
+                    pending.extend(
+                        str(alias).upper() for alias in (candidate.identifier, *candidate.aliases)
+                    )
         return Result(tuple(selected), self._acquired())
 
     def for_commit(self, commit: GitSha) -> Result[tuple[AdvisoryRecord, ...]]:

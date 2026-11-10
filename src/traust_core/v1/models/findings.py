@@ -521,6 +521,13 @@ def _first_line(lines: str | None) -> int | None:
     return int(m.group()) if (m := _FIRST_LINE.search(lines or "")) else None
 
 
+def _approver_identity(approver: str) -> str:
+    """One canonical spelling per approver identity: stripped, lowercased, any actor-ref
+    prefix (`human:`) removed, so `alice` and `human:alice` name the same person and an
+    author cannot count as their own approver under a different spelling."""
+    return approver.strip().lower().removeprefix(f"{ActorKind.HUMAN}:")
+
+
 class Finding(Entity):
     """3b · one weakness or vulnerability in a repository, identified by fingerprint."""
 
@@ -639,9 +646,9 @@ class Restatement(Model):
         return {f: v for f in RESTATABLE if (v := getattr(self, f)) is not None}
 
     def independent_approvers(self, author: Principal) -> frozenset[str]:
-        """The approvers it names, normalised, without its author."""
-        named = {a.strip().lower() for a in self.approvers if a.strip()}
-        return frozenset(named - {author.identity.strip().lower()})
+        """The approvers it names, normalised to one spelling, without its author."""
+        named = {_approver_identity(a) for a in self.approvers if a.strip()}
+        return frozenset(named - {_approver_identity(author.identity)})
 
     def validate_authority(self) -> None:
         if not self.ticket.strip():

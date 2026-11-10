@@ -994,7 +994,9 @@ class ExposureService:
         best: dict[UUID, tuple[AdvisoryRecord, set[PackageVersion]]] = {}
         for record in records:
             assert record.advisory_id is not None
-            touched = set().union(*(hit[name] for name in (record.identifier, *record.aliases)))
+            names = (record.identifier, *record.aliases)
+            # A fetched advisory can name aliases the package query never returned as hits.
+            touched = set().union(*(hit[name] for name in names if name in hit))
             kept = best.get(record.advisory_id)
             if kept is None:
                 best[record.advisory_id] = (record, touched)

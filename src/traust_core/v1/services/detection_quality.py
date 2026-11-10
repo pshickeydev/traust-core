@@ -657,6 +657,12 @@ class DetectionQualityService:
             raise NotFoundError(f"CVE replay advisory {advisory}")
         audit, report = bound
         now = self._clock.now()
+        published = record.published_at
+        if published is None or not audit.audited_at < published <= now:
+            raise ValidationError(
+                f"CVE replay advisory {advisory}: publication must be known, strictly after "
+                f"the audit ({audit.audited_at.isoformat()}) and no later than now"
+            )
         check = CveReplayCandidate.classify(
             audit,
             "\n".join(report.text_fragments(sections=("findings", "negative_results"))),

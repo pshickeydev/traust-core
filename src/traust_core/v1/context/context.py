@@ -743,6 +743,7 @@ class Context:
             _run_order_fork_columns(engine)  # artifact_run_order's upgrade needs these first
             _artifact_run_order(engine, upgrade=local)
             _run_order_fork_scheduled(engine, upgrade=local)
+            _finding_external_ref_scope(engine)
         return engine
 
     @cached_property
@@ -1292,6 +1293,26 @@ def _run_order_fork_scheduled(engine: Engine, *, upgrade: bool) -> None:
         ("traust_ops", "run_order", "fork_scheduled_at"),
         "run_order_fork_scheduled_upgrade",
         upgrade=upgrade,
+    )
+
+
+def _finding_external_ref_scope(engine: Engine) -> None:
+    """contracts added `finding_external_ref.assessment_id` (contracts#132) with deliberately
+    no upgrade channel: shared tables are additive-bootstrap only, so a store whose
+    finding_external_ref predates the column is refused here, with the supported recovery
+    path, rather than failing the first finding-link read with a raw driver error."""
+    dialect = Dialect.of(engine)
+    schema = "traust" if dialect == Dialect.POSTGRES else None
+    inspector = sa.inspect(engine)
+    if not inspector.has_table("finding_external_ref", schema=schema):
+        return
+    columns = {c["name"] for c in inspector.get_columns("finding_external_ref", schema=schema)}
+    if "assessment_id" in columns:
+        return
+    raise ConfigError(
+        "the database's finding_external_ref predates assessment_id: the shared tables are "
+        "additive-bootstrap only (traust-contracts#132); recreate the store from the current "
+        "schema, or add the column by hand before opening it"
     )
 
 

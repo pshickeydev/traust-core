@@ -212,6 +212,21 @@ def test_malware_ranks_first_then_severity_then_reach(engine: Engine) -> None:
     assert swept.advisories[0].malicious
 
 
+def test_a_fetched_record_naming_an_unhit_alias_still_keeps_its_own_hits(
+    engine: Engine,
+) -> None:
+    commits(engine, CDX)
+    lookup = SweepLookup(
+        {"lodash": ("GHSA-x",)},
+        osv("GHSA-x", "lodash", aliases=["CVE-2099-1234"], database_specific={"severity": "HIGH"}),
+    )
+    swept = service(engine, lookup).sweep(ScannerSeverity.LOW)
+    assert swept.status == SweepStatus.COMPLETE
+    [row] = swept.advisories
+    assert row.display_id == "CVE-2099-1234"  # the alias names the same advisory
+    assert row.packages == ("npm/lodash",)
+
+
 def test_records_of_one_cve_are_one_row_at_their_highest_severity(engine: Engine) -> None:
     commits(engine, CDX)
     lookup = SweepLookup(

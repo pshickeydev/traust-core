@@ -16,11 +16,10 @@ from traust_core.v1.models.findings import (
     Occurrence,
 )
 from traust_core.v1.models.inventory import RepositoryRef, default_line, ref_line
-from traust_core.v1.models.vocabulary import DecisionReason
 from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.repositories.objects import ObjectStore
 from traust_core.v1.services.artifact_publishing import AssessmentLog
-from traust_core.v1.services.findings.claims import ApprovedClaim, approved_claims
+from traust_core.v1.services.findings.claims import ApprovedClaim, approved_claims_for
 from traust_core.v1.services.portfolio import Inventory
 
 
@@ -52,15 +51,12 @@ class FindingFacts:
         """Decisions made after `until` are left out; every occurrence is kept."""
         ids = [f.id for f in findings if f.id is not None]
         decisions: defaultdict[UUID, list[Decision]] = defaultdict(list)
-        all_decisions = uow.decisions.list_for_findings(ids, read_budget=read_budget)
-        corrected = {
-            decision.finding_id
-            for decision in all_decisions
-            if decision.reason == DecisionReason.BASELINE_REWRITE
-        }
-        for d in all_decisions:
-            if until is None or d.occurred_at <= until:
-                decisions[d.finding_id].append(d)
+        for d in uow.decisions.list_for_findings(ids, until=until, read_budget=read_budget):
+            decisions[d.finding_id].append(d)
+        # A claim correction rewrote the finding row, so the claim chain is needed even when
+        # its acceptance falls after `until` (the view then restores the pre-claim base).
+        # The id set is one narrow distinct query, not the unbounded decision history.
+        corrected = set(uow.decisions.list_finding_ids_with_claims()) & set(ids)
         occurrences = uow.occurrences.list_for_findings(ids, read_budget=read_budget)
         assessments = AssessmentLog(uow).list_by_ids(
             {o.assessment_id for o in occurrences}
@@ -105,11 +101,11 @@ class FindingFacts:
             cwes=cwes,
             labels=labels,
             assessments={a.id: a for a in assessments if a.id is not None},
-            claims={
-                finding.id: approved_claims(uow, objects, finding)
-                for finding in findings
-                if objects is not None and finding.id in corrected
-            },
+            claims=(
+                approved_claims_for(uow, objects, claimed)
+                if objects is not None and (claimed := [f for f in findings if f.id in corrected])
+                else {}
+            ),
         )
 
     def reported_by(self, finding_id: UUID, as_of: datetime | None) -> list[Occurrence]:

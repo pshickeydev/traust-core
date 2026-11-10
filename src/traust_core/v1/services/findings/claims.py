@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import re
+from collections import defaultdict
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING
@@ -92,8 +94,31 @@ def approved_claims(
 ) -> list[ApprovedClaim]:
     assert finding.id is not None
     history = {decision.id: decision for decision in uow.decisions.list_for_finding(finding.id)}
+    artifact_ids = {
+        decision.artifact_id
+        for decision in history.values()
+        if decision.reason == DecisionReason.BASELINE_REWRITE and decision.artifact_id is not None
+    }
+    artifacts = {
+        row.id: row
+        for row in (AssessmentLog(uow).list_artifacts_by_ids(artifact_ids) if artifact_ids else ())
+    }
+    return _accepted_claims(
+        uow, objects, finding, history, artifacts, uow.review_items.list_for_finding(finding.id)
+    )
+
+
+def _accepted_claims(
+    uow: TraustUnitOfWork,
+    objects: ObjectStore,
+    finding: Finding,
+    history: Mapping[UUID, Decision],
+    artifacts: Mapping[UUID, Artifact],
+    review_items: Sequence[ReviewItem],
+) -> list[ApprovedClaim]:
+    assert finding.id is not None
     claims: dict[UUID | None, ApprovedClaim] = {}
-    for item in uow.review_items.list_for_finding(finding.id):
+    for item in review_items:
         if (
             item.reason != ReviewReason.REBASELINE_MAPPING
             or item.status != ReviewItemStatus.ACCEPTED
@@ -103,7 +128,7 @@ def approved_claims(
             continue
         proposal = history.get(item.decision_id)
         decision = history.get(item.resolved_by_decision_id)
-        row = retained_claim_artifact(uow, proposal) if proposal is not None else None
+        row = _retained_claim_artifact(artifacts, proposal)
         if row is None:
             continue
         assert proposal is not None
@@ -148,6 +173,47 @@ def approved_claims(
     if claims:
         raise IntegrityError(f"finding {finding.id} has a broken claim history")
     return ordered
+
+
+def _retained_claim_artifact(
+    artifacts: Mapping[UUID, Artifact], decision: Decision | None
+) -> Artifact | None:
+    if decision is None or decision.reason != DecisionReason.BASELINE_REWRITE:
+        return None
+    if decision.artifact_id is None:
+        return None
+    row = artifacts.get(decision.artifact_id)
+    return row if row is not None and row.kind == FindingClaimArtifact.schema else None
+
+
+def approved_claims_for(
+    uow: TraustUnitOfWork,
+    objects: ObjectStore,
+    findings: Sequence[Finding],
+) -> dict[UUID, list[ApprovedClaim]]:
+    """`approved_claims` for many findings: one query per table, not one loop per finding."""
+    wanted = {f.id: f for f in findings if f.id is not None}
+    if not wanted:
+        return {}
+    history = {decision.id: decision for decision in uow.decisions.list_for_findings(list(wanted))}
+    artifact_ids = {
+        decision.artifact_id
+        for decision in history.values()
+        if decision.reason == DecisionReason.BASELINE_REWRITE and decision.artifact_id is not None
+    }
+    artifacts = {
+        row.id: row
+        for row in (AssessmentLog(uow).list_artifacts_by_ids(artifact_ids) if artifact_ids else ())
+    }
+    items: dict[UUID, list[ReviewItem]] = defaultdict(list)
+    for item in uow.review_items.list_for_findings(list(wanted)):
+        items[item.finding_id].append(item)
+    approved: dict[UUID, list[ApprovedClaim]] = {}
+    for finding_id, finding in wanted.items():
+        approved[finding_id] = _accepted_claims(
+            uow, objects, finding, history, artifacts, items.get(finding_id, [])
+        )
+    return approved
 
 
 class FindingClaims:

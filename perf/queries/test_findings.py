@@ -513,8 +513,9 @@ def open_count(url: str) -> Callable[[SqlTraustUnitOfWork], None]:
 
 
 def on(statements: list[Explained], table: str) -> Explained:
-    """The statement reading `table` (a baseline reads each table once)."""
-    (found,) = [e for e in statements if re.search(rf"\bFROM traust\.{table}\b", e.sql)]
+    """The statement reading `table` (a baseline reads each table once, except the distinct
+    claim-candidates query that shares the decision table)."""
+    (found, *_rest) = [e for e in statements if re.search(rf"\bFROM traust\.{table}\b", e.sql)]
     return found
 
 

@@ -37,7 +37,7 @@ from traust_core.v1.models.vocabulary import (
 from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.repositories.objects import ObjectStore
 from traust_core.v1.services.artifact_publishing import AssessmentLog
-from traust_core.v1.services.findings.claims import approved_claims, retained_claim_artifact
+from traust_core.v1.services.findings.claims import approved_claims_for, retained_claim_artifact
 from traust_core.v1.services.findings.identity import IdentityPolicy
 from traust_core.v1.services.findings.review import request
 from traust_core.v1.services.findings.taxonomy import TaxonomyPolicy
@@ -199,12 +199,15 @@ class FindingIntake:
         identities: dict[tuple[str, str], Finding] = {}
         immutable_occurrences: set[UUID] = set()
         ids = uow.decisions.list_finding_ids_with_claims()
-        for finding in uow.findings.list_by_ids(ids) if ids else ():
-            if finding.repository_id != repository_id:
-                continue
-            if self._objects is None:
-                raise ConfigError("resolving retained claim identities needs the object store")
-            for accepted in approved_claims(uow, self._objects, finding):
+        findings = [f for f in uow.findings.list_by_ids(ids) if f.repository_id == repository_id]
+        if not findings:
+            return identities, immutable_occurrences
+        if self._objects is None:
+            raise ConfigError("resolving retained claim identities needs the object store")
+        by_id = {f.id: f for f in findings}
+        for finding_id, accepted_list in approved_claims_for(uow, self._objects, findings).items():
+            finding = by_id[finding_id]
+            for accepted in accepted_list:
                 immutable_occurrences.update(accepted.base.occurrence_ids)
                 for claim in (accepted.base, accepted.claim):
                     key = (claim.fingerprint_algo, claim.fingerprint)

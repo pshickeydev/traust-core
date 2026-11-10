@@ -342,6 +342,46 @@ def test_oracle_refuses_non_audit_missing_assessment_and_unknown_advisory(
     assert snapshot_rows(bench) == []
 
 
+def test_oracle_adjudicates_only_advisories_published_inside_the_replay_window(
+    bench: Bench, engine: Engine
+) -> None:
+    audit = bench.audit(bound_report(bench), AssessmentKind.SECURE_CODE_CANONICAL)
+    with bench.uow as uow:
+        audited_at = uow.assessments.get(audit).occurred_at
+    with OsvFixture() as osv:
+        osv.records["CVE-2026-99901"] = advisory(published=None)
+        service = quality(bench, engine, osv)
+        with pytest.raises(ValidationError, match="publication must be known"):
+            service.cve_replay_oracle(
+                audit,
+                "CVE-2026-99901",
+                present_at_audit=False,
+                principal=HUMAN,
+                presence_evidence=EVIDENCE,
+            )
+        osv.records["CVE-2026-99901"] = advisory(
+            published=audited_at.isoformat().replace("+00:00", "Z")
+        )
+        with pytest.raises(ValidationError, match="strictly after the audit"):
+            service.cve_replay_oracle(
+                audit,
+                "CVE-2026-99901",
+                present_at_audit=False,
+                principal=HUMAN,
+                presence_evidence=EVIDENCE,
+            )
+        osv.records["CVE-2026-99901"] = advisory(published="2099-01-01T00:00:00Z")
+        with pytest.raises(ValidationError, match="no later than now"):
+            service.cve_replay_oracle(
+                audit,
+                "CVE-2026-99901",
+                present_at_audit=False,
+                principal=HUMAN,
+                presence_evidence=EVIDENCE,
+            )
+    assert snapshot_rows(bench) == []
+
+
 @pytest.mark.parametrize("since", [datetime(2026, 10, 1), datetime(2099, 1, 1, tzinfo=UTC)])
 def test_invalid_watermark_fails_before_network_or_snapshot_write(
     bench: Bench, engine: Engine, since: datetime
