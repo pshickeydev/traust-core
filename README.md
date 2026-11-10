@@ -61,8 +61,8 @@ The latest-recorded assessment read joins repository ownership in SQL and return
 at most one assessment without loading or binding the repository's ref history.
 Algorithm-free fingerprint reads use the contracts-owned
 `(repository_id, fingerprint)` index, retaining exact opaque identity and ambiguity
-across algorithms. Local stores receive its additive index upgrade; configured
-databases must apply `contracts.finding_fingerprint_index_upgrade(dialect)` first.
+across algorithms. The index is part of the static bootstrap schema; existing
+databases require the separately designed upgrade feature.
 
 `POST /v1/remediations/{work_item_id}/pull-request` (`record_remediation_pull_request`,
 generated `RecordRemediationPullRequest`) accepts an `ExternalRef` (`system`, actual
@@ -72,9 +72,9 @@ tracker and `pr_opened` progress commit together. Replaying the same PR is a no-
 including after merge; a different PR conflicts. Finding-wide Jira tickets retain
 their existing semantics, while PR trackers are scoped by assessment ID and never
 spread to other attempts over the same findings. Immutable worker reports are not
-rewritten. Existing local stores gain the nullable scope automatically; configured
-databases apply `contracts.finding_external_ref_assessment_upgrade(dialect)` when
-`finding_external_ref.assessment_id` is absent. Historical links remain unscoped.
+rewritten. Historical links remain unscoped. Core validates pairing on tracker
+inserts and scope changes and keeps finding repository identity immutable;
+the schema retains one guard for repository-ref moves.
 
 ## Historical reads and reporting correctness
 
@@ -797,9 +797,10 @@ Everything here is `v1` API, reshaped in place until it is frozen. Each contract
 - Every table repository has behaviour tests on SQLite and Postgres; stores and providers have contract tests.
 - traust-core is the hub: other traust repos depend on it, not the reverse. The only code dependency is traust-ledger's pure functions (Merkle, signing, verifying), imported only by `services/ledger.py`; traust-contracts is pinned data. HTTP only in providers (outbound) and the HTTP adapter (inbound).
 
-## Domain services (stubs)
+## Domain services
 
-Repositories are real; services are mostly stubs. Every stub raises `NotImplementedError("stub: replaces …")` naming the code it replaces. A service declares the section unit of work it needs; `SqlTraustUnitOfWork` satisfies every one on one connection.
+Services own their domain's use cases and declare the section unit of work they need;
+`SqlTraustUnitOfWork` satisfies those protocols on one connection.
 
 | Domain | Service | Unit of work (tables) |
 |---|---|---|
@@ -1048,3 +1049,52 @@ make test-integration   # Postgres tests (marked `integration`)
 make test-repositories  # repository layer on SQLite and Postgres
 make db-down
 ```
+
+## Adoption parity APIs
+
+| Capability | Core owner |
+|---|---|
+| Aliased advisory context | `ExposureService.find_advisory` / preparation preserve each alias package's ecosystem, ranges, fixes and source provenance; sweep exposes nullable `fix_available`. |
+| CVE replay | `DetectionQualityService.cve_replay`, `cve_replay_oracle`, `cve_replay_candidates`, `cve_replay_trends`; typed results in `models.cve_replay`. |
+| Spend declarations | `SpendService.record(SpendEvent(...))` retains `repository_label`, `loc`, `batch`, `note` and optional canonical `repository_id`. |
+| Repository availability | `PortfolioService.record_forge_facts`, `record_liveness`, `liveness`, `liveness_in`, `liveness_reference`; `Liveness` / `RepoLiveness` in `models.inventory`. |
+| Reviewed claim corrections | `FindingService.request_claim_correction`, `correct_claim`, `claim`; `services.findings.claims` and `models.finding_claims`. |
+| Configuration cap | `ConfigMatrix.enumerate(ToolRequest(..., params={"max_triples": n}))` accepts nonnegative integers, retains judged defaults first and reports truncation as a coverage gap. |
+
+CVE replay reads the original bound audit report, not later context. Monitor queries finish
+before any snapshot/watermark is recorded; failed or malformed sources advance nothing.
+Presence adjudication requires a verified human principal and evidence. Unknown presence
+never enters missed-finding trends, and a confirmed miss is not benchmark admission.
+
+Claim requests retain digest-checked proposal bytes and queue review. Acceptance requires
+the restate role, ticket, meaningful rationale and configured independent approvers.
+It rejects stale bases, changed original occurrence sets and fingerprint collisions.
+Title/fingerprint and the accepted claim projection change; original occurrences, reported
+severity and disposition do not. `claim(finding_id, as_of=...)` supports historical reads.
+Ledger proof and the finding/review projections share one transaction.
+
+Spend identity resolves only a registered exact URL/UUID or the associated order; ambiguous
+labels remain supplied text, with cost retained and canonical identity unknown. Ordered
+events store no independent repository ID: every rollup derives it from the order, including
+an unknown order repository. Only order-less declarations store canonical repository identity.
+Declared/measured token double counting is unchanged.
+
+Availability is `active`, `archived`, `moved`, `missing`, `disabled` or `unknown`.
+Credential/network failures remain unknown, not missing or reachable. Unqueried repositories
+have no invented observation time and are absent from stored snapshots; unchanged status
+keeps its original `status_since`. Availability is separate from successful commit observations.
+
+Imported artifact publication serializes each kind and admits a new row only when database
+statement time advances beyond its latest publication. Clock ties retry within a bounded
+window; a frozen/backward clock raises `RepositoryError` without changing history.
+SQLite's millisecond resolution limits same-kind publication throughput.
+`latest_imported` returns the retained document and prior ID; `publish_successor` rejects
+stale priors and older-digest reverts. No publication-revision column or historical backfill
+is used. New schema changes are bootstrap-only: existing databases are not upgraded by
+conditional scripts or automatic reconciliation.
+
+`ArtifactPublisher.stage` validates and uploads immutable bytes before write/lease locks;
+`publish_staged` publishes their metadata within the caller's atomic transaction.
+`ArtifactDocument.from_document` captures the serialized snapshot, not its caller's mutable
+mapping. Native scanner assessments retain `finding-intake` label/fingerprint bindings so
+claim review never guesses an original label from a replacement report.
