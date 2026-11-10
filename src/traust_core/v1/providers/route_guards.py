@@ -9,7 +9,7 @@ import os
 import re
 import sys
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Any
 
@@ -29,7 +29,13 @@ from traust_core.v1.models.code_facts import (
 from traust_core.v1.models.common import CodeSpan, RepoPath
 from traust_core.v1.providers.base import Acquisition, Readiness, Result
 from traust_core.v1.providers.clock import Clock
-from traust_core.v1.providers.python_guards import FLASK_LOGIN_GUARDS, GuardReader
+from traust_core.v1.providers.python_guards import (
+    FLASK_LOGIN_GUARDS,
+    KNOWN_GUARDS,
+    UNREADABLE,
+    GuardReader,
+    requires_nothing,
+)
 from traust_core.v1.providers.route_ownership import (
     JUDGED,
     HandlerFacts,
@@ -102,6 +108,8 @@ OTHER_FRAMEWORKS = (
         (".java", ".kt"),
         re.compile(r"\bRouterFunctions\.(?:route|nest)\b|\bcoRouter\s*\{"),
     ),
+    # Flask-based, its routes declared in an OpenAPI spec
+    ("connexion", (".py",), re.compile(r"^\s*(?:from|import)\s+connexion\b", re.M)),
 )
 _FLASK_IMPORT = re.compile(
     r"^\s*(?:from\s+(?:flask|flask_restful|flask_restx|flask_restplus|flask_smorest|apiflask)\b"
@@ -131,6 +139,16 @@ _VIEW_BASE = re.compile(r"(MethodView|^View$|\.View$|Resource$|MethodResource$)"
 # flask-local additions: `check_*` decorators guard, `*exempt*` decorators unguard.
 _FLASK_GUARD_EXTRA = re.compile(r"(?i)(^|\.)check_")
 _FLASK_UNGUARD_EXTRA = re.compile(r"(?i)exempt")
+# flask-login's `LOGIN_DISABLED` set to anything but false, in code or a config file
+_LOGIN_DISABLED = re.compile(
+    r"(?:LOGIN_DISABLED|_login_disabled)\W*(?:=|:|,)(?!\s*[\"']?(?i:false|0|no|off|none)\b)"
+)
+_CONFIG_SUFFIXES = {".py", ".cfg", ".ini", ".env", ".toml", ".yaml", ".yml", ".json", ".conf"}
+# a response cache answers from the cache ahead of the decorators it wraps
+_RESPONSE_CACHE = re.compile(r"^(cached|memoize|cache_page|cache_response)$")
+# the packages whose `Resource` reads `method_decorators`
+_RESTFUL = ("flask_restful", "flask_restx", "flask_restplus")
+_VIEW_LISTS = ("decorators", "method_decorators")
 GUARD_FAMILIES = (
     (GuardFamily.SCOPE, re.compile(r"(?i)scope")),
     (GuardFamily.ADMIN, re.compile(r"(?i)admin")),
@@ -333,26 +351,38 @@ def _kwarg(call: ast.Call, name: str) -> ast.expr | None:
     return next((kw.value for kw in call.keywords if kw.arg == name), None)
 
 
-def _flask_split(names: Iterable[str], reader: GuardReader) -> tuple[list[str], list[str]]:
-    """The guards among decorator names: a known auth guard or checkout code that refuses an
-    anonymous caller (D36); `optional:` and exemptions unguard."""
+def _flask_split(
+    names: list[str], reader: GuardReader, outer_first: bool = True
+) -> tuple[list[str], list[str]]:
+    """The guards among decorator names (a known auth guard, D37), but none a response cache
+    wraps; `optional:` and exemptions unguard. `View.decorators` lists the innermost first."""
+    cached = [i for i, n in enumerate(names) if _caches([n])]
+    inside = (
+        set(range(cached[0] + 1, len(names)) if outer_first else range(cached[-1]))
+        if cached
+        else set()
+    )
     guards, unguards = [], []
-    for n in names:
+    for i, n in enumerate(names):
         if not n or _last(n) in _FLASK_REGISTRATION_ATTRS:
             continue
         if n.startswith(_OPTIONAL) or UNGUARD_RX.search(_last(n)) or _FLASK_UNGUARD_EXTRA.search(n):
             unguards.append(n)
-        elif reader.guards(n):
+        elif i not in inside and reader.guards(n):
             guards.append(n)
     return _unique(guards), sorted(set(unguards))
 
 
-def _names_in(node: ast.AST | None) -> list[str]:
+def _caches(names: Iterable[str]) -> bool:
+    return any(_RESPONSE_CACHE.match(_last(n)) for n in names)
+
+
+def _names_in(node: ast.AST | None, name: Callable[[ast.AST], str] = _dotted) -> list[str]:
     """A decorators-style value: a list of decorators, or a verb -> list dict."""
     if isinstance(node, ast.List | ast.Tuple | ast.Set):
-        return [_dotted(e) for e in node.elts]
+        return [name(e) for e in node.elts]
     if isinstance(node, ast.Dict):
-        return [n for v in node.values for n in _names_in(v)]
+        return [n for v in node.values for n in _names_in(v, name)]
     return []
 
 
@@ -361,9 +391,9 @@ def _method_decorators(node: ast.AST) -> tuple[list[str], dict[str, list[str]]]:
         per = {}
         for k, v in zip(node.keys, node.values, strict=False):
             if key := _const_str(k):
-                per[key.lower()] = _names_in(v)
+                per[key.lower()] = _names_in(v, _deco_name)
         return [], per
-    return _names_in(node), {}
+    return _names_in(node, _deco_name), {}
 
 
 def _raises(fn: ast.AST) -> bool:
@@ -406,7 +436,9 @@ def _own_nodes(fn: ast.AST):
 
 def _deco_name(d: ast.AST) -> str:
     """A decorator's name; `optional:` when it lets an anonymous caller through
-    (`jwt_required(optional=True)`)."""
+    (`jwt_required(optional=True)`), none when it asks for nothing (`roles_required()`)."""
+    if requires_nothing(d):
+        return ""
     optional = isinstance(d, ast.Call) and (
         any(
             k.arg == "optional" and not (isinstance(k.value, ast.Constant) and not k.value.value)
@@ -471,14 +503,21 @@ class _FlaskIndex:
     class_defs: dict[str, list[_Class]] = field(default_factory=dict)
     _readers: dict[str, GuardReader] = field(default_factory=dict)
     login_disabled: bool = False
+    # known guard names a checkout assignment binds: `login_required = lambda f: f`
+    assigned: dict[str, list[_Function]] = field(default_factory=dict)
+    # (class, attribute) set outside the class body: `Items.decorators = []`
+    rebound: set[tuple[str, str]] = field(default_factory=set)
+    unparsed: list[str] = field(default_factory=list)  # checkout modules this Python can't parse
+    _chains: dict[tuple[str, str], list[_Class]] = field(default_factory=dict)
 
     def pick(self, found: list[Any], name: str, rel: str) -> Any | None:
-        """Of the definitions a name may be, the one `rel` means: its own file's, the module it
-        imports the name (or the name's module) from, else the only one; None when unsure."""
+        """Of the definitions a name may be, the one `rel` means: its own file's (the last, which
+        is what the name is bound to), the module it imports the name (or the name's module)
+        from, else the only one; None when unsure."""
         head = name.split(".")[0]
         here = [c for c in found if c.path == rel]
         if here and "." not in name:
-            return here[0]
+            return max(here, key=lambda c: c.line)
         module = self.imported.get(rel, {}).get(head)
         if module is not None:
             target = f"{module}.{head}" if "." in name else module
@@ -506,9 +545,13 @@ class _FlaskIndex:
         if rel not in self._readers:
 
             def resolve(name: str) -> ast.AST | None:
-                fn = self.resolve_fn(name, rel)
-                cls = self.class_named(name, rel) if fn is None else None
-                return fn.node if fn is not None else cls.node if cls is not None else None
+                bare = self.renamed.get(rel, {}).get(_last(name), _last(name))
+                for found in (self.functions, self.class_defs, self.assigned):
+                    if found.get(bare):
+                        # a checkout binding of the name, even one we can't tell is which
+                        picked = self.pick(found[bare], name, rel)
+                        return picked.node if picked is not None and picked.node else UNREADABLE
+                return UNREADABLE if self.unparsed_import(name, rel) else None
 
             # flask-login's `LOGIN_DISABLED` lets every caller past its guards
             self._readers[rel] = GuardReader(
@@ -524,14 +567,28 @@ class _FlaskIndex:
         bare = self.renamed.get(rel, {}).get(_last(name), _last(name))
         return self.pick(self.class_defs.get(bare, []), name, rel)
 
-    def chain(self, name: str, rel: str, seen: set[int] | None = None) -> list[_Class]:
-        """The class and its in-repo bases, nearest first, cycle-safe."""
-        seen = seen if seen is not None else set()
+    def unparsed_import(self, name: str, rel: str) -> bool:
+        """`rel` imports the name (or its module) from a checkout module this Python can't parse."""
+        head = name.split(".")[0]
+        module = self.imported.get(rel, {}).get(head)
+        return module is not None and any(
+            _same_module(u, m) for u in self.unparsed for m in (module, f"{module}.{head}")
+        )
+
+    def chain(self, name: str, rel: str, seen: frozenset[int] = frozenset()) -> list[_Class]:
+        """The class and its in-repo bases in method resolution order (C3, else depth-first),
+        cycle-safe."""
+        if not seen and (name, rel) in self._chains:
+            return self._chains[(name, rel)]
         info = self.class_named(name, rel)
         if info is None or id(info) in seen:
             return []
-        seen.add(id(info))
-        return [info, *(c for b in info.bases for c in self.chain(b, info.path, seen))]
+        lines = [line for b in info.bases if (line := self.chain(b, info.path, seen | {id(info)}))]
+        merged = _c3([*lines, [line[0] for line in lines]], id)
+        out = [info, *(merged or {id(c): c for line in lines for c in line}.values())]
+        if not seen:
+            self._chains[(name, rel)] = out
+        return out
 
 
 def _module_of(rel: str) -> str:
@@ -555,11 +612,37 @@ def _same_module(rel: str, module: str) -> bool:
     return bool(module) and (mod == module or mod.endswith("." + module))
 
 
-def _flask_index(sources: list[_Source]) -> _FlaskIndex:
+def _c3(lines: list[list[Any]], key: Callable[[Any], object]) -> list[Any] | None:
+    """C3's merge of the bases' linearizations and the bases list; None for an order Python
+    would refuse too."""
+    out: list[Any] = []
+    while any(lines):
+        head = next(
+            (
+                line[0]
+                for line in lines
+                if line and not any(key(line[0]) in {key(x) for x in other[1:]} for other in lines)
+            ),
+            None,
+        )
+        if head is None:
+            return None
+        out.append(head)
+        lines = [[x for x in line if key(x) != key(head)] for line in lines]
+    return out
+
+
+def _flask_index(sources: list[_Source], files: list[TreeFile]) -> _FlaskIndex:
     index = _FlaskIndex()
     index.login_disabled = any(
-        re.search(r"LOGIN_DISABLED\W*(?:=|:)\s*(?!False\b)", s.file.text) for s in sources
+        _LOGIN_DISABLED.search(f.text)
+        for f in files
+        if f.path.suffix in _CONFIG_SUFFIXES or f.name.startswith(".env")
     )
+    parsed = {s.file.rel for s in sources}
+    index.unparsed = [
+        f.rel for f in files if f.path.suffix == ".py" and f.text and f.rel not in parsed
+    ]
     for src in sources:
         rel, imports_flask = src.file.rel, src.imports_flask
 
@@ -572,6 +655,14 @@ def _flask_index(sources: list[_Source]) -> _FlaskIndex:
                         index.renamed.setdefault(rel, {})[alias.asname] = alias.name
         renamed = index.renamed.get(rel, {})
         for node in ast.walk(src.tree):
+            if isinstance(node, ast.Assign | ast.AnnAssign) and node.value is not None:
+                for t in _targets(node):
+                    if isinstance(t, ast.Name) and t.id in KNOWN_GUARDS:
+                        index.assigned.setdefault(t.id, []).append(
+                            _Function(rel, node.lineno, [], node.value)
+                        )
+                    elif isinstance(t, ast.Attribute) and t.attr in _VIEW_LISTS:
+                        index.rebound.add((_last(_dotted(t.value)), t.attr))
             if (
                 imports_flask
                 and isinstance(node, ast.Assign | ast.AnnAssign)
@@ -640,7 +731,8 @@ def _class_info(node: ast.ClassDef, rel: str) -> _Class:
         if isinstance(stmt, ast.Assign):
             for t in stmt.targets:
                 if isinstance(t, ast.Name) and t.id == "decorators":
-                    info.decorators, info.sets_decorators = _names_in(stmt.value), True
+                    info.decorators = _names_in(stmt.value, _deco_name)
+                    info.sets_decorators = True
                 elif isinstance(t, ast.Name) and t.id == "method_decorators":
                     info.method_all, info.method_per = _method_decorators(stmt.value)
                     info.sets_method_decorators = True
@@ -740,13 +832,29 @@ def _class_rows(
     # `decorators` and `method_decorators` are class attributes: the nearest class's list wins,
     # and only flask-restful/restx Resources read `method_decorators`
     decorators = next((c for c in chain if c.sets_decorators), None)
-    resource = any(_last(b).endswith("Resource") for c in chain for b in c.bases)
+    resource = any(
+        index.imported.get(c.path, {}).get(b.split(".")[0], b).startswith(_RESTFUL)
+        for c in chain
+        for b in c.bases
+    )
     method_decorators = next((c for c in chain if c.sets_method_decorators), None)
     method_decorators = method_decorators if resource else None
-    class_level: list[str] = list(decorators.decorators if decorators else [])
-    class_level += method_decorators.method_all if method_decorators else []
+    as_view: list[str] = list(decorators.decorators if decorators else [])
+    dispatch = method_decorators.method_all if method_decorators else []
     per_verb: dict[str, list[str]] = dict(method_decorators.method_per) if method_decorators else {}
-    cls_guards, cls_unguards = _flask_split(class_level, reader)
+    # what a list set outside the class body holds is unknown: it may hold a cache
+    rebound = any(
+        (c.node.name, attr) in index.rebound
+        for c in chain
+        if c.node is not None
+        for attr in _VIEW_LISTS
+    )
+    cls_guards, cls_unguards = _flask_split(as_view, reader, outer_first=False)
+    more, fewer = _flask_split(dispatch, reader, outer_first=False)
+    cached = rebound or _caches(as_view)
+    cls_guards = [] if rebound else _unique(cls_guards + ([] if cached else more))
+    cls_unguards += fewer
+    cached = cached or _caches(dispatch)
     base_guards: list[str] = []
     verbs = [v for v in methods if v != "dispatch_request"] or (
         ["dispatch_request"] if "dispatch_request" in methods else []
@@ -764,11 +872,15 @@ def _class_rows(
     for verb in verbs:
         fn = methods.get(verb, _Function(chain[0].path, chain[0].line, []))
         guards, unguards = _flask_split(fn.decos, reader)
-        pv_guards, pv_unguards = _flask_split(per_verb.get(verb, []), reader)
+        pv_guards, pv_unguards = _flask_split(per_verb.get(verb, []), reader, outer_first=False)
         owner = next((c for c in chain if verb in c.methods), chain[0])
         # a class decorator wraps the methods of its own class only
         own_guards, own_unguards = _flask_split(owner.class_decos, reader)
         guards, unguards = _unique(guards + own_guards), unguards + own_unguards
+        if cached:
+            guards, pv_guards = [], []
+        elif _caches(per_verb.get(verb, [])):
+            guards = []
         for pattern, dynamic in patterns:
             row = _row(
                 RouteFamily.FLASK,
@@ -824,7 +936,7 @@ def _view_target(view: ast.AST) -> tuple[str, list[str]]:
         return (_dotted(body.func) if isinstance(body, ast.Call) else _dotted(body)), []
     if isinstance(view, ast.Call) and view.args:
         inner, wraps = _view_target(view.args[0])
-        return inner, [_dotted(view.func), *wraps]
+        return inner, [_deco_name(view.func), *wraps]
     return _dotted(view), []
 
 
@@ -936,6 +1048,30 @@ class _FlaskFile:
         ]
         return values[0] if len(values) == 1 else None
 
+    def _library_call(self, call: ast.Call) -> bool:
+        """A call to no checkout function or class, nor a Flask constructor: a library builds it."""
+        name = _dotted(call.func)
+        return (
+            _last(name) not in FLASK_RECEIVER_CTORS
+            and self.index.resolve_fn(name, self.rel) is None
+            and self.index.class_named(name, self.rel) is None
+        )
+
+    def _library_routes(
+        self,
+        node: ast.Call,
+        prefix: ast.AST | None,
+        default: str,
+        what: str,
+        recv: str | None = None,
+    ) -> list[_Row]:
+        """A placeholder for the routes a library mounts (a blueprint it builds, Flask-Admin's
+        views): their paths and guards aren't in the checkout."""
+        mount = _pattern(prefix, self.consts)[0] if prefix is not None else default
+        pattern = _flask_join(mount or "", f"[{what[:80]}]")
+        row = _row(RouteFamily.FLASK, "ANY", pattern, what[:200], self.rel, node.lineno, [], [], [])
+        return [_mark(row, recv, True, self.rel)]
+
     def _call(self, node: ast.Call) -> list[_Row]:
         if isinstance(node.func, ast.Call) and node.args:
             # `app.route("/export", methods=["POST"])(export)`, `bp.delete("/wipe")(wipe)`
@@ -966,9 +1102,25 @@ class _FlaskFile:
             return [row]
         fn = _dotted(node.func)
         attr = _last(fn)
-        recv = self.receiver(fn) if attr in ("add_url_rule", "add_resource") else None
+        if attr == "Admin" and self.index.imported.get(self.rel, {}).get(attr, fn).startswith(
+            "flask_admin"
+        ):
+            app = _dotted(node.args[0]) if node.args else None
+            return self._library_routes(node, _kwarg(node, "url"), "/admin", "Flask-Admin", app)
+        recv = (
+            self.receiver(fn)
+            if attr in ("add_url_rule", "add_resource", "register_blueprint")
+            else None
+        )
         if recv is None:
             return []
+        if attr == "register_blueprint":
+            arg = node.args[0] if node.args else None
+            built = self.bound(arg.id) if isinstance(arg, ast.Name) else arg
+            if not (isinstance(built, ast.Call) and self._library_call(built)):
+                return []
+            prefix = _kwarg(node, "url_prefix")
+            return self._library_routes(node, prefix, "", ast.unparse(arg), recv)
         if attr == "add_resource":
             if not node.args:
                 return []
@@ -1073,11 +1225,14 @@ class _FlaskFile:
         return [row]
 
 
-def _flask(sources: list[_Source], files: list[TreeFile]) -> tuple[list[_Row], bool]:
-    """The flask rows, and whether the tree uses flask at all (so no rows is a gap, not clean)."""
+def _flask(
+    sources: list[_Source], files: list[TreeFile], config: list[TreeFile]
+) -> tuple[list[_Row], bool]:
+    """The flask rows, and whether the tree uses flask at all (so no rows is a gap, not clean);
+    `config` also holds the config files that may set `LOGIN_DISABLED`."""
     if not any(s.imports_flask for s in sources):
         return [], False
-    index = _flask_index(sources)
+    index = _flask_index(sources, config)
     shared, own = _string_constants(files), file_constants(files)
     modules = [s.file.rel for s in sources]
     seen: dict[str, dict[str, str]] = {}
@@ -1098,7 +1253,12 @@ def _flask(sources: list[_Source], files: list[TreeFile]) -> tuple[list[_Row], b
             )
         return seen[rel]
 
-    rows = [r for s in sources for r in _FlaskFile(s, index, consts(s.file.rel)).rows()]
+    rows = [
+        part
+        for s in sources
+        for r in _FlaskFile(s, index, consts(s.file.rel)).rows()
+        for part in _options_apart(r)
+    ]
     prefix_of = _flask_prefixes(sources, consts, index)
     for row in rows:
         if (found := prefix_of(row.path, row.receiver)) is not None:
@@ -1106,6 +1266,17 @@ def _flask(sources: list[_Source], files: list[TreeFile]) -> tuple[list[_Row], b
             row.pattern = _flask_join(prefix, row.pattern)
             row.dynamic = row.dynamic or dynamic
     return rows, True
+
+
+def _options_apart(row: _Row) -> list[_Row]:
+    """Flask's auth decorators let OPTIONS through unchecked (flask-login, flask-jwt-extended,
+    flask-httpauth): a route serving OPTIONS itself has an OPTIONS row with no guard."""
+    verbs = row.method.split(",")
+    if "OPTIONS" not in verbs or not row.guarded:
+        return [row]
+    options = replace(row, method="OPTIONS", guards=[], scope_guards=[])
+    rest = ",".join(v for v in verbs if v != "OPTIONS")
+    return [replace(row, method=rest), options] if rest else [options]
 
 
 def _flask_join(prefix: str, rule: str) -> str:
@@ -1116,6 +1287,7 @@ def _flask_join(prefix: str, rule: str) -> str:
 
 
 _Key = tuple[str, str]  # (module, name) a receiver is bound at
+_ROOT: _Key = ("", "")  # what a WSGI dispatcher mounts apps under
 
 
 def _targets(node: ast.Assign | ast.AugAssign | ast.AnnAssign) -> list[ast.AST]:
@@ -1200,7 +1372,9 @@ def _flask_prefixes(
                 for t in targets:
                     own.setdefault(t, set()).add((prefix or "", dynamic))
                 calls.append((rel, node, "Api", loops))
-            elif ctor in ("register_blueprint", "add_namespace", "init_app") and "." in fn:
+            elif ctor == "DispatcherMiddleware" or (
+                ctor in ("register_blueprint", "add_namespace", "init_app") and "." in fn
+            ):
                 calls.append((rel, node, ctor, loops))
     # mounts, once every receiver's binding is known
     for rel, node, ctor, loops in calls:
@@ -1216,6 +1390,15 @@ def _flask_prefixes(
             parent = key(rel, _dotted(app)) if app is not None else None
             for t in targets if app is not None else ():
                 mounts.setdefault(t, set()).add((parent, None, False))
+            continue
+        if ctor == "DispatcherMiddleware":
+            # werkzeug's `DispatcherMiddleware(front, {"/api": api.wsgi_app})` mounts apps
+            apps = node.args[1] if len(node.args) > 1 else _kwarg(node, "mounts")
+            pairs = zip(apps.keys, apps.values, strict=True) if isinstance(apps, ast.Dict) else []
+            for k, v in pairs:
+                child = key(rel, _dotted(v).removesuffix(".wsgi_app")) if k is not None else None
+                if child is not None:
+                    mounts.setdefault(child, set()).add((_ROOT, *_pattern(k, consts(rel))))
             continue
         receiver = key(rel, _last(fn.rsplit(".", 1)[0]))
         if ctor == "namespace":
@@ -1466,10 +1649,12 @@ class _PyIndex:
     aliases: dict[_Key, ast.Subscript] = field(default_factory=dict)
     paths: dict[int, str] = field(default_factory=dict)
     _callees: dict[tuple[str, str], _Function | None] = field(default_factory=dict)
+    unparsed: set[str] = field(default_factory=set)  # the modules this Python can't parse
 
     @classmethod
-    def of(cls, sources: list[_Source]) -> _PyIndex:
+    def of(cls, sources: list[_Source], unparsed: Iterable[TreeFile] = ()) -> _PyIndex:
         index = cls(sources, _Modules({_module_of(s.file.rel): s.file.rel for s in sources}))
+        index.unparsed = {_module_of(f.rel) for f in unparsed}
         for src in sources:
             rel = src.file.rel
             calls, defs = index.calls.setdefault(rel, []), index.defs.setdefault(rel, [])
@@ -2643,8 +2828,8 @@ def route_guards(files: list[TreeFile]) -> RouteGuardFact:
     files = [f for f in files if f.rel not in tests or f.path.suffix == ".py"]
     py = [f for f in files if f.path.suffix == ".py"]
     sources, unparsed = _parsed(py)
-    flask_rows, uses_flask = _flask(sources, py)
-    index, consts = _PyIndex.of(sources), _string_constants(py)
+    flask_rows, uses_flask = _flask(sources, py, files)
+    index, consts = _PyIndex.of(sources, unparsed), _string_constants(py)
     fastapi_rows, uses_fastapi = _fastapi(index, consts)
     aiohttp_rows, uses_aiohttp = _aiohttp(index, consts)
     # they build on this module

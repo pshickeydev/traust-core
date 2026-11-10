@@ -8,7 +8,11 @@ from textwrap import dedent
 
 import pytest
 
-from traust_core.v1.providers.python_guards import FLASK_LOGIN_GUARDS, GuardReader
+from traust_core.v1.providers.python_guards import (
+    FLASK_LOGIN_GUARDS,
+    GuardReader,
+    requires_nothing,
+)
 
 
 def _reader(code: str = "", **kwargs: frozenset[str]) -> GuardReader:
@@ -76,3 +80,18 @@ def test_login_disabled_turns_flask_logins_guards_off() -> None:
     reader = _reader(disabled=FLASK_LOGIN_GUARDS)
     assert not reader.guards("login_required")
     assert reader.guards("jwt_required")
+
+
+@pytest.mark.parametrize(
+    ("decorator", "nothing"),
+    [
+        ("permission_required([])", True),
+        ("permission_required(perm=())", True),
+        ("security.roles_required()", True),
+        ("roles_accepted(*ROLES)", False),  # what it is given is unknown
+        ("permission_required('notes.view_note')", False),
+        ("login_required()", False),  # no requirement guard
+    ],
+)
+def test_a_requirement_guard_given_nothing_admits_anyone(decorator: str, nothing: bool) -> None:
+    assert requires_nothing(ast.parse(decorator, mode="eval").body) is nothing

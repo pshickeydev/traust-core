@@ -743,6 +743,14 @@
     [],
     true,
     false
+   ],
+   [
+    "django-drf",
+    "any",
+    "api/notes/[BulkModelViewSet actions]",
+    [],
+    true,
+    true
    ]
   ]
  },
@@ -3620,6 +3628,14 @@
     [],
     true,
     false
+   ],
+   [
+    "django-drf",
+    "any",
+    "users/[AccountViewSet actions]",
+    [],
+    true,
+    true
    ]
   ]
  },
@@ -5411,6 +5427,1496 @@
     "flask",
     "GET",
     "/v2/y",
+    [],
+    true,
+    false
+   ]
+  ]
+ },
+ {
+  "case": "drf_simplejwt_base_read_as_rest_framework",
+  "contract": 2,
+  "expect": "any token/ unguarded, judged (simplejwt's TokenViewBase sets permission_classes = (); a non-DRF library base), like any token2/",
+  "files": {
+   "app/settings.py": "ROOT_URLCONF='app.urls'\nREST_FRAMEWORK = {'DEFAULT_PERMISSION_CLASSES': ['rest_framework.permissions.IsAuthenticated']}\n",
+   "app/urls.py": "from django.urls import path\nfrom . import views\nurlpatterns = [path('token/', views.Token.as_view()), path('token2/', views.Token2.as_view())]\n",
+   "app/views.py": "from rest_framework_simplejwt.views import TokenObtainPairView\nfrom jwtlib.views import TokenObtainPairView as OtherTokenView\nclass Token(TokenObtainPairView):\n    pass\nclass Token2(OtherTokenView):\n    pass\n"
+  },
+  "rows": [
+   [
+    "django-drf",
+    "any",
+    "token/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "any",
+    "token2/",
+    [],
+    true,
+    false
+   ]
+  ]
+ },
+ {
+  "case": "drf_authtoken_subclass_keeps_default",
+  "contract": 2,
+  "expect": "any tok/ unguarded, judged (DRF's ObtainAuthToken sets permission_classes = ()), like any tok2/ (the same view, unsubclassed)",
+  "files": {
+   "app/settings.py": "ROOT_URLCONF='app.urls'\nREST_FRAMEWORK = {'DEFAULT_PERMISSION_CLASSES': ['rest_framework.permissions.IsAuthenticated']}\n",
+   "app/urls.py": "from django.urls import path\nfrom rest_framework.authtoken.views import obtain_auth_token\nfrom . import views\nurlpatterns = [path('tok/', views.Tok.as_view()), path('tok2/', obtain_auth_token)]\n",
+   "app/views.py": "from rest_framework.authtoken.views import ObtainAuthToken\nclass Tok(ObtainAuthToken):\n    pass\n"
+  },
+  "rows": [
+   [
+    "django-drf",
+    "any",
+    "tok/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "any",
+    "tok2/",
+    [],
+    true,
+    false
+   ]
+  ]
+ },
+ {
+  "case": "drf_permission_override_later_in_mro",
+  "contract": 2,
+  "expect": "every notes/ row and GET a/ judged (a get_permissions/check_permissions later in the MRO still runs), as every tags/ row is (the override in the same class)",
+  "files": {
+   "app/settings.py": "ROOT_URLCONF='app.urls'\n",
+   "app/urls.py": "from django.urls import path, include\nfrom rest_framework.routers import SimpleRouter\nfrom . import views\nrouter = SimpleRouter()\nrouter.register('notes', views.NoteViewSet)\nrouter.register('tags', views.TagViewSet)\nurlpatterns = [path('', include(router.urls)), path('a/', views.A.as_view())]\n",
+   "app/views.py": "from rest_framework import viewsets\nfrom rest_framework.views import APIView\nfrom rest_framework.permissions import AllowAny, IsAuthenticated\nclass PublicReadMixin:\n    def get_permissions(self):\n        if self.action in ('list', 'retrieve'):\n            return [AllowAny()]\n        return super().get_permissions()\nclass NoteViewSet(PublicReadMixin, viewsets.ModelViewSet):\n    permission_classes = [IsAuthenticated]\nclass BaseView(APIView):\n    def check_permissions(self, request):\n        return None\nclass A(BaseView):\n    permission_classes = [IsAuthenticated]\n    def get(self, request): ...\nclass TagViewSet(viewsets.ModelViewSet):\n    permission_classes = [IsAuthenticated]\n    def get_permissions(self):\n        return [AllowAny()]\n"
+  },
+  "rows": [
+   [
+    "django-drf",
+    "DELETE",
+    "notes/<pk>/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "DELETE",
+    "tags/<pk>/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "GET",
+    "a/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "GET",
+    "notes/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "GET",
+    "notes/<pk>/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "GET",
+    "tags/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "GET",
+    "tags/<pk>/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "PATCH",
+    "notes/<pk>/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "PATCH",
+    "tags/<pk>/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "POST",
+    "notes/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "POST",
+    "tags/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "PUT",
+    "notes/<pk>/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "PUT",
+    "tags/<pk>/",
+    [],
+    true,
+    false
+   ]
+  ]
+ },
+ {
+  "case": "drf_permission_classes_rebound_outside_class_body",
+  "contract": 2,
+  "expect": "GET a/, c/, d/ judged (permission_classes rebound after the class, per instance in setup(), by a class decorator), like GET b/ (AllowAny in the class body)",
+  "files": {
+   "app/settings.py": "ROOT_URLCONF='app.urls'\n",
+   "app/urls.py": "from django.urls import path\nfrom . import views\nurlpatterns = [path('a/', views.A.as_view()), path('b/', views.B.as_view()), path('c/', views.C.as_view()), path('d/', views.D.as_view())]\n",
+   "app/views.py": "from rest_framework.views import APIView\nfrom rest_framework.permissions import IsAuthenticated, AllowAny\ndef open_access(cls):\n    cls.permission_classes = [AllowAny]\n    return cls\nclass A(APIView):\n    permission_classes = [IsAuthenticated]\n    def get(self, request): ...\nA.permission_classes = [AllowAny]\nclass B(APIView):\n    permission_classes = [AllowAny]\n    def get(self, request): ...\nclass C(APIView):\n    permission_classes = [IsAuthenticated]\n    def setup(self, request, *args, **kwargs):\n        super().setup(request, *args, **kwargs)\n        if request.GET.get('public'):\n            self.permission_classes = [AllowAny]\n    def get(self, request): ...\n@open_access\nclass D(APIView):\n    permission_classes = [IsAuthenticated]\n    def get(self, request): ...\n"
+  },
+  "rows": [
+   [
+    "django-drf",
+    "GET",
+    "a/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "GET",
+    "b/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "GET",
+    "c/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "GET",
+    "d/",
+    [],
+    true,
+    false
+   ]
+  ]
+ },
+ {
+  "case": "fl_decorators_rebound_after_class",
+  "contract": 2,
+  "expect": "GET /items judged (Items.decorators emptied before as_view reads it), like GET /twin",
+  "files": {
+   "app.py": "from flask import Flask\nfrom flask.views import MethodView\nfrom flask_login import login_required\napp = Flask(__name__)\nclass Items(MethodView):\n    decorators = [login_required]\n    def get(self): ...\nItems.decorators = []\nclass Twin(MethodView):\n    decorators = []\n    def get(self): ...\napp.add_url_rule('/items', view_func=Items.as_view('items'))\napp.add_url_rule('/twin', view_func=Twin.as_view('twin'))\n"
+  },
+  "rows": [
+   [
+    "flask",
+    "GET",
+    "/items",
+    [],
+    true,
+    false
+   ],
+   [
+    "flask",
+    "GET",
+    "/twin",
+    [],
+    true,
+    false
+   ]
+  ]
+ },
+ {
+  "case": "dj_known_guard_method_of_checkout_object",
+  "contract": 2,
+  "expect": "any a/ unguarded, judged (SSO.login_required is a checkout method), like any b/",
+  "files": {
+   "app/urls.py": "from django.urls import path\nfrom . import views\nurlpatterns = [path('a/', views.a), path('b/', views.b)]\n",
+   "app/sso.py": "class SSO:\n    def login_required(self, view):\n        return view\nsso = SSO()\ndef sso_login_required(view):\n    return view\n",
+   "app/views.py": "from .sso import sso, sso_login_required\n@sso.login_required\ndef a(request): ...\n@sso_login_required\ndef b(request): ...\n"
+  },
+  "rows": [
+   [
+    "django-drf",
+    "any",
+    "a/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "any",
+    "b/",
+    [],
+    true,
+    false
+   ]
+  ]
+ },
+ {
+  "case": "dj_known_guard_bound_by_assignment_or_conditional_def",
+  "contract": 2,
+  "expect": "any a/, b/ judged (login_required redefined under `if settings.DEBUG`, staff_member_required bound to a lambda); any c/ judged (app.auth.login_required is a checkout assignment admitting everyone); like any d/ (a top-level checkout def)",
+  "files": {
+   "app/urls.py": "from django.urls import path\nfrom . import views, views2\nurlpatterns = [path('a/', views.a), path('b/', views.b), path('c/', views2.c), path('d/', views.d)]\n",
+   "app/auth.py": "from django.contrib.auth.decorators import user_passes_test\nlogin_required = user_passes_test(lambda u: True)\ndef sso_required(view):\n    return view\n",
+   "app/views.py": "from django.conf import settings\nfrom django.contrib.auth.decorators import login_required\nfrom .auth import sso_required\nif settings.DEBUG:\n    def login_required(view):\n        return view\nstaff_member_required = lambda v: v\n@login_required\ndef a(request): ...\n@staff_member_required\ndef b(request): ...\n@sso_required\ndef d(request): ...\n",
+   "app/views2.py": "from .auth import login_required\n@login_required\ndef c(request): ...\n"
+  },
+  "rows": [
+   [
+    "django-drf",
+    "any",
+    "a/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "any",
+    "b/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "any",
+    "c/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "any",
+    "d/",
+    [],
+    true,
+    false
+   ]
+  ]
+ },
+ {
+  "case": "fl_known_guard_bound_by_assignment",
+  "contract": 2,
+  "expect": "GET /a and GET /b judged (login_required rebound to a lambda; app.auth.login_required a checkout assignment), like GET /c (a def under the same if)",
+  "files": {
+   "app/auth.py": "import os\nfrom flask_login import login_required as _lr\nlogin_required = _lr if os.environ.get('AUTH') else (lambda f: f)\n",
+   "app/views.py": "import os\nfrom flask import Flask\nfrom flask_login import login_required, fresh_login_required\napp = Flask(__name__)\nif os.environ.get('NO_AUTH'):\n    login_required = lambda f: f\n    def fresh_login_required(f):\n        return f\n@app.route('/a')\n@login_required\ndef a(): ...\n@app.route('/c')\n@fresh_login_required\ndef c(): ...\n",
+   "app/views2.py": "from flask import Blueprint\nfrom app.auth import login_required\nbp = Blueprint('b', __name__)\n@bp.route('/b')\n@login_required\ndef b(): ...\n"
+  },
+  "rows": [
+   [
+    "flask",
+    "GET",
+    "/a",
+    [],
+    true,
+    false
+   ],
+   [
+    "flask",
+    "GET",
+    "/b",
+    [],
+    true,
+    false
+   ],
+   [
+    "flask",
+    "GET",
+    "/c",
+    [],
+    true,
+    false
+   ]
+  ]
+ },
+ {
+  "case": "dj_guard_defined_in_unparseable_module",
+  "contract": 2,
+  "expect": "any a/ judged (login_required is the checkout's own, in a module this interpreter can't parse), like any b/ (the same definition, parseable); no coverage gap is emitted for app/auth.py either",
+  "files": {
+   "app/urls.py": "from django.urls import path\nfrom . import views, views2\nurlpatterns = [path('a/', views.a), path('b/', views2.b)]\n",
+   "app/auth.py": "def login_required(view):\n    print 'TODO: wire up SSO'\n    return view\n",
+   "app/auth2.py": "def login_required(view):\n    return view\n",
+   "app/views.py": "from .auth import login_required\n@login_required\ndef a(request): ...\n",
+   "app/views2.py": "from .auth2 import login_required\n@login_required\ndef b(request): ...\n"
+  },
+  "rows": [
+   [
+    "django-drf",
+    "any",
+    "a/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "any",
+    "b/",
+    [],
+    true,
+    false
+   ]
+  ]
+ },
+ {
+  "case": "fl_guard_defined_in_unparseable_module",
+  "contract": 2,
+  "expect": "GET /c judged (checkout login_required in a module this interpreter can't parse); twin: the same def parseable is judged (R3 checkout_definition_shadows_known_guard_name); no coverage gap for web/auth.py",
+  "files": {
+   "web/auth.py": "def login_required(f):\n    print 'TODO'\n    return f\n",
+   "web/app.py": "from flask import Flask\nfrom .auth import login_required\napp = Flask(__name__)\n@app.route('/c')\n@login_required\ndef c(): ...\n"
+  },
+  "rows": [
+   [
+    "flask",
+    "GET",
+    "/c",
+    [],
+    true,
+    false
+   ]
+  ]
+ },
+ {
+  "case": "dj_star_import_rebinds_library_guard",
+  "contract": 2,
+  "expect": "any a/ judged (the star import after the library import rebinds login_required to app.auth's passthrough); any b/ guarded (library import last)",
+  "files": {
+   "app/urls.py": "from django.urls import path\nfrom . import views, views2\nurlpatterns = [path('a/', views.a), path('b/', views2.b)]\n",
+   "app/auth.py": "def login_required(view):\n    return view\n",
+   "app/views.py": "from django.contrib.auth.decorators import login_required\nfrom .auth import *\n@login_required\ndef a(request): ...\n",
+   "app/views2.py": "from .auth import *\nfrom django.contrib.auth.decorators import login_required\n@login_required\ndef b(request): ...\n"
+  },
+  "rows": [
+   [
+    "django-drf",
+    "any",
+    "a/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "any",
+    "b/",
+    [
+     "login_required"
+    ],
+    false,
+    false
+   ]
+  ]
+ },
+ {
+  "case": "fl_ambiguous_checkout_guard_definition",
+  "contract": 2,
+  "expect": "GET /a (package re-export) and GET /c (star import rebinding) judged: both name app.auth's passthrough; like GET /b (direct import)",
+  "files": {
+   "app/__init__.py": "from .auth import login_required\n",
+   "app/auth.py": "def login_required(f):\n    return f\n",
+   "admin/auth.py": "from flask_login import login_required as _lr\ndef login_required(f):\n    return _lr(f)\n",
+   "app/views.py": "from flask import Blueprint\nfrom app import login_required\nfrom app.auth import login_required as lr2\nbp = Blueprint('v', __name__)\n@bp.route('/a')\n@login_required\ndef a(): ...\n@bp.route('/b')\n@lr2\ndef b(): ...\n",
+   "app/views2.py": "from flask import Blueprint\nfrom flask_login import login_required\nfrom app.auth import *\nbp2 = Blueprint('v2', __name__)\n@bp2.route('/c')\n@login_required\ndef c(): ...\n"
+  },
+  "rows": [
+   [
+    "flask",
+    "GET",
+    "/a",
+    [],
+    true,
+    false
+   ],
+   [
+    "flask",
+    "GET",
+    "/b",
+    [],
+    true,
+    false
+   ],
+   [
+    "flask",
+    "GET",
+    "/c",
+    [],
+    true,
+    false
+   ]
+  ]
+ },
+ {
+  "case": "dj_star_import_order_view",
+  "contract": 2,
+  "expect": "any a/ judged (views.page is legacy's, star-imported last), like any b/",
+  "files": {
+   "app/urls.py": "from django.urls import path\nfrom . import views, views2\nurlpatterns = [path('a/', views.page), path('b/', views2.page)]\n",
+   "app/views/__init__.py": "from .secure import *\nfrom .legacy import *\n",
+   "app/views/secure.py": "from django.contrib.auth.decorators import login_required\n@login_required\ndef page(request): ...\n",
+   "app/views/legacy.py": "def page(request): ...\n",
+   "app/views2/__init__.py": "from .legacy import *\n",
+   "app/views2/legacy.py": "def page(request): ...\n"
+  },
+  "rows": [
+   [
+    "django-drf",
+    "any",
+    "a/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "any",
+    "b/",
+    [],
+    true,
+    false
+   ]
+  ]
+ },
+ {
+  "case": "fl_duplicate_def_first_wins",
+  "contract": 2,
+  "expect": "GET /report judged (the later, unguarded def is what report names), like GET /other",
+  "files": {
+   "app.py": "from flask import Flask\nfrom flask_login import login_required\napp = Flask(__name__)\n@login_required\ndef report(): ...\ndef report(): ...\ndef other(): ...\napp.add_url_rule('/report', view_func=report)\napp.add_url_rule('/other', view_func=other)\n"
+  },
+  "rows": [
+   [
+    "flask",
+    "GET",
+    "/other",
+    [],
+    true,
+    false
+   ],
+   [
+    "flask",
+    "GET",
+    "/report",
+    [],
+    true,
+    false
+   ]
+  ]
+ },
+ {
+  "case": "dj_guarded_method_in_mixin_after_library_view",
+  "contract": 2,
+  "expect": "GET a/ judged (TemplateView.get precedes the mixin's guarded get in the MRO); GET b/ guarded",
+  "files": {
+   "app/urls.py": "from django.urls import path\nfrom . import views\nurlpatterns = [path('a/', views.Page.as_view()), path('b/', views.Page2.as_view())]\n",
+   "app/views.py": "from django.contrib.auth.decorators import login_required\nfrom django.utils.decorators import method_decorator\nfrom django.views.generic import TemplateView\nclass SecureGetMixin:\n    @method_decorator(login_required)\n    def get(self, request, *args, **kwargs):\n        return super().get(request, *args, **kwargs)\nclass Page(TemplateView, SecureGetMixin):\n    template_name = 'x.html'\nclass Page2(SecureGetMixin, TemplateView):\n    template_name = 'x.html'\n"
+  },
+  "rows": [
+   [
+    "django-drf",
+    "GET",
+    "a/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "GET",
+    "b/",
+    [
+     "login_required"
+    ],
+    false,
+    false
+   ]
+  ]
+ },
+ {
+  "case": "fl_diamond_mro_depth_first",
+  "contract": 2,
+  "expect": "GET /v judged (C3 order V, A, B, Base: B's get and empty decorators win), like GET /w",
+  "files": {
+   "app.py": "from flask import Flask\nfrom flask.views import MethodView\nfrom flask_login import login_required\napp = Flask(__name__)\nclass Base(MethodView):\n    decorators = [login_required]\n    @login_required\n    def get(self): ...\nclass A(Base):\n    pass\nclass B(Base):\n    decorators = []\n    def get(self): ...\nclass V(A, B):\n    pass\nclass W(B):\n    pass\napp.add_url_rule('/v', view_func=V.as_view('v'))\napp.add_url_rule('/w', view_func=W.as_view('w'))\n"
+  },
+  "rows": [
+   [
+    "flask",
+    "GET",
+    "/v",
+    [],
+    true,
+    false
+   ],
+   [
+    "flask",
+    "GET",
+    "/w",
+    [],
+    true,
+    false
+   ]
+  ]
+ },
+ {
+  "case": "fl_optional_lost_in_decorators_list_and_wrapper",
+  "contract": 2,
+  "expect": "GET /feed, /items, /wall, /wall2 judged (jwt_required(optional=True) admits anonymous), as GET /twin is",
+  "files": {
+   "app.py": "from flask import Flask\nfrom flask.views import MethodView\nfrom flask_restful import Api, Resource\nfrom flask_jwt_extended import jwt_required\napp = Flask(__name__)\napi = Api(app)\nclass Feed(MethodView):\n    decorators = [jwt_required(optional=True)]\n    def get(self): ...\nclass Items(Resource):\n    method_decorators = {'get': [jwt_required(optional=True)]}\n    def get(self): ...\nclass Twin(MethodView):\n    @jwt_required(optional=True)\n    def get(self): ...\ndef wall(): ...\napp.add_url_rule('/feed', view_func=Feed.as_view('feed'))\napi.add_resource(Items, '/items')\napp.add_url_rule('/twin', view_func=Twin.as_view('twin'))\napp.add_url_rule('/wall', view_func=jwt_required(optional=True)(wall))\napp.route('/wall2')(jwt_required(optional=True)(wall))\n"
+  },
+  "rows": [
+   [
+    "flask",
+    "GET",
+    "/feed",
+    [],
+    true,
+    false
+   ],
+   [
+    "flask",
+    "GET",
+    "/items",
+    [],
+    true,
+    false
+   ],
+   [
+    "flask",
+    "GET",
+    "/twin",
+    [],
+    true,
+    false
+   ],
+   [
+    "flask",
+    "GET",
+    "/wall",
+    [],
+    true,
+    false
+   ],
+   [
+    "flask",
+    "GET",
+    "/wall2",
+    [],
+    true,
+    false
+   ]
+  ]
+ },
+ {
+  "case": "fl_method_decorators_on_non_restful_class",
+  "contract": 2,
+  "expect": "GET /items and GET /docs judged (MethodView, and flask-apispec's MethodResource, never read method_decorators; only flask-restful/restx Resource does), like GET /twin",
+  "files": {
+   "app.py": "from flask import Flask\nfrom flask.views import MethodView\nfrom flask_apispec import MethodResource\nfrom flask_login import login_required\napp = Flask(__name__)\nclass BaseResource(MethodView):\n    method_decorators = [login_required]\nclass Items(BaseResource):\n    def get(self): ...\nclass Docs(MethodResource):\n    method_decorators = [login_required]\n    def get(self): ...\nclass BaseView(MethodView):\n    method_decorators = [login_required]\nclass Twin(BaseView):\n    def get(self): ...\napp.add_url_rule('/items', view_func=Items.as_view('items'))\napp.add_url_rule('/docs', view_func=Docs.as_view('docs'))\napp.add_url_rule('/twin', view_func=Twin.as_view('twin'))\n"
+  },
+  "rows": [
+   [
+    "flask",
+    "GET",
+    "/docs",
+    [],
+    true,
+    false
+   ],
+   [
+    "flask",
+    "GET",
+    "/items",
+    [],
+    true,
+    false
+   ],
+   [
+    "flask",
+    "GET",
+    "/twin",
+    [],
+    true,
+    false
+   ]
+  ]
+ },
+ {
+  "case": "fl_login_disabled_in_non_python_config",
+  "contract": 2,
+  "expect": "GET /me judged (settings.cfg, loaded by from_pyfile, sets LOGIN_DISABLED); twin: the same line in a .py module (from_pyfile('settings.py') / app.config[...] = True) is judged",
+  "files": {
+   "app.py": "from flask import Flask\nfrom flask_login import LoginManager, login_required\napp = Flask(__name__)\napp.config.from_pyfile('settings.cfg')\nLoginManager(app)\n@app.route('/me')\n@login_required\ndef me(): ...\n",
+   "settings.cfg": "LOGIN_DISABLED = True\nSECRET_KEY = 'dev'\n"
+  },
+  "rows": [
+   [
+    "flask",
+    "GET",
+    "/me",
+    [],
+    true,
+    false
+   ]
+  ]
+ },
+ {
+  "case": "fl_login_disabled_other_spellings",
+  "contract": 2,
+  "expect": "GET /me and GET /me2 judged (LOGIN_DISABLED set by setdefault / flask-login's legacy _login_disabled setter); twin: app.config['LOGIN_DISABLED'] = True is judged (R3)",
+  "files": {
+   "app.py": "from flask import Flask\nfrom flask_login import LoginManager, login_required\napp = Flask(__name__)\napp.config.setdefault('LOGIN_DISABLED', True)\n@app.route('/me')\n@login_required\ndef me(): ...\n",
+   "b.py": "from flask import Flask\nfrom flask_login import LoginManager, login_required\nb = Flask(__name__)\nlm = LoginManager(b)\nwith b.app_context():\n    lm._login_disabled = True\n@b.route('/me2')\n@login_required\ndef me2(): ...\n"
+  },
+  "rows": [
+   [
+    "flask",
+    "GET",
+    "/me",
+    [],
+    true,
+    false
+   ],
+   [
+    "flask",
+    "GET",
+    "/me2",
+    [],
+    true,
+    false
+   ]
+  ]
+ },
+ {
+  "case": "fl_auth_decorators_exempt_options",
+  "contract": 2,
+  "expect": "OPTIONS of /x and OPTIONS /z judged: flask-login, flask-jwt-extended (and flask-httpauth) let OPTIONS through, and listing/defining OPTIONS turns off Flask's automatic answer so the view runs; POST /y and GET /z guarded",
+  "files": {
+   "app.py": "from flask import Flask\nfrom flask.views import MethodView\nfrom flask_login import login_required\nfrom flask_jwt_extended import jwt_required\napp = Flask(__name__)\n@app.route('/x', methods=['POST', 'OPTIONS'])\n@login_required\ndef x(): ...\n@app.route('/y', methods=['POST'])\n@login_required\ndef y(): ...\nclass Z(MethodView):\n    decorators = [jwt_required()]\n    def get(self): ...\n    def options(self): ...\napp.add_url_rule('/z', view_func=Z.as_view('z'))\n"
+  },
+  "rows": [
+   [
+    "flask",
+    "GET",
+    "/z",
+    [
+     "jwt_required"
+    ],
+    false,
+    false
+   ],
+   [
+    "flask",
+    "OPTIONS",
+    "/x",
+    [],
+    true,
+    false
+   ],
+   [
+    "flask",
+    "OPTIONS",
+    "/z",
+    [],
+    true,
+    false
+   ],
+   [
+    "flask",
+    "POST",
+    "/x",
+    [
+     "login_required"
+    ],
+    false,
+    false
+   ],
+   [
+    "flask",
+    "POST",
+    "/y",
+    [
+     "login_required"
+    ],
+    false,
+    false
+   ]
+  ]
+ },
+ {
+  "case": "dj_settings_inplace_or_and_del",
+  "contract": 2,
+  "expect": "GET a/ judged (REST_FRAMEWORK |= replaces the default with AllowAny) and any b/ judged (del MIDDLEWARE[-1]), like GET c/ and any d/ (subscript assignment, .pop())",
+  "files": {
+   "p1/settings.py": "ROOT_URLCONF='p1.urls'\nREST_FRAMEWORK = {'DEFAULT_PERMISSION_CLASSES': ['rest_framework.permissions.IsAuthenticated']}\nREST_FRAMEWORK |= {'DEFAULT_PERMISSION_CLASSES': ['rest_framework.permissions.AllowAny']}\n",
+   "p1/urls.py": "from django.urls import path\nfrom .views import A\nurlpatterns = [path('a/', A.as_view())]\n",
+   "p1/views.py": "from rest_framework.views import APIView\nclass A(APIView):\n    def get(self, request): ...\n",
+   "p2/settings.py": "ROOT_URLCONF='p2.urls'\nMIDDLEWARE = ['django.contrib.sessions.middleware.SessionMiddleware','django.contrib.auth.middleware.AuthenticationMiddleware','django.contrib.auth.middleware.LoginRequiredMiddleware']\ndel MIDDLEWARE[-1]\n",
+   "p2/urls.py": "from django.urls import path\nfrom . import views\nurlpatterns = [path('b/', views.me)]\n",
+   "p2/views.py": "def me(request): ...\n",
+   "p3/settings.py": "ROOT_URLCONF='p3.urls'\nREST_FRAMEWORK = {'DEFAULT_PERMISSION_CLASSES': ['rest_framework.permissions.IsAuthenticated']}\nREST_FRAMEWORK['DEFAULT_PERMISSION_CLASSES'] = ['rest_framework.permissions.AllowAny']\nMIDDLEWARE = ['django.contrib.sessions.middleware.SessionMiddleware','django.contrib.auth.middleware.AuthenticationMiddleware','django.contrib.auth.middleware.LoginRequiredMiddleware']\nMIDDLEWARE.pop()\n",
+   "p3/urls.py": "from django.urls import path\nfrom . import views\nurlpatterns = [path('c/', views.C.as_view()), path('d/', views.me)]\n",
+   "p3/views.py": "from rest_framework.views import APIView\nclass C(APIView):\n    def get(self, request): ...\ndef me(request): ...\n"
+  },
+  "rows": [
+   [
+    "django-drf",
+    "GET",
+    "a/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "GET",
+    "c/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "any",
+    "b/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "any",
+    "d/",
+    [],
+    true,
+    false
+   ]
+  ]
+ },
+ {
+  "case": "dj_settings_star_import_in_try",
+  "contract": 2,
+  "expect": "GET a/ and any me/ judged (local.py, star-imported in try/except, replaces MIDDLEWARE and the DRF default), like any me2/ (the same star import unconditionally)",
+  "files": {
+   "config/settings/__init__.py": "ROOT_URLCONF='config.urls'\nMIDDLEWARE = ['django.contrib.sessions.middleware.SessionMiddleware','django.contrib.auth.middleware.AuthenticationMiddleware','django.contrib.auth.middleware.LoginRequiredMiddleware']\nREST_FRAMEWORK = {'DEFAULT_PERMISSION_CLASSES': ['rest_framework.permissions.IsAuthenticated']}\ntry:\n    from .local import *\nexcept ImportError:\n    pass\n",
+   "config/settings/local.py": "MIDDLEWARE = ['django.contrib.sessions.middleware.SessionMiddleware','django.contrib.auth.middleware.AuthenticationMiddleware']\nREST_FRAMEWORK = {'DEFAULT_PERMISSION_CLASSES': ['rest_framework.permissions.AllowAny']}\n",
+   "config/urls.py": "from django.urls import path\nfrom app.views import A, me\nurlpatterns = [path('a/', A.as_view()), path('me/', me)]\n",
+   "app/views.py": "from rest_framework.views import APIView\nclass A(APIView):\n    def get(self, request): ...\ndef me(request): ...\n",
+   "config2/settings/__init__.py": "ROOT_URLCONF='config2.urls'\nMIDDLEWARE = ['django.contrib.sessions.middleware.SessionMiddleware','django.contrib.auth.middleware.AuthenticationMiddleware','django.contrib.auth.middleware.LoginRequiredMiddleware']\nfrom .local import *\n",
+   "config2/settings/local.py": "MIDDLEWARE = ['django.contrib.sessions.middleware.SessionMiddleware','django.contrib.auth.middleware.AuthenticationMiddleware']\n",
+   "config2/urls.py": "from django.urls import path\nfrom app.views import me\nurlpatterns = [path('me2/', me)]\n"
+  },
+  "rows": [
+   [
+    "django-drf",
+    "GET",
+    "a/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "any",
+    "me/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "any",
+    "me2/",
+    [],
+    true,
+    false
+   ]
+  ]
+ },
+ {
+  "case": "dj_settings_star_order_in_module_naming_no_setting",
+  "contract": 2,
+  "expect": "any me/ judged (production.py star-imports open.py after base.py, dropping LoginRequiredMiddleware), like any me2/ (the same module, which also names ROOT_URLCONF)",
+  "files": {
+   "config/settings/base.py": "ROOT_URLCONF='config.urls'\nMIDDLEWARE = ['django.contrib.sessions.middleware.SessionMiddleware','django.contrib.auth.middleware.AuthenticationMiddleware','django.contrib.auth.middleware.LoginRequiredMiddleware']\n",
+   "config/settings/open.py": "MIDDLEWARE = ['django.contrib.sessions.middleware.SessionMiddleware','django.contrib.auth.middleware.AuthenticationMiddleware']\n",
+   "config/settings/production.py": "from .base import *\nfrom .open import *\n",
+   "config/urls.py": "from django.urls import path\nfrom app.views import me\nurlpatterns = [path('me/', me)]\n",
+   "config2/settings/base.py": "ROOT_URLCONF='config2.urls'\nMIDDLEWARE = ['django.contrib.sessions.middleware.SessionMiddleware','django.contrib.auth.middleware.AuthenticationMiddleware','django.contrib.auth.middleware.LoginRequiredMiddleware']\n",
+   "config2/settings/open.py": "MIDDLEWARE = ['django.contrib.sessions.middleware.SessionMiddleware','django.contrib.auth.middleware.AuthenticationMiddleware']\n",
+   "config2/settings/production.py": "from .base import *\nfrom .open import *\nDEBUG = False\nROOT_URLCONF = 'config2.urls'\n",
+   "config2/urls.py": "from django.urls import path\nfrom app.views import me\nurlpatterns = [path('me2/', me)]\n",
+   "app/views.py": "def me(request): ...\n"
+  },
+  "rows": [
+   [
+    "django-drf",
+    "any",
+    "me/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "any",
+    "me2/",
+    [],
+    true,
+    false
+   ]
+  ]
+ },
+ {
+  "case": "dj_dispatch_conditional_super_skips_mixin",
+  "contract": 2,
+  "expect": "GET a/ judged (its dispatch calls get() ahead of LoginRequiredMixin for ?preview), like GET b/",
+  "files": {
+   "app/urls.py": "from django.urls import path\nfrom . import views\nurlpatterns = [path('a/', views.A.as_view()), path('b/', views.B.as_view())]\n",
+   "app/views.py": "from django.contrib.auth.mixins import LoginRequiredMixin\nfrom django.views import View\nclass PublicPreviewMixin:\n    def dispatch(self, request, *args, **kwargs):\n        if request.GET.get('preview'):\n            return self.get(request, *args, **kwargs)\n        return super().dispatch(request, *args, **kwargs)\nclass A(PublicPreviewMixin, LoginRequiredMixin, View):\n    def get(self, request): ...\nclass SkipMixin:\n    def dispatch(self, request, *args, **kwargs):\n        return self.get(request, *args, **kwargs)\nclass B(SkipMixin, LoginRequiredMixin, View):\n    def get(self, request): ...\n"
+  },
+  "rows": [
+   [
+    "django-drf",
+    "GET",
+    "a/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "GET",
+    "b/",
+    [],
+    true,
+    false
+   ]
+  ]
+ },
+ {
+  "case": "dj_async_dispatch_skips_mixin",
+  "contract": 2,
+  "expect": "GET a/ judged (an async dispatch ahead of LoginRequiredMixin never calls it), like GET b/ (the same, sync)",
+  "files": {
+   "app/urls.py": "from django.urls import path\nfrom . import views\nurlpatterns = [path('a/', views.A.as_view()), path('b/', views.B.as_view())]\n",
+   "app/views.py": "from django.contrib.auth.mixins import LoginRequiredMixin\nfrom django.views import View\nclass Fast:\n    async def dispatch(self, request, *args, **kwargs):\n        return await self.get(request, *args, **kwargs)\nclass A(Fast, LoginRequiredMixin, View):\n    async def get(self, request): ...\nclass Slow:\n    def dispatch(self, request, *args, **kwargs):\n        return self.get(request, *args, **kwargs)\nclass B(Slow, LoginRequiredMixin, View):\n    def get(self, request): ...\n"
+  },
+  "rows": [
+   [
+    "django-drf",
+    "GET",
+    "a/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "GET",
+    "b/",
+    [],
+    true,
+    false
+   ]
+  ]
+ },
+ {
+  "case": "dj_login_required_attr_set_after_def",
+  "contract": 2,
+  "expect": "any h/ judged (health.login_required = False is what LoginRequiredMiddleware reads), like any h2/; me/ guarded",
+  "files": {
+   "app/settings.py": "ROOT_URLCONF='app.urls'\nMIDDLEWARE = ['django.contrib.sessions.middleware.SessionMiddleware','django.contrib.auth.middleware.AuthenticationMiddleware','django.contrib.auth.middleware.LoginRequiredMiddleware']\n",
+   "app/urls.py": "from django.urls import path\nfrom . import views\nurlpatterns = [path('h/', views.health), path('h2/', views.health2), path('me/', views.me)]\n",
+   "app/views.py": "from django.contrib.auth.decorators import login_not_required\ndef health(request): ...\nhealth.login_required = False\n@login_not_required\ndef health2(request): ...\ndef me(request): ...\n"
+  },
+  "rows": [
+   [
+    "django-drf",
+    "any",
+    "h/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "any",
+    "h2/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "any",
+    "me/",
+    [
+     "LoginRequiredMiddleware"
+    ],
+    false,
+    false
+   ]
+  ]
+ },
+ {
+  "case": "dj_login_not_required_aliased",
+  "contract": 2,
+  "expect": "any h/ judged (login_not_required imported as no_login), like any h2/",
+  "files": {
+   "app/settings.py": "ROOT_URLCONF='app.urls'\nMIDDLEWARE = ['django.contrib.sessions.middleware.SessionMiddleware','django.contrib.auth.middleware.AuthenticationMiddleware','django.contrib.auth.middleware.LoginRequiredMiddleware']\n",
+   "app/urls.py": "from django.urls import path\nfrom . import views\nurlpatterns = [path('h/', views.health), path('h2/', views.health2)]\n",
+   "app/views.py": "from django.contrib.auth.decorators import login_not_required as no_login\nfrom django.contrib.auth.decorators import login_not_required\n@no_login\ndef health(request): ...\n@login_not_required\ndef health2(request): ...\n"
+  },
+  "rows": [
+   [
+    "django-drf",
+    "any",
+    "h/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "any",
+    "h2/",
+    [],
+    true,
+    false
+   ]
+  ]
+ },
+ {
+  "case": "fl_cache_outside_login_required",
+  "contract": 2,
+  "expect": "GET /dash and GET /v judged (Flask-Caching's cached(), keyed by path, answers from cache before login_required runs: outermost decorator / last in View.decorators); GET /dash2 and GET /w guarded",
+  "files": {
+   "app.py": "from flask import Flask\nfrom flask.views import MethodView\nfrom flask_caching import Cache\nfrom flask_login import login_required\napp = Flask(__name__)\ncache = Cache(app)\n@app.route('/dash')\n@cache.cached(timeout=60)\n@login_required\ndef dash(): ...\n@app.route('/dash2')\n@login_required\n@cache.cached(timeout=60)\ndef dash2(): ...\nclass V(MethodView):\n    decorators = [login_required, cache.cached(timeout=60)]\n    def get(self): ...\nclass W(MethodView):\n    decorators = [cache.cached(timeout=60), login_required]\n    def get(self): ...\napp.add_url_rule('/v', view_func=V.as_view('v'))\napp.add_url_rule('/w', view_func=W.as_view('w'))\n"
+  },
+  "rows": [
+   [
+    "flask",
+    "GET",
+    "/dash",
+    [],
+    true,
+    false
+   ],
+   [
+    "flask",
+    "GET",
+    "/dash2",
+    [
+     "login_required"
+    ],
+    false,
+    false
+   ],
+   [
+    "flask",
+    "GET",
+    "/v",
+    [],
+    true,
+    false
+   ],
+   [
+    "flask",
+    "GET",
+    "/w",
+    [
+     "login_required"
+    ],
+    false,
+    false
+   ]
+  ]
+ },
+ {
+  "case": "drf_cache_page_around_view",
+  "contract": 2,
+  "expect": "GET stats/ judged (cache_page around the DRF view answers from cache before DRF's permission check; token auth adds no Vary); GET s2/ guarded",
+  "files": {
+   "app/settings.py": "ROOT_URLCONF='app.urls'\nREST_FRAMEWORK={'DEFAULT_AUTHENTICATION_CLASSES':['rest_framework.authentication.TokenAuthentication']}\n",
+   "app/urls.py": "from django.urls import path\nfrom django.views.decorators.cache import cache_page\nfrom . import views\nurlpatterns = [path('stats/', cache_page(900)(views.Stats.as_view())), path('s2/', views.Stats.as_view())]\n",
+   "app/views.py": "from rest_framework.views import APIView\nfrom rest_framework.permissions import IsAuthenticated\nclass Stats(APIView):\n    permission_classes = [IsAuthenticated]\n    def get(self, request): ...\n"
+  },
+  "rows": [
+   [
+    "django-drf",
+    "GET",
+    "s2/",
+    [
+     "IsAuthenticated"
+    ],
+    false,
+    false
+   ],
+   [
+    "django-drf",
+    "GET",
+    "stats/",
+    [],
+    true,
+    false
+   ]
+  ]
+ },
+ {
+  "case": "drf_unwrapping_decorator_hides_permission_classes",
+  "contract": 2,
+  "expect": "GET a/ judged (timed, without functools.wraps, drops the permission_classes attribute api_view reads, so DRF's AllowAny default applies); GET b/ guarded",
+  "files": {
+   "app/settings.py": "ROOT_URLCONF='app.urls'\n",
+   "app/urls.py": "from django.urls import path\nfrom . import views\nurlpatterns = [path('a/', views.a), path('b/', views.b)]\n",
+   "app/views.py": "from rest_framework.decorators import api_view, permission_classes\nfrom rest_framework.permissions import IsAuthenticated\ndef timed(f):\n    def inner(*a, **k):\n        return f(*a, **k)\n    return inner\n@api_view(['GET'])\n@timed\n@permission_classes([IsAuthenticated])\ndef a(request): ...\n@api_view(['GET'])\n@permission_classes([IsAuthenticated])\n@timed\ndef b(request): ...\n"
+  },
+  "rows": [
+   [
+    "django-drf",
+    "GET",
+    "a/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "GET",
+    "b/",
+    [
+     "IsAuthenticated"
+    ],
+    false,
+    false
+   ]
+  ]
+ },
+ {
+  "case": "dj_empty_permission_requirement",
+  "contract": 2,
+  "expect": "any a/ and GET b/ judged (an empty permission list passes AnonymousUser.has_perms); any c/ guarded",
+  "files": {
+   "app/urls.py": "from django.urls import path\nfrom . import views\nurlpatterns = [path('a/', views.a), path('b/', views.B.as_view()), path('c/', views.c)]\n",
+   "app/views.py": "from django.contrib.auth.decorators import permission_required\nfrom django.contrib.auth.mixins import PermissionRequiredMixin\nfrom django.views import View\n@permission_required([])\ndef a(request): ...\nclass B(PermissionRequiredMixin, View):\n    permission_required = ()\n    def get(self, request): ...\n@permission_required('notes.view_note')\ndef c(request): ...\n"
+  },
+  "rows": [
+   [
+    "django-drf",
+    "GET",
+    "b/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "any",
+    "a/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "any",
+    "c/",
+    [
+     "permission_required"
+    ],
+    false,
+    false
+   ]
+  ]
+ },
+ {
+  "case": "drf_library_viewset_extra_actions_missing",
+  "contract": 1,
+  "expect": "the users rows plus a placeholder (any auth/users/[...]) for the @actions the library base defines (djoser: users/me/, users/activation/, users/reset_password/ ...); notes rows incl. GET auth/notes/recent/",
+  "files": {
+   "app/urls.py": "from django.urls import path, include\nfrom rest_framework.routers import DefaultRouter\nfrom . import views\nrouter = DefaultRouter()\nrouter.register('users', views.Users)\nrouter.register('notes', views.Notes)\nurlpatterns = [path('auth/', include(router.urls))]\n",
+   "app/views.py": "from djoser.views import UserViewSet\nfrom rest_framework import viewsets\nfrom rest_framework.decorators import action\nclass Users(UserViewSet):\n    pass\nclass Notes(viewsets.ModelViewSet):\n    @action(detail=False)\n    def recent(self, request): ...\n"
+  },
+  "rows": [
+   [
+    "django-drf",
+    "DELETE",
+    "auth/notes/<pk>/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "DELETE",
+    "auth/users/<pk>/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "GET",
+    "auth/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "GET",
+    "auth/notes/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "GET",
+    "auth/notes/<pk>/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "GET",
+    "auth/notes/recent/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "GET",
+    "auth/users/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "GET",
+    "auth/users/<pk>/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "PATCH",
+    "auth/notes/<pk>/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "PATCH",
+    "auth/users/<pk>/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "POST",
+    "auth/notes/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "POST",
+    "auth/users/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "PUT",
+    "auth/notes/<pk>/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "PUT",
+    "auth/users/<pk>/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "any",
+    "auth/users/[UserViewSet actions]",
+    [],
+    true,
+    true
+   ]
+  ]
+ },
+ {
+  "case": "fl_library_blueprint_and_extension_routes_missing",
+  "contract": 1,
+  "expect": "placeholder rows (ANY, pattern_dynamic) for /login/..., /docs/... and /admin/... (library blueprints and Flask-Admin views), as ANY /graphql (a library view class) gets one; GET /m/x",
+  "files": {
+   "app.py": "from flask import Flask, Blueprint\nfrom flask_dance.contrib.github import make_github_blueprint\nfrom flask_swagger_ui import get_swaggerui_blueprint\nfrom flask_admin import Admin\nfrom flask_admin.contrib.sqla import ModelView\nfrom flask_graphql import GraphQLView\nfrom .models import db, User\napp = Flask(__name__)\ngh = make_github_blueprint(client_id='x', client_secret='y')\nswagger = get_swaggerui_blueprint('/docs', '/static/openapi.json')\nmine = Blueprint('mine', __name__)\n@mine.route('/x')\ndef x(): ...\napp.register_blueprint(gh, url_prefix='/login')\napp.register_blueprint(swagger, url_prefix='/docs')\napp.register_blueprint(mine, url_prefix='/m')\nadmin = Admin(app)\nadmin.add_view(ModelView(User, db.session))\napp.add_url_rule('/graphql', view_func=GraphQLView.as_view('graphql'))\n"
+  },
+  "rows": [
+   [
+    "flask",
+    "ANY",
+    "/admin/[Flask-Admin]",
+    [],
+    true,
+    true
+   ],
+   [
+    "flask",
+    "ANY",
+    "/docs/[swagger]",
+    [],
+    true,
+    true
+   ],
+   [
+    "flask",
+    "ANY",
+    "/graphql",
+    [],
+    true,
+    false
+   ],
+   [
+    "flask",
+    "ANY",
+    "/login/[gh]",
+    [],
+    true,
+    true
+   ],
+   [
+    "flask",
+    "GET",
+    "/m/x",
+    [],
+    true,
+    false
+   ]
+  ]
+ },
+ {
+  "case": "fl_connexion_app_no_rows_no_gap",
+  "contract": 1,
+  "expect": "a coverage gap (or placeholder row) for the connexion app's spec-defined routes, as the bare Flask app gets 'flask imports detected but no route registration'",
+  "files": {
+   "app.py": "import connexion\napp = connexion.App(__name__, specification_dir='openapi/')\napp.add_api('api.yaml')\n",
+   "api/items.py": "def search():\n    return []\n",
+   "b/app.py": "from flask import Flask\nb = Flask(__name__)\n"
+  },
+  "rows": []
+ },
+ {
+  "case": "dj_error_handler_views_missing",
+  "contract": 1,
+  "expect": "rows (any method, any unmatched path) for the handler404/handler500 views, which Django runs for requests no pattern matches; any x/ listed",
+  "files": {
+   "app/urls.py": "from django.urls import path\nfrom . import views\nurlpatterns = [path('x/', views.x)]\nhandler404 = views.not_found\nhandler500 = 'app.views.oops'\n",
+   "app/views.py": "def x(request): ...\ndef not_found(request, exception): ...\ndef oops(request): ...\n"
+  },
+  "rows": [
+   [
+    "django-drf",
+    "any",
+    "[handler404]",
+    [],
+    true,
+    true
+   ],
+   [
+    "django-drf",
+    "any",
+    "[handler500]",
+    [],
+    true,
+    true
+   ],
+   [
+    "django-drf",
+    "any",
+    "x/",
+    [],
+    true,
+    false
+   ]
+  ]
+ },
+ {
+  "case": "drf_nested_router_default_lookup",
+  "contract": 3,
+  "expect": "comments rows under notes/<nested_1_pk>/comments/ (drf-nested-routers' default lookup is 'nested_<n>'), as items rows sit under tags/<tag_pk>/items/",
+  "files": {
+   "app/urls.py": "from django.urls import path, include\nfrom rest_framework.routers import SimpleRouter\nfrom rest_framework_nested.routers import NestedSimpleRouter\nfrom . import views\nrouter = SimpleRouter()\nrouter.register('notes', views.Notes)\nrouter.register('tags', views.Notes)\nnested = NestedSimpleRouter(router, 'notes')\nnested.register('comments', views.Comments)\nnested2 = NestedSimpleRouter(router, 'tags', lookup='tag')\nnested2.register('items', views.Comments)\nurlpatterns = [path('', include(router.urls)), path('', include(nested.urls)), path('', include(nested2.urls))]\n",
+   "app/views.py": "from rest_framework import viewsets\nclass Notes(viewsets.ReadOnlyModelViewSet):\n    pass\nclass Comments(viewsets.ReadOnlyModelViewSet):\n    pass\n"
+  },
+  "rows": [
+   [
+    "django-drf",
+    "GET",
+    "notes/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "GET",
+    "notes/<nested_1_pk>/comments/",
+    [],
+    true,
+    true
+   ],
+   [
+    "django-drf",
+    "GET",
+    "notes/<nested_1_pk>/comments/<pk>/",
+    [],
+    true,
+    true
+   ],
+   [
+    "django-drf",
+    "GET",
+    "notes/<pk>/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "GET",
+    "tags/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "GET",
+    "tags/<pk>/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "GET",
+    "tags/<tag_pk>/items/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "GET",
+    "tags/<tag_pk>/items/<pk>/",
+    [],
+    true,
+    false
+   ]
+  ]
+ },
+ {
+  "case": "fl_dispatcher_middleware_prefix",
+  "contract": 3,
+  "expect": "GET /api/items (or /items with pattern_dynamic): DispatcherMiddleware mounts the api app under /api, as GET /v2/things carries its blueprint prefix",
+  "files": {
+   "app.py": "from flask import Flask, Blueprint\nfrom werkzeug.middleware.dispatcher import DispatcherMiddleware\nfront = Flask('front')\napi = Flask('api')\nbp = Blueprint('v2', __name__)\n@front.route('/')\ndef home(): ...\n@api.route('/items')\ndef items(): ...\n@bp.route('/things')\ndef things(): ...\nfront.register_blueprint(bp, url_prefix='/v2')\nfront.wsgi_app = DispatcherMiddleware(front.wsgi_app, {'/api': api.wsgi_app})\n"
+  },
+  "rows": [
+   [
+    "flask",
+    "GET",
+    "/",
+    [],
+    true,
+    false
+   ],
+   [
+    "flask",
+    "GET",
+    "/api/items",
+    [],
+    true,
+    false
+   ],
+   [
+    "flask",
+    "GET",
+    "/v2/things",
     [],
     true,
     false

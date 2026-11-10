@@ -10,12 +10,20 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field, replace
 
 from traust_core.v1.models.code_facts import RouteFamily
-from traust_core.v1.providers.python_guards import GuardReader
+from traust_core.v1.providers.python_guards import (
+    UNREADABLE,
+    GuardReader,
+    empty,
+    requires_nothing,
+)
 from traust_core.v1.providers.route_guards import (
+    _c3,
     _const_str,
+    _Def,
     _dotted,
     _guards_in,
     _mark,
+    _own_nodes,
     _PyIndex,
     _resolve_import,
     _Row,
@@ -106,6 +114,9 @@ _AUTH_VIEWS = {
 }  # fmt: skip
 # a library view: its `dispatch` runs before any mixin after it in the method order
 _LIBRARY_VIEW = re.compile(r"(View|ViewSet)$")
+# DRF's own classes that keep DRF's default permissions; any other sets its own (`ObtainAuthToken`)
+_DRF_DEFAULTED = {*_GENERIC_METHODS, *_VIEWSET_ACTIONS, *_NO_ACTIONS, *_PLAIN_VIEWS}
+_HANDLERS = ("handler400", "handler403", "handler404", "handler500")
 # permissions that admit any caller, or any caller to read
 _ANONYMOUS = re.compile(r"^(AllowAny|IsAnonymous\w*)$")
 _SAFE = {"GET", "HEAD", "OPTIONS", "any"}
@@ -138,7 +149,7 @@ class _Router:
     registered: list[tuple[str, ast.Call]] = field(default_factory=list)
     extends: list[tuple[str, str]] = field(default_factory=list)
     # a nested router's parent, the parent's route it nests under, and its lookup prefix
-    parent: tuple[tuple[str, str] | None, str, str] | None = None
+    parent: tuple[tuple[str, str] | None, str, str | None] | None = None
     default: bool = False
     slash: str = "/"
     dynamic: bool = False
@@ -164,6 +175,10 @@ class _Django:
     origins: dict[tuple[str, str], str] = field(default_factory=dict)
     own_constants: dict[str, dict[str, str]] = field(default_factory=dict)
     _constants: dict[str, dict[str, str]] = field(default_factory=dict)
+    _statements: dict[str, list[tuple[ast.stmt, bool]]] = field(default_factory=dict)
+    _settings: dict[str, dict[str, ast.AST]] = field(default_factory=dict)
+    _written: dict[str, set[str]] = field(default_factory=dict)
+    _attributes: set[tuple[str, str]] | None = None
 
     def __post_init__(self) -> None:
         self.trees = {s.file.rel: s.tree for s in self.index.sources}
@@ -182,12 +197,93 @@ class _Django:
         return self._constants[rel]
 
     def reader(self, rel: str) -> GuardReader:
-        """Guards read from `rel`: a name resolves to the checkout definition it imports."""
+        """Guards read from `rel`: a name resolves to the checkout code it is bound to."""
         if rel not in self._readers:
             self._readers[rel] = GuardReader(
-                lambda name: found[1] if (found := self.definition(name, rel)) else None
+                lambda name: self.bound_to(name, rel), origin=lambda name: self.origin(rel, name)
             )
         return self._readers[rel]
+
+    def bound_to(self, dotted: str, rel: str) -> ast.AST | None:
+        """The checkout definition or value a name in `rel` is bound to, UNREADABLE for checkout
+        code we can't read (a conditional def, an object's method); None for a library's."""
+        if (found := self.lookup_name(dotted, rel, frozenset())) is not None:
+            return found[1]
+        return UNREADABLE if self.checkout_bound(dotted, rel, frozenset()) else None
+
+    def checkout_bound(self, dotted: str, rel: str, seen: frozenset[str]) -> bool | None:
+        """Whether `rel` binds a name's head to checkout code (True) or a library's (False): any
+        conditional checkout binding, else the last binding; None when nothing there binds it."""
+        if rel in seen or len(seen) > _MAX_DEPTH:
+            return None
+        head, _, rest = dotted.partition(".")
+        kinds = [
+            (kind, conditional)
+            for n, conditional in self.statements(rel)
+            if (kind := self.binds(n, head, rest, rel, seen | {rel})) is not None
+        ]
+        settled = [kind for kind, conditional in kinds if not conditional]
+        if any(kind for kind, conditional in kinds if conditional):
+            return True
+        return settled[-1] if settled else (False if kinds else None)
+
+    def binds(
+        self, n: ast.stmt, head: str, rest: str, rel: str, seen: frozenset[str]
+    ) -> bool | None:
+        """Whether statement `n` binds `head` to checkout code, through what it imports."""
+        if isinstance(n, ast.ImportFrom):
+            module = _resolve_import(rel, n.module, n.level)
+            for a in n.names:
+                if a.name == "*":
+                    where = self.file(module, rel)
+                    dotted = f"{head}.{rest}" if rest else head
+                    if where is not None:
+                        return self.checkout_bound(dotted, where, seen)
+                    return True if self.unparsed(module) else None
+                if (a.asname or a.name) == head:
+                    return self.imported_bound(f"{module}.{a.name}", rest, rel, seen)
+            return None
+        if isinstance(n, ast.Import):
+            for a in n.names:
+                if (a.asname or a.name.split(".")[0]) == head:
+                    return self.imported_bound(a.name if a.asname else head, rest, rel, seen)
+            return None
+        return True if head in _bound_names(n) else None
+
+    def imported_bound(self, full: str, rest: str, rel: str, seen: frozenset[str]) -> bool:
+        """Whether an imported name is checkout code: the longest part of it that is a checkout
+        module binds the rest to checkout code, or that module doesn't parse."""
+        if self.unparsed(full) or self.unparsed(full.rpartition(".")[0]):
+            return True
+        parts = [*full.split("."), *(rest.split(".") if rest else [])]
+        for i in range(len(parts), 0, -1):
+            if (where := self.file(".".join(parts[:i]), rel)) is not None:
+                inner = ".".join(parts[i:])
+                return not inner or bool(self.checkout_bound(inner, where, seen))
+        return False
+
+    def unparsed(self, module: str) -> bool:
+        return bool(module) and any(
+            u == module or u.endswith(f".{module}") for u in self.index.unparsed
+        )
+
+    def statements(self, rel: str) -> list[tuple[ast.stmt, bool]]:
+        if rel not in self._statements:
+            tree = self.trees.get(rel)
+            self._statements[rel] = list(_module_statements(tree.body, False)) if tree else []
+        return self._statements[rel]
+
+    def attributes(self) -> set[tuple[str, str]]:
+        """(name, attribute) of every `name.attribute = ..` in the checkout."""
+        if self._attributes is None:
+            self._attributes = {
+                (_dotted(t.value).split(".")[-1], t.attr)
+                for assigns in self.index.assigns.values()
+                for n in assigns
+                for t in _targets(n)
+                if isinstance(t, ast.Attribute)
+            }
+        return self._attributes
 
     def file(self, module: str, rel: str) -> str | None:
         return self.index.modules.near(module, rel)
@@ -200,8 +296,8 @@ class _Django:
         found: dict[str, list[tuple[list[str], list[ast.AST]]]] = {}
         texts = {src.file.rel: src.file.text for src in self.index.sources}
         for rel in self.trees:
-            # a module that names no setting adds nothing to the ones it star-imports
-            if not any(k in texts[rel] for k in ("ROOT_URLCONF", "MIDDLEWARE", "REST_FRAMEWORK")):
+            # a module that names no setting, nor star-imports one that does, changes none
+            if not self.names_settings(rel, texts, frozenset()):
                 continue
             values = self.setting_values(rel, frozenset())
             if not values.keys() & {"ROOT_URLCONF", "MIDDLEWARE", "REST_FRAMEWORK"}:
@@ -249,34 +345,63 @@ class _Django:
             for root, entries in found.items()
         }
 
+    def names_settings(self, rel: str, texts: dict[str, str], seen: frozenset[str]) -> bool:
+        return any(k in texts[rel] for k in ("ROOT_URLCONF", "MIDDLEWARE", "REST_FRAMEWORK")) or (
+            "import *" in texts[rel]
+            and any(
+                self.names_settings(star, texts, seen | {rel})
+                for star in self.stars(rel)
+                if star not in seen | {rel}
+            )
+        )
+
     def setting_values(self, rel: str, seen: frozenset[str]) -> dict[str, ast.AST]:
         """A settings module's unconditional top-level values, over the ones it star-imports."""
         tree = self.trees.get(rel)
         if tree is None or rel in seen:
             return {}
+        if rel in self._settings:
+            return self._settings[rel]
         values: dict[str, ast.AST] = {}
-        for n in tree.body:
+        read: set[int] = set()  # the statements read as a setting's value
+        for n, conditional in _module_statements(tree.body, False):
             if isinstance(n, ast.ImportFrom) and any(a.name == "*" for a in n.names):
                 module = _resolve_import(rel, n.module, n.level)
-                if (where := self.file(module, rel)) is not None:
-                    values.update(self.setting_values(where, seen | {rel}))
+                if (where := self.file(module, rel)) is None:
+                    continue
+                found = self.setting_values(where, seen | {rel})
+                if not conditional:
+                    values.update(found)
+                    continue
+                # `try: from .local import *` may replace whatever that module sets
+                for name in {*found, *self.written(where)}:
+                    values.pop(name, None)
+            elif conditional:
+                continue
             elif isinstance(n, ast.Assign | ast.AnnAssign) and n.value is not None:
+                read.add(id(n))
                 for t in _targets(n):
                     if isinstance(t, ast.Name) and t.id.isupper():
                         values[t.id] = n.value
-        # a setting changed after it is set, or set under a condition, is not known
-        top = {id(n) for n in tree.body}
-        for n in ast.walk(tree):
-            changed: list[str] = []
-            if isinstance(n, ast.Assign | ast.AnnAssign | ast.AugAssign) and id(n) not in top:
-                changed = [_dotted(t).split(".")[0] for t in _targets(n)]
-            if isinstance(n, ast.Assign | ast.AugAssign):
-                changed += [_dotted(t.value) for t in _targets(n) if isinstance(t, ast.Subscript)]
-            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute):
-                changed.append(_dotted(n.func.value))
-            for name in changed:
-                values.pop(name, None)
+            elif (
+                isinstance(n, ast.AugAssign)
+                and isinstance(n.op, ast.Add)
+                and isinstance(n.target, ast.Name)
+                and isinstance(before := values.get(n.target.id), ast.List | ast.Tuple)
+                and isinstance(n.value, ast.List | ast.Tuple)
+            ):
+                read.add(id(n))  # `MIDDLEWARE += [..]`
+                values[n.target.id] = ast.List(elts=[*before.elts, *n.value.elts])
+        for name in _changed(tree, read):
+            values.pop(name, None)
+        self._settings[rel] = values
         return values
+
+    def written(self, rel: str) -> set[str]:
+        """Every name a module assigns or changes."""
+        if rel not in self._written:
+            self._written[rel] = _changed(self.trees[rel], set())
+        return self._written[rel]
 
     # ---- urlconfs
     def run(self) -> list[_Row]:
@@ -296,6 +421,13 @@ class _Django:
             # an include we can't follow may be what mounts a urlconf nothing else includes
             self.mount(rel, "", unplaced and rel not in self.projects, frozenset())
         self.current = ([], [])  # what can't be placed takes no project's settings
+        # the views a root urlconf names for a request no pattern matches, or one that fails
+        for rel in roots:
+            for name in _HANDLERS:
+                if isinstance(view := self.defined(rel).get(name), ast.expr):
+                    if (path := _const_str(view)) is not None and re.fullmatch(r"[\w.]+", path):
+                        view = ast.copy_location(ast.parse(path, mode="eval").body, view)
+                    self.view_rows(rel, view, f"[{name}]", True, view.lineno)
         # what the walk couldn't place (a urlconf mounted from code it can't read, a route list
         # built by a function) is listed with its prefix unknown, never dropped
         for rel in confs:
@@ -545,6 +677,9 @@ class _Django:
             info, routes = replace(_UNREAD), [("any", pattern, text, None)]
         else:
             routes = [(m, pattern, h, n) for m, h, n in info.methods]
+        if info.drf and any(_dotted(w).split(".")[-1] == "cache_page" for w in wrappers):
+            # a cached response is served before DRF checks permissions (token auth adds no Vary)
+            info.permissions = []
         for w in wrappers:
             guards, unguards = _decorator_guards(w, self.reader(rel))
             info.guards = _unique([*info.guards, *guards])
@@ -573,12 +708,16 @@ class _Django:
             )
             # `LoginRequiredMiddleware` exempts views marked `login_not_required`, and Django
             # marks its own (login, logout, password reset): it guards only checkout views
-            # DRF marks every view of its own `login_required = False`
+            # DRF marks every view of its own `login_required = False`, as another library may
             exempt = (
                 "login_not_required" in unguards
                 or node is None
                 or info.drf
-                or any(isinstance(c, str) and c in _AUTH_VIEWS for _, c in info.mro or [])
+                or any(
+                    isinstance(c, str)
+                    and (c in _AUTH_VIEWS or (_unknown_view(c) and self.third_party(w, c)))
+                    for w, c in info.mro or []
+                )
             )
             scope = [] if exempt else list(middleware)
             row = _row(
@@ -698,9 +837,9 @@ class _Django:
                 return where, here
             if where != rel and name in self.index.modules.imported.get(where, {}):
                 return self.lookup_name(name, where, seen | {rel})  # re-exported
-            for star in self.stars(where) if where != rel else []:
+            for star in reversed(self.stars(where)) if where != rel else []:
                 if (found := self.lookup_name(name, star, seen | {rel, where})) is not None:
-                    return found  # `from .other import *`
+                    return found  # `from .other import *`, the last binding it
         if target is not None or name in self.defined(rel):
             return None  # imported from a library, or bound here to what we can't read
         # a name the urlconf never imports (a star import): the checkout's one definition of it
@@ -763,23 +902,8 @@ class _Django:
                 lines.append([(rel, name.split(".")[-1])])
                 self.origins[(rel, name.split(".")[-1])] = self.origin(rel, name)
         lines.append([line[0] for line in lines])
-        out: list[tuple[str, ast.ClassDef | str]] = [(rel, cls)]
-        key = _class_key
-        while any(lines):
-            head = next(
-                (
-                    line[0]
-                    for line in lines
-                    if line
-                    and not any(key(line[0]) in {key(x) for x in other[1:]} for other in lines)
-                ),
-                None,
-            )
-            if head is None:
-                return None  # an order Python would refuse too
-            out.append(head)
-            lines = [[x for x in line if key(x) != key(head)] for line in lines]
-        return out
+        merged = _c3(lines, _class_key)
+        return [(rel, cls), *merged] if merged is not None else None
 
     def depth_first(
         self, rel: str, cls: ast.ClassDef, depth: int
@@ -805,11 +929,17 @@ class _Django:
         names = [c if isinstance(c, str) else c.name for _, c in mro]
         defined: dict[str, tuple[str, ast.AST]] = {}
         aliases: dict[str, str] = {}
+        blocked = False  # a library view earlier in the order may answer any method itself
         for where, c in mro:
-            if isinstance(c, ast.ClassDef):
+            if isinstance(c, str):
+                for http in _GENERIC_METHODS.get(c, ()):
+                    defined.setdefault(http.lower(), (where, cls))
+                blocked |= _unknown_view(c)
+            else:
                 for n in c.body:
                     if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef):
-                        defined.setdefault(n.name, (where, n))
+                        shadowed = blocked and n.name in _HTTP
+                        defined.setdefault(n.name, (where, cls if shadowed else n))
                     elif isinstance(n, ast.Assign) and isinstance(n.value, ast.Name):
                         for t in n.targets:  # `post = get`
                             aliases.setdefault(_dotted(t), n.value.id)
@@ -839,13 +969,9 @@ class _Django:
         policy.drf = any(
             isinstance(c, str) and _drf(self.origins.get((w, c), ""), c) for w, c in mro
         )
-        if any(
-            isinstance(c, str)
-            and _LIBRARY_VIEW.search(c)
-            and c not in _GENERIC_METHODS
-            and c not in _PLAIN_VIEWS
-            for _, c in mro
-        ) and all(m != "any" for m, _, _ in methods):
+        if any(isinstance(c, str) and _unknown_view(c) for _, c in mro) and all(
+            m != "any" for m, _, _ in methods
+        ):
             # a library view whose own methods we don't know (`LoginView` answers POST)
             policy.methods = [*methods, ("any", cls.name, cls)]
         policy.mro = mro
@@ -862,12 +988,14 @@ class _Django:
         permissions: list[ast.AST] | None = None
         settled = viewed = False
         earlier: set[str] = set()  # the methods a class earlier in the order defines
+        required: ast.AST | None = None  # the nearest `permission_required`
         for where, c in mro:
             if isinstance(c, str):
                 origin = self.origins.get((where, c), "")
-                if _LIBRARY_VIEW.search(c):
+                own_policy = origin.startswith("rest_framework.") and c not in _DRF_DEFAULTED
+                if _LIBRARY_VIEW.search(c) or own_policy:
                     viewed = True
-                    third = bool(origin) and not origin.startswith(("rest_framework", "django."))
+                    third = own_policy or self.third_party(where, c)
                     if not settled and third:
                         # another library's view may set its own permissions
                         unguards.append(c)
@@ -881,15 +1009,10 @@ class _Django:
             if not viewed and own & _MIXIN_HOOKS:
                 viewed = True  # overrides what the library mixins after it decide by
             dispatch = next(
-                (n for n in c.body if isinstance(n, ast.FunctionDef) and n.name == "dispatch"), None
+                (n for n in c.body if isinstance(n, _Def) and n.name == "dispatch"), None
             )
-            # its own dispatch may skip the mixins after it: not calling `super()`, or calling
-            # past one (`super(LoginRequiredMixin, self)`)
-            if dispatch is not None and (
-                "super().dispatch(" not in (text := ast.unparse(dispatch))
-                or re.search(r"\bsuper\(\s*\w", text)
-            ):
-                viewed = True
+            if dispatch is not None and not _defers(dispatch):
+                viewed = True  # its own dispatch may answer before the mixins after it
             for d in c.decorator_list:
                 method = (
                     _const_str(next((k.value for k in d.keywords if k.arg == "name"), None))
@@ -907,38 +1030,66 @@ class _Django:
             # a DRF view's own dispatch that skips `super()` never runs `initial()`'s checks
             skips = (
                 dispatch is not None
-                and "super().dispatch(" not in ast.unparse(dispatch)
+                and not _defers(dispatch)
                 and any(
                     isinstance(x, str) and _drf(self.origins.get((w, x), ""), x) for w, x in mro
                 )
             )
             decided = sorted(own & _PERMISSION_METHODS) + (["dispatch"] if skips else [])
-            if not settled and decided:
-                # which permissions apply is decided by code: never shown as a guard
+            if decided:
+                # which permissions apply is decided by code, wherever it sits in the order
                 unguards.append(decided[0])
                 permissions, settled = [], True
-            branched = any(
-                isinstance(n, ast.Assign | ast.AnnAssign)
-                and any(_dotted(t) == "permission_classes" for t in _targets(n))
+            per_instance = ("self", "permission_classes") in self.attributes()
+            nested = [
+                isinstance(stmt, ast.FunctionDef | ast.AsyncFunctionDef)
                 for stmt in c.body
-                if not isinstance(stmt, ast.Assign | ast.AnnAssign | ast.FunctionDef)
+                if not isinstance(stmt, ast.Assign | ast.AnnAssign)
+                and (per_instance or not isinstance(stmt, ast.FunctionDef | ast.AsyncFunctionDef))
                 for n in ast.walk(stmt)
-            )
-            if not settled and branched:
-                unguards.append("permission_classes")  # set under a condition in the class body
+                if isinstance(n, ast.Assign | ast.AnnAssign | ast.AugAssign)
+                and any(_dotted(t).split(".")[-1] == "permission_classes" for t in _targets(n))
+            ]
+            # set per instance (`self.permission_classes` in `setup()`), else under a condition
+            # in the body, after the class (`A.permission_classes = ..`) or by a class decorator
+            if any(nested) or (not settled and (nested or self.rebinds(where, c))):
+                unguards.append("permission_classes")
                 permissions, settled = [], True
-            if not settled:
-                for n in c.body:
-                    if (
-                        isinstance(n, ast.Assign | ast.AnnAssign)
-                        and n.value is not None
-                        and any(_dotted(t) == "permission_classes" for t in _targets(n))
-                    ):
-                        permissions, settled = _elements(n.value), True
+            body = {
+                _dotted(t): n.value
+                for n in c.body
+                if isinstance(n, ast.Assign | ast.AnnAssign) and n.value is not None
+                for t in _targets(n)
+            }
+            if not settled and "permission_classes" in body:
+                permissions, settled = _elements(body["permission_classes"]), True
+            required = body.get("permission_required") if required is None else required
             earlier |= own
+        if required is not None and empty(required):
+            # `permission_required = ()`: `has_perms(())` admits anyone
+            guards = [g for g in guards if g.split(".")[-1] != "PermissionRequiredMixin"]
         return _View([], _unique(guards), sorted(set(unguards)), permissions, named=named)
 
+    def third_party(self, rel: str, name: str) -> bool:
+        """A library class neither DRF's nor Django's."""
+        origin = self.origins.get((rel, name), "")
+        return bool(origin) and not origin.startswith(("rest_framework.", "django."))
+
+    def rebinds(self, rel: str, cls: ast.ClassDef) -> bool:
+        """`A.permission_classes = ..` after the class, or a class decorator that may set it."""
+        return (cls.name, "permission_classes") in self.attributes() or any(
+            (found := self.bound_to(_dotted(d), rel)) is not None
+            and (
+                found is UNREADABLE
+                or isinstance(found, ast.expr)
+                or "permission_classes" in ast.unparse(found)
+            )
+            for d in cls.decorator_list
+            if not (isinstance(d, ast.Call) and _name(d) == "method_decorator")
+        )
+
     def function_view(self, fn: ast.FunctionDef | ast.AsyncFunctionDef) -> _View:
+        rel = self.index.paths.get(id(fn), "")
         methods: tuple[str, ...] = ("any",)
         guards: list[str] = []
         unguards: list[str] = []
@@ -961,10 +1112,17 @@ class _Django:
                     and isinstance(d, ast.Call)
                     and d.args
                 ):
-                    permissions = _elements(d.args[0])
+                    # api_view reads the attribute it sets: one between them may drop it
+                    between = fn.decorator_list[api_view + 1 : i]
+                    kept = all(self.keeps_attributes(x, rel) for x in between)
+                    permissions = _elements(d.args[0]) if kept else []
                 continue
-            more, fewer = _decorator_guards(d, self.reader(self.index.paths.get(id(fn), "")))
+            more, fewer = _decorator_guards(d, self.reader(rel))
             guards, unguards = [*guards, *more], [*unguards, *fewer]
+        if api_view is not None and "cache_page" in names[:api_view]:
+            permissions = []  # a cached response is served before DRF checks permissions
+        if (fn.name, "login_required") in self.attributes():
+            unguards.append("login_not_required")  # `view.login_required = False`: what it sets
         return _View(
             [(m, fn.name, fn) for m in methods],
             _unique(guards),
@@ -972,6 +1130,17 @@ class _Django:
             permissions,
             drf=api_view is not None,
         )
+
+    def keeps_attributes(self, d: ast.AST, rel: str) -> bool:
+        """A decorator that keeps the attributes of what it wraps: Django's and DRF's, the inert
+        ones, and checkout code using `functools.wraps`."""
+        name = _dotted(d)
+        if _INERT_DECORATORS.match(name.split(".")[-1]) or self.origin(rel, name).startswith(
+            ("django.", "rest_framework.")
+        ):
+            return True
+        found = self.bound_to(name, rel)
+        return found is not None and "wraps(" in ast.unparse(found)
 
     # ---- DRF routers
     def routers(self) -> dict[tuple[str, str], _Router]:
@@ -1005,7 +1174,7 @@ class _Django:
                     # `NestedSimpleRouter(parent, r"notes", lookup="note")`
                     parent = self.router_key(rel, _dotted(value.args[0]))
                     route, computed = self.part(value.args[1], rel)
-                    lookup = _const_str(kw.get("lookup")) or "parent"
+                    lookup = _const_str(kw.get("lookup"))
                     router.parent = (parent, route.strip("^$").strip("/"), lookup)
                     router.dynamic |= computed or parent is None
         self._routers = found
@@ -1144,7 +1313,17 @@ class _Django:
             ),
             "pk",
         )
-        return f"{above}{route}/<{lookup}_{field}>/", dynamic
+        # drf-nested-routers' default lookup is `nested_<depth>`, read but not certain
+        nested = f"nested_{self.depth(parent)}"
+        return f"{above}{route}/<{lookup or nested}_{field}>/", dynamic or lookup is None
+
+    def depth(self, key: tuple[str, str] | None) -> int:
+        """How deep a nested router's parent sits: 1 under a plain router."""
+        depth, seen = 1, set()
+        while key is not None and key not in seen and (r := self.routers().get(key)) and r.parent:
+            seen.add(key)
+            depth, key = depth + 1, r.parent[0]
+        return depth
 
     def viewset_rows(
         self, rel: str, node: ast.AST, prefix: str, dynamic: bool, line: int, slash: str = "/"
@@ -1158,12 +1337,16 @@ class _Django:
         actions: dict[str, ast.AST] = {}
         extra: list[tuple[str, str, ast.AST, bool, list[str]]] = []
         acting: dict[int, ast.Call] = {}
+        library = None  # another library's viewset, whose `@action`s we don't know
         for where_c, c in reversed(mro):
             if isinstance(c, str):
-                # a library base whose actions we don't know may answer any of them
+                # a base whose actions we don't know may answer any of them
                 known = _VIEWSET_ACTIONS.get(c)
-                for a in known if known is not None else (() if c in _NO_ACTIONS else _ALL_ACTIONS):
-                    actions.setdefault(a, cls)
+                if known is None and c not in _NO_ACTIONS:
+                    known = _ALL_ACTIONS
+                    library = c if self.third_party(where_c, c) else library
+                for a in known or ():
+                    actions[a] = cls  # its own, over those of the classes after it
                 continue
             mapped: dict[str, list[tuple[str, ast.AST]]] = {}
             for n in c.body:
@@ -1231,23 +1414,21 @@ class _Django:
         methods_of = {
             n.name for _, _, _, n in routes if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef)
         }
-        self.emit(
-            rel,
-            line,
-            dynamic,
-            _View(
-                [],
-                policy.guards,
-                policy.unguards,
-                policy.permissions,
-                True,
-                methods_of,
-                policy.named,
-                mro,
-                acting,
-            ),
-            routes,
+        info = _View(
+            [],
+            policy.guards,
+            policy.unguards,
+            policy.permissions,
+            True,
+            methods_of,
+            policy.named,
+            mro,
+            acting,
         )
+        self.emit(rel, line, dynamic, info, routes)
+        if library is not None:
+            # the routes its `@action`s add (djoser's `users/me/`) aren't in the checkout
+            self.emit(rel, line, True, info, [("any", f"{lead}[{library} actions]", cls.name, cls)])
 
     def is_action(self, rel: str, d: ast.AST) -> bool:
         """`@action`, legacy `@detail_route`/`@list_route`, or an alias of one."""
@@ -1287,6 +1468,70 @@ def _forwarded(tree: ast.Module) -> set[int]:
                 and len(n.args) >= 2
                 and any(isinstance(a, ast.Name) and a.id in params for a in n.args[:2])
             }
+    return out
+
+
+def _unknown_view(name: str) -> bool:
+    """A library view whose own methods we don't know (`LoginView` answers POST)."""
+    return bool(_LIBRARY_VIEW.search(name)) and name not in {*_GENERIC_METHODS, *_PLAIN_VIEWS}
+
+
+def _defers(dispatch: ast.AST) -> bool:
+    """A view's own `dispatch` that hands every request to `super().dispatch()` before it could
+    answer one itself; `super(Mixin, self)` calls past the mixins."""
+    if re.search(r"\bsuper\(\s*\w", ast.unparse(dispatch)):
+        return False
+    nodes = list(_own_nodes(dispatch))
+    calls = [
+        n for n in nodes if isinstance(n, ast.Call) and ast.unparse(n.func) == "super().dispatch"
+    ]
+    if not calls:
+        return False
+    first = min(c.lineno for c in calls)
+    return not any(
+        isinstance(n, ast.Return)
+        and n.lineno <= first
+        and not any(c is n.value or c is getattr(n.value, "value", None) for c in calls)
+        for n in nodes
+    )
+
+
+def _bound_names(n: ast.stmt) -> set[str]:
+    """The names a module-level statement binds."""
+    if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+        return {n.name}
+    if isinstance(n, ast.Assign | ast.AnnAssign | ast.AugAssign):
+        targets = _targets(n)
+    elif isinstance(n, ast.For | ast.AsyncFor):
+        targets = [n.target]
+    else:
+        return set()
+    out: set[str] = set()
+    while targets:
+        t = targets.pop()
+        if isinstance(t, ast.Name):
+            out.add(t.id)
+        elif isinstance(t, ast.Tuple | ast.List):
+            targets += t.elts
+        elif isinstance(t, ast.Starred):
+            targets.append(t.value)
+    return out
+
+
+def _changed(tree: ast.Module, read: set[int]) -> set[str]:
+    """The names a module changes other than by the statements read as values: assigned under a
+    condition or in place (`|=`), through a subscript or a method call, or deleted."""
+    out: set[str] = set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Assign | ast.AnnAssign | ast.AugAssign) and id(n) not in read:
+            out |= {_dotted(t).split(".")[0] for t in _targets(n)}
+        if isinstance(n, ast.Delete):
+            out |= {_dotted(t) for t in n.targets}
+        if isinstance(n, ast.Assign | ast.AugAssign | ast.Delete):
+            targets = n.targets if isinstance(n, ast.Assign | ast.Delete) else [n.target]
+            out |= {_dotted(t.value) for t in targets if isinstance(t, ast.Subscript)}
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute):
+            out.add(_dotted(n.func.value))
     return out
 
 
@@ -1358,7 +1603,7 @@ def _decorator_guards(d: ast.AST, reader: GuardReader) -> tuple[list[str], list[
         out = [_decorator_guards(x, reader) for x in _elements(inner)]
         return _unique([g for x, _ in out for g in x]), sorted({u for _, x in out for u in x})
     found = reader.resolve(_dotted(d))
-    if name == "login_not_required" or (
+    if "login_not_required" in (name, reader.origin(_dotted(d)).split(".")[-1]) or (
         found is not None and ".login_required = False" in ast.unparse(found)
     ):
         return [], ["login_not_required"]  # what `LoginRequiredMiddleware` exempts
@@ -1372,6 +1617,8 @@ def _decorator_guards(d: ast.AST, reader: GuardReader) -> tuple[list[str], list[
         for k in d.keywords
     ):
         return [], [f"optional:{label}"]  # `login_required(optional=True)` lets anyone through
+    if requires_nothing(d):
+        return [], []  # `permission_required([])`: `has_perms(())` admits anyone
     return ([label] if reader.guards(_dotted(d)) else []), []
 
 

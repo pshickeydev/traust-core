@@ -22,17 +22,46 @@ KNOWN_PERMISSIONS = {
     "TokenHasScope", "TokenHasReadWriteScope", "TokenHasResourceScope", "HasAPIKey",
 }  # fmt: skip
 READ_ONLY_PERMISSIONS = {"IsAuthenticatedOrReadOnly", "DjangoModelPermissionsOrAnonReadOnly"}
+# guards that check what they are given: given nothing, they admit anyone
+REQUIREMENT_GUARDS = {
+    "permission_required", "roles_required", "roles_accepted", "permissions_required",
+    "permissions_accepted",
+}  # fmt: skip
+# a checkout binding that can't be read (an assignment, a module this interpreter can't parse)
+UNREADABLE = ast.Module(body=[], type_ignores=[])
 
 Resolve = Callable[[str], ast.AST | None]
+
+
+def empty(node: ast.AST | None) -> bool:
+    """An empty literal: `[]`, `()`, `""`."""
+    if isinstance(node, ast.List | ast.Tuple | ast.Set | ast.Dict):
+        return not getattr(node, "elts", getattr(node, "keys", None))
+    return isinstance(node, ast.Constant) and node.value in ("", None)
+
+
+def requires_nothing(d: ast.AST) -> bool:
+    """`permission_required([])`, `roles_required()`: a requirement guard given nothing."""
+    if not isinstance(d, ast.Call) or ast.unparse(d.func).split(".")[-1] not in REQUIREMENT_GUARDS:
+        return False
+    first = d.args[0] if d.args else next((k.value for k in d.keywords if k.arg == "perm"), None)
+    return first is None or empty(first)
 
 
 class GuardReader:
     """Whether a name is a known guard; `resolve` finds a checkout definition by the name used
     for it (None for a library's), which makes the name no known guard."""
 
-    def __init__(self, resolve: Resolve, *, disabled: frozenset[str] = frozenset()) -> None:
+    def __init__(
+        self,
+        resolve: Resolve,
+        *,
+        disabled: frozenset[str] = frozenset(),
+        origin: Callable[[str], str] = lambda name: name,
+    ) -> None:
         self.resolve = resolve
         self.disabled = disabled  # known guards configured off (flask-login's `LOGIN_DISABLED`)
+        self.origin = origin  # the full name a name is imported as
 
     def guards(self, name: str) -> bool:
         """A decorator or mixin named `name` is a known guard the checkout doesn't redefine."""

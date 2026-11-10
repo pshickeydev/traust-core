@@ -458,3 +458,590 @@ def test_matrix_holes_a_review_found_stay_closed(tmp_path: Path, case: dict) -> 
         if r["family"] in ("django-drf", "flask")
     )
     assert rows == case["rows"]
+
+
+_DRF_DEFAULT = (
+    "ROOT_URLCONF = 'app.urls'\n"
+    "REST_FRAMEWORK = {'DEFAULT_PERMISSION_CLASSES': "
+    "['rest_framework.permissions.IsAuthenticated']}\n"
+)
+_LOGIN_MIDDLEWARE = (
+    "ROOT_URLCONF = 'app.urls'\n"
+    "MIDDLEWARE = ['django.contrib.auth.middleware.LoginRequiredMiddleware']\n"
+)
+
+
+def _urls(*routes: str, imports: str = "from . import views") -> str:
+    return f"from django.urls import path\n{imports}\nurlpatterns = [{', '.join(routes)}]\n"
+
+
+# per app, the guards each row shows: none where a binding, an order or a library is unread (D38)
+_PROTECTION = {
+    "drf_package_named_like_rest_framework_sets_its_own": (
+        {
+            "app/settings.py": _DRF_DEFAULT,
+            "app/urls.py": _urls("path('t/', views.T.as_view())"),
+            "app/views.py": """\
+                from rest_framework_simplejwt.views import TokenObtainPairView
+                class T(TokenObtainPairView):
+                    pass
+            """,
+        },
+        {("any", "t/"): []},
+    ),
+    "drf_view_with_its_own_permissions": (
+        {
+            "app/settings.py": _DRF_DEFAULT,
+            "app/urls.py": _urls("path('t/', views.T.as_view())"),
+            "app/views.py": """\
+                from rest_framework.authtoken.views import ObtainAuthToken
+                class T(ObtainAuthToken):
+                    pass
+            """,
+        },
+        {("any", "t/"): []},
+    ),
+    "drf_permission_method_later_in_the_order": (
+        {
+            "app/urls.py": _urls("path('a/', views.A.as_view())"),
+            "app/views.py": """\
+                from rest_framework.views import APIView
+                from rest_framework.permissions import IsAuthenticated
+                class Open:
+                    def get_permissions(self):
+                        return []
+                class A(Open, APIView):
+                    permission_classes = [IsAuthenticated]
+                    def get(self, request): ...
+            """,
+        },
+        {("GET", "a/"): []},
+    ),
+    "drf_permission_classes_set_outside_the_class_body": (
+        {
+            "app/urls.py": _urls(*(f"path('{c}/', views.{c.upper()}.as_view())" for c in "acd")),
+            "app/views.py": """\
+                from rest_framework.views import APIView
+                from rest_framework.permissions import AllowAny, IsAuthenticated
+                def public(cls):
+                    cls.permission_classes = [AllowAny]
+                    return cls
+                class A(APIView):
+                    permission_classes = [IsAuthenticated]
+                    def get(self, request): ...
+                A.permission_classes = [AllowAny]
+                class C(APIView):
+                    permission_classes = [IsAuthenticated]
+                    def setup(self, request, *args, **kwargs):
+                        self.permission_classes = [AllowAny]
+                    def get(self, request): ...
+                @public
+                class D(APIView):
+                    permission_classes = [IsAuthenticated]
+                    def get(self, request): ...
+            """,
+        },
+        {("GET", "a/"): [], ("GET", "c/"): [], ("GET", "d/"): []},
+    ),
+    "dj_guard_name_bound_by_checkout_code": (
+        {
+            "app/urls.py": _urls(*(f"path('{v}/', views.{v})" for v in "abcd")),
+            "app/sso.py": (
+                "class SSO:\n    def login_required(self, view):\n        return view\n"
+                "sso = SSO()\n"
+            ),
+            "app/auth.py": (
+                "from django.contrib.auth.decorators import user_passes_test\n"
+                "login_required = user_passes_test(lambda u: True)\n"
+            ),
+            "app/views.py": """\
+                from django.conf import settings
+                from django.contrib.auth.decorators import login_required
+                from .sso import sso
+                from . import auth
+                if settings.DEBUG:
+                    def login_required(view):
+                        return view
+                staff_member_required = lambda v: v
+                @login_required
+                def a(request): ...
+                @staff_member_required
+                def b(request): ...
+                @auth.login_required
+                def c(request): ...
+                @sso.login_required
+                def d(request): ...
+            """,
+        },
+        {("any", "a/"): [], ("any", "b/"): [], ("any", "c/"): [], ("any", "d/"): []},
+    ),
+    "dj_guard_in_a_module_python_cant_parse": (
+        {
+            "app/urls.py": _urls("path('a/', views.a)"),
+            "app/auth.py": "def login_required(view):\n    print 'todo'\n    return view\n",
+            "app/views.py": (
+                "from .auth import login_required\n@login_required\ndef a(request): ...\n"
+            ),
+        },
+        {("any", "a/"): []},
+    ),
+    "dj_star_import_order_decides_the_binding": (
+        {
+            "app/urls.py": _urls(
+                "path('a/', views.a)",
+                "path('b/', views2.b)",
+                "path('c/', pages.page)",
+                imports="from . import views, views2, pages",
+            ),
+            "app/auth.py": "def login_required(view):\n    return view\n",
+            "app/views.py": """\
+                from django.contrib.auth.decorators import login_required
+                from .auth import *
+                @login_required
+                def a(request): ...
+            """,
+            "app/views2.py": """\
+                from .auth import *
+                from django.contrib.auth.decorators import login_required
+                @login_required
+                def b(request): ...
+            """,
+            "app/pages/__init__.py": "from .secure import *\nfrom .legacy import *\n",
+            "app/pages/secure.py": (
+                "from django.contrib.auth.decorators import login_required\n"
+                "@login_required\ndef page(request): ...\n"
+            ),
+            "app/pages/legacy.py": "def page(request): ...\n",
+        },
+        {("any", "a/"): [], ("any", "b/"): ["login_required"], ("any", "c/"): []},
+    ),
+    "dj_library_view_method_ahead_of_a_guarded_mixin": (
+        {
+            "app/urls.py": _urls("path('a/', views.A.as_view())", "path('b/', views.B.as_view())"),
+            "app/views.py": """\
+                from django.contrib.auth.decorators import login_required
+                from django.utils.decorators import method_decorator
+                from django.views.generic import TemplateView
+                class Secure:
+                    @method_decorator(login_required)
+                    def get(self, request): ...
+                class A(TemplateView, Secure):
+                    pass
+                class B(Secure, TemplateView):
+                    pass
+            """,
+        },
+        {("GET", "a/"): [], ("GET", "b/"): ["login_required"]},
+    ),
+    "dj_settings_changed_in_place_deleted_or_star_imported_under_try": (
+        {
+            "app/settings.py": (
+                "ROOT_URLCONF = 'app.urls'\n"
+                "REST_FRAMEWORK = {'DEFAULT_PERMISSION_CLASSES': ['IsAuthenticated']}\n"
+                "REST_FRAMEWORK |= {'DEFAULT_PERMISSION_CLASSES': ['AllowAny']}\n"
+            ),
+            "app/urls.py": _urls("path('a/', views.A.as_view())"),
+            "app/views.py": (
+                "from rest_framework.views import APIView\n"
+                "class A(APIView):\n    def get(self, request): ...\n"
+            ),
+            "b/settings.py": (
+                "ROOT_URLCONF = 'b.urls'\n"
+                "MIDDLEWARE = ['django.contrib.auth.middleware.LoginRequiredMiddleware']\n"
+                "del MIDDLEWARE[-1]\n"
+            ),
+            "b/urls.py": _urls("path('b/', views.me)"),
+            "b/views.py": "def me(request): ...\n",
+            "c/settings/__init__.py": (
+                "ROOT_URLCONF = 'c.urls'\n"
+                "MIDDLEWARE = ['django.contrib.auth.middleware.LoginRequiredMiddleware']\n"
+                "try:\n    from .local import *\nexcept ImportError:\n    pass\n"
+            ),
+            "c/settings/local.py": "MIDDLEWARE = []\n",
+            "c/urls.py": _urls("path('c/', views.me)"),
+            "c/views.py": "def me(request): ...\n",
+            "d/settings/base.py": _LOGIN_MIDDLEWARE.replace("app.urls", "d.urls"),
+            "d/settings/open.py": "MIDDLEWARE = []\n",
+            "d/settings/production.py": "from .base import *\nfrom .open import *\n",
+            "d/urls.py": _urls("path('d/', views.me)"),
+            "d/views.py": "def me(request): ...\n",
+        },
+        {("GET", "a/"): [], ("any", "b/"): [], ("any", "c/"): [], ("any", "d/"): []},
+    ),
+    "dj_dispatch_answering_before_the_mixins": (
+        {
+            "app/urls.py": _urls("path('a/', views.A.as_view())", "path('b/', views.B.as_view())"),
+            "app/views.py": """\
+                from django.contrib.auth.mixins import LoginRequiredMixin
+                from django.views import View
+                class Preview:
+                    def dispatch(self, request, *args, **kwargs):
+                        if request.GET.get('preview'):
+                            return self.get(request)
+                        return super().dispatch(request, *args, **kwargs)
+                class Fast:
+                    async def dispatch(self, request, *args, **kwargs):
+                        return await self.get(request)
+                class A(Preview, LoginRequiredMixin, View):
+                    def get(self, request): ...
+                class B(Fast, LoginRequiredMixin, View):
+                    async def get(self, request): ...
+            """,
+        },
+        {("GET", "a/"): [], ("GET", "b/"): []},
+    ),
+    "dj_middleware_exemptions_by_attribute_or_alias": (
+        {
+            "app/settings.py": _LOGIN_MIDDLEWARE,
+            "app/urls.py": _urls(
+                "path('h/', views.h)", "path('h2/', views.h2)", "path('me/', views.me)"
+            ),
+            "app/views.py": """\
+                from django.contrib.auth.decorators import login_not_required as public_view
+                def h(request): ...
+                h.login_required = False
+                @public_view
+                def h2(request): ...
+                def me(request): ...
+            """,
+        },
+        {("any", "h/"): [], ("any", "h2/"): [], ("any", "me/"): ["LoginRequiredMiddleware"]},
+    ),
+    "drf_permissions_a_cache_or_decorator_puts_out_of_reach": (
+        {
+            "app/urls.py": _urls(
+                "path('s/', cache_page(60)(views.S.as_view()))",
+                "path('s2/', views.S.as_view())",
+                "path('a/', views.a)",
+                "path('b/', views.b)",
+                imports="from django.views.decorators.cache import cache_page\nfrom . import views",
+            ),
+            "app/views.py": """\
+                from rest_framework.decorators import api_view, permission_classes
+                from rest_framework.permissions import IsAuthenticated
+                from rest_framework.views import APIView
+                def timed(f):
+                    def inner(*a, **k):
+                        return f(*a, **k)
+                    return inner
+                class S(APIView):
+                    permission_classes = [IsAuthenticated]
+                    def get(self, request): ...
+                @api_view(['GET'])
+                @timed
+                @permission_classes([IsAuthenticated])
+                def a(request): ...
+                @api_view(['GET'])
+                @permission_classes([IsAuthenticated])
+                @timed
+                def b(request): ...
+            """,
+        },
+        {
+            ("GET", "s/"): [],
+            ("GET", "s2/"): ["IsAuthenticated"],
+            ("GET", "a/"): [],
+            ("GET", "b/"): ["IsAuthenticated"],
+        },
+    ),
+    "dj_permission_requirement_asking_for_nothing": (
+        {
+            "app/urls.py": _urls(
+                "path('a/', views.a)", "path('b/', views.B.as_view())", "path('c/', views.c)"
+            ),
+            "app/views.py": """\
+                from django.contrib.auth.decorators import permission_required
+                from django.contrib.auth.mixins import PermissionRequiredMixin
+                from django.views import View
+                @permission_required([])
+                def a(request): ...
+                class B(PermissionRequiredMixin, View):
+                    permission_required = ()
+                    def get(self, request): ...
+                @permission_required('notes.view_note')
+                def c(request): ...
+            """,
+        },
+        {("any", "a/"): [], ("GET", "b/"): [], ("any", "c/"): ["permission_required"]},
+    ),
+    "fl_guard_name_bound_by_checkout_code": (
+        {
+            "app/auth.py": "login_required = lambda f: f\n",
+            "app/legacy.py": "def fresh_login_required(f):\n    print 'todo'\n",
+            "app/one.py": "def jwt_required(f):\n    return f\n",
+            "app/two.py": "def jwt_required(f):\n    return f\n",
+            "app/views.py": """\
+                from flask import Flask
+                from app.auth import login_required
+                from app.legacy import fresh_login_required
+                from flask_jwt_extended import jwt_required
+                from app.one import *
+                app = Flask(__name__)
+                @app.route('/a')
+                @login_required
+                def a(): ...
+                @app.route('/b')
+                @fresh_login_required
+                def b(): ...
+                @app.route('/c')
+                @jwt_required
+                def c(): ...
+                @login_required
+                def d(): ...
+                def d(): ...
+                app.add_url_rule('/d', view_func=d)
+            """,
+        },
+        {("GET", "/a"): [], ("GET", "/b"): [], ("GET", "/c"): [], ("GET", "/d"): []},
+    ),
+    "fl_class_decorators_read_in_method_order": (
+        {
+            "app.py": """\
+                from flask import Flask
+                from flask.views import MethodView
+                from flask_login import login_required
+                app = Flask(__name__)
+                class Base(MethodView):
+                    decorators = [login_required]
+                    @login_required
+                    def get(self): ...
+                class A(Base):
+                    pass
+                class B(Base):
+                    decorators = []
+                    def get(self): ...
+                class V(A, B):
+                    pass
+                class Items(MethodView):
+                    decorators = [login_required]
+                    def get(self): ...
+                Items.decorators = []
+                app.add_url_rule('/v', view_func=V.as_view('v'))
+                app.add_url_rule('/items', view_func=Items.as_view('items'))
+            """,
+        },
+        {("GET", "/v"): [], ("GET", "/items"): []},
+    ),
+    "fl_decorators_that_let_anyone_through": (
+        {
+            "app.py": """\
+                from flask import Flask
+                from flask.views import MethodView
+                from flask_restful import Api, Resource
+                from flask_jwt_extended import jwt_required
+                from flask_login import login_required
+                app = Flask(__name__)
+                api = Api(app)
+                class Feed(MethodView):
+                    decorators = [jwt_required(optional=True)]
+                    def get(self): ...
+                class Items(Resource):
+                    method_decorators = {'get': [jwt_required(optional=True)]}
+                    def get(self): ...
+                class BaseResource(MethodView):
+                    method_decorators = [login_required]
+                class Docs(BaseResource):
+                    def get(self): ...
+                def wall(): ...
+                app.add_url_rule('/feed', view_func=Feed.as_view('feed'))
+                api.add_resource(Items, '/items')
+                app.add_url_rule('/docs', view_func=Docs.as_view('docs'))
+                app.add_url_rule('/wall', view_func=jwt_required(optional=True)(wall))
+            """,
+        },
+        {("GET", "/feed"): [], ("GET", "/items"): [], ("GET", "/docs"): [], ("GET", "/wall"): []},
+    ),
+    "fl_login_disabled_in_a_config_file": (
+        {
+            "app.py": """\
+                from flask import Flask
+                from flask_login import login_required
+                app = Flask(__name__)
+                app.config.from_pyfile('settings.cfg')
+                @app.route('/me')
+                @login_required
+                def me(): ...
+            """,
+            "settings.cfg": "LOGIN_DISABLED = True\n",
+        },
+        {("GET", "/me"): []},
+    ),
+    "fl_login_disabled_by_setdefault": (
+        {
+            "app.py": """\
+                from flask import Flask
+                from flask_login import login_required
+                app = Flask(__name__)
+                app.config.setdefault('LOGIN_DISABLED', True)
+                @app.route('/me')
+                @login_required
+                def me(): ...
+            """,
+        },
+        {("GET", "/me"): []},
+    ),
+    "fl_login_disabled_by_the_legacy_setter": (
+        {
+            "app.py": """\
+                from flask import Flask
+                from flask_login import LoginManager, login_required
+                app = Flask(__name__)
+                LoginManager(app)._login_disabled = True
+                @app.route('/me')
+                @login_required
+                def me(): ...
+            """,
+        },
+        {("GET", "/me"): []},
+    ),
+    "fl_auth_decorators_let_options_through": (
+        {
+            "app.py": """\
+                from flask import Flask
+                from flask.views import MethodView
+                from flask_login import login_required
+                from flask_jwt_extended import jwt_required
+                app = Flask(__name__)
+                @app.route('/x', methods=['POST', 'OPTIONS'])
+                @login_required
+                def x(): ...
+                class Z(MethodView):
+                    decorators = [jwt_required()]
+                    def get(self): ...
+                    def options(self): ...
+                app.add_url_rule('/z', view_func=Z.as_view('z'))
+            """,
+        },
+        {
+            ("OPTIONS", "/x"): [],
+            ("POST", "/x"): ["login_required"],
+            ("OPTIONS", "/z"): [],
+            ("GET", "/z"): ["jwt_required"],
+        },
+    ),
+    "fl_response_cache_outside_the_guard": (
+        {
+            "app.py": """\
+                from flask import Flask
+                from flask.views import MethodView
+                from flask_caching import Cache
+                from flask_login import login_required
+                app = Flask(__name__)
+                cache = Cache(app)
+                @app.route('/dash')
+                @cache.cached(timeout=60)
+                @login_required
+                def dash(): ...
+                @app.route('/dash2')
+                @login_required
+                @cache.cached(timeout=60)
+                def dash2(): ...
+                class V(MethodView):
+                    decorators = [login_required, cache.cached(timeout=60)]
+                    def get(self): ...
+                class W(MethodView):
+                    decorators = [cache.cached(timeout=60), login_required]
+                    def get(self): ...
+                app.add_url_rule('/v', view_func=V.as_view('v'))
+                app.add_url_rule('/w', view_func=W.as_view('w'))
+            """,
+        },
+        {
+            ("GET", "/dash"): [],
+            ("GET", "/dash2"): ["login_required"],
+            ("GET", "/v"): [],
+            ("GET", "/w"): ["login_required"],
+        },
+    ),
+}
+
+
+@pytest.mark.parametrize(("files", "shown"), _PROTECTION.values(), ids=_PROTECTION)
+def test_a_row_shows_only_guards_that_protect_it(
+    tmp_path: Path, files: dict[str, str], shown: dict[tuple[str, str], list[str]]
+) -> None:
+    _write(tmp_path, {rel: dedent(text) for rel, text in files.items()})
+    rows = _rows(tmp_path)
+    for key, guards in shown.items():
+        row = rows[key]
+        assert [*row["guards"], *row["scope_guards"]] == guards, key
+        assert row["judgement_required"] is not guards, key
+
+
+def test_routes_a_library_serves_are_listed_with_their_path_unknown(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        {
+            "app/urls.py": (
+                "from django.urls import include, path\n"
+                "from rest_framework.routers import SimpleRouter\nfrom . import views\n"
+                "router = SimpleRouter()\nrouter.register('users', views.Users)\n"
+                "urlpatterns = [path('', include(router.urls))]\n"
+                "handler404 = views.not_found\nhandler500 = 'app.views.oops'\n"
+            ),
+            "app/views.py": (
+                "from djoser.views import UserViewSet\n"
+                "class Users(UserViewSet):\n    pass\n"
+                "def not_found(request, exception): ...\ndef oops(request): ...\n"
+            ),
+            "web.py": dedent("""\
+                from flask import Flask
+                from flask_dance.contrib.github import make_github_blueprint
+                from flask_admin import Admin
+                app = Flask(__name__)
+                gh = make_github_blueprint(client_id='x')
+                app.register_blueprint(gh, url_prefix='/login')
+                admin = Admin(app)
+            """),
+            "spec/app.py": (
+                "import connexion\napp = connexion.App(__name__)\napp.add_api('api.yaml')\n"
+            ),
+        },
+    )
+    result = route_guards(tree_files(tmp_path))
+    rows = {(r.method, r.pattern): r for r in result.routes}
+    for key in (
+        ("any", "users/[UserViewSet actions]"),  # the library viewset's `@action`s
+        ("any", "[handler404]"),
+        ("any", "[handler500]"),
+        ("ANY", "/login/[gh]"),
+        ("ANY", "/admin/[Flask-Admin]"),
+    ):
+        assert rows[key].pattern_dynamic and rows[key].judgement_required, key
+    assert rows[("any", "[handler500]")].handler.expr == "oops"
+    assert "connexion" in {g.system for g in result.coverage_gaps}
+
+
+def test_prefixes_drf_nested_routers_and_wsgi_dispatchers_add(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        {
+            "app/urls.py": (
+                "from django.urls import include, path\n"
+                "from rest_framework.routers import SimpleRouter\n"
+                "from rest_framework_nested.routers import NestedSimpleRouter\n"
+                "from . import views\n"
+                "router = SimpleRouter()\nrouter.register('notes', views.Notes)\n"
+                "nested = NestedSimpleRouter(router, 'notes')\n"
+                "nested.register('comments', views.Notes)\n"
+                "urlpatterns = [path('', include(nested.urls))]\n"
+            ),
+            "app/views.py": (
+                "from rest_framework import viewsets\n"
+                "class Notes(viewsets.ReadOnlyModelViewSet):\n    pass\n"
+            ),
+            "web.py": dedent("""\
+                from flask import Flask
+                from werkzeug.middleware.dispatcher import DispatcherMiddleware
+                front = Flask('front')
+                api = Flask('api')
+                @api.route('/items')
+                def items(): ...
+                front.wsgi_app = DispatcherMiddleware(front.wsgi_app, {'/api': api.wsgi_app})
+            """),
+        },
+    )
+    rows = _rows(tmp_path)
+    # drf-nested-routers' default lookup, which the reading can't be sure of
+    assert rows[("GET", "notes/<nested_1_pk>/comments/")]["pattern_dynamic"]
+    assert not rows[("GET", "/api/items")]["pattern_dynamic"]
