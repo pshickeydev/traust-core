@@ -1064,10 +1064,13 @@ def test_an_outcome_reported_outside_a_run_ends_the_attempt_and_folds(
     assert service.get(item.work_item_id).status == "merged"  # the fold, re-read
     for finding in found:
         said = decisions(engine, finding)[-1]
-        assert (said.assessment_id, said.reason, said.rationale) == (
+        # an attempt's statements are authored by the attempt, never a principal (contracts:
+        # CHECK (assessment_id IS NULL OR actor IS NULL)); the forge's word rides the rationale
+        assert (said.assessment_id, said.reason, said.rationale, said.actor) == (
             item.work_item_id,
             "merged",
             f"merged as {sha} by octocat",
+            None,
         )
     before = [decisions(engine, f) for f in found]
     assert service.record_outcome(item.work_item_id, merged(sha, "octocat"), PERSON) == ended
@@ -1158,4 +1161,6 @@ def test_outcome_recording_is_a_person_s_or_a_granted_machine_s_word(
     service = scoped.services().remediation
     ended = service.record_outcome(item.work_item_id, report, tracker)
     assert ended.status == "abandoned"
+    said = decisions(engine, found[0])[-1]
+    assert (said.reason, said.actor) == ("abandoned", None)  # the attempt's own statement
     assert service.record_outcome(item.work_item_id, report, PERSON).status == "abandoned"
