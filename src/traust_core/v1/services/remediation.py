@@ -81,6 +81,7 @@ from traust_core.v1.models.remediation import (
     Fork,
     PatchNarrative,
     PatchResult,
+    ProgressReport,
     Propagation,
     PropagationEvidence,
     RemediationDraft,
@@ -687,7 +688,9 @@ class RemediationService:
         if known is not None and known.public:
             raise ValidationError(f"{fork_url} is a public repository: a fix never goes there")
 
-    def record_progress(self, work_item_id: UUID, status: RemediationStatus) -> WorkItem:
+    def record_progress(
+        self, work_item_id: UUID, status: RemediationStatus, *, rationale: str | None = None
+    ) -> WorkItem:
         """Move the work item to `status` (forward only); the same status again is a no-op.
         A remediation scheduled on the item follows it, in the same transaction."""
         item = self.get(work_item_id)
@@ -695,13 +698,36 @@ class RemediationService:
             return item
         with self._uow.write() as uow:
             self._findings.decisions.record_resolution(
-                work_item_id, item.finding_ids, resolution_for(status), status
+                work_item_id,
+                item.finding_ids,
+                resolution_for(status),
+                status,
+                rationales=None
+                if rationale is None
+                else {finding_id: rationale for finding_id in item.finding_ids},
             )
             uow.commit()
         self._uow.after_commit(
             lambda: log.info("work item %s: %s -> %s", work_item_id, item.status, status)
         )
         return self.get(work_item_id)
+
+    def record_outcome(
+        self, work_item_id: UUID, outcome: ProgressReport, principal: Principal
+    ) -> WorkItem:
+        """End an attempt from outside a run, where a run's report cannot say it: a PR merged
+        upstream (the commit it merged as) or abandoned. A verified person may say it, or a
+        machine granted remediation recording on the item's repository — filing happens
+        outside order leases, so no lease is bound."""
+        item = self.get(work_item_id)
+        repository_id = self._inventory.get_ref(item.repository_ref_id).repository_id
+        self._ops.authorize_write(REMEDIATE_FINDING, repository_id, principal)
+        with self._uow.write() as uow:
+            # a concurrent report for the item waits here, then sees this outcome
+            self._findings.lock_findings(item.finding_ids)
+            moved = self.record_progress(work_item_id, outcome.status, rationale=outcome.rationale)
+            uow.commit()
+        return moved
 
     def record_pull_request(
         self, work_item_id: UUID, tracker: ExternalRef, principal: Principal

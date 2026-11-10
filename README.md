@@ -76,6 +76,18 @@ rewritten. Historical links remain unscoped. Core validates pairing on tracker
 inserts and scope changes and keeps finding repository identity immutable;
 the schema retains one guard for repository-ref moves.
 
+`POST /v1/remediations/{work_item_id}/progress` (`record_remediation_progress`,
+generated `RecordRemediationProgress`) accepts a `ProgressReport` (`status`:
+`merged` or `abandoned`, the merge commit as `merge_sha`, who ended it as `actor`)
+and returns the moved `WorkItem` — the write path for a PR-filing loop that learns
+of a merge or close outside any order lease. A verified person, or a machine
+granted `remediate_finding` on the repository in `recording.start`, may call it
+(`OpsService.authorize_write`, the same grant the scheduling door reads);
+unverified and ungranted identities are refused. A run's own statuses still come
+from its report. The ending decisions carry the merge SHA and actor as their
+rationale; replays are no-ops, and a status the forward-only state machine refuses
+answers 409.
+
 ## Historical reads and reporting correctness
 
 The native consumer doors above remain owned by their existing services and models.

@@ -6,7 +6,7 @@ from uuid import UUID
 from fastapi import APIRouter, Query
 
 from traust_core.v1.models.common import Cursor, Page, PageRequest
-from traust_core.v1.models.remediation import ExternalRef, WorkItem
+from traust_core.v1.models.remediation import ExternalRef, ProgressReport, WorkItem
 from traust_core.v1.models.remediation_scheduling import RemediationRequest, ScheduledEffort
 from traust_core.v1.models.vocabulary import RemediationStatus
 from traust_core.v1.rest.common.deps import Caller
@@ -62,3 +62,17 @@ def record_remediation_pull_request(
     work_item_id: UUID, body: ExternalRef, remediation: Remediation, caller: Caller
 ) -> WorkItem:
     return remediation.record_pull_request(work_item_id, body, caller)
+
+
+@router.post(
+    "/v1/remediations/{work_item_id}/progress",
+    responses=PROBLEMS(401, 403, 404, 409, 422),
+)
+def record_remediation_progress(
+    work_item_id: UUID, body: ProgressReport, remediation: Remediation, caller: Caller
+) -> WorkItem:
+    """End a remediation attempt from outside a run — merged (the commit it merged as) or
+    abandoned. The PR-filing loop's word: a verified person, or a machine granted
+    `remediate_finding` on the repository in `recording.start`. A run's own statuses come
+    from its report, never here."""
+    return remediation.record_outcome(work_item_id, body, caller)

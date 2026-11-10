@@ -15,6 +15,7 @@ from traust_core.v1.errors import ConflictError
 from traust_core.v1.models.findings import Finding, FindingView
 from traust_core.v1.models.remediation import (
     EvidenceItem,
+    ProgressReport,
     WorkItem,
     furthest,
     mutation_evidence,
@@ -194,6 +195,40 @@ def test_the_same_status_again_is_the_same_item() -> None:
 def test_where_an_item_stands_is_its_furthest_step() -> None:
     assert furthest(["candidate", "patched", "forked"]) == "patched"
     assert furthest(["merged", "candidate"]) == "merged"
+
+
+@pytest.mark.parametrize("status", ["merged", "abandoned"])
+def test_a_progress_report_ends_an_attempt(status: str) -> None:
+    report = ProgressReport(status=RemediationStatus(status))
+    assert report.merge_sha is None and report.actor is None and report.rationale is None
+
+
+@pytest.mark.parametrize("status", ["candidate", "forked", "patched", "checks_failed", "pr_opened"])
+def test_a_progress_report_never_replaces_a_run_s_own_status(status: str) -> None:
+    with pytest.raises(pydantic.ValidationError, match="this door ends an attempt"):
+        ProgressReport(status=RemediationStatus(status))
+
+
+def test_a_merge_report_carries_its_commit_and_its_actor() -> None:
+    sha = "1f0e8dad" + "0" * 32
+    said = ProgressReport(
+        status=RemediationStatus("merged"), merge_sha=sha, actor="octocat"
+    ).rationale
+    assert said == f"merged as {sha} by octocat"
+    assert ProgressReport(status=RemediationStatus("merged"), actor="octocat").rationale == (
+        "merged by octocat"
+    )
+    assert ProgressReport(status=RemediationStatus("abandoned"), actor="octocat").rationale == (
+        "abandoned by octocat"
+    )
+
+
+def test_a_merge_commit_rides_a_merged_report_only_and_must_be_a_git_sha() -> None:
+    sha = "1f0e8dad" + "0" * 32
+    with pytest.raises(pydantic.ValidationError, match="merged report only"):
+        ProgressReport(status=RemediationStatus("abandoned"), merge_sha=sha)
+    with pytest.raises(pydantic.ValidationError, match="not a full lowercase git sha"):
+        ProgressReport(status=RemediationStatus("merged"), merge_sha="not-a-sha")
 
 
 @pytest.mark.parametrize(

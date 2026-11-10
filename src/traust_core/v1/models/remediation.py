@@ -34,7 +34,7 @@ from traust_core.v1.models.findings import (
 from traust_core.v1.models.inventory import OrgName
 from traust_core.v1.models.operations import RunOrder
 from traust_core.v1.models.validation import ValidationAttempt
-from traust_core.v1.models.values import HttpsRepoUrl
+from traust_core.v1.models.values import GitSha, HttpsRepoUrl
 from traust_core.v1.models.vocabulary import (
     CrossRepoPropagation,
     DispositionResolution,
@@ -334,6 +334,39 @@ class WorkItem(Model):
 
     def is_done(self) -> bool:
         return self.report is not None
+
+
+class ProgressReport(Model):
+    """An attempt's end reported from outside a run: merged (the commit it merged as) or
+    abandoned — a run's own statuses come from its report, never this door."""
+
+    status: RemediationStatus
+    merge_sha: str | None = None
+    actor: str | None = None
+
+    @pydantic.model_validator(mode="after")
+    def _ends_the_attempt(self) -> Self:
+        if self.status not in _FINAL:
+            raise ValueError(f"{self.status} is a run's own progress; this door ends an attempt")
+        if self.merge_sha is not None:
+            if self.status is not RemediationStatus.MERGED:
+                raise ValueError("merge_sha rides a merged report only")
+            GitSha.parse(self.merge_sha)
+        if self.actor is not None and not self.actor.strip():
+            raise ValueError("actor must be nonblank text")
+        return self
+
+    @property
+    def rationale(self) -> str | None:
+        """The ending decisions' attribution: the commit a merge landed as, who ended it."""
+        if self.merge_sha is None and self.actor is None:
+            return None
+        said = [f"{self.status.value}"]
+        if self.merge_sha is not None:
+            said.append(f"as {self.merge_sha}")
+        if self.actor is not None:
+            said.append(f"by {self.actor}")
+        return " ".join(said)
 
 
 # The SKILL.md's preferred strategy per weakness class; anything else is the agent's call.

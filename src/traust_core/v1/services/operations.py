@@ -632,6 +632,17 @@ class OpsService:
                 "person, or a machine granted it in recording.start, may"
             )
 
+    def authorize_write(self, asset: AssetName, repository_id: UUID, principal: Principal) -> None:
+        """Who may record an operational write outside a run (a remediation outcome reported
+        from filing): the same principals that may ask for the run. The record doors bind a
+        lease; filing happens outside order leases, so the `recording.start` grant alone is
+        the machine's scope."""
+        if not self._may_request(asset, repository_id, principal):
+            raise ForbiddenError(
+                f"recording {asset} progress on repository {repository_id} requires a "
+                "verified person, or a machine granted it in recording.start"
+            )
+
     def _in_start_scope(self, principal: Principal, asset: AssetName, repository_id: UUID) -> bool:
         return any(
             scope.principal == principal.ref
