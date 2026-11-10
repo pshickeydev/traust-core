@@ -211,14 +211,31 @@ class FindingService:
         return view
 
     def list_by_ids(
-        self, finding_ids: Collection[UUID], *, read_budget: RecordBudget | None = None
+        self,
+        finding_ids: Collection[UUID],
+        *,
+        repository_ref_id: UUID | None = None,
+        read_budget: RecordBudget | None = None,
     ) -> list[FindingView]:
-        """These findings as they stand; NotFoundError names any that don't exist."""
+        """These findings on the requested ref (default line otherwise); missing IDs raise."""
         with self._uow as uow:
             found = uow.findings.list_by_ids(finding_ids, read_budget=read_budget)
             if missing := set(finding_ids) - {f.id for f in found}:
                 raise NotFoundError(f"findings {', '.join(sorted(map(str, missing)))}")
-            return self._views.views(uow, found, as_of=None, read_budget=read_budget)
+            facts = None
+            if repository_ref_id is not None:
+                ref = self._inventory.get_ref(repository_ref_id)
+                for finding in found:
+                    if finding.repository_id != ref.repository_id:
+                        raise ValidationError(
+                            f"finding {finding.id} is not in commit {ref.id}'s repository"
+                        )
+                if not found:
+                    return []
+                facts = FindingFacts.load(
+                    uow, found, None, repository_ref_id, read_budget=read_budget
+                )
+            return self._views.views(uow, found, as_of=None, facts=facts, read_budget=read_budget)
 
     def list_by_cwe(self, cwe: str) -> list[FindingView]:
         """Every finding tagged with this CWE, in any repository (a fleet fix's targets)."""

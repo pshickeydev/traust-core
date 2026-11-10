@@ -16,10 +16,15 @@ from traust_core.v1.errors import (
     IntegrityError,
     Issue,
     NotFoundError,
+    RemovedSecretError,
     ValidationError,
 )
 from traust_core.v1.models.analysis_results import ResultKind
-from traust_core.v1.models.artifacts import ARTIFACT_FOR_SCHEMA, ArtifactDocument
+from traust_core.v1.models.artifacts import (
+    ARTIFACT_FOR_SCHEMA,
+    ArtifactDocument,
+    RemediationArtifact,
+)
 from traust_core.v1.models.assessment import Artifact, Assessment
 from traust_core.v1.models.base import Dto
 from traust_core.v1.models.common import ArtifactRef, RecordBudget, TimeWindow
@@ -36,6 +41,32 @@ from traust_core.v1.repositories.traust.assessments import AssessmentsUnitOfWork
 A = TypeVar("A", bound=ArtifactDocument)
 _BATCH = 500  # ids per IN list
 log = logging.getLogger(__name__)
+
+
+def _split_diff(text: str) -> tuple[str, str]:
+    """A diff's added lines (what a patch introduces) and everything else."""
+    added: list[str] = []
+    other: list[str] = []
+    in_hunk = False
+    for line in text.splitlines(keepends=True):
+        if line.startswith("diff --git "):
+            in_hunk = False
+        elif line.startswith("@@ "):
+            in_hunk = True
+        if line.startswith("+") and (in_hunk or not line.startswith("+++ ")):
+            added.append(line[1:])
+        else:
+            other.append(line)
+    # A PEM can introduce key material in added lines between unchanged delimiters.
+    for match in PEM_PATTERN.finditer(text):
+        start = text.rfind("\n", 0, match.start()) + 1
+        block = text[start : match.end()]
+        lines = block.splitlines()
+        if lines[0].startswith("-") and lines[-1].startswith("-"):
+            continue
+        if any(line.startswith("+") for line in lines):
+            added.append(block)
+    return "".join(added), "".join(other)
 
 
 class InputFormat(Protocol):
@@ -354,6 +385,16 @@ class StagedArtifact(Generic[A]):
     _publisher: ArtifactPublisher = field(repr=False)
 
 
+@dataclass(frozen=True, slots=True)
+class StagedCompanion:
+    """A producer-supplied, digest-bound companion staged for the caller's transaction."""
+
+    kind: ResultKind
+    primary: ObjectRef
+    started: float
+    _publisher: ArtifactPublisher = field(repr=False)
+
+
 class ArtifactPublisher:
     def __init__(
         self,
@@ -431,6 +472,63 @@ class ArtifactPublisher:
         """Publish staged metadata; the caller may attach it in the same transaction."""
         return self._publish_staged(staged, None)[0]
 
+    def publish_companion(
+        self, artifact: ArtifactDocument, kind: ResultKind, payload: bytes
+    ) -> ArtifactRef:
+        """Stage and index a producer-supplied companion in one call."""
+        return self.record_companion(self.stage_companion(artifact, kind, payload))
+
+    def stage_companion(
+        self, artifact: ArtifactDocument, kind: ResultKind, payload: bytes
+    ) -> StagedCompanion:
+        """Validate and upload a digest-bound companion without writing metadata."""
+        started = perf_counter()
+        spec = self._specs.get(artifact.name)
+        artifact = spec.artifact.parse(artifact.payload)
+        self._check_secrets(spec.name, "$", artifact.text_fragments())
+        if not isinstance(artifact, RemediationArtifact) or kind != ResultKind.REMEDIATION_PATCH:
+            raise ValidationError(
+                f"{artifact.name}: only remediation reports with "
+                f"{ResultKind.REMEDIATION_PATCH.value} may retain producer-generated companions"
+            )
+        expected_digest = artifact.patch.diff_sha256
+        if expected_digest is None:
+            raise ValidationError(f"{artifact.name}: report declares no patch diff digest")
+        if sha256_hex(payload) != expected_digest:
+            raise IntegrityError(f"{artifact.name}: companion diff digest does not match report")
+        self._check_companion(spec.name, kind, payload)
+        # NEED(artifacts: orphaned object GC): collect bytes left unreferenced by metadata rollback.
+        stored = self._objects.put(
+            ObjectKey.parse(f"artifacts/{artifact.schema}/{expected_digest}-{kind.value}"), payload
+        )
+        return StagedCompanion(kind, stored, started, self)
+
+    def record_companion(self, staged: StagedCompanion) -> ArtifactRef:
+        """Index a staged companion in the caller's transaction, without object I/O."""
+        if staged._publisher is not self:
+            raise ValidationError("staged companion belongs to a different publisher")
+        with self._uow as uow:
+            row, created = _record_artifact_with_status(
+                uow,
+                Artifact(
+                    digest=staged.primary.sha256,
+                    kind=staged.kind.value,
+                    uri=str(staged.primary.key),
+                ),
+            )
+            uow.commit()
+        assert row.id is not None
+        if created:
+            self._uow.after_commit(
+                lambda: log.info(
+                    "companion published id=%s kind=%s digest=%s",
+                    row.id,
+                    staged.kind.value,
+                    staged.primary.sha256,
+                )
+            )
+        return ArtifactRef(id=row.id, name=staged.kind.value, digest=staged.primary.sha256)
+
     def _publish_staged(
         self, staged: StagedArtifact[A], successor: _Successor | None
     ) -> tuple[PublishResult, bool]:
@@ -470,14 +568,35 @@ class ArtifactPublisher:
         )
 
     def _check_secrets(self, name: str, path: str, texts: Iterable[str]) -> None:
-        categories = sorted(
-            {h.category for text in texts for h in self._redaction.scan(text) if h.high_confidence}
-        )
+        categories = self._secret_categories(texts)
         if categories:
             raise DocumentError(
                 name,
                 [Issue(path, f"unredacted high-confidence secret ({c})") for c in categories],
             )
+
+    def _check_companion(self, name: str, kind: ResultKind, data: bytes) -> None:
+        """Admit a companion: UTF-8 text; a patch is judged by what it adds."""
+        path = f"companions/{kind.value}"
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            raise DocumentError(name, [Issue(path, "companion must be UTF-8 text")]) from None
+        if kind == ResultKind.REMEDIATION_PATCH:
+            added, other = _split_diff(text)
+            self._check_secrets(name, path, (added,))
+            if categories := self._secret_categories((text, other)):
+                raise RemovedSecretError(
+                    name,
+                    [Issue(path, f"unredacted high-confidence secret ({c})") for c in categories],
+                )
+            return
+        self._check_secrets(name, path, (text,))
+
+    def _secret_categories(self, texts: Iterable[str]) -> list[str]:
+        return sorted(
+            {h.category for text in texts for h in self._redaction.scan(text) if h.high_confidence}
+        )
 
     def metadata(self, artifact_id: UUID) -> Artifact:
         return AssessmentLog(self._uow).get_artifact(artifact_id)

@@ -313,6 +313,12 @@ class WorkItem(Model):
     tracker: ExternalRef | None = None
     evidence: tuple[EvidenceItem, ...] = ()
     report: ArtifactRef | None = None
+    patch: ArtifactRef | None = None
+    patch_refusal: str | None = pydantic.Field(
+        default=None,
+        description="Secret categories when recording withholds a patch for removed/context-line "
+        "secrets; null on report-only calls and subsequent reads. Not persisted.",
+    )
     reported_by: UUID | None = None  # the order whose run recorded the report, if one did
     fix_branch: str | None = None
     fix_commit: str | None = None  # the remediation report's fork.fix_commit
@@ -462,8 +468,7 @@ class PatchNarrative(Model):
 
 @dataclass(frozen=True, slots=True)
 class RemediationDraft:
-    """An assembled, schema-valid report not yet recorded, and the diff its `patch.diff_path`
-    names (the caller writes it beside the report)."""
+    """An assembled report and patch bytes to pass to `record(report, provenance, diff=diff)`."""
 
     report: RemediationArtifact
     diff: bytes
