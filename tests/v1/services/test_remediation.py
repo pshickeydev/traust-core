@@ -21,7 +21,7 @@ from sqlalchemy.engine import Engine
 from tests.v1.conftest import SQL_BACKENDS, commit_all, contract_db, git
 from tests.v1.repositories.tables.conftest import Seed
 from traust_core.v1.context import Config, Context
-from traust_core.v1.context.config import ProcessConfig
+from traust_core.v1.context.config import ProcessConfig, RecordingConfig
 from traust_core.v1.errors import (
     ConfigError,
     ConflictError,
@@ -37,12 +37,14 @@ from traust_core.v1.models.findings import Finding, FindingCandidate, Label
 from traust_core.v1.models.identity import IdentitySource, Principal
 from traust_core.v1.models.insight import ViewFilter, ViewName
 from traust_core.v1.models.inventory import RepositoryRef
+from traust_core.v1.models.operations import RecordingStartScope
 from traust_core.v1.models.remediation import (
     Check,
     CheckOutcome,
     EvidenceItem,
     ExternalRef,
     PatchNarrative,
+    ProgressReport,
     WorkItem,
     WorkItemFilter,
     checks_status,
@@ -1038,3 +1040,151 @@ def test_pull_request_recording_requires_a_verified_person(
             principal,
         )
     assert service.get(item.work_item_id) == item
+
+
+def merged(merge_sha: str, actor: str | None = None) -> ProgressReport:
+    return ProgressReport(status=RemediationStatus.MERGED, merge_sha=merge_sha, actor=actor)
+
+
+def test_an_outcome_reported_outside_a_run_ends_the_attempt_and_folds(
+    service: RemediationService, engine: Engine
+) -> None:
+    """The door SCI's filing loop needs: a PR that merged upstream (or was closed unmerged)
+    ends the attempt, its decisions carrying the merge commit and who ended it."""
+    ref, found = seeded(engine, findings=2)
+    item = service.open(ids(found), ref.id)
+    service.record_pull_request(
+        item.work_item_id,
+        ExternalRef(system="github", ref="https://github.com/example/svc/pull/101"),
+        PERSON,
+    )
+    sha = "1f0e8dad" + "0" * 32
+    ended = service.record_outcome(item.work_item_id, merged(sha, "octocat"), PERSON)
+    assert ended.status == "merged" and ended.tracker is not None
+    assert service.get(item.work_item_id).status == "merged"  # the fold, re-read
+    for finding in found:
+        said = decisions(engine, finding)[-1]
+        # an attempt's statements are authored by the attempt, never a principal (contracts:
+        # CHECK (assessment_id IS NULL OR actor IS NULL)); the forge's word rides the rationale
+        assert (said.assessment_id, said.reason, said.rationale, said.actor) == (
+            item.work_item_id,
+            "merged",
+            f"merged as {sha} by octocat",
+            None,
+        )
+    before = [decisions(engine, f) for f in found]
+    assert service.record_outcome(item.work_item_id, merged(sha, "octocat"), PERSON) == ended
+    assert [decisions(engine, f) for f in found] == before  # a replay writes nothing
+    with pytest.raises(ConflictError, match="merged can't move to abandoned"):
+        service.record_outcome(
+            item.work_item_id, ProgressReport(status=RemediationStatus.ABANDONED), PERSON
+        )
+    retry = service.open(ids(found), ref.id)  # a retry is a new attempt
+    service.record_pull_request(
+        retry.work_item_id,
+        ExternalRef(system="github", ref="https://github.com/example/svc/pull/102"),
+        PERSON,
+    )
+    closed = service.record_outcome(
+        retry.work_item_id,
+        ProgressReport(status=RemediationStatus.ABANDONED, actor="octocat"),
+        PERSON,
+    )
+    assert closed.status == "abandoned"
+    said = decisions(engine, found[0])[-1]
+    assert (said.assessment_id, said.reason) == (retry.work_item_id, "abandoned")
+
+
+def test_outcome_recording_is_a_person_s_or_a_granted_machine_s_word(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """The authorization matrix: a verified person always; a machine only inside a
+    `recording.start` grant for `remediate_finding` on the item's repository."""
+    ref, found = seeded(engine)
+    tracker = Principal(
+        identity="tracker",
+        kind=ActorKind.MACHINE,
+        display="PR tracker",
+        verified_by=IdentitySource.OIDC,
+    )
+    ungranted = Context(Config(home=tmp_path, remediation=PRIVATE, process=GIT))
+    ungranted.__dict__["database"] = engine
+    service = ungranted.services().remediation
+    item = service.open(ids(found), ref.id)
+    report = ProgressReport(status=RemediationStatus.ABANDONED)
+    for refused in (
+        tracker,
+        tracker.model_copy(update={"verified_by": None}),
+        PERSON.model_copy(update={"verified_by": None}),
+    ):
+        with pytest.raises(ForbiddenError, match="requires a verified person"):
+            service.record_outcome(item.work_item_id, report, refused)
+    assert service.get(item.work_item_id).status == "candidate"
+
+    granted = Context(
+        Config(
+            home=tmp_path,
+            remediation=PRIVATE,
+            process=GIT,
+            recording=RecordingConfig(
+                start=(
+                    RecordingStartScope(
+                        principal=tracker.ref,
+                        assets=("remediate_finding",),
+                        repository_ids=(uuid4(),),  # another repository's scope
+                    ),
+                )
+            ),
+        )
+    )
+    granted.__dict__["database"] = engine
+    with pytest.raises(ForbiddenError, match="requires a verified person"):
+        granted.services().remediation.record_outcome(item.work_item_id, report, tracker)
+
+    scoped = Context(
+        Config(
+            home=tmp_path,
+            remediation=PRIVATE,
+            process=GIT,
+            recording=RecordingConfig(
+                start=(
+                    RecordingStartScope(
+                        principal=tracker.ref,
+                        assets=("remediate_finding",),
+                        repository_ids=(ref.repository_id,),
+                    ),
+                )
+            ),
+        )
+    )
+    scoped.__dict__["database"] = engine
+    service = scoped.services().remediation
+    ended = service.record_outcome(item.work_item_id, report, tracker)
+    assert ended.status == "abandoned"
+    said = decisions(engine, found[0])[-1]
+    assert (said.reason, said.actor) == ("abandoned", None)  # the attempt's own statement
+    assert service.record_outcome(item.work_item_id, report, PERSON).status == "abandoned"
+
+
+def test_an_ungranted_caller_s_probe_is_refused_before_the_item_is_read(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """No 404-vs-403 oracle on work-item existence: the door checks the caller's shape
+    before it reads the item, so an ungranted or unverified machine hears forbidden
+    whether or not the item exists."""
+    ungranted = Context(Config(home=tmp_path, remediation=PRIVATE, process=GIT))
+    ungranted.__dict__["database"] = engine
+    service = ungranted.services().remediation
+    tracker = Principal(
+        identity="tracker",
+        kind=ActorKind.MACHINE,
+        display="PR tracker",
+        verified_by=IdentitySource.OIDC,
+    )
+    for refused in (
+        tracker,
+        tracker.model_copy(update={"verified_by": None}),
+        PERSON.model_copy(update={"verified_by": None}),
+    ):
+        with pytest.raises(ForbiddenError):
+            service.record_outcome(uuid4(), merged("1f0e8dad" + "0" * 32), refused)

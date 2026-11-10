@@ -373,8 +373,7 @@ class OpsService:
         `recording.start` grant for this asset and repository. `authorize_request` enforces this
         rule; the policy gates report it as a typed issue — one rule, two doors."""
         return principal.is_verified_human() or (
-            principal.kind == ActorKind.MACHINE
-            and principal.verified_by is not None
+            principal.is_verified_machine()
             and repository_id is not None
             and self._in_start_scope(principal, asset, repository_id)
         )
@@ -630,6 +629,37 @@ class OpsService:
             raise ForbiddenError(
                 f"not allowed to ask for {asset} on repository {repository_id}: a verified "
                 "person, or a machine granted it in recording.start, may"
+            )
+
+    def authorize_write(self, asset: AssetName, repository_id: UUID, principal: Principal) -> None:
+        """Who may record an operational write outside a run (a remediation outcome reported
+        from filing): the same principals that may ask for the run. The record doors bind a
+        lease; filing happens outside order leases, so the `recording.start` grant alone is
+        the machine's scope."""
+        if not self._may_request(asset, repository_id, principal):
+            raise ForbiddenError(
+                f"recording {asset} progress on repository {repository_id} requires a "
+                "verified person, or a machine granted it in recording.start"
+            )
+
+    def authorize_recorder(self, asset: AssetName, principal: Principal) -> None:
+        """The write doors' gate before their subject is read: a verified person, or a
+        verified machine holding a `recording.start` grant for the asset somewhere. The
+        repository scope needs the subject, so it follows the read (`authorize_write`); a
+        caller refused here learns nothing about whether the subject exists."""
+        if not (
+            principal.is_verified_human()
+            or (
+                principal.is_verified_machine()
+                and any(
+                    scope.principal == principal.ref and asset in scope.assets
+                    for scope in self._recording_starts
+                )
+            )
+        ):
+            raise ForbiddenError(
+                f"recording {asset} progress requires a verified person, or a machine "
+                "granted it in recording.start"
             )
 
     def _in_start_scope(self, principal: Principal, asset: AssetName, repository_id: UUID) -> bool:
