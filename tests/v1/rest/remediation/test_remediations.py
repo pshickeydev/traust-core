@@ -19,6 +19,7 @@ from tests.v1.services.test_verification import World, audited, report
 from traust_core.v1.context import Context
 from traust_core.v1.models.common import PageRequest
 from traust_core.v1.models.operations import RecordingStartScope
+from traust_core.v1.models.remediation import ACTOR_CAP
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 
 URL = "/v1/remediations"
@@ -308,6 +309,7 @@ def test_progress_door_validates_its_body_and_the_state_machine(
         {"status": "abandoned", "merge_sha": sha},
         {"status": "merged", "merge_sha": "not-a-sha"},
         {"status": "merged", "actor": " "},
+        {"status": "merged", "actor": "a" * (ACTOR_CAP + 1)},  # past the intake cap
         {"status": "unknown_status"},
     ):
         response = client.post(route, json=invalid, headers=bearer(context))

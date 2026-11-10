@@ -336,6 +336,10 @@ class WorkItem(Model):
         return self.report is not None
 
 
+# rides the append-only decisions' rationale, so it takes the verification rationale's bound
+ACTOR_CAP = 500
+
+
 class ProgressReport(Model):
     """An attempt's end reported from outside a run: merged (the commit it merged as) or
     abandoned — a run's own statuses come from its report, never this door."""
@@ -354,6 +358,8 @@ class ProgressReport(Model):
             GitSha.parse(self.merge_sha)
         if self.actor is not None and not self.actor.strip():
             raise ValueError("actor must be nonblank text")
+        if self.actor is not None and len(self.actor) > ACTOR_CAP:
+            raise ValueError(f"actor must be at most {ACTOR_CAP} characters")
         return self
 
     @property

@@ -14,6 +14,7 @@ import pytest
 from traust_core.v1.errors import ConflictError
 from traust_core.v1.models.findings import Finding, FindingView
 from traust_core.v1.models.remediation import (
+    ACTOR_CAP,
     EvidenceItem,
     ProgressReport,
     WorkItem,
@@ -221,6 +222,18 @@ def test_a_merge_report_carries_its_commit_and_its_actor() -> None:
     assert ProgressReport(status=RemediationStatus("abandoned"), actor="octocat").rationale == (
         "abandoned by octocat"
     )
+
+
+def test_an_actor_is_capped_at_intake() -> None:
+    sha = "1f0e8dad" + "0" * 32
+    at_cap = ProgressReport(
+        status=RemediationStatus("merged"), merge_sha=sha, actor="a" * ACTOR_CAP
+    )
+    assert at_cap.rationale == f"merged as {sha} by {'a' * ACTOR_CAP}"
+    with pytest.raises(pydantic.ValidationError, match=f"at most {ACTOR_CAP} characters"):
+        ProgressReport(
+            status=RemediationStatus("merged"), merge_sha=sha, actor="a" * (ACTOR_CAP + 1)
+        )
 
 
 def test_a_merge_commit_rides_a_merged_report_only_and_must_be_a_git_sha() -> None:
