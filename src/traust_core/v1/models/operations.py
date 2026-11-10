@@ -324,11 +324,13 @@ class SchedulePlan(Model):
 
 
 class OrderFilter(Model):
-    """`window` bounds a timeline by finished_at; `list` pages by created_at and refuses it."""
+    """`window` bounds a timeline by finished_at; `list` pages by created_at and refuses it.
+    `repository_ids` selects several repositories in one indexed query (a page's worth)."""
 
     states: tuple[OrderState, ...] = ()
     asset: AssetName | None = None
     repository_id: UUID | None = None
+    repository_ids: tuple[UUID, ...] = ()
     run_batch_id: UUID | None = None
     window: TimeWindow | None = None
 

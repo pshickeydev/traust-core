@@ -268,6 +268,33 @@ def complete_attempt(
     return ops
 
 
+def test_a_liveness_page_reads_completed_orders_in_one_query(
+    uow: SqlTraustUnitOfWork, seed: Seed
+) -> None:
+    """The page's repositories' degraded repo_state orders are fetched in one indexed
+    query over their repository ids, not one query per repository — a page render used
+    to run (and manifest-parse) per repository."""
+    repositories = [seed.repository() for _ in range(3)]
+    ops: OpsService | None = None
+    for repository in repositories:
+        ops = complete_attempt(
+            uow, seed, repository.id, NOW, JobResult.partly({"no-credentials": 1})
+        )
+    assert ops is not None
+    calls = []
+    original = ops.list
+
+    def counting(filter, page):
+        calls.append(filter.repository_ids)
+        return original(filter, page)
+
+    ops.list = counting
+    rows = portfolio(uow, ops=ops).liveness(RepositoryFilter(), PageRequest(limit=10)).items
+    assert len(rows) == 3
+    assert all(row.unobserved == ComparisonStatus.NO_CREDENTIALS for row in rows)
+    assert len(calls) == 1 and set(calls[0]) == {repository.id for repository in repositories}
+
+
 @pytest.mark.parametrize("failure", [ComparisonStatus.NO_CREDENTIALS, ComparisonStatus.UNREACHABLE])
 def test_recorded_access_failures_remain_unknown_without_a_successful_state_observation(
     uow: SqlTraustUnitOfWork, seed: Seed, failure: ComparisonStatus

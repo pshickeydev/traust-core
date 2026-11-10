@@ -555,11 +555,12 @@ class PortfolioService:
                 ids,
             ).never_assessed_repository_ids
         )
+        completed = self._completed_orders(ids, now)
         rows = []
         for repository in repositories:
             assert repository.id is not None
             row = recorded.get(repository.id) or self._unqueried_liveness(repository, unaudited)
-            row = self._completed_liveness(row, now)
+            row = self._fold_completed(row, completed.get(repository.id, ()), now)
             rows.append(
                 row.model_copy(
                     update={
@@ -609,8 +610,11 @@ class PortfolioService:
                 raise ValidationError(
                     "liveness observation predates the repository's recorded history"
                 )
-            previous = self._completed_liveness(
+            previous = self._fold_completed(
                 previous or Liveness(repository_id=row.repository_id, url=repository.url),
+                self._completed_orders((row.repository_id,), row.observed_at).get(
+                    row.repository_id, ()
+                ),
                 row.observed_at,
             )
             saved = row.model_copy(
@@ -635,35 +639,42 @@ class PortfolioService:
             except ConflictError:
                 continue
 
-    def _completed_liveness(self, row: Liveness, now: datetime) -> Liveness:
+    def _completed_orders(self, repository_ids: Sequence[UUID], now: datetime) -> dict[UUID, list]:
+        """The finished degraded/failed/refused repo_state orders of several repositories,
+        one indexed query for the whole page instead of one per repository — a liveness
+        page render used to run (and manifest-parse) per repository."""
         ops = self._ops
-        if ops is None:
-            return row
+        if ops is None or not repository_ids:
+            return {}
         filter = OrderFilter(
-            repository_id=row.repository_id,
+            repository_ids=tuple(repository_ids),
             asset=AssetName("repo_state"),
             states=(OrderState.DEGRADED, OrderState.FAILED, OrderState.REFUSED),
         )
+        grouped: dict[UUID, list] = {}
+        for order in every_item(lambda page: ops.list(filter, page)):
+            if order.finished_at is not None and order.finished_at <= now:
+                grouped.setdefault(order.repository_id, []).append(order)
+        return grouped
+
+    def _fold_completed(self, row: Liveness, orders: Sequence, now: datetime) -> Liveness:
         failures = set(ComparisonStatus) - OBSERVED - {ComparisonStatus.NO_PINNED_SHA}
         orders = sorted(
             (
                 order
-                for order in every_item(lambda page: ops.list(filter, page))
-                if order.finished_at is not None
-                and order.finished_at <= now
-                and (
-                    row.observed_at is None
-                    or (
-                        order.finished_at > row.observed_at
-                        and (order.started_at is None or order.started_at > row.observed_at)
-                    )
+                for order in orders
+                if row.observed_at is None
+                or (
+                    order.finished_at > row.observed_at
+                    and (order.started_at is None or order.started_at > row.observed_at)
                 )
             ),
             key=lambda order: (order.finished_at, str(order.id)),
         )
         for order in orders:
             assert order.id is not None
-            manifest = ops.manifest(order.id)
+            assert self._ops is not None  # the fold only runs with an ops service
+            manifest = self._ops.manifest(order.id)
             statuses = sorted(
                 (status for status in failures if manifest.degraded.get(status.value, 0) > 0),
                 key=lambda status: status.value,

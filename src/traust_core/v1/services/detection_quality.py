@@ -559,7 +559,7 @@ class DetectionQualityService:
         exposure.require_commit_advisories()
         audits = self._cve_audits()
         records = self._cve_records()
-        snapshots = self._cve_snapshots(records)
+        snapshots = self._cve_snapshots(records, audits)
         answers: dict[str, tuple[AdvisoryRecord, ...]] = {}
         pending: list[tuple[CveReplayAudit, tuple[CveReplayCandidate, ...]]] = []
         fresh: list[CveReplayCandidate] = []
@@ -601,9 +601,19 @@ class DetectionQualityService:
         for audit, checks in pending:
             prior = snapshots.get(audit.audit_id)
             state = CveReplayState(checks=prior.checks if prior else ()).merged(checks)
-            watermark = max(now, prior.watermark) if prior and prior.watermark else now
-            if prior and state.checks == prior.checks and watermark == prior.watermark:
+            # A snapshot republishes only when its checks changed. The run's
+            # watermark is always `now` (a later prior watermark is refused
+            # above, so the max collapses to now), and requiring it to equal
+            # the prior one meant the skip fired only on a same-instant retry:
+            # every run republished a snapshot per audit — one new artifact and
+            # CVE_REPLAY assessment each, embedding the full accumulated checks
+            # list. The same_advisory merge already prevents re-checking; a
+            # no-change run leaves the stored watermark where it last published,
+            # and the per-advisory `published < prior.watermark` fast path
+            # narrows to what the dedup then covers.
+            if prior and state.checks == prior.checks:
                 continue
+            watermark = max(now, prior.watermark) if prior and prior.watermark else now
             snapshot = CveReplaySnapshot(
                 audit=audit,
                 revision=prior.revision + 1 if prior else 1,
@@ -648,7 +658,8 @@ class DetectionQualityService:
             require_nonblank(presence_evidence, "CVE replay presence evidence")
         elif presence_evidence is not None:
             raise ValidationError("CVE replay presence evidence requires a presence verdict")
-        bound = next((row for row in self._cve_audits() if row[0].audit_id == assessment_id), None)
+        audits = self._cve_audits()
+        bound = next((row for row in audits if row[0].audit_id == assessment_id), None)
         if bound is None:
             raise NotFoundError(f"CVE replay recorded audit {assessment_id}")
         exposure = self._require(self._exposure, "CVE replay advisory source")
@@ -676,7 +687,7 @@ class DetectionQualityService:
             presence_evidence=presence_evidence,
         )
         records = self._cve_records()
-        prior = self._cve_snapshots(records).get(audit.audit_id)
+        prior = self._cve_snapshots(records, audits).get(audit.audit_id)
         state = CveReplayState(checks=prior.checks if prior else ()).merged((check,))
         if prior is None or state.checks != prior.checks:
             self._cve_commit(
@@ -739,10 +750,17 @@ class DetectionQualityService:
         )
 
     def _cve_snapshots(
-        self, records: Sequence[tuple[Assessment, Artifact]] | None = None
+        self,
+        records: Sequence[tuple[Assessment, Artifact]] | None = None,
+        audits: Sequence[tuple[CveReplayAudit, ReportArtifact]] | None = None,
     ) -> dict[UUID, CveReplaySnapshot]:
+        """The recorded snapshots, keyed by audit. `records` and `audits` thread in
+        copies a caller already fetched — `_cve_audits()` reads and parses every
+        SECURE_CODE report payload from the object store, so a caller that holds
+        them must not pay for them twice."""
         snapshots: dict[UUID, CveReplaySnapshot] = {}
-        audits = {audit.audit_id: audit for audit, _ in self._cve_audits()}
+        audit_rows = self._cve_audits() if audits is None else audits
+        audits = {audit.audit_id: audit for audit, _ in audit_rows}
         for assessment, artifact in self._cve_records() if records is None else records:
             assert artifact.id is not None
             document = self._publisher.read(artifact.id, CveReplayArtifact)

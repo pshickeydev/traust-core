@@ -978,7 +978,9 @@ class OpsService:
 
     def list(self, filter: OrderFilter, page: PageRequest) -> Page[RunOrder]:
         after = page.position()
-        if not (filter.states or filter.repository_id or filter.run_batch_id):
+        if not (
+            filter.states or filter.repository_id or filter.repository_ids or filter.run_batch_id
+        ):
             raise ValidationError("list needs states, a repository_id or a run_batch_id (indexed)")
         if filter.window is not None:
             raise ValidationError("list pages by created_at; a window bounds a timeline")
@@ -1167,7 +1169,15 @@ class SpendService:
             repository_id = None
             if order is None:
                 repository_id = self._repository_id(event)
-            elif order.repository_id is not None:
+            else:
+                # An ordered row stores no repository of its own (the schema's
+                # `run_order_id IS NULL OR repository_id IS NULL`), so any
+                # repository the event attests must agree with the order's —
+                # including a fleet-wide order, which names none: an attested
+                # identity there disagrees with the order's scope, and the
+                # schema leaves no room to preserve it, so refuse rather than
+                # silently drop the attestation. An unresolvable label is
+                # supplied metadata, not identity: it rides along unchanged.
                 supplied_repository_id = self._repository_id(event)
                 if (
                     supplied_repository_id is not None

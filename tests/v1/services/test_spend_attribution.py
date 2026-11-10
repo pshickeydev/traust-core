@@ -287,9 +287,14 @@ def test_order_spend_cannot_be_reattributed_to_another_repository(
 
 
 @pytest.mark.parametrize("reference", ["id", "url"])
-def test_repositoryless_order_ignores_supplied_attribution_but_keeps_metadata(
+def test_fleet_wide_order_spend_refuses_an_attested_repository(
     engine: Engine, reference: str
 ) -> None:
+    """A fleet-wide order names no repository, so an event attesting one disagrees with
+    the order's scope — and the schema keeps ordered rows from storing a repository of
+    their own (`run_order_id IS NULL OR repository_id IS NULL`), so the attestation
+    cannot be preserved either. Refuse it, as the repository-scoped mismatch does,
+    rather than silently overwrite the attested identity with None."""
     with SqlTraustUnitOfWork(engine) as uow:
         seed = Seed(uow)
         repo = seed.repository()
@@ -300,7 +305,34 @@ def test_repositoryless_order_ignores_supplied_attribution_but_keeps_metadata(
             repository_label=repo.url,
             loc=0,
             batch="batch-1",
-            note="repositoryless order",
+            note="fleet-wide order",
+        )
+        uow.commit()
+    service = SpendService(
+        SqlTraustUnitOfWork(engine),
+        FixedClock(T0),
+        (),
+        inventory=Inventory(SqlTraustUnitOfWork(engine)),
+    )
+    with pytest.raises(ValidationError, match="disagrees"):
+        service.record(event)
+    assert service.summary(SpendFilter(window=OCTOBER), None) == []
+
+
+def test_fleet_wide_order_spend_keeps_unattributed_metadata(engine: Engine) -> None:
+    """An unresolvable label is supplied metadata, not identity: it rides along
+    unchanged, the row stays unattributed, and the rollup follows the order."""
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        seed.repository(url="https://github.com/team-a/project")
+        seed.repository(url="https://github.com/team-b/project")
+        order = seed.run_order(lane="audit")
+        event = seed.new_spend_event(
+            run_order_id=order.id,
+            repository_label="project",
+            loc=0,
+            batch="batch-1",
+            note="fleet-wide order",
         )
         uow.commit()
     service = SpendService(
@@ -314,9 +346,7 @@ def test_repositoryless_order_ignores_supplied_attribution_but_keeps_metadata(
         stored = uow.spend_events.get(saved.id)
     assert stored == saved
     assert stored.repository_id is None and stored.lane == "audit"
-    assert stored.model_copy(update={"id": None, "created_at": None, "lane": None}) == (
-        event.model_copy(update={"repository_id": None})
-    )
+    assert stored.model_copy(update={"id": None, "created_at": None, "lane": None}) == event
     assert service.summary(SpendFilter(window=OCTOBER), SpendDimension.REPOSITORY) == [
         rollup(1, 100, 20, "0.25")
     ]

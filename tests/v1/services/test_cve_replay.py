@@ -535,6 +535,50 @@ def test_monitor_cannot_overwrite_verified_human_presence_with_external_discover
     assert result.checks[0].present_at_audit is None
 
 
+def test_an_unchanged_replay_does_not_republish_per_run(bench: Bench, engine: Engine) -> None:
+    """A re-run with a moving clock and no newly published advisories republishes nothing:
+    the skip is the checks' equality, not a watermark that always advances to now (a later
+    prior watermark is refused, so requiring watermark equality made the skip fire only on a
+    same-instant retry — every run wrote a new artifact and CVE_REPLAY assessment per audit,
+    each embedding the full accumulated checks list)."""
+    bench.audit(bound_report(bench), AssessmentKind.SECURE_CODE_CANONICAL)
+    with OsvFixture() as osv:
+        osv.responses[(SHA, "")] = (200, {"vulns": [advisory()]})
+        service = quality(bench, engine, osv)
+        first = service.cve_replay()
+        assert len(first.checks) == 1
+        after_first = snapshot_rows(bench)
+        assert len(after_first) == 1
+        service._clock = FixedClock(NOW.replace(day=4))
+        second = service.cve_replay()
+    # nothing newly classified (the same_advisory fast path skips the
+    # already-checked advisory), the accumulated state is unchanged, and no
+    # snapshot row was republished for the watermark alone
+    assert second.checks == ()
+    assert second.candidates.candidates == first.candidates.candidates
+    assert snapshot_rows(bench) == after_first
+
+
+def test_cve_replay_reads_the_report_corpus_once(bench: Bench, engine: Engine) -> None:
+    """The audits a caller already fetched are threaded into the snapshot read:
+    `_cve_audits()` reads and parses every SECURE_CODE report payload from the
+    object store, and cve_replay used to pay for it twice (once directly, once
+    inside `_cve_snapshots`)."""
+    bench.audit(bound_report(bench), AssessmentKind.SECURE_CODE_CANONICAL)
+    with OsvFixture() as osv:
+        service = quality(bench, engine, osv)
+        original = service._cve_audits
+        calls = []
+
+        def counted():
+            calls.append(1)
+            return original()
+
+        service._cve_audits = counted
+        service.cve_replay()
+    assert len(calls) == 1
+
+
 def test_successful_empty_commit_answer_records_watermark_without_candidates(
     bench: Bench, engine: Engine
 ) -> None:
