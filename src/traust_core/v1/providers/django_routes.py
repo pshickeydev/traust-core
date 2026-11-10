@@ -1183,6 +1183,32 @@ class _Django:
                     and isinstance(own[1], ast.ClassDef)
                     and any(isinstance(c, str) and "Default" in c for _, c in self.mro(*own))
                 )
+                if slash is None and own is not None and isinstance(own[1], ast.ClassDef):
+                    # DRF reads `trailing_slash` off the instance at route-generation
+                    # time, so a subclass's class attribute shapes the URLs exactly as
+                    # the init kwarg does; the MRO's first definition wins, as at
+                    # runtime.
+                    for _, c in self.mro(*own):
+                        if not isinstance(c, ast.ClassDef):
+                            continue
+                        for attr in c.body:
+                            if isinstance(attr, ast.Assign | ast.AnnAssign) and any(
+                                _dotted(t) == "trailing_slash" for t in _targets(attr)
+                            ):
+                                slash = attr.value
+                                break
+                        if slash is not None:
+                            break
+                for other, _ in _module_statements(tree.body, False):
+                    # a later instance assignment (`router.trailing_slash = ...`)
+                    # overrides both, as at runtime; statement order gives last-wins
+                    if isinstance(other, ast.Assign) and any(
+                        isinstance(t, ast.Attribute)
+                        and t.attr == "trailing_slash"
+                        and _dotted(t.value) in {_dotted(x) for x in _targets(n)}
+                        for t in other.targets
+                    ):
+                        slash = other.value
                 router.slash = "" if isinstance(slash, ast.Constant) and not slash.value else "/"
                 router.dynamic |= slash is not None and not isinstance(slash, ast.Constant)
                 if _name(value).startswith("Nested") and len(value.args) >= 2:

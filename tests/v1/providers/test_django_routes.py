@@ -49,6 +49,142 @@ def test_include_chains_join_their_prefixes(tmp_path: Path) -> None:
     assert rows[("any", "api/notes/<int:pk>/")]["handler"]["path"] == "notes/views.py"
 
 
+def test_a_namespaced_include_mounts_under_its_prefix(tmp_path: Path) -> None:
+    """`include(("app.urls", "app"), namespace="x")`: the tuple's module resolves and mounts
+    with its prefix. The namespace itself names reverse() lookups, not the URL pattern or the
+    view, so the row's identity (method, pattern, handler) needs no extra field."""
+    _write(
+        tmp_path,
+        {
+            "site/settings.py": 'ROOT_URLCONF = "site.urls"\n',
+            "site/urls.py": (
+                "from django.urls import include, path\n"
+                "urlpatterns = [\n"
+                '    path("v1/", include(("notes.urls", "notes"), namespace="notes-v1")),\n'
+                '    path("v2/", include("notes.urls", namespace="notes-v2")),\n'
+                "]\n"
+            ),
+            "notes/urls.py": (
+                'from django.urls import path\nfrom . import views\napp_name = "notes"\n'
+                'urlpatterns = [path("notes/<int:pk>/", views.note, name="detail")]\n'
+            ),
+            "notes/views.py": "def note(request, pk): ...\n",
+        },
+    )
+    rows = _rows(tmp_path)
+    assert set(rows) == {("any", "v1/notes/<int:pk>/"), ("any", "v2/notes/<int:pk>/")}
+    assert rows[("any", "v1/notes/<int:pk>/")]["handler"]["path"] == "notes/views.py"
+
+
+def test_routers_record_their_own_trailing_slash_forms_distinctly(tmp_path: Path) -> None:
+    """A DefaultRouter and a `trailing_slash=False` router keep their own URL forms —
+    `/notes/` beside `/items` — each recorded as configured, never collapsed."""
+    _write(
+        tmp_path,
+        {
+            "site/settings.py": 'ROOT_URLCONF = "site.urls"\n',
+            "site/urls.py": (
+                "from django.urls import include, path\n"
+                "from rest_framework.routers import DefaultRouter, SimpleRouter\n"
+                "from notes.views import NoteViewSet\n"
+                "default = DefaultRouter()\ndefault.register('notes', NoteViewSet)\n"
+                "simple = SimpleRouter(trailing_slash=False)\n"
+                "simple.register('items', NoteViewSet)\n"
+                "urlpatterns = [\n"
+                '    path("d/", include(default.urls)),\n'
+                '    path("s/", include(simple.urls)),\n'
+                "]\n"
+            ),
+            "notes/views.py": (
+                "from rest_framework.viewsets import ModelViewSet\n"
+                "class NoteViewSet(ModelViewSet): ...\n"
+            ),
+        },
+    )
+    rows = _rows(tmp_path)
+    assert ("GET", "d/") in rows  # DefaultRouter's API root view
+    assert ("GET", "d/notes/") in rows and ("GET", "d/notes/<pk>/") in rows
+    assert ("GET", "s/items") in rows and ("GET", "s/items/<pk>") in rows
+    assert ("GET", "s/") not in rows  # a SimpleRouter has no API root
+    assert {pattern for _, pattern in rows if pattern.startswith("s/")} == {
+        "s/items",
+        "s/items/<pk>",
+    }
+
+
+def test_a_trailing_slash_class_attribute_or_instance_assignment_shapes_the_urls(
+    tmp_path: Path,
+) -> None:
+    """DRF reads `trailing_slash` off the instance at route-generation time, so a subclass's
+    class attribute or a later `router.trailing_slash = ...` changes the generated URLs the
+    way the init kwarg does. The kwarg wins over the class attribute (the constructor sets
+    the instance attribute), and the last instance assignment wins overall."""
+    _write(
+        tmp_path,
+        {
+            "site/settings.py": 'ROOT_URLCONF = "site.urls"\n',
+            "site/urls.py": (
+                "from django.urls import include, path\n"
+                "from rest_framework.routers import DefaultRouter\n"
+                "from notes.views import NoteViewSet\n"
+                "class NoSlashRouter(DefaultRouter):\n"
+                "    trailing_slash = False\n"
+                "no_slash = NoSlashRouter()\nno_slash.register('a', NoteViewSet)\n"
+                "kwarg = NoSlashRouter(trailing_slash=True)\nkwarg.register('b', NoteViewSet)\n"
+                "assigned = DefaultRouter()\nassigned.trailing_slash = ''\n"
+                "assigned.register('c', NoteViewSet)\n"
+                "urlpatterns = [path('', include(no_slash.urls)),\n"
+                "    path('', include(kwarg.urls)),\n"
+                "    path('', include(assigned.urls))]\n"
+            ),
+            "notes/views.py": (
+                "from rest_framework.viewsets import ModelViewSet\n"
+                "class NoteViewSet(ModelViewSet): ...\n"
+            ),
+        },
+    )
+    rows = _rows(tmp_path)
+    assert ("GET", "a") in rows and ("GET", "a/<pk>") in rows
+    assert ("GET", "b/") in rows and ("GET", "b/<pk>/") in rows  # the kwarg wins
+    assert ("GET", "c") in rows and ("GET", "c/<pk>") in rows
+    assert ("GET", "a/") not in rows and ("GET", "b") not in rows and ("GET", "c/") not in rows
+
+
+def test_a_settings_module_guards_only_its_own_projects_routes(tmp_path: Path) -> None:
+    """Two projects in one checkout: one's LoginRequiredMiddleware and DRF defaults scope to
+    the urlconfs its ROOT_URLCONF reaches, never to the other project's routes."""
+    _write(
+        tmp_path,
+        {
+            "a/settings.py": (
+                'ROOT_URLCONF = "a.urls"\n'
+                "MIDDLEWARE = ['django.contrib.auth.middleware.LoginRequiredMiddleware']\n"
+                "REST_FRAMEWORK = {'DEFAULT_PERMISSION_CLASSES': "
+                "['rest_framework.permissions.IsAuthenticated']}\n"
+            ),
+            "a/urls.py": (
+                "from django.urls import include, path\n"
+                'urlpatterns = [path("", include("a.app.urls"))]\n'
+            ),
+            "a/app/urls.py": (
+                "from django.urls import path\nfrom . import views\n"
+                'urlpatterns = [path("a-note/", views.a_note)]\n'
+            ),
+            "a/app/views.py": "def a_note(request): ...\n",
+            "b/settings.py": 'ROOT_URLCONF = "b.urls"\n',
+            "b/urls.py": (
+                "from django.urls import path\nfrom . import views\n"
+                'urlpatterns = [path("b-note/", views.b_note)]\n'
+            ),
+            "b/views.py": "def b_note(request): ...\n",
+        },
+    )
+    rows = _rows(tmp_path)
+    assert rows[("any", "a-note/")]["scope_guards"] == ["LoginRequiredMiddleware"]
+    assert rows[("any", "b-note/")]["scope_guards"] == []
+    assert rows[("any", "b-note/")]["guards"] == []
+
+
 def test_a_class_view_has_a_row_per_method_it_defines(tmp_path: Path) -> None:
     _write(
         tmp_path,
