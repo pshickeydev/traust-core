@@ -200,7 +200,9 @@ class _Django:
         """Guards read from `rel`: a name resolves to the checkout code it is bound to."""
         if rel not in self._readers:
             self._readers[rel] = GuardReader(
-                lambda name: self.bound_to(name, rel), origin=lambda name: self.origin(rel, name)
+                lambda name: self.bound_to(name, rel),
+                origin=lambda name: self.origin(rel, name),
+                local=self.index.modules.local,
             )
         return self._readers[rel]
 
@@ -405,9 +407,17 @@ class _Django:
 
     # ---- urlconfs
     def run(self) -> list[_Row]:
-        confs = [rel for rel in self.trees if "urlpatterns" in self.lists(rel)]
+        # a urlconf builds `urlpatterns` or re-exports one (`from .api.urls import urlpatterns`)
+        reexported = {
+            rel: found[0]
+            for rel in self.trees
+            if "urlpatterns" not in self.lists(rel)
+            if (found := self.imported_list(rel, "urlpatterns")) is not None
+        }
+        confs = [rel for rel in self.trees if "urlpatterns" in self.lists(rel) or rel in reexported]
         # what each urlconf includes, so the ones nothing includes are the roots
         unplaced = False
+        self.included |= set(reexported.values())
         for rel in confs:
             for n in ast.walk(self.trees[rel]):
                 if self.is_path(rel, n):
@@ -421,6 +431,8 @@ class _Django:
             # an include we can't follow may be what mounts a urlconf nothing else includes
             self.mount(rel, "", unplaced and rel not in self.projects, frozenset())
         self.current = ([], [])  # what can't be placed takes no project's settings
+        # a re-exported list was read where its root mounted it
+        self.mounted |= {child for rel, child in reexported.items() if rel in self.mounted}
         # the views a root urlconf names for a request no pattern matches, or one that fails
         for rel in roots:
             for name in _HANDLERS:
@@ -508,13 +520,13 @@ class _Django:
             return out
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
             return self.flatten(rel, node.left, stack) + self.flatten(rel, node.right, stack)
-        if isinstance(node, ast.Name) and node.id in stack:
+        if isinstance(node, ast.Name) and f"{rel}:{node.id}" in stack:
             return []
         if isinstance(node, ast.Name) and node.id in self.lists(rel):
             return [
                 e
                 for part in self.lists(rel)[node.id]
-                for e in self.flatten(rel, part, stack | {node.id})
+                for e in self.flatten(rel, part, stack | {f"{rel}:{node.id}"})
             ]
         if (urls := _as_urls(node)) is not None:
             return [urls]  # `router.urls`, `router.get_urls()`
@@ -523,7 +535,7 @@ class _Django:
             if found is not None:
                 # a list another module builds: its entries read in that module
                 where, name = found
-                out = self.flatten(where, ast.Name(id=name), frozenset())
+                out = self.flatten(where, ast.Name(id=name), stack | {f"{rel}:{_dotted(node)}"})
                 self.homes.update({id(e): where for e in out})
                 return out
             return [node]  # a list we can't read: listed as a placeholder
@@ -921,8 +933,7 @@ class _Django:
 
     def origin(self, rel: str, dotted: str) -> str:
         """The module path a name in `rel` is imported from: `rest_framework.views.APIView`."""
-        target = self.index.modules.imported.get(rel, {}).get(dotted.split(".")[0], "")
-        return ".".join([target, *dotted.split(".")[1:]]) if target else ""
+        return self.index.modules.full(dotted, rel)
 
     def class_view(self, rel: str, cls: ast.ClassDef, mapping: dict[str, str] | None) -> _View:
         mro = self.mro(rel, cls)
@@ -1166,9 +1177,7 @@ class _Django:
                     and isinstance(own[1], ast.ClassDef)
                     and any(isinstance(c, str) and "Default" in c for _, c in self.mro(*own))
                 )
-                router.slash = (
-                    "" if isinstance(slash, ast.Constant) and slash.value is False else "/"
-                )
+                router.slash = "" if isinstance(slash, ast.Constant) and not slash.value else "/"
                 router.dynamic |= slash is not None and not isinstance(slash, ast.Constant)
                 if _name(value).startswith("Nested") and len(value.args) >= 2:
                     # `NestedSimpleRouter(parent, r"notes", lookup="note")`
@@ -1372,8 +1381,9 @@ class _Django:
                     isinstance(kw.get("detail"), ast.Constant) and kw["detail"].value is True
                 )
                 listed = kw.get("methods")
-                if isinstance(listed, ast.Name):  # `methods=WRITE`, a module constant
-                    listed = self.defined(where_c).get(listed.id, listed)
+                if isinstance(listed, ast.Name | ast.Attribute):  # `methods=WRITE`, a constant
+                    bound = self.binding(_dotted(listed), where_c)
+                    listed = bound[1] if bound is not None else listed
                 methods = (
                     [m.upper() for m in _strings(listed)]
                     if isinstance(listed, ast.List | ast.Tuple | ast.Set)
@@ -1617,7 +1627,7 @@ def _decorator_guards(d: ast.AST, reader: GuardReader) -> tuple[list[str], list[
         for k in d.keywords
     ):
         return [], [f"optional:{label}"]  # `login_required(optional=True)` lets anyone through
-    if requires_nothing(d):
+    if requires_nothing(d, reader.name(_dotted(d.func)) if isinstance(d, ast.Call) else ""):
         return [], []  # `permission_required([])`: `has_perms(())` admits anyone
     return ([label] if reader.guards(_dotted(d)) else []), []
 
@@ -1652,7 +1662,7 @@ def _allows(node: ast.AST, verb: str, reader: GuardReader) -> str:
     if not isinstance(node, ast.Name | ast.Attribute):
         return "none"  # `[A] if DEBUG else [B]`, `HasScope("x")`: not read
     name = _dotted(node)
-    if _ANONYMOUS.match(name.split(".")[-1]) or _unguards_in(name.split(".")[-1]):
+    if _ANONYMOUS.match(reader.name(name)) or _unguards_in(name.split(".")[-1]):
         return "open"
     kind = reader.permission(name)
     if kind == "read-only":

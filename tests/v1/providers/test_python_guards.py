@@ -95,3 +95,20 @@ def test_login_disabled_turns_flask_logins_guards_off() -> None:
 )
 def test_a_requirement_guard_given_nothing_admits_anyone(decorator: str, nothing: bool) -> None:
     assert requires_nothing(ast.parse(decorator, mode="eval").body) is nothing
+
+
+@pytest.mark.parametrize(
+    ("full", "guards"),
+    [
+        ("django.contrib.auth.decorators.login_required", True),
+        ("flask_login.login_required", True),  # imported under another name
+        ("app.auth.login_required", True),  # a checkout module re-exporting one
+        ("someauth.decorators.login_required", False),  # another library's of that name
+        ("", True),  # not imported here: read by its name
+    ],
+)
+def test_a_guard_is_read_through_its_import(full: str, guards: bool) -> None:
+    reader = GuardReader(
+        lambda name: None, origin=lambda name: full, local=lambda f: f.startswith("app.")
+    )
+    assert reader.guards("require_login" if full else "login_required") is guards

@@ -1045,3 +1045,97 @@ def test_prefixes_drf_nested_routers_and_wsgi_dispatchers_add(tmp_path: Path) ->
     # drf-nested-routers' default lookup, which the reading can't be sure of
     assert rows[("GET", "notes/<nested_1_pk>/comments/")]["pattern_dynamic"]
     assert not rows[("GET", "/api/items")]["pattern_dynamic"]
+
+
+def test_a_root_urlconf_re_exporting_a_list_keeps_its_projects_guards(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        {
+            "site/settings.py": (
+                "ROOT_URLCONF = 'site.urls'\n"
+                "MIDDLEWARE = ['django.contrib.auth.middleware.LoginRequiredMiddleware']\n"
+            ),
+            "site/urls.py": "from notes.urls import urlpatterns\n",
+            "notes/urls.py": (
+                "from django.urls import path\nfrom . import views\n"
+                "urlpatterns = [path('notes/', views.notes)]\n"
+            ),
+            "notes/views.py": "def notes(request): ...\n",
+        },
+    )
+    result = route_guards(tree_files(tmp_path)).model_dump(mode="json")
+    [row] = [r for r in result["routes"] if r["family"] == "django-drf"]
+    assert row["scope_guards"] == ["LoginRequiredMiddleware"]
+
+
+def test_urlconfs_importing_each_others_lists_end_the_walk(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        {
+            "a/urls.py": "from b.urls import urlpatterns as b_urls\nurlpatterns = b_urls\n",
+            "b/urls.py": "from a.urls import urlpatterns as a_urls\nurlpatterns = a_urls\n",
+        },
+    )
+    assert _rows(tmp_path) == {}
+
+
+@pytest.mark.parametrize(
+    ("router", "pattern"),
+    [("SimpleRouter(trailing_slash='')", "notes"), ("SimpleRouter(trailing_slash=0)", "notes")],
+)
+def test_router_actions_read_imported_methods_and_any_falsy_slash(
+    tmp_path: Path, router: str, pattern: str
+) -> None:
+    _write(
+        tmp_path,
+        {
+            "app/urls.py": (
+                "from rest_framework.routers import SimpleRouter\nfrom .views import NoteViewSet\n"
+                f"router = {router}\nrouter.register('notes', NoteViewSet)\n"
+                "urlpatterns = router.urls\n"
+            ),
+            "app/consts.py": "WRITE = ['post', 'put']\n",
+            "app/views.py": (
+                "from rest_framework import viewsets\n"
+                "from rest_framework.decorators import action\nfrom . import consts\n"
+                "class NoteViewSet(viewsets.ViewSet):\n"
+                "    def list(self, request): ...\n"
+                "    @action(detail=True, methods=consts.WRITE)\n"
+                "    def pin(self, request, pk=None): ...\n"
+            ),
+        },
+    )
+    assert set(_rows(tmp_path)) == {
+        ("GET", pattern),
+        ("POST", f"{pattern}/<pk>/pin"),
+        ("PUT", f"{pattern}/<pk>/pin"),
+    }
+
+
+def test_guards_read_through_aliases_and_only_from_auth_libraries(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        {
+            "app/urls.py": (
+                "from django.urls import path\nfrom . import views\n"
+                "urlpatterns = [\n"
+                "    path('a/', views.a), path('b/', views.b), path('c/', views.C.as_view())\n"
+                "]\n"
+            ),
+            "app/views.py": (
+                "from django.contrib.auth.decorators import login_required as require_login\n"
+                "from someauth.decorators import login_required\n"
+                "from rest_framework.views import APIView\n"
+                "from rest_framework.permissions import IsAuthenticated as Authenticated\n"
+                "@require_login\ndef a(request): ...\n"
+                "@login_required\ndef b(request): ...\n"
+                "class C(APIView):\n"
+                "    permission_classes = [Authenticated]\n"
+                "    def get(self, request): ...\n"
+            ),
+        },
+    )
+    rows = _rows(tmp_path)
+    assert rows[("any", "a/")]["guards"] == ["require_login"]
+    assert rows[("any", "b/")]["guards"] == [] and rows[("any", "b/")]["judgement_required"]
+    assert rows[("GET", "c/")]["guards"] == ["Authenticated"]

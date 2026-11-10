@@ -1548,3 +1548,83 @@ def test_flask_decorators_count_only_below_the_route_and_hooks_by_their_effect(
     assert rows["/feed"]["unguard_markers"] == ["optional:jwt_required"]
     # a hook that looks at which endpoint it runs for may let some through: no guard
     assert all("before_request:load_user" not in r["scope_guards"] for r in rows.values())
+
+
+@pytest.mark.parametrize(
+    ("imports", "rebinds", "guards"),
+    [
+        ("from flask_login import login_required as require_login", "", ["require_login"]),
+        # the alias, rebound to an identity decorator, guards nothing
+        ("from flask_login import login_required as require_login", "require_login = id", []),
+        # a known guard's name from a library that isn't an auth library
+        ("from someauth.decorators import login_required as require_login", "", []),
+    ],
+)
+def test_flask_guard_names_read_through_their_import(
+    tmp_path: Path, imports: str, rebinds: str, guards: list[str]
+) -> None:
+    _write(
+        tmp_path,
+        "app/views.py",
+        f"from flask import Flask\n{imports}\napp = Flask(__name__)\n{rebinds}\n"
+        "@app.route('/a')\n@require_login\ndef a(): ...\n",
+    )
+    assert _row(_enum(tmp_path), "GET", "/a")["guards"] == guards
+
+
+def test_flask_an_aliased_requirement_given_nothing_guards_nothing(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "app/views.py",
+        "from flask import Flask\nfrom flask_security import roles_required as need\n"
+        "app = Flask(__name__)\n@app.route('/a')\n@need()\ndef a(): ...\n",
+    )
+    assert _row(_enum(tmp_path), "GET", "/a")["guards"] == []
+
+
+@pytest.mark.parametrize(
+    ("module_deco", "method_deco"), [("", "@login_required"), ("@login_required", "")]
+)
+def test_flask_a_method_never_lends_its_decorators_to_a_view_of_its_name(
+    tmp_path: Path, module_deco: str, method_deco: str
+) -> None:
+    _write(
+        tmp_path,
+        "app/views.py",
+        "from flask import Flask\nfrom flask_login import login_required\napp = Flask(__name__)\n"
+        f"{module_deco}\ndef index(): ...\napp.add_url_rule('/', view_func=index)\n"
+        f"class Other:\n    {method_deco}\n    def index(self): ...\n",
+    )
+    assert _row(_enum(tmp_path), "GET", "/")["guards"] == (
+        ["login_required"] if module_deco else []
+    )
+
+
+def test_flask_a_test_suites_login_switches_leave_real_guards_alone(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "app/views.py",
+        "from flask import Flask\nfrom flask_login import login_required\napp = Flask(__name__)\n"
+        "@app.route('/a')\n@login_required\ndef a(): ...\n",
+    )
+    _write(
+        tmp_path,
+        "tests/test_views.py",
+        "from app.views import app\napp.config['LOGIN_DISABLED'] = True\n",
+    )
+    _write(tmp_path, "tests/stubs.py", "def login_required(f):\n    return f\n")
+    assert _row(_enum(tmp_path), "GET", "/a")["guards"] == ["login_required"]
+
+
+def test_flask_options_split_off_a_guarded_route_is_no_asymmetry(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "app/views.py",
+        "from flask import Flask\nfrom flask_login import login_required\napp = Flask(__name__)\n"
+        "@app.route('/a', methods=['GET', 'OPTIONS'])\n@login_required\ndef a(): ...\n",
+    )
+    result = _enum(tmp_path)
+    options, get = _row(result, "OPTIONS", "/a"), _row(result, "GET", "/a")
+    assert options["guards"] == [] and not options["asymmetry"]
+    assert get["guards"] == ["login_required"]
+    assert result["asymmetries"] == []
