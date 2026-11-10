@@ -373,8 +373,7 @@ class OpsService:
         `recording.start` grant for this asset and repository. `authorize_request` enforces this
         rule; the policy gates report it as a typed issue — one rule, two doors."""
         return principal.is_verified_human() or (
-            principal.kind == ActorKind.MACHINE
-            and principal.verified_by is not None
+            principal.is_verified_machine()
             and repository_id is not None
             and self._in_start_scope(principal, asset, repository_id)
         )
@@ -641,6 +640,26 @@ class OpsService:
             raise ForbiddenError(
                 f"recording {asset} progress on repository {repository_id} requires a "
                 "verified person, or a machine granted it in recording.start"
+            )
+
+    def authorize_recorder(self, asset: AssetName, principal: Principal) -> None:
+        """The write doors' gate before their subject is read: a verified person, or a
+        verified machine holding a `recording.start` grant for the asset somewhere. The
+        repository scope needs the subject, so it follows the read (`authorize_write`); a
+        caller refused here learns nothing about whether the subject exists."""
+        if not (
+            principal.is_verified_human()
+            or (
+                principal.is_verified_machine()
+                and any(
+                    scope.principal == principal.ref and asset in scope.assets
+                    for scope in self._recording_starts
+                )
+            )
+        ):
+            raise ForbiddenError(
+                f"recording {asset} progress requires a verified person, or a machine "
+                "granted it in recording.start"
             )
 
     def _in_start_scope(self, principal: Principal, asset: AssetName, repository_id: UUID) -> bool:

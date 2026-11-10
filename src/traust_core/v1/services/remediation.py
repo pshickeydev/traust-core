@@ -719,6 +719,8 @@ class RemediationService:
         upstream (the commit it merged as) or abandoned. A verified person may say it, or a
         machine granted remediation recording on the item's repository — filing happens
         outside order leases, so no lease is bound."""
+        # before the read: a caller refused here learns nothing about whether the item exists
+        self._ops.authorize_recorder(REMEDIATE_FINDING, principal)
         item = self.get(work_item_id)
         repository_id = self._inventory.get_ref(item.repository_ref_id).repository_id
         self._ops.authorize_write(REMEDIATE_FINDING, repository_id, principal)

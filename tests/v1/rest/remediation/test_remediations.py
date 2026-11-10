@@ -273,6 +273,8 @@ def test_progress_door_takes_a_person_a_granted_machine_and_no_one_else(
     assert client.post(route, json=body).status_code == 401
     refused = client.post(route, json=body, headers=runner(context))
     assert refused.status_code == 403, refused.text  # no recording.start grant: no outcome
+    probe = client.post(f"{URL}/{uuid4()}/progress", json=body, headers=runner(context))
+    assert probe.status_code == 403, probe.text  # refused before the read: no existence oracle
     grant = RecordingStartScope(
         principal="machine:runner-7",
         assets=("remediate_finding",),

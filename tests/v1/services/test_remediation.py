@@ -1164,3 +1164,27 @@ def test_outcome_recording_is_a_person_s_or_a_granted_machine_s_word(
     said = decisions(engine, found[0])[-1]
     assert (said.reason, said.actor) == ("abandoned", None)  # the attempt's own statement
     assert service.record_outcome(item.work_item_id, report, PERSON).status == "abandoned"
+
+
+def test_an_ungranted_caller_s_probe_is_refused_before_the_item_is_read(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """No 404-vs-403 oracle on work-item existence: the door checks the caller's shape
+    before it reads the item, so an ungranted or unverified machine hears forbidden
+    whether or not the item exists."""
+    ungranted = Context(Config(home=tmp_path, remediation=PRIVATE, process=GIT))
+    ungranted.__dict__["database"] = engine
+    service = ungranted.services().remediation
+    tracker = Principal(
+        identity="tracker",
+        kind=ActorKind.MACHINE,
+        display="PR tracker",
+        verified_by=IdentitySource.OIDC,
+    )
+    for refused in (
+        tracker,
+        tracker.model_copy(update={"verified_by": None}),
+        PERSON.model_copy(update={"verified_by": None}),
+    ):
+        with pytest.raises(ForbiddenError):
+            service.record_outcome(uuid4(), merged("1f0e8dad" + "0" * 32), refused)
