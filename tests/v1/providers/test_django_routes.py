@@ -150,6 +150,91 @@ def test_a_trailing_slash_class_attribute_or_instance_assignment_shapes_the_urls
     assert ("GET", "a/") not in rows and ("GET", "b") not in rows and ("GET", "c/") not in rows
 
 
+def test_a_trailing_slash_assignment_in_a_module_that_imports_the_router(tmp_path: Path) -> None:
+    """`from .routers import router; router.trailing_slash = ""` in the urlconf that
+    mounts it: the assignment rides a module other than the one binding the router,
+    resolved through the import exactly as a register() call is."""
+    _write(
+        tmp_path,
+        {
+            "site/settings.py": 'ROOT_URLCONF = "site.urls"\n',
+            "site/urls.py": (
+                "from django.urls import include, path\n"
+                "from .routers import router\n"
+                "router.trailing_slash = ''\n"
+                "urlpatterns = [path('api/', include(router.urls))]\n"
+            ),
+            "site/routers.py": (
+                "from rest_framework.routers import DefaultRouter\n"
+                "from notes.views import NoteViewSet\n"
+                "router = DefaultRouter()\nrouter.register('notes', NoteViewSet)\n"
+            ),
+            "notes/views.py": (
+                "from rest_framework.viewsets import ModelViewSet\n"
+                "class NoteViewSet(ModelViewSet): ...\n"
+            ),
+        },
+    )
+    rows = _rows(tmp_path)
+    assert ("GET", "api/notes") in rows and ("GET", "api/notes/<pk>") in rows
+    assert ("GET", "api/notes/") not in rows and ("GET", "api/notes/<pk>/") not in rows
+
+
+def test_disagreeing_trailing_slash_assignments_leave_the_rows_dynamic(tmp_path: Path) -> None:
+    """Two assignments to one router's trailing_slash, in different modules: their
+    order is import order, which the walk cannot see — the form reads unknown."""
+    _write(
+        tmp_path,
+        {
+            "site/settings.py": 'ROOT_URLCONF = "site.urls"\n',
+            "site/urls.py": (
+                "from django.urls import include, path\n"
+                "from .routers import router\n"
+                "router.trailing_slash = ''\n"
+                "urlpatterns = [path('api/', include(router.urls))]\n"
+            ),
+            "site/routers.py": (
+                "from rest_framework.routers import DefaultRouter\n"
+                "from notes.views import NoteViewSet\n"
+                "router = DefaultRouter()\nrouter.trailing_slash = '/'\n"
+                "router.register('notes', NoteViewSet)\n"
+            ),
+            "notes/views.py": (
+                "from rest_framework.viewsets import ModelViewSet\n"
+                "class NoteViewSet(ModelViewSet): ...\n"
+            ),
+        },
+    )
+    rows = _rows(tmp_path)
+    slashless = [r for r in rows.values() if r["pattern"] in ("api/notes", "api/notes/")]
+    assert slashless and all(r["pattern_dynamic"] for r in slashless)
+
+
+def test_a_computed_root_urlconf_scopes_the_settings_nowhere(tmp_path: Path) -> None:
+    """`ROOT_URLCONF = os.environ.get(..)` is set but not literal: which urlconf it
+    names is unknown, so the settings' guards scope nowhere — the beside-the-settings
+    fallback must not apply one project's middleware to the urlconfs beside it."""
+    _write(
+        tmp_path,
+        {
+            "a/settings.py": (
+                "import os\n"
+                'ROOT_URLCONF = os.environ.get("URLCONF", "a.urls")\n'
+                "MIDDLEWARE = ['django.contrib.auth.middleware.LoginRequiredMiddleware']\n"
+            ),
+            "a/urls.py": (
+                "from django.urls import path\nfrom . import views\n"
+                'urlpatterns = [path("a-note/", views.a_note)]\n'
+            ),
+            "a/views.py": "def a_note(request): ...\n",
+        },
+    )
+    rows = _rows(tmp_path)
+    assert set(rows) == {("any", "a-note/")}
+    assert rows[("any", "a-note/")]["scope_guards"] == []
+    assert rows[("any", "a-note/")]["judgement_required"]
+
+
 def test_a_settings_module_guards_only_its_own_projects_routes(tmp_path: Path) -> None:
     """Two projects in one checkout: one's LoginRequiredMiddleware and DRF defaults scope to
     the urlconfs its ROOT_URLCONF reaches, never to the other project's routes."""

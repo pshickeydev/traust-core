@@ -16,7 +16,7 @@ from traust_core.v1.providers.python_guards import (
     empty,
     requires_nothing,
 )
-from traust_core.v1.providers.route_guards import (
+from traust_core.v1.providers.route_plumbing import (
     _c3,
     _const_str,
     _Def,
@@ -325,16 +325,23 @@ class _Django:
             spread = any(k is None for k, _ in items[(last or 0) :])
             permissions = items[last][1] if last is not None and not spread else None
             entry = (middleware, _elements(permissions) if permissions is not None else [])
-            root = _const_str(values.get("ROOT_URLCONF"))
+            root_value = values.get("ROOT_URLCONF")
+            root = _const_str(root_value)
             where = self.file(root, rel) if root else None
             if where is not None:
                 found.setdefault(where, []).append(entry)
-            elif root is None:
-                # no ROOT_URLCONF: the urlconfs beside the settings
+            elif root_value is None:
+                # no ROOT_URLCONF at all: the urlconfs beside the settings
                 home = rel.rsplit("/", 1)[0] + "/" if "/" in rel else ""
                 for conf in self.trees:
                     if conf.startswith(home) and "urlpatterns" in self.lists(conf):
                         found.setdefault(conf, []).append(entry)
+            # else: ROOT_URLCONF is set but not a literal (`os.environ.get(..)`, a
+            # setting built at runtime): the urlconf it names is unknown, so these
+            # settings scope nowhere — the beside-the-settings fallback must not
+            # run, or one project's middleware would guard every urlconf beside a
+            # settings module in a multi-project checkout. The rows carry no
+            # project's settings and read judged.
         return {
             root: (
                 [m for m in entries[0][0] if all(m in e[0] for e in entries)],
@@ -1199,16 +1206,6 @@ class _Django:
                                 break
                         if slash is not None:
                             break
-                for other, _ in _module_statements(tree.body, False):
-                    # a later instance assignment (`router.trailing_slash = ...`)
-                    # overrides both, as at runtime; statement order gives last-wins
-                    if isinstance(other, ast.Assign) and any(
-                        isinstance(t, ast.Attribute)
-                        and t.attr == "trailing_slash"
-                        and _dotted(t.value) in {_dotted(x) for x in _targets(n)}
-                        for t in other.targets
-                    ):
-                        slash = other.value
                 router.slash = "" if isinstance(slash, ast.Constant) and not slash.value else "/"
                 router.dynamic |= slash is not None and not isinstance(slash, ast.Constant)
                 if _name(value).startswith("Nested") and len(value.args) >= 2:
@@ -1219,6 +1216,31 @@ class _Django:
                     router.parent = (parent, route.strip("^$").strip("/"), lookup)
                     router.dynamic |= computed or parent is None
         self._routers = found
+        # `router.trailing_slash = ...` — an instance assignment overrides the init
+        # kwarg and any class attribute, as at runtime (DRF reads the attribute at
+        # route-generation time). The assignment may sit in the module that binds
+        # the router OR in any module that imports it (`from .routers import r;
+        # r.trailing_slash = ""` in the urlconf that mounts it), so the receiver is
+        # resolved through the import exactly as a register() call is. Assignments
+        # that disagree, or a computed one, leave the rows pattern-dynamic: their
+        # order across modules is import order, which the walk cannot see.
+        assigned: dict[tuple[str, str], list[ast.AST]] = {}
+        for rel, tree in self.trees.items():
+            for n, _ in _module_statements(tree.body, False):
+                if not isinstance(n, ast.Assign):
+                    continue
+                for target in n.targets:
+                    if not (isinstance(target, ast.Attribute) and target.attr == "trailing_slash"):
+                        continue
+                    key = self.router_key(rel, _dotted(target.value))
+                    if key is not None and key in found:
+                        assigned.setdefault(key, []).append(n.value)
+        for key, values in assigned.items():
+            constants = {v.value for v in values if isinstance(v, ast.Constant)}
+            if any(not isinstance(v, ast.Constant) for v in values) or len(constants) > 1:
+                found[key].dynamic = True
+            elif constants:
+                found[key].slash = "" if not next(iter(constants)) else "/"
         for rel in self.trees:
             for n, _ in self.index.calls.get(rel, []):
                 if not isinstance(n.func, ast.Attribute):
