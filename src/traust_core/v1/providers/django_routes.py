@@ -10,7 +10,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field, replace
 
 from traust_core.v1.models.code_facts import RouteFamily
-from traust_core.v1.providers.python_guards import GuardReader, refuses_anonymous
+from traust_core.v1.providers.python_guards import GuardReader
 from traust_core.v1.providers.route_guards import (
     _const_str,
     _dotted,
@@ -92,7 +92,11 @@ _POLICY_DECORATORS = {
     "parser_classes", "schema", "versioning_class", "metadata_class",
 }  # fmt: skip
 # code that decides which permissions apply, or skips checking them
-_PERMISSION_METHODS = {"get_permissions", "check_permissions", "permission_classes", "initial"}
+_PERMISSION_METHODS = {
+    "get_permissions", "check_permissions", "permission_classes", "initial", "permission_denied",
+}  # fmt: skip
+# what Django's auth mixins decide by: a view overriding one may let anyone in
+_MIXIN_HOOKS = {"has_permission", "handle_no_permission", "get_permission_required", "test_func"}
 # Django's views marked `login_not_required`
 # library views that answer only the methods a subclass defines
 _PLAIN_VIEWS = {"View", "APIView", "GenericAPIView", "ViewSet", "GenericViewSet", "ViewSetMixin"}
@@ -208,18 +212,20 @@ class _Django:
                 if v == "django.contrib.auth.middleware.LoginRequiredMiddleware"
             ]
             drf = values.get("REST_FRAMEWORK")
-            permissions = (
-                next(
-                    (
-                        v
-                        for k, v in zip(drf.keys, drf.values, strict=False)
-                        if _const_str(k) == "DEFAULT_PERMISSION_CLASSES"
-                    ),
-                    None,
-                )
-                if isinstance(drf, ast.Dict)
-                else None
+            # the last `DEFAULT_PERMISSION_CLASSES` key wins; a `**spread` after it may replace it
+            items = (
+                list(zip(drf.keys, drf.values, strict=False)) if isinstance(drf, ast.Dict) else []
             )
+            last = max(
+                (
+                    i
+                    for i, (k, _) in enumerate(items)
+                    if _const_str(k) == "DEFAULT_PERMISSION_CLASSES"
+                ),
+                default=None,
+            )
+            spread = any(k is None for k, _ in items[(last or 0) :])
+            permissions = items[last][1] if last is not None and not spread else None
             entry = (middleware, _elements(permissions) if permissions is not None else [])
             root = _const_str(values.get("ROOT_URLCONF"))
             where = self.file(root, rel) if root else None
@@ -567,9 +573,11 @@ class _Django:
             )
             # `LoginRequiredMiddleware` exempts views marked `login_not_required`, and Django
             # marks its own (login, logout, password reset): it guards only checkout views
+            # DRF marks every view of its own `login_required = False`
             exempt = (
                 "login_not_required" in unguards
                 or node is None
+                or info.drf
                 or any(isinstance(c, str) and c in _AUTH_VIEWS for _, c in info.mro or [])
             )
             scope = [] if exempt else list(middleware)
@@ -870,14 +878,18 @@ class _Django:
                     guards, unguards = [*guards, *more], [*unguards, *fewer]
                 continue
             own = {n.name for n in c.body if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef)}
+            if not viewed and own & _MIXIN_HOOKS:
+                viewed = True  # overrides what the library mixins after it decide by
             dispatch = next(
                 (n for n in c.body if isinstance(n, ast.FunctionDef) and n.name == "dispatch"), None
             )
-            if dispatch is not None and not viewed:
-                if refuses_anonymous(dispatch):
-                    guards.append(f"{c.name}.dispatch")
-                if "super(" not in ast.unparse(dispatch):
-                    viewed = True  # its own dispatch skips the mixins after it
+            # its own dispatch may skip the mixins after it: not calling `super()`, or calling
+            # past one (`super(LoginRequiredMixin, self)`)
+            if dispatch is not None and (
+                "super().dispatch(" not in (text := ast.unparse(dispatch))
+                or re.search(r"\bsuper\(\s*\w", text)
+            ):
+                viewed = True
             for d in c.decorator_list:
                 method = (
                     _const_str(next((k.value for k in d.keywords if k.arg == "name"), None))
@@ -892,9 +904,18 @@ class _Django:
                         held[1].extend(fewer)
                 elif "dispatch" not in earlier:
                     guards, unguards = [*guards, *more], [*unguards, *fewer]
-            if not settled and own & _PERMISSION_METHODS:
+            # a DRF view's own dispatch that skips `super()` never runs `initial()`'s checks
+            skips = (
+                dispatch is not None
+                and "super().dispatch(" not in ast.unparse(dispatch)
+                and any(
+                    isinstance(x, str) and _drf(self.origins.get((w, x), ""), x) for w, x in mro
+                )
+            )
+            decided = sorted(own & _PERMISSION_METHODS) + (["dispatch"] if skips else [])
+            if not settled and decided:
                 # which permissions apply is decided by code: never shown as a guard
-                unguards.append(sorted(own & _PERMISSION_METHODS)[0])
+                unguards.append(decided[0])
                 permissions, settled = [], True
             branched = any(
                 isinstance(n, ast.Assign | ast.AnnAssign)
@@ -992,7 +1013,7 @@ class _Django:
             for n, _ in self.index.calls.get(rel, []):
                 if not isinstance(n.func, ast.Attribute):
                     continue
-                if n.func.attr == "register" and len(n.args) >= 2:
+                if n.func.attr == "register" and _registered(n) is not None:
                     key = self.router_key(rel, _dotted(n.func.value))
                     if key in found:
                         found[key].registered.append((rel, n))
@@ -1022,7 +1043,7 @@ class _Django:
                     and n.func.attr == "register"
                     and isinstance(n.func.value, ast.Name)
                     and n.func.value.id in {a.arg for a in fn.args.args}
-                    and len(n.args) >= 2
+                    and _registered(n) is not None
                 ):
                     by_fn.setdefault(id(fn), (fn, []))[1].append(n)
             for fn, calls in by_fn.values():
@@ -1088,11 +1109,12 @@ class _Django:
             )
         for k in [key, *router.extends]:
             for where, n in routers[k].registered:
-                route, computed = self.part(n.args[0], where)
+                prefix_node, viewset = _registered(n)  # type: ignore[misc]
+                route, computed = self.part(prefix_node, where)
                 route = route.strip("^$").strip("/")
                 self.viewset_rows(
                     where,
-                    n.args[1],
+                    viewset,
                     _join(prefix, base + route),
                     dynamic or computed,
                     n.lineno,
@@ -1115,8 +1137,9 @@ class _Django:
                 for where, n in (
                     self.routers()[parent].registered if parent in self.routers() else []
                 )
-                if self.part(n.args[0], where)[0].strip("^$").strip("/") == route
-                and (viewset := self.definition(_dotted(n.args[1]), where)) is not None
+                if (args := _registered(n)) is not None
+                and self.part(args[0], where)[0].strip("^$").strip("/") == route
+                and (viewset := self.definition(_dotted(args[1]), where)) is not None
                 and isinstance(viewset[1], ast.ClassDef)
             ),
             "pk",
@@ -1165,11 +1188,16 @@ class _Django:
                 detail = _dotted(deco).endswith("detail_route") or (
                     isinstance(kw.get("detail"), ast.Constant) and kw["detail"].value is True
                 )
-                methods = [
-                    e.value.upper()
-                    for e in getattr(kw.get("methods"), "elts", [])
-                    if isinstance(e, ast.Constant) and isinstance(e.value, str)
-                ] or ["GET"]
+                listed = kw.get("methods")
+                if isinstance(listed, ast.Name):  # `methods=WRITE`, a module constant
+                    listed = self.defined(where_c).get(listed.id, listed)
+                methods = (
+                    [m.upper() for m in _strings(listed)]
+                    if isinstance(listed, ast.List | ast.Tuple | ast.Set)
+                    else ["any"]
+                    if listed is not None
+                    else ["GET"]
+                ) or ["any"]
                 url_path = _const_str(kw.get("url_path")) or n.name
                 extra.append((n.name, url_path, n, detail, methods))
             for action, url_path, fn0, detail, _ in list(extra):
@@ -1293,6 +1321,14 @@ def _as_urls(node: ast.AST | None) -> ast.Attribute | None:
     return None
 
 
+def _registered(call: ast.Call) -> tuple[ast.AST, ast.AST] | None:
+    """A router `register()` call's prefix and viewset, positional or by keyword."""
+    kw = {k.arg: k.value for k in call.keywords}
+    prefix = call.args[0] if call.args else kw.get("prefix")
+    viewset = call.args[1] if len(call.args) > 1 else kw.get("viewset")
+    return (prefix, viewset) if prefix is not None and viewset is not None else None
+
+
 def _route_args(call: ast.Call) -> tuple[ast.AST | None, ast.AST | None]:
     """A path() call's route and view, positional or by keyword (`path(route=.., view=..)`)."""
     kw = {k.arg: k.value for k in call.keywords}
@@ -1321,8 +1357,11 @@ def _decorator_guards(d: ast.AST, reader: GuardReader) -> tuple[list[str], list[
         inner = d.args[0]
         out = [_decorator_guards(x, reader) for x in _elements(inner)]
         return _unique([g for x, _ in out for g in x]), sorted({u for _, x in out for u in x})
-    if name == "login_not_required":
-        return [], [name]
+    found = reader.resolve(_dotted(d))
+    if name == "login_not_required" or (
+        found is not None and ".login_required = False" in ast.unparse(found)
+    ):
+        return [], ["login_not_required"]  # what `LoginRequiredMiddleware` exempts
     if _INERT_DECORATORS.match(name) or name in _POLICY_DECORATORS or _NOT_GUARDS.search(name):
         return [], []
     label = _dotted(d)

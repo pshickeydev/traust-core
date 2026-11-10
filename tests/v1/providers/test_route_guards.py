@@ -267,10 +267,11 @@ def test_flask_blueprint_before_request_is_baseline(tmp_path):
         "    return 'ok'\n",
     )
     result = _enum(tmp_path)
+    # a before_request hook is checkout code: no guard (D37), so the route is judged
     settings = _row(result, "GET", "/settings")
     assert settings["guards"] == []
-    assert settings["scope_guards"] == ["before_request:require_admin_session"]
-    assert settings["judgement_required"] is False
+    assert settings["scope_guards"] == []
+    assert settings["judgement_required"] is True
     # the baseline is receiver-scoped: another blueprint does not inherit it
     status = _row(result, "GET", "/status")
     assert status["scope_guards"] == []
@@ -295,46 +296,19 @@ def test_flask_before_request_that_cannot_reject_is_not_a_guard(tmp_path):
     assert row["judgement_required"] is True
 
 
-_AUTH = (
-    "from functools import wraps\n"
-    "from flask import abort\n"
-    "from flask_login import current_user\n\n"
-    "def _refusing(f):\n"
-    "    @wraps(f)\n"
-    "    def inner(*args, **kwargs):\n"
-    "        if not current_user.is_authenticated:\n"
-    "            abort(401)\n"
-    "        return f(*args, **kwargs)\n"
-    "    return inner\n\n"
-    "def token_required(f):\n    return _refusing(f)\n\n"
-    "def require_auth(f):\n    return _refusing(f)\n\n"
-    "def admin_required(f):\n    return _refusing(f)\n\n"
-    "def require_scope(scope):\n"
-    "    def deco(f):\n"
-    "        @wraps(f)\n"
-    "        def inner(*args, **kwargs):\n"
-    "            if not current_user.is_authenticated or scope not in current_user.scopes:\n"
-    "                abort(403)\n"
-    "            return f(*args, **kwargs)\n"
-    "        return inner\n"
-    "    return deco\n"
-)
-
-
 def test_flask_methodview_one_row_per_method(tmp_path):
-    _write(tmp_path, "svc/auth.py", _AUTH)
     _write(
         tmp_path,
         "svc/views.py",
         "from flask import Flask\n"
         "from flask.views import MethodView\n"
-        "from .auth import token_required\n\n"
+        "from flask_jwt_extended import jwt_required\n\n"
         "app = Flask(__name__)\n\n"
         "class WidgetAPI(MethodView):\n"
-        "    @token_required\n"
+        "    @jwt_required()\n"
         "    def get(self, wid):\n"
         "        return {}\n\n"
-        "    @token_required\n"
+        "    @jwt_required()\n"
         "    def put(self, wid):\n"
         "        return {}\n\n"
         "    def delete(self, wid):\n"
@@ -346,7 +320,7 @@ def test_flask_methodview_one_row_per_method(tmp_path):
     assert sorted(r["method"] for r in rows) == ["DELETE", "GET", "PUT"]
     assert all(r["view_class"] == "WidgetAPI" for r in rows)
     get = _row(result, "GET", "/widgets/<wid>")
-    assert get["guards"] == ["token_required"]
+    assert get["guards"] == ["jwt_required"]
     assert get["handler"]["expr"] == "WidgetAPI.get"
     delete = _row(result, "DELETE", "/widgets/<wid>")
     assert delete["guards"] == [] and delete["judgement_required"] is True
@@ -354,29 +328,28 @@ def test_flask_methodview_one_row_per_method(tmp_path):
 
 
 def test_flask_restx_method_decorators_and_inheritance(tmp_path):
-    _write(tmp_path, "svc/auth.py", _AUTH)
     _write(
         tmp_path,
         "svc/base.py",
         "from flask_restx import Resource\n"
-        "from .auth import require_auth\n\n"
+        "from flask_login import login_required\n\n"
         "class AuthedResource(Resource):\n"
-        "    method_decorators = [require_auth]\n",
+        "    method_decorators = [login_required]\n",
     )
     _write(
         tmp_path,
         "svc/api.py",
         "from flask_restx import Api, Namespace, Resource\n"
         "from .base import AuthedResource\n"
-        "from .auth import require_scope\n\n"
+        "from flask_security import roles_required\n\n"
         "api = Api()\n"
         "ns = Namespace('reports')\n\n"
         "@ns.route('/reports')\n"
         "class Reports(AuthedResource):\n"
-        "    @require_scope('read')\n"
+        "    @roles_required('read')\n"
         "    def get(self):\n"
         "        return []\n\n"
-        "    @require_scope('write')\n"
+        "    @roles_required('write')\n"
         "    def post(self):\n"
         "        return {}\n\n"
         "    def delete(self):\n"
@@ -388,15 +361,15 @@ def test_flask_restx_method_decorators_and_inheritance(tmp_path):
     )
     result = _enum(tmp_path)
     get = _row(result, "GET", "/reports")
-    assert get["guards"] == ["require_scope"]
-    assert get["scope_guards"] == ["require_auth"]  # inherited method_decorators
+    assert get["guards"] == ["roles_required"]
+    assert get["scope_guards"] == ["login_required"]  # inherited method_decorators
     # every Reports method carries the inherited authn guard, but only two
-    # of three carry the scope check — the odd one out must be judged
+    # of three carry the role check — the odd one out must be judged
     delete = _row(result, "DELETE", "/reports")
-    assert delete["scope_guards"] == ["require_auth"]
+    assert delete["scope_guards"] == ["login_required"]
     assert delete["judgement_required"] is True
-    assert delete["guard_family_gaps"] == ["scope"]
-    fam = [a for a in result["asymmetries"] if a.get("guard_family") == "scope"]
+    assert delete["guard_family_gaps"] == ["role"]
+    fam = [a for a in result["asymmetries"] if a.get("guard_family") == "role"]
     assert fam and fam[0]["unguarded"] == ["DELETE /reports"]
     # add_resource with two paths -> one row per path
     health = sorted(r["pattern"] for r in _flask(result) if r.get("view_class") == "Health")
@@ -404,15 +377,14 @@ def test_flask_restx_method_decorators_and_inheritance(tmp_path):
 
 
 def test_flask_restful_method_decorators_dict(tmp_path):
-    _write(tmp_path, "svc/auth.py", _AUTH)
     _write(
         tmp_path,
         "svc/api.py",
         "from flask_restful import Api, Resource\n"
-        "from .auth import admin_required\n\n"
+        "from flask_security import roles_required\n\n"
         "api = Api()\n\n"
         "class Users(Resource):\n"
-        "    method_decorators = {'post': [admin_required]}\n"
+        "    method_decorators = {'post': [roles_required('admin')]}\n"
         "    def get(self):\n"
         "        return []\n"
         "    def post(self):\n"
@@ -420,7 +392,7 @@ def test_flask_restful_method_decorators_dict(tmp_path):
         "api.add_resource(Users, '/users')\n",
     )
     result = _enum(tmp_path)
-    assert _row(result, "POST", "/users")["scope_guards"] == ["admin_required"]
+    assert _row(result, "POST", "/users")["scope_guards"] == ["roles_required"]
     assert _row(result, "GET", "/users")["scope_guards"] == []
 
 
@@ -495,8 +467,10 @@ def test_flask_app_hook_scoped_to_its_app_and_registered_blueprints(tmp_path):
         "    return ''\n",
     )
     result = _enum(tmp_path)
-    assert _row(result, "GET", "/me")["scope_guards"] == ["before_request:check_token"]
-    assert _row(result, "GET", "/orders")["scope_guards"] == ["before_request:check_token"]
+    # a before_request hook is checkout code: no guard (D37), so the routes are judged
+    for pattern in ("/me", "/orders"):
+        row = _row(result, "GET", pattern)
+        assert row["scope_guards"] == [] and row["judgement_required"] is True
     # a second app in the same tree does not inherit the first app's hook
     debug = _row(result, "GET", "/debug")
     assert debug["scope_guards"] == []

@@ -1259,7 +1259,6 @@
     "GET",
     "api/me/",
     [
-     "LoginRequiredMiddleware",
      "rest_framework.permissions.IsAuthenticated"
     ],
     false,
@@ -2009,10 +2008,8 @@
     "flask",
     "GET",
     "/admin/users",
-    [
-     "before_request:require_admin"
-    ],
-    false,
+    [],
+    true,
     false
    ],
    [
@@ -4034,10 +4031,8 @@
     "flask",
     "GET",
     "/orders2",
-    [
-     "before_request:require_login2"
-    ],
-    false,
+    [],
+    true,
     false
    ]
   ]
@@ -4057,10 +4052,8 @@
     "flask",
     "GET",
     "/users",
-    [
-     "before_request:require_admin"
-    ],
-    false,
+    [],
+    true,
     false
    ],
    [
@@ -4396,6 +4389,1028 @@
     "flask",
     "GET",
     "/users/list",
+    [],
+    true,
+    false
+   ]
+  ]
+ },
+ {
+  "case": "drf_views_credited_login_required_middleware",
+  "contract": 2,
+  "expect": "GET a/, POST f/, the api/notes rows: no LoginRequiredMiddleware (DRF's as_view sets login_required=False; DEFAULT is AllowAny), judged; GET d/, any me/ guarded by middleware",
+  "files": {
+   "app/settings.py": "ROOT_URLCONF='app.urls'\nMIDDLEWARE = ['django.contrib.sessions.middleware.SessionMiddleware','django.contrib.auth.middleware.AuthenticationMiddleware','django.contrib.auth.middleware.LoginRequiredMiddleware']\nINSTALLED_APPS=['rest_framework']\n",
+   "app/urls.py": "from django.urls import path, include\nfrom rest_framework.routers import DefaultRouter\nfrom . import views\nrouter = DefaultRouter()\nrouter.register(r'notes', views.NoteViewSet)\nurlpatterns = [path('a/', views.A.as_view()), path('f/', views.f), path('api/', include(router.urls)), path('d/', views.D.as_view()), path('me/', views.me)]\n",
+   "app/views.py": "from django.views import View\nfrom rest_framework.views import APIView\nfrom rest_framework.decorators import api_view\nfrom rest_framework import viewsets\nclass A(APIView):\n    def get(self, request): ...\n@api_view(['POST'])\ndef f(request): ...\nclass NoteViewSet(viewsets.ModelViewSet):\n    pass\nclass D(View):\n    def get(self, request): ...\ndef me(request): ...\n"
+  },
+  "rows": [
+   [
+    "django-drf",
+    "DELETE",
+    "api/notes/<pk>/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "GET",
+    "a/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "GET",
+    "api/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "GET",
+    "api/notes/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "GET",
+    "api/notes/<pk>/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "GET",
+    "d/",
+    [
+     "LoginRequiredMiddleware"
+    ],
+    false,
+    false
+   ],
+   [
+    "django-drf",
+    "PATCH",
+    "api/notes/<pk>/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "POST",
+    "api/notes/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "POST",
+    "f/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "PUT",
+    "api/notes/<pk>/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "any",
+    "me/",
+    [
+     "LoginRequiredMiddleware"
+    ],
+    false,
+    false
+   ]
+  ]
+ },
+ {
+  "case": "dj_checkout_decorator_sets_login_required_false",
+  "contract": 2,
+  "expect": "any h/ judged (login_exempt sets view.login_required = False, the attribute the middleware reads), like any h2/; me/ guarded",
+  "files": {
+   "app/settings.py": "ROOT_URLCONF='app.urls'\nMIDDLEWARE = ['django.contrib.sessions.middleware.SessionMiddleware','django.contrib.auth.middleware.AuthenticationMiddleware','django.contrib.auth.middleware.LoginRequiredMiddleware']\n",
+   "app/urls.py": "from django.urls import path\nfrom . import views\nurlpatterns = [path('h/', views.health), path('h2/', views.health2), path('me/', views.me)]\n",
+   "app/decorators.py": "def login_exempt(view):\n    view.login_required = False\n    return view\n",
+   "app/views.py": "from django.contrib.auth.decorators import login_not_required\nfrom .decorators import login_exempt\n@login_exempt\ndef health(request): ...\n@login_not_required\ndef health2(request): ...\ndef me(request): ...\n"
+  },
+  "rows": [
+   [
+    "django-drf",
+    "any",
+    "h/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "any",
+    "h2/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "any",
+    "me/",
+    [
+     "LoginRequiredMiddleware"
+    ],
+    false,
+    false
+   ]
+  ]
+ },
+ {
+  "case": "fl_hook_exemption_inside_anonymous_branch",
+  "contract": 2,
+  "expect": "GET /health judged (the hook lets PUBLIC endpoints through inside its anonymous branch), as GET /health_b is",
+  "files": {
+   "app.py": "from flask import Flask, request, redirect, url_for\nfrom flask_login import current_user\napp = Flask(__name__)\nPUBLIC = {'login', 'health', 'static'}\n@app.before_request\ndef require_login():\n    if not current_user.is_authenticated:\n        if request.endpoint in PUBLIC:\n            return\n        return redirect(url_for('login'))\n@app.route('/health')\ndef health(): ...\n",
+   "b.py": "from flask import Flask, request, redirect, url_for\nfrom flask_login import current_user\nb = Flask(__name__)\nPUBLIC = {'login', 'health', 'static'}\n@b.before_request\ndef require_login_b():\n    if request.endpoint in PUBLIC:\n        return\n    if not current_user.is_authenticated:\n        return redirect(url_for('login'))\n@b.route('/health_b')\ndef health_b(): ...\n"
+  },
+  "rows": [
+   [
+    "flask",
+    "GET",
+    "/health",
+    [],
+    true,
+    false
+   ],
+   [
+    "flask",
+    "GET",
+    "/health_b",
+    [],
+    true,
+    false
+   ]
+  ]
+ },
+ {
+  "case": "fl_hook_exemption_in_for_loop",
+  "contract": 2,
+  "expect": "GET /health judged (the hook's for loop returns early for OPEN paths)",
+  "files": {
+   "app.py": "from flask import Flask, request, redirect, url_for\nfrom flask_login import current_user\napp = Flask(__name__)\nOPEN = ('/static', '/health', '/login')\n@app.before_request\ndef require_login():\n    for prefix in OPEN:\n        if request.path.startswith(prefix):\n            return\n    if not current_user.is_authenticated:\n        return redirect(url_for('login'))\n@app.route('/health')\ndef health(): ...\n"
+  },
+  "rows": [
+   [
+    "flask",
+    "GET",
+    "/health",
+    [],
+    true,
+    false
+   ]
+  ]
+ },
+ {
+  "case": "fl_hook_exemption_in_try",
+  "contract": 2,
+  "expect": "GET /health judged (the hook returns early for OPEN_ENDPOINTS inside a try)",
+  "files": {
+   "app.py": "from flask import Flask, request, abort\nfrom flask_login import current_user\napp = Flask(__name__)\n@app.before_request\ndef require_login():\n    try:\n        if request.endpoint in app.config['OPEN_ENDPOINTS']:\n            return\n    except KeyError:\n        pass\n    if not current_user.is_authenticated:\n        abort(401)\n@app.route('/health')\ndef health(): ...\n"
+  },
+  "rows": [
+   [
+    "flask",
+    "GET",
+    "/health",
+    [],
+    true,
+    false
+   ]
+  ]
+ },
+ {
+  "case": "decorator_calls_view_inside_anonymous_branch",
+  "contract": 2,
+  "expect": "GET /items unguarded, judged (the wrapper calls the view for an anonymous GET)",
+  "files": {
+   "app.py": "from functools import wraps\nfrom flask import Flask, request, abort\nfrom flask_login import current_user\napp = Flask(__name__)\ndef writes_need_login(f):\n    @wraps(f)\n    def inner(*a, **k):\n        if not current_user.is_authenticated:\n            if request.method == 'GET':\n                return f(*a, **k)\n            abort(401)\n        return f(*a, **k)\n    return inner\n@app.route('/items', methods=['GET'])\n@writes_need_login\ndef items(): ...\n"
+  },
+  "rows": [
+   [
+    "flask",
+    "GET",
+    "/items",
+    [],
+    true,
+    false
+   ]
+  ]
+ },
+ {
+  "case": "fl_current_user_truthiness_read_as_identity_check",
+  "contract": 2,
+  "expect": "GET /a and GET /b unguarded, judged (flask-login's current_user is an AnonymousUserMixin: truthy, never None); GET /c guarded",
+  "files": {
+   "app.py": "from functools import wraps\nfrom flask import Flask, abort, redirect\nfrom flask_login import current_user\napp = Flask(__name__)\ndef must_login(f):\n    @wraps(f)\n    def inner(*a, **k):\n        if not current_user:\n            abort(401)\n        return f(*a, **k)\n    return inner\ndef must_login2(f):\n    @wraps(f)\n    def inner(*a, **k):\n        if current_user is None:\n            abort(401)\n        return f(*a, **k)\n    return inner\ndef must_login3(f):\n    @wraps(f)\n    def inner(*a, **k):\n        if not current_user.is_authenticated:\n            abort(401)\n        return f(*a, **k)\n    return inner\n@app.route('/a')\n@must_login\ndef a(): ...\n@app.route('/b')\n@must_login2\ndef b(): ...\n@app.route('/c')\n@must_login3\ndef c(): ...\n"
+  },
+  "rows": [
+   [
+    "flask",
+    "GET",
+    "/a",
+    [],
+    true,
+    false
+   ],
+   [
+    "flask",
+    "GET",
+    "/b",
+    [],
+    true,
+    false
+   ],
+   [
+    "flask",
+    "GET",
+    "/c",
+    [],
+    true,
+    false
+   ]
+  ]
+ },
+ {
+  "case": "dj_request_user_truthiness_read_as_identity_check",
+  "contract": 2,
+  "expect": "any a/ and GET b/ unguarded, judged (request.user is an AnonymousUser: never None, truthy); any c/ guarded",
+  "files": {
+   "app/urls.py": "from django.urls import path\nfrom . import views\nurlpatterns = [path('a/', views.a), path('b/', views.B.as_view()), path('c/', views.c)]\n",
+   "app/views.py": "from functools import wraps\nfrom django.http import HttpResponseForbidden\nfrom django.views import View\ndef user_required(f):\n    @wraps(f)\n    def inner(request, *a, **k):\n        if request.user is None:\n            return HttpResponseForbidden()\n        return f(request, *a, **k)\n    return inner\nclass NeedUser:\n    def dispatch(self, request, *a, **k):\n        if not request.user:\n            return HttpResponseForbidden()\n        return super().dispatch(request, *a, **k)\ndef user_required3(f):\n    @wraps(f)\n    def inner(request, *a, **k):\n        if not request.user.is_authenticated:\n            return HttpResponseForbidden()\n        return f(request, *a, **k)\n    return inner\n@user_required\ndef a(request): ...\nclass B(NeedUser, View):\n    def get(self, request): ...\n@user_required3\ndef c(request): ...\n"
+  },
+  "rows": [
+   [
+    "django-drf",
+    "GET",
+    "b/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "any",
+    "a/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "any",
+    "c/",
+    [],
+    true,
+    false
+   ]
+  ]
+ },
+ {
+  "case": "guest_only_check_read_as_guard",
+  "contract": 2,
+  "expect": "any signup/, GET/POST register/ unguarded, judged (guest_only/GuestOnlyMixin turn away *authenticated* callers and admit anonymous ones); any me/ guarded",
+  "files": {
+   "app/urls.py": "from django.urls import path\nfrom . import views\nurlpatterns = [path('signup/', views.signup), path('register/', views.Register.as_view()), path('me/', views.me)]\n",
+   "app/views.py": "from functools import wraps\nfrom django.shortcuts import redirect\nfrom django.views import View\ndef guest_only(f):\n    @wraps(f)\n    def inner(request, *a, **k):\n        if not request.user.is_anonymous:\n            return redirect('home')\n        return f(request, *a, **k)\n    return inner\nclass GuestOnlyMixin:\n    def dispatch(self, request, *a, **k):\n        if not request.user.is_anonymous:\n            return redirect('home')\n        return super().dispatch(request, *a, **k)\ndef user_only(f):\n    @wraps(f)\n    def inner(request, *a, **k):\n        if request.user.is_anonymous:\n            return redirect('login')\n        return f(request, *a, **k)\n    return inner\n@guest_only\ndef signup(request): ...\nclass Register(GuestOnlyMixin, View):\n    def get(self, request): ...\n    def post(self, request): ...\n@user_only\ndef me(request): ...\n"
+  },
+  "rows": [
+   [
+    "django-drf",
+    "GET",
+    "register/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "POST",
+    "register/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "any",
+    "me/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "any",
+    "signup/",
+    [],
+    true,
+    false
+   ]
+  ]
+ },
+ {
+  "case": "checkout_definition_shadows_known_guard_name",
+  "contract": 2,
+  "expect": "any a/ and GET b/ unguarded, judged (checkout login_required/IsAuthenticated admit everyone), like any c/ and GET d/",
+  "files": {
+   "app/urls.py": "from django.urls import path\nfrom . import views\nurlpatterns = [path('a/', views.a), path('b/', views.B.as_view()), path('c/', views.c), path('d/', views.D.as_view())]\n",
+   "app/auth.py": "from rest_framework.permissions import BasePermission\ndef login_required(view):\n    # TODO: wire up SSO\n    return view\ndef sso_required(view):\n    return view\nclass IsAuthenticated(BasePermission):\n    def has_permission(self, request, view):\n        return True\nclass Anyone(BasePermission):\n    def has_permission(self, request, view):\n        return True\n",
+   "app/views.py": "from rest_framework.views import APIView\nfrom .auth import login_required, sso_required, IsAuthenticated, Anyone\n@login_required\ndef a(request): ...\nclass B(APIView):\n    permission_classes = [IsAuthenticated]\n    def get(self, request): ...\n@sso_required\ndef c(request): ...\nclass D(APIView):\n    permission_classes = [Anyone]\n    def get(self, request): ...\n"
+  },
+  "rows": [
+   [
+    "django-drf",
+    "GET",
+    "b/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "GET",
+    "d/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "any",
+    "a/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "any",
+    "c/",
+    [],
+    true,
+    false
+   ]
+  ]
+ },
+ {
+  "case": "dj_permission_required_mixin_has_permission_override",
+  "contract": 2,
+  "expect": "GET n/<int:pk>/ judged (has_permission admits anonymous callers to public notes); GET m/<int:pk>/ guarded",
+  "files": {
+   "app/urls.py": "from django.urls import path\nfrom . import views\nurlpatterns = [path('n/<int:pk>/', views.NoteDetail.as_view()), path('m/<int:pk>/', views.Plain.as_view())]\n",
+   "app/views.py": "from django.contrib.auth.mixins import PermissionRequiredMixin\nfrom django.views.generic import DetailView\nfrom .models import Note\nclass NoteDetail(PermissionRequiredMixin, DetailView):\n    model = Note\n    permission_required = 'notes.view_note'\n    def has_permission(self):\n        return self.get_object().is_public or super().has_permission()\nclass Plain(PermissionRequiredMixin, DetailView):\n    model = Note\n    permission_required = 'notes.view_note'\n"
+  },
+  "rows": [
+   [
+    "django-drf",
+    "GET",
+    "m/<int:pk>/",
+    [
+     "PermissionRequiredMixin"
+    ],
+    false,
+    false
+   ],
+   [
+    "django-drf",
+    "GET",
+    "n/<int:pk>/",
+    [],
+    true,
+    false
+   ]
+  ]
+ },
+ {
+  "case": "decorator_may_return_view_unwrapped",
+  "contract": 2,
+  "expect": "GET /a judged (the decorator may return f unwrapped), GET /b and /b2 judged (optional returns the view unwrapped)",
+  "files": {
+   "app.py": "import os\nfrom functools import wraps\nfrom flask import Flask, abort\nfrom flask_login import current_user\napp = Flask(__name__)\ndef auth(f):\n    @wraps(f)\n    def inner(*a, **k):\n        if not current_user.is_authenticated:\n            abort(401)\n        return f(*a, **k)\n    if os.environ.get('AUTH_DISABLED'):\n        return f\n    return inner\ndef auth_factory(optional=False):\n    def deco(f):\n        @wraps(f)\n        def inner(*a, **k):\n            if not current_user.is_authenticated:\n                abort(401)\n            return f(*a, **k)\n        return f if optional else inner\n    return deco\n@app.route('/a')\n@auth\ndef a(): ...\n@app.route('/b')\n@auth_factory(optional=True)\ndef b(): ...\n@app.route('/b2')\n@auth_factory(True)\ndef b2(): ...\n"
+  },
+  "rows": [
+   [
+    "flask",
+    "GET",
+    "/a",
+    [],
+    true,
+    false
+   ],
+   [
+    "flask",
+    "GET",
+    "/b",
+    [],
+    true,
+    false
+   ],
+   [
+    "flask",
+    "GET",
+    "/b2",
+    [],
+    true,
+    false
+   ]
+  ]
+ },
+ {
+  "case": "decorator_unused_refusing_helper",
+  "contract": 2,
+  "expect": "GET /a unguarded, judged (the refusing helper is never called by the wrapper)",
+  "files": {
+   "app.py": "from functools import wraps\nfrom flask import Flask, abort, g\nfrom flask_login import current_user\napp = Flask(__name__)\ndef audited(f):\n    def _deny_anonymous():\n        if not current_user.is_authenticated:\n            abort(401)\n    @wraps(f)\n    def inner(*a, **k):\n        g.audit = True\n        return f(*a, **k)\n    return inner\n@app.route('/a')\n@audited\ndef a(): ...\n"
+  },
+  "rows": [
+   [
+    "flask",
+    "GET",
+    "/a",
+    [],
+    true,
+    false
+   ]
+  ]
+ },
+ {
+  "case": "fl_login_disabled_config",
+  "contract": 2,
+  "expect": "GET /me and /me2 judged (flask-login's login_required lets everyone through when LOGIN_DISABLED is set)",
+  "files": {
+   "app.py": "from flask import Flask\nfrom flask_login import LoginManager, login_required\napp = Flask(__name__)\napp.config['LOGIN_DISABLED'] = True\nLoginManager(app)\n@app.route('/me')\n@login_required\ndef me(): ...\n",
+   "b.py": "from flask import Flask\nfrom flask_login import LoginManager, login_required\nb = Flask(__name__)\nb.config.update(LOGIN_DISABLED=True)\n@b.route('/me2')\n@login_required\ndef me2(): ...\n"
+  },
+  "rows": [
+   [
+    "flask",
+    "GET",
+    "/me",
+    [],
+    true,
+    false
+   ],
+   [
+    "flask",
+    "GET",
+    "/me2",
+    [],
+    true,
+    false
+   ]
+  ]
+ },
+ {
+  "case": "fl_jwt_optional_positional",
+  "contract": 2,
+  "expect": "GET /a and GET /c judged (positional optional=True), as GET /b is",
+  "files": {
+   "app.py": "from flask import Flask\nfrom flask_jwt_extended import jwt_required, verify_jwt_in_request\napp = Flask(__name__)\n@app.route('/a')\n@jwt_required(True)\ndef a(): ...\n@app.route('/b')\n@jwt_required(optional=True)\ndef b(): ...\nbp_app = Flask('x')\n@bp_app.before_request\ndef hook():\n    verify_jwt_in_request(True)\n@bp_app.route('/c')\ndef c(): ...\n"
+  },
+  "rows": [
+   [
+    "flask",
+    "GET",
+    "/a",
+    [],
+    true,
+    false
+   ],
+   [
+    "flask",
+    "GET",
+    "/b",
+    [],
+    true,
+    false
+   ],
+   [
+    "flask",
+    "GET",
+    "/c",
+    [],
+    true,
+    false
+   ]
+  ]
+ },
+ {
+  "case": "fl_app_hook_covers_same_named_blueprint_of_other_app",
+  "contract": 2,
+  "expect": "POST /pub/signup unguarded, judged (public.bp is registered on public_app); GET /admin/users guarded by require_admin",
+  "files": {
+   "admin/__init__.py": "from flask import Blueprint\nbp = Blueprint('admin', __name__, url_prefix='/admin')\n@bp.route('/users')\ndef users(): ...\n",
+   "public/__init__.py": "from flask import Blueprint\nbp = Blueprint('public', __name__, url_prefix='/pub')\n@bp.route('/signup', methods=['POST'])\ndef signup(): ...\n",
+   "admin_app.py": "from flask import Flask, abort\nfrom flask_login import current_user\nimport admin\nadmin_app = Flask('admin')\n@admin_app.before_request\ndef require_admin():\n    if not current_user.is_authenticated:\n        abort(401)\nadmin_app.register_blueprint(admin.bp)\n",
+   "public_app.py": "from flask import Flask\nimport public\npublic_app = Flask('public')\npublic_app.register_blueprint(public.bp)\n"
+  },
+  "rows": [
+   [
+    "flask",
+    "GET",
+    "/admin/users",
+    [],
+    true,
+    true
+   ],
+   [
+    "flask",
+    "POST",
+    "/pub/signup",
+    [],
+    true,
+    true
+   ]
+  ]
+ },
+ {
+  "case": "drf_rest_framework_dict_later_key_wins",
+  "contract": 2,
+  "expect": "GET a/ and GET b/ unguarded (AllowAny wins: **OPEN after, duplicate key last wins), judged",
+  "files": {
+   "app/settings.py": "ROOT_URLCONF='app.urls'\nOPEN = {'DEFAULT_PERMISSION_CLASSES': ['rest_framework.permissions.AllowAny']}\nREST_FRAMEWORK = {\n  'DEFAULT_PERMISSION_CLASSES': ['rest_framework.permissions.IsAuthenticated'],\n  **OPEN,\n}\n",
+   "b/settings.py": "ROOT_URLCONF='b.urls'\nREST_FRAMEWORK = {\n  'DEFAULT_PERMISSION_CLASSES': ['rest_framework.permissions.IsAuthenticated'],\n  'PAGE_SIZE': 10,\n  'DEFAULT_PERMISSION_CLASSES': ['rest_framework.permissions.AllowAny'],\n}\n",
+   "app/urls.py": "from django.urls import path\nfrom . import views\nurlpatterns = [path('a/', views.A.as_view())]\n",
+   "b/urls.py": "from django.urls import path\nfrom . import views\nurlpatterns = [path('b/', views.B.as_view())]\n",
+   "app/views.py": "from rest_framework.views import APIView\nclass A(APIView):\n    def get(self, request): ...\n",
+   "b/views.py": "from rest_framework.views import APIView\nclass B(APIView):\n    def get(self, request): ...\n"
+  },
+  "rows": [
+   [
+    "django-drf",
+    "GET",
+    "a/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "GET",
+    "b/",
+    [],
+    true,
+    false
+   ]
+  ]
+ },
+ {
+  "case": "drf_permission_denied_override_swallows",
+  "contract": 2,
+  "expect": "GET a/ judged (permission_denied that doesn't raise lets the request through); GET b/ guarded",
+  "files": {
+   "app/urls.py": "from django.urls import path\nfrom . import views\nurlpatterns = [path('a/', views.A.as_view()), path('b/', views.B.as_view())]\n",
+   "app/views.py": "from rest_framework.views import APIView\nfrom rest_framework.permissions import IsAuthenticated\nclass A(APIView):\n    permission_classes = [IsAuthenticated]\n    def permission_denied(self, request, message=None, code=None):\n        pass\n    def get(self, request): ...\nclass B(APIView):\n    permission_classes = [IsAuthenticated]\n    def get(self, request): ...\n"
+  },
+  "rows": [
+   [
+    "django-drf",
+    "GET",
+    "a/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "GET",
+    "b/",
+    [
+     "IsAuthenticated"
+    ],
+    false,
+    false
+   ]
+  ]
+ },
+ {
+  "case": "drf_own_dispatch_skips_initial",
+  "contract": 2,
+  "expect": "POST hook/ judged (its dispatch skips APIView.dispatch, so initial()/check_permissions never run); POST b/ guarded",
+  "files": {
+   "app/urls.py": "from django.urls import path\nfrom . import views\nurlpatterns = [path('hook/', views.Hook.as_view()), path('b/', views.B.as_view())]\n",
+   "app/views.py": "from django.views import View\nfrom rest_framework.views import APIView\nfrom rest_framework.permissions import IsAuthenticated\nclass Hook(APIView):\n    permission_classes = [IsAuthenticated]\n    def dispatch(self, request, *a, **k):\n        return View.dispatch(self, request, *a, **k)\n    def post(self, request): ...\nclass B(APIView):\n    permission_classes = [IsAuthenticated]\n    def post(self, request): ...\n"
+  },
+  "rows": [
+   [
+    "django-drf",
+    "POST",
+    "b/",
+    [
+     "IsAuthenticated"
+    ],
+    false,
+    false
+   ],
+   [
+    "django-drf",
+    "POST",
+    "hook/",
+    [],
+    true,
+    false
+   ]
+  ]
+ },
+ {
+  "case": "dj_super_past_login_required_mixin",
+  "contract": 2,
+  "expect": "GET a/ judged (super(LoginRequiredMixin, self) skips the mixin's check); GET b/ guarded",
+  "files": {
+   "app/urls.py": "from django.urls import path\nfrom . import views\nurlpatterns = [path('a/', views.A.as_view()), path('b/', views.B.as_view())]\n",
+   "app/views.py": "from django.conf import settings\nfrom django.contrib.auth.mixins import LoginRequiredMixin\nfrom django.views import View\nclass Maybe(LoginRequiredMixin):\n    def dispatch(self, request, *a, **k):\n        if getattr(self, 'public', False):\n            return super(LoginRequiredMixin, self).dispatch(request, *a, **k)\n        return super().dispatch(request, *a, **k)\nclass A(Maybe, View):\n    public = True\n    def get(self, request): ...\nclass B(LoginRequiredMixin, View):\n    def get(self, request): ...\n"
+  },
+  "rows": [
+   [
+    "django-drf",
+    "GET",
+    "a/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "GET",
+    "b/",
+    [
+     "LoginRequiredMixin"
+    ],
+    false,
+    false
+   ]
+  ]
+ },
+ {
+  "case": "drf_router_register_by_keyword",
+  "contract": 1,
+  "expect": "api/notes/ six rows, api/tags/ two rows (register(prefix=, viewset=) is the same registration), as api/users/",
+  "files": {
+   "app/urls.py": "from django.urls import path, include\nfrom rest_framework.routers import SimpleRouter\nfrom . import views\nrouter = SimpleRouter()\nrouter.register(prefix='notes', viewset=views.NoteViewSet, basename='note')\nrouter.register(r'tags', viewset=views.TagViewSet)\nrouter.register(r'users', views.UserViewSet)\nurlpatterns = [path('api/', include(router.urls))]\n",
+   "app/views.py": "from rest_framework import viewsets\nfrom rest_framework.permissions import IsAuthenticated\nclass NoteViewSet(viewsets.ModelViewSet):\n    permission_classes = [IsAuthenticated]\nclass TagViewSet(viewsets.ReadOnlyModelViewSet):\n    permission_classes = [IsAuthenticated]\nclass UserViewSet(viewsets.ReadOnlyModelViewSet):\n    permission_classes = [IsAuthenticated]\n"
+  },
+  "rows": [
+   [
+    "django-drf",
+    "DELETE",
+    "api/notes/<pk>/",
+    [
+     "IsAuthenticated"
+    ],
+    false,
+    false
+   ],
+   [
+    "django-drf",
+    "GET",
+    "api/notes/",
+    [
+     "IsAuthenticated"
+    ],
+    false,
+    false
+   ],
+   [
+    "django-drf",
+    "GET",
+    "api/notes/<pk>/",
+    [
+     "IsAuthenticated"
+    ],
+    false,
+    false
+   ],
+   [
+    "django-drf",
+    "GET",
+    "api/tags/",
+    [
+     "IsAuthenticated"
+    ],
+    false,
+    false
+   ],
+   [
+    "django-drf",
+    "GET",
+    "api/tags/<pk>/",
+    [
+     "IsAuthenticated"
+    ],
+    false,
+    false
+   ],
+   [
+    "django-drf",
+    "GET",
+    "api/users/",
+    [
+     "IsAuthenticated"
+    ],
+    false,
+    false
+   ],
+   [
+    "django-drf",
+    "GET",
+    "api/users/<pk>/",
+    [
+     "IsAuthenticated"
+    ],
+    false,
+    false
+   ],
+   [
+    "django-drf",
+    "PATCH",
+    "api/notes/<pk>/",
+    [
+     "IsAuthenticated"
+    ],
+    false,
+    false
+   ],
+   [
+    "django-drf",
+    "POST",
+    "api/notes/",
+    [
+     "IsAuthenticated"
+    ],
+    false,
+    false
+   ],
+   [
+    "django-drf",
+    "PUT",
+    "api/notes/<pk>/",
+    [
+     "IsAuthenticated"
+    ],
+    false,
+    false
+   ]
+  ]
+ },
+ {
+  "case": "drf_action_methods_by_name",
+  "contract": 1,
+  "expect": "POST and DELETE notes/<pk>/share/ (or an any-method row), as for pin",
+  "files": {
+   "app/urls.py": "from django.urls import path, include\nfrom rest_framework.routers import SimpleRouter\nfrom . import views\nrouter = SimpleRouter()\nrouter.register(r'notes', views.NoteViewSet)\nurlpatterns = [path('', include(router.urls))]\n",
+   "app/views.py": "from rest_framework import viewsets\nfrom rest_framework.decorators import action\nWRITE = ['post', 'delete']\nclass NoteViewSet(viewsets.GenericViewSet):\n    @action(detail=True, methods=WRITE)\n    def share(self, request, pk=None): ...\n    @action(detail=True, methods=['post', 'delete'])\n    def pin(self, request, pk=None): ...\n"
+  },
+  "rows": [
+   [
+    "django-drf",
+    "DELETE",
+    "notes/<pk>/pin/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "DELETE",
+    "notes/<pk>/share/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "POST",
+    "notes/<pk>/pin/",
+    [],
+    true,
+    false
+   ],
+   [
+    "django-drf",
+    "POST",
+    "notes/<pk>/share/",
+    [],
+    true,
+    false
+   ]
+  ]
+ },
+ {
+  "case": "fl_blueprint_or_app_subclass_receiver",
+  "contract": 1,
+  "expect": "GET /notes/list and POST /notes/x (a Blueprint subclass), as GET /tags/list",
+  "files": {
+   "app/bp.py": "from flask import Blueprint\nclass ApiBlueprint(Blueprint):\n    pass\nnotes = ApiBlueprint('notes', __name__, url_prefix='/notes')\ntags = Blueprint('tags', __name__, url_prefix='/tags')\n",
+   "app/views.py": "from flask import jsonify\nfrom .bp import notes, tags\n@notes.get('/list')\ndef note_list(): ...\n@notes.route('/x', methods=['POST'])\ndef note_x(): ...\n@tags.get('/list')\ndef tag_list(): ...\n",
+   "app/__init__.py": "from flask import Flask\nfrom .bp import notes, tags\napp = Flask(__name__)\napp.register_blueprint(notes)\napp.register_blueprint(tags)\n"
+  },
+  "rows": [
+   [
+    "flask",
+    "GET",
+    "/notes/list",
+    [],
+    true,
+    false
+   ],
+   [
+    "flask",
+    "GET",
+    "/tags/list",
+    [],
+    true,
+    false
+   ],
+   [
+    "flask",
+    "POST",
+    "/notes/x",
+    [],
+    true,
+    false
+   ]
+  ]
+ },
+ {
+  "case": "fl_flask_subclass_app_verbs",
+  "contract": 1,
+  "expect": "GET /a and POST /b (app is a Flask subclass), as GET /c",
+  "files": {
+   "app.py": "from flask import Flask\nclass App(Flask):\n    pass\napp = App(__name__)\n@app.get('/a')\ndef a(): ...\n@app.post('/b')\ndef b(): ...\nother = Flask('o')\n@other.get('/c')\ndef c(): ...\n"
+  },
+  "rows": [
+   [
+    "flask",
+    "GET",
+    "/a",
+    [],
+    true,
+    false
+   ],
+   [
+    "flask",
+    "GET",
+    "/c",
+    [],
+    true,
+    false
+   ],
+   [
+    "flask",
+    "POST",
+    "/b",
+    [],
+    true,
+    false
+   ]
+  ]
+ },
+ {
+  "case": "fl_methodview_method_alias",
+  "contract": 1,
+  "expect": "GET and POST /items (post = get: MethodView answers POST), as /items2",
+  "files": {
+   "app.py": "from flask import Flask\nfrom flask.views import MethodView\napp = Flask(__name__)\nclass Items(MethodView):\n    def get(self): ...\n    post = get\nclass Items2(MethodView):\n    def get(self): ...\n    def post(self): ...\napp.add_url_rule('/items', view_func=Items.as_view('items'))\napp.add_url_rule('/items2', view_func=Items2.as_view('items2'))\n"
+  },
+  "rows": [
+   [
+    "flask",
+    "GET",
+    "/items",
+    [],
+    true,
+    false
+   ],
+   [
+    "flask",
+    "GET",
+    "/items2",
+    [],
+    true,
+    false
+   ],
+   [
+    "flask",
+    "POST",
+    "/items",
+    [],
+    true,
+    false
+   ],
+   [
+    "flask",
+    "POST",
+    "/items2",
+    [],
+    true,
+    false
+   ]
+  ]
+ },
+ {
+  "case": "fl_apiflask_app_unseen",
+  "contract": 1,
+  "expect": "GET /pets and DELETE /pets/<int:pet_id> (APIFlask is a Flask subclass), or at least a coverage gap",
+  "files": {
+   "app.py": "from apiflask import APIFlask, APIBlueprint\napp = APIFlask(__name__)\n@app.get('/pets')\ndef pets(): ...\n@app.delete('/pets/<int:pet_id>')\ndef delete_pet(pet_id): ...\n"
+  },
+  "rows": [
+   [
+    "flask",
+    "DELETE",
+    "/pets/<int:pet_id>",
+    [],
+    true,
+    false
+   ],
+   [
+    "flask",
+    "GET",
+    "/pets",
+    [],
+    true,
+    false
+   ]
+  ]
+ },
+ {
+  "case": "fl_restx_api_namespace_method_loses_path",
+  "contract": 3,
+  "expect": "GET /todos/ and DELETE /todos/<int:id> (the flask-restx README's api.namespace()), as GET /cats/",
+  "files": {
+   "app.py": "from flask import Flask\nfrom flask_restx import Api, Resource\napp = Flask(__name__)\napi = Api(app)\nns = api.namespace('todos', description='TODO operations')\n@ns.route('/')\nclass TodoList(Resource):\n    def get(self): ...\n@ns.route('/<int:id>')\nclass Todo(Resource):\n    def delete(self, id): ...\n",
+   "b.py": "from flask import Flask\nfrom flask_restx import Api, Namespace, Resource\nb = Flask('b')\napi2 = Api(b)\nns2 = Namespace('cats')\napi2.add_namespace(ns2)\n@ns2.route('/')\nclass CatList(Resource):\n    def get(self): ...\n"
+  },
+  "rows": [
+   [
+    "flask",
+    "DELETE",
+    "/todos/<int:id>",
+    [],
+    true,
+    false
+   ],
+   [
+    "flask",
+    "GET",
+    "/cats/",
+    [],
+    true,
+    false
+   ],
+   [
+    "flask",
+    "GET",
+    "/todos/",
+    [],
+    true,
+    false
+   ]
+  ]
+ },
+ {
+  "case": "fl_blueprint_subclass_loses_prefix",
+  "contract": 3,
+  "expect": "GET /v1/x (the subclass keeps url_prefix), as GET /v2/y",
+  "files": {
+   "app/__init__.py": "from flask import Flask, Blueprint\nclass ApiBlueprint(Blueprint):\n    pass\nv1 = ApiBlueprint('v1', __name__, url_prefix='/v1')\nv2 = Blueprint('v2', __name__, url_prefix='/v2')\n@v1.route('/x')\ndef x(): ...\n@v2.route('/y')\ndef y(): ...\napp = Flask(__name__)\napp.register_blueprint(v1)\napp.register_blueprint(v2)\n"
+  },
+  "rows": [
+   [
+    "flask",
+    "GET",
+    "/v1/x",
+    [],
+    true,
+    false
+   ],
+   [
+    "flask",
+    "GET",
+    "/v2/y",
     [],
     true,
     false
