@@ -27,9 +27,7 @@ def scope() -> ValidationScope:
                 ClusterScope(context="lab", api="https://api.example:6443", namespaces=("app",)),
             ),
             http_targets=(
-                HttpTarget(
-                    host="app.example", context="lab", resource="http_targets", name="web"
-                ),
+                HttpTarget(host="app.example", context="lab", resource="http_targets", name="web"),
             ),
         )
     )

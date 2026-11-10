@@ -239,8 +239,10 @@ def _http_origin(value: str) -> tuple[str, str, int]:
         suffix = authority[closing + 1 :]
         if suffix and (not suffix.startswith(":") or not suffix[1:].isdigit()):
             raise ValueError("invalid HTTP port")
-    elif "[" in authority or "]" in authority or (
-        ":" in authority and not authority.rsplit(":", 1)[1].isdigit()
+    elif (
+        "[" in authority
+        or "]" in authority
+        or (":" in authority and not authority.rsplit(":", 1)[1].isdigit())
     ):
         raise ValueError("invalid HTTP authority")
     return result

@@ -24,6 +24,7 @@ from traust_core.v1.models.code_facts import (
     ClusterRequest,
     CryptoProbeId,
     ImageRequest,
+    NamespaceDiscovery,
     NamespaceScope,
 )
 from traust_core.v1.models.dependencies import NoImageSbomError
@@ -279,6 +280,28 @@ def test_cluster_discovery_checks_real_resource_and_verb() -> None:
     assert any("scope denied: list pods" in gap for gap in census.gaps)
     assert not census.scope[0].decision.allowed
     assert any(gap.startswith("scope denied: app-ns —") for gap in census.gaps)
+
+
+def test_a_denied_pod_listing_keeps_the_collected_services() -> None:
+    oc = FakeOc({"app-ns": ["web-0"]})
+    denied_pods = scope(["app-ns"]).model_copy(
+        update={"off_limits": (OffLimit(resource="pods", verb="list"),)}
+    )
+    census = wired(None, cluster=ClusterCryptoProbe(oc, CLOCK)).cluster_crypto(  # type: ignore[arg-type]
+        ClusterRequest(context="lab", namespaces=("app-ns",), discover=True), denied_pods
+    )
+    assert any(call[3:5] == ["get", "svc"] for call in oc.calls)
+    assert not any(call[3:5] == ["get", "pods"] for call in oc.calls)
+    assert any("scope denied: list pods in app-ns" in gap for gap in census.gaps)
+    assert census.discovery == (
+        NamespaceDiscovery(
+            namespace="app-ns",
+            services=2,
+            endpoints=2,
+            tls_endpoints=0,
+            plaintext_endpoints=0,
+        ),
+    )
 
 
 def test_the_cluster_door_needs_its_probe_and_oc(monkeypatch: pytest.MonkeyPatch) -> None:

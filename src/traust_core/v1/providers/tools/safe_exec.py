@@ -168,6 +168,12 @@ PROTECTED_ENV_VARS = frozenset(
         "MAVEN_OPTS",
         "GRADLE_OPTS",
         "_JAVA_OPTIONS",
+        # OpenSSL loader variables make the child process load attacker-controlled
+        # configuration and native provider/engine modules.
+        "OPENSSL_CONF",
+        "OPENSSL_CONF_INCLUDE",
+        "OPENSSL_MODULES",
+        "OPENSSL_ENGINES",
         "SAFE_EXEC_MODE",
         "SAFE_EXEC_DISABLED",
         RECURSION_ENV,
@@ -1014,6 +1020,31 @@ def _curl_deny(opt: str, why: str) -> str:
     return f"curl option {opt!r} is denied under safe_exec ({why})"
 
 
+_HTTP_METHOD_RX = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
+# Option values that become request bytes: the request line or headers. curl
+# transmits custom methods verbatim (CURLOPT_CUSTOMREQUEST), so a value with
+# spaces or CR/LF can forge an absolute-form request line past the host
+# allowlist or split into extra headers. Response-format values (-w) and
+# request bodies (-d) may legitimately contain newlines and stay exempt.
+_REQUEST_TEXT_OPTS = frozenset(
+    {
+        "-X",
+        "--request",
+        "-A",
+        "--user-agent",
+        "-e",
+        "--referer",
+        "-u",
+        "--user",
+        "--request-target",
+        "-H",
+        "--header",
+        "-b",
+        "--cookie",
+    }
+)
+
+
 @dataclass(frozen=True, slots=True)
 class _CurlVetter:
     """Vets one curl argv against the tables above, returning the deny
@@ -1180,6 +1211,10 @@ class _CurlVetter:
     ) -> str:
         if val is None:
             return f"curl option {opt!r} is missing its value and is denied under safe_exec"
+        if opt in ("-X", "--request") and not _HTTP_METHOD_RX.fullmatch(val):
+            return _curl_deny(opt, "custom method must be a plain HTTP token")
+        if opt in _REQUEST_TEXT_OPTS and any(c in val for c in "\x00\r\n"):
+            return _curl_deny(opt, "control characters in a request value")
         if kind == "data":
             if val.startswith("@"):
                 return _curl_deny(opt, f"{opt} @<file>/@- upload — local-file exfiltration")

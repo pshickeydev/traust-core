@@ -20,9 +20,7 @@ NOW = datetime(2026, 10, 22, 12, tzinfo=UTC)
 def scope() -> ValidationScope:
     return ValidationScope.bind(
         explicit=ValidationScope(
-            clusters=(
-                ClusterScope(context="lab", api="https://api.example", namespaces=("app",)),
-            ),
+            clusters=(ClusterScope(context="lab", api="https://api.example", namespaces=("app",)),),
             http_targets=(HttpTarget(host="app.example", context="lab", resource="http_targets"),),
         )
     )
@@ -121,12 +119,23 @@ def test_approval_rejects_different_host_or_invalid_origin(
         _authorize_http_step(direct_step(url=url), scope, NOW)
 
 
+@pytest.mark.parametrize("namespace", [None, "app"])
 @pytest.mark.parametrize("scheme,port", [("http", None), ("https", 443), ("auto", 1234)])
 def test_approval_rejects_scheme_and_port_mismatches(
-    scope: ValidationScope, scheme: str, port: int | None
+    scope: ValidationScope, namespace: str | None, scheme: str, port: int | None
 ) -> None:
     with pytest.raises(ForbiddenError):
-        _authorize_http_step(direct_step(scheme=scheme, port=port), scope, NOW)
+        _authorize_http_step(direct_step(namespace=namespace, scheme=scheme, port=port), scope, NOW)
+
+
+@pytest.mark.parametrize("namespace", [None, "app"])
+def test_approval_rejects_non_origin_direct_urls(
+    scope: ValidationScope, namespace: str | None
+) -> None:
+    with pytest.raises(ForbiddenError):
+        _authorize_http_step(
+            direct_step(namespace=namespace, url="https://app.example:8443/path"), scope, NOW
+        )
 
 
 def test_approval_requires_exact_context_pinned_api_and_explicit_binding(

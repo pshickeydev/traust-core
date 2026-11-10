@@ -213,6 +213,17 @@ class _Run:
                 self.gaps.append(str(e))
         pods = self.running_pods(namespace)
         if pods is None:
+            # The service read succeeded; keep its counts alongside the denial
+            # gap instead of discarding authorized evidence.
+            self.discovery.append(
+                NamespaceDiscovery(
+                    namespace=namespace,
+                    services=len({e.service for e in endpoints}),
+                    endpoints=len(endpoints),
+                    tls_endpoints=0,
+                    plaintext_endpoints=0,
+                )
+            )
             return
         pod = (namespace, pods[0]) if pods else apiserver
         tls = plaintext = 0

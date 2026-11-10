@@ -62,7 +62,17 @@ def test_path_form_denied_unless_the_profile_names_the_path_head() -> None:
 
 def test_env_prefix_ok_and_protected() -> None:
     assert SE.validate_argv(["FOO=bar", "echo", "hi"], VP).ok
-    for var in ("PATH", "LD_PRELOAD", "PYTHONPATH", "GIT_SSH_COMMAND", "SAFE_EXEC_MODE", "GIT_X"):
+    for var in (
+        "PATH",
+        "LD_PRELOAD",
+        "PYTHONPATH",
+        "GIT_SSH_COMMAND",
+        "SAFE_EXEC_MODE",
+        "GIT_X",
+        "JAVA_TOOL_OPTIONS",
+        "OPENSSL_CONF",
+        "OPENSSL_MODULES",
+    ):
         v = SE.validate_argv([f"{var}=/tmp/x", "echo", "hi"], VP)
         assert not v.ok and "protected env var" in v.reason
 
@@ -379,6 +389,9 @@ def test_baseline_and_privileged_public_behavior() -> None:
         ["--write-out=%output{file}", "http://example.org"],
         ["http://example.org", "--unknown-option"],
         ["--url", "http://example.org/{a,b}"],
+        ["-X", "GET http://other.example/ HTTP/1.1\r\nX-Padding:", "--url", "http://example.org"],
+        ["-A", "agent\r\nX-Inject: 1", "--url", "http://example.org"],
+        ["-b", "session=x\r\nX-Inject: 1", "--url", "http://example.org"],
     ],
 )
 def test_curl_option_walker_denies_routing_and_exfiltration(args: list[str]) -> None:
@@ -390,13 +403,24 @@ def test_curl_parser_handles_clusters_values_and_end_of_options() -> None:
         ["-sS", "-o/dev/null", "-w%{http_code}", "https://example.org"],
         ["--url=https://example.org", "--data", "inline"],
         ["--", "https://example.org/path"],
+        ["-X", "POST", "--url", "https://example.org"],
+        ["-w", "\nvf-http-status:%{http_code}", "--url", "https://example.org"],
     ):
         assert SE.validate_argv(["curl", *args], VP, allowed_hosts=("example.org",)).ok
 
 
 @pytest.mark.parametrize(
     "name",
-    ["http_proxy", "HTTPS_PROXY", "ALL_PROXY", "no_proxy", "KUBECONFIG", "RES_OPTIONS"],
+    [
+        "http_proxy",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "no_proxy",
+        "KUBECONFIG",
+        "RES_OPTIONS",
+        "OPENSSL_CONF",
+        "OPENSSL_ENGINES",
+    ],
 )
 def test_target_environment_cannot_redirect_or_override_identity(name: str) -> None:
     assert not SE.validate_argv(

@@ -1301,6 +1301,7 @@ def _http_plan(
     url: str | None = None,
     scheme: str = "auto",
     port: int | None = None,
+    scope_binding_mode: str = "explicit",
 ) -> ArtifactRef:
     resource = {
         "route": "routes",
@@ -1321,7 +1322,7 @@ def _http_plan(
         "name": name,
         "url": url
         if url is not None
-        else ("https://web.apps.example/healthz" if mode == "direct" else None),
+        else ("https://web.apps.example" if mode == "direct" else None),
         "headers": {},
         "authenticate": authenticate,
         "csrf": False,
@@ -1347,7 +1348,7 @@ def _http_plan(
         ValidationPlanArtifact.from_document(
             {
                 "target": "example",
-                "scope_binding_mode": "explicit",
+                "scope_binding_mode": scope_binding_mode,
                 "chains": [],
                 "steps": [step],
             }
@@ -1356,10 +1357,19 @@ def _http_plan(
 
 
 def _approve_http(
-    validation: ValidationService, plan: ArtifactRef, scope: ValidationScope
+    validation: ValidationService,
+    plan: ArtifactRef,
+    scope: ValidationScope,
+    *,
+    skip: tuple[str, ...] = (),
 ) -> ArtifactRef:
     return validation.authorize(
-        plan.id, scope, _reviewer(), confirmed=True, mode=ValidationApprovalMode.INTERACTIVE
+        plan.id,
+        scope,
+        _reviewer(),
+        confirmed=True,
+        mode=ValidationApprovalMode.INTERACTIVE,
+        skip_step_ids=skip,
     )
 
 
@@ -1447,6 +1457,85 @@ def test_named_route_literal_origin_must_match_exact_or_domain_grant(
             plan,
             ValidationScope.bind(explicit=ValidationScope(clusters=(other_domain,))),
         )
+
+
+def test_unnamed_route_literal_origin_uses_scoped_domain_without_inventing_name(
+    harness: ValidationHarness, tmp_path: Path
+) -> None:
+    validation, _ = _attestation_plan(harness, tmp_path)
+    plan = _http_plan(validation, "route", url="https://web.apps.example", authenticate=True)
+    policy = HttpDiscovery(
+        session_check_path="/whoami",
+        session_check_contains="reviewer",
+        routes=(
+            RouteGrant(
+                namespace="example-a",
+                names=("web", "other"),
+                domains=("apps.example",),
+                credentials=True,
+            ),
+        ),
+    )
+    cluster = ClusterScope(
+        context="example-lab",
+        api="https://api.example",
+        namespaces=("example-*",),
+        http_discovery=policy,
+    )
+    scope = ValidationScope.bind(explicit=ValidationScope(clusters=(cluster,)))
+    assert _approve_http(validation, plan, scope).id
+    assert validation.get_plan(plan.id).steps[0].target.name is None
+
+    denied_verb = scope.model_copy(
+        update={"clusters": (scope.clusters[0].model_copy(update={"verbs_denied": {"get"}}),)}
+    )
+    with pytest.raises(ForbiddenError, match="scope denied"):
+        _approve_http(validation, plan, denied_verb)
+    denied_name = scope.model_copy(
+        update={"off_limits": (OffLimit(resource="routes", name="other"),)}
+    )
+    with pytest.raises(ForbiddenError, match="scope denied"):
+        _approve_http(validation, plan, denied_name)
+    missing_credentials = scope.model_copy(
+        update={
+            "clusters": (
+                scope.clusters[0].model_copy(
+                    update={
+                        "http_discovery": policy.model_copy(
+                            update={
+                                "routes": (
+                                    policy.routes[0].model_copy(update={"credentials": False}),
+                                )
+                            }
+                        )
+                    }
+                ),
+            )
+        }
+    )
+    with pytest.raises(ForbiddenError, match="route credentials"):
+        _approve_http(validation, plan, missing_credentials)
+    inline = ValidationScope.bind(inline=ValidationScope(clusters=(cluster,)))
+    inline_plan = _http_plan(
+        validation, "route", url="https://web.apps.example", scope_binding_mode="inline"
+    )
+    with pytest.raises(ForbiddenError, match="explicit pinned cluster API"):
+        _approve_http(validation, inline_plan, inline)
+
+
+def test_skipped_http_steps_do_not_block_plan_approval(
+    harness: ValidationHarness, tmp_path: Path
+) -> None:
+    validation, _ = _attestation_plan(harness, tmp_path)
+    plan = _http_plan(validation, "route", name="web")
+    cluster = ClusterScope(
+        context="example-lab", api="https://api.example", namespaces=("example-*",)
+    )
+    ungranted = ValidationScope.bind(explicit=ValidationScope(clusters=(cluster,)))
+    with pytest.raises(ForbiddenError, match="route HTTP"):
+        _approve_http(validation, plan, ungranted)
+    approval = _approve_http(validation, plan, ungranted, skip=("step-001",))
+    assert approval.id
 
 
 @pytest.mark.parametrize(

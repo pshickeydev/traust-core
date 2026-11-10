@@ -302,12 +302,12 @@ def _authorize_http_step(step: SchemaView, scope: ValidationScope, now: datetime
                 if not isinstance(url, str):
                     raise ValueError("missing URL")
                 scheme, host, port = origin(url)
-                if ns is None and (
-                    (getattr(probe, "scheme", None) or "auto") not in ("auto", scheme)
-                    or (
-                        getattr(probe, "port", None) is not None
-                        and getattr(probe, "port", None) != port
-                    )
+                parsed = urlsplit(url)
+                if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+                    raise ValueError("direct URL must be an origin")
+                if (getattr(probe, "scheme", None) or "auto") not in ("auto", scheme) or (
+                    getattr(probe, "port", None) is not None
+                    and getattr(probe, "port", None) != port
                 ):
                     raise ValueError("direct URL does not match its scheme or port")
             except ValueError as e:
@@ -714,11 +714,13 @@ class ValidationService:
         binding = next(iter(scope.modes)).value if len(scope.modes) == 1 else "mixed"
         if plan.scope_binding_mode != binding:
             raise ValidationError(f"validation plan {plan_id} is not bound to {binding} scope")
-        for step in plan.steps:
-            _authorize_http_step(step, scope, now)
         step_ids = {step.id for step in plan.steps}
         if len(set(skip_step_ids)) != len(skip_step_ids) or set(skip_step_ids) - step_ids:
             raise ValidationError("validation approval names duplicate or unknown steps")
+        skipped = frozenset(skip_step_ids)
+        for step in plan.steps:
+            if step.id not in skipped:
+                _authorize_http_step(step, scope, now)
         scope_doc = scope.model_dump(mode="json")
         scope_doc["modes"] = sorted(scope_doc["modes"])
         for cluster in scope_doc["clusters"]:
