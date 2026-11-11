@@ -1,69 +1,1401 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
-from datetime import datetime
+import copy
+import json
+import logging
+from collections import Counter, defaultdict
+from collections.abc import Collection, Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from datetime import UTC, datetime, time
+from pathlib import Path
+from time import monotonic
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
-from traust_core.v1.models.artifacts import AssessmentArtifact
+import pydantic
+
+from traust_core.v1 import contracts
+from traust_core.v1.errors import (
+    ConfigError,
+    ConflictError,
+    IntegrityError,
+    NotFoundError,
+    ServiceError,
+    ValidationError,
+)
+from traust_core.v1.models import candidate_formats
+from traust_core.v1.models.artifacts import (
+    AssessmentArtifact,
+    CloudConfigAuditArtifact,
+    FindingIntakeArtifact,
+    FuzzReportArtifact,
+    IsolationReviewArtifact,
+    PrivProfileArtifact,
+    ReportArtifact,
+    RepoStateArtifact,
+    ThreatModelArtifact,
+)
 from traust_core.v1.models.assessment import (
+    ASSESSMENT_COMPLETED,
+    ASSESSMENT_DEGRADED,
+    REBASELINED_KINDS,
+    RECORDED_SCHEMAS,
+    REPORTED_FINDINGS,
+    Artifact,
     Assessment,
     AssessmentFilter,
+    AssessmentIntakeBindings,
     AssessmentKind,
+    AssessmentRecordResult,
     AssessmentSkillInput,
-    CoverageRow,
+    AttackScenario,
+    AuditScope,
+    Coverage,
+    CoverageGap,
+    DiffCaller,
+    DiffCluster,
+    DiffFile,
+    DiffRefused,
+    DiffRequest,
+    DiffResolution,
+    DiffScope,
     Freshness,
     Population,
+    PopulationRow,
     PrivilegeProfile,
+    ReportGap,
+    TenantBoundary,
     Threat,
     ThreatFilter,
+    ThreatModelEntryPoint,
+    ThreatRatings,
     ToolName,
-    ToolRun,
+    report_gaps,
 )
-from traust_core.v1.models.common import Page, PageRequest, Provenance
+from traust_core.v1.models.cloud_config import audit_candidates, audit_judgments
+from traust_core.v1.models.code_facts import SymbolFact
+from traust_core.v1.models.common import ArtifactRef, Page, PageRequest, Provenance
+from traust_core.v1.models.findings import (
+    CandidateFormat,
+    Decision,
+    FindingCandidate,
+    FindingContext,
+    FindingView,
+    IntakeResult,
+    Label,
+    OwaspFactors,
+    RatingInputs,
+)
+from traust_core.v1.models.identity import Principal
+from traust_core.v1.models.integrity import sha256_hex
+from traust_core.v1.models.inventory import DEFAULT_FORGE_HOSTS, default_line
+from traust_core.v1.models.observation import (
+    CHURN_FULL_LINES,
+    MAX_CHANGED_FILE_RATIO,
+    SENSITIVE_RX,
+    ObservationTarget,
+    is_deps_manifest,
+    is_first_party,
+)
+from traust_core.v1.models.operations import RecordKind
+from traust_core.v1.providers.base import ProviderRegistry
+from traust_core.v1.providers.checkout import GitCheckout, NumstatRow
+from traust_core.v1.providers.clock import Clock, SystemClock
+from traust_core.v1.providers.symbols import SymbolIndex, SymbolReference
+from traust_core.v1.providers.tools import ToolProvider, ToolRequest, ToolRun
 from traust_core.v1.repositories.traust.assessments import AssessmentsUnitOfWork
+from traust_core.v1.services.artifact_publishing import (
+    A,
+    ArtifactPublisher,
+    AssessmentLog,
+    StagedArtifact,
+)
+from traust_core.v1.services.cloud_config import CloudConfigCitations
+from traust_core.v1.services.findings.decisions import FindingDecisions
 from traust_core.v1.services.findings.intake import FindingIntake
+from traust_core.v1.services.findings.rating import RatingPolicy
+from traust_core.v1.services.findings.service import FindingService
+from traust_core.v1.services.fuzz import FuzzHarnessReferences
+from traust_core.v1.services.isolation_review import GapInterfaces
+from traust_core.v1.services.lint import Lint, LintContext, LintReport
+from traust_core.v1.services.observation import parse_audit_date
+from traust_core.v1.services.portfolio import Inventory
+
+if TYPE_CHECKING:
+    from traust_core.v1.services.operations import OpsService
+
+log = logging.getLogger(__name__)
+
+AUDIT_LINT = Lint(
+    {
+        CloudConfigAuditArtifact: [CloudConfigCitations()],
+        IsolationReviewArtifact: [GapInterfaces()],
+        FuzzReportArtifact: [FuzzHarnessReferences()],
+    }
+)
+MAX_GAP_EXAMPLES = 8
+
+
+MAX_CLUSTERS = 5
+HUNK_CONTEXT_LINES = 10
+MAX_FILE_HUNK_BYTES = 20_000
+MAX_TOTAL_HUNK_BYTES = 400_000
+MAX_SYMBOLS_PER_FILE = 10
+MAX_CALLERS = 40
+
+
+def clusters(paths: Sequence[str]) -> list[tuple[str, list[str]]]:
+    """Paths grouped by top-level directory (root files under "(root)"), largest first; past
+    MAX_CLUSTERS the smallest merge into "other", which bounds one reviewer per cluster."""
+    groups: dict[str, list[str]] = defaultdict(list)
+    for p in paths:
+        groups[p.split("/", 1)[0] if "/" in p else "(root)"].append(p)
+    ranked = sorted(groups.items(), key=lambda kv: (-len(kv[1]), kv[0]))
+    if len(ranked) > MAX_CLUSTERS:
+        head, tail = ranked[: MAX_CLUSTERS - 1], ranked[MAX_CLUSTERS - 1 :]
+        ranked = [*head, ("other", [p for _, ps in tail for p in ps])]
+    return [(name, sorted(ps)) for name, ps in ranked]
+
+
+def touches(location: str, paths: Collection[str]) -> bool:
+    """A reported location names one of `paths`, allowing for a component- or repo-root prefix."""
+    a = location.removeprefix("./").lstrip("/")
+    return any(
+        a == b or a.endswith("/" + b) or b.endswith("/" + a)
+        for b in (p.removeprefix("./").lstrip("/") for p in paths)
+    )
 
 
 class AssessmentService:
-    def __init__(self, uow: AssessmentsUnitOfWork, intake: FindingIntake) -> None:
+    def __init__(
+        self,
+        uow: AssessmentsUnitOfWork,
+        intake: FindingIntake | None = None,  # record doors only
+        *,
+        clock: Clock | None = None,
+        hosts: Mapping[str, str] | None = None,
+        tools: ProviderRegistry[ToolProvider[Any]] | None = None,
+        decisions: FindingDecisions | None = None,  # record_audit and fuzz record
+        publisher: ArtifactPublisher | None = None,  # record_audit only
+        findings: FindingService | None = None,  # prepare only
+        git: GitCheckout | None = None,  # prepare's diff mode
+        symbols: SymbolIndex | None = None,  # prepare's diff mode
+        rating: RatingPolicy | None = None,  # rate_threats only
+        recording: OpsService | None = None,
+    ) -> None:
         self._uow = uow
+        self._inventory = Inventory(uow, hosts)
+        self._log = AssessmentLog(uow)
         self._intake = intake
+        self._clock = clock or SystemClock()
+        self._hosts = dict(hosts or DEFAULT_FORGE_HOSTS)
+        self._tools = tools
+        self._decisions = decisions
+        self._publisher = publisher
+        self._findings = findings
+        self._git = git
+        self._symbols = symbols
+        self._rating = rating
+        self._recording = recording
 
-    def run_tools(self, repository_ref_id: UUID, tools: Sequence[ToolName]) -> ToolRun:
-        raise NotImplementedError("stub: replaces run_checkov.py, adapters _contract_bridge")
+    def run_tools(self, workspace: Path, tools: Sequence[ToolName]) -> ToolRun:
+        """Each tool over one checkout; any tool not ready stops the run before one starts."""
+        if self._tools is None:
+            raise ConfigError("run_tools needs the tool providers (Context wires them)")
+        if not tools:
+            raise ValidationError("run_tools needs at least one tool")
+        providers = {name: self._tools.get(name) for name in dict.fromkeys(tools)}
+        if unready := [
+            f"{name}: {readiness.detail}"
+            for name, p in providers.items()
+            if not (readiness := p.check()).ready
+        ]:
+            raise ConfigError(f"tools not ready: {'; '.join(unready)}")
+        results = {}
+        for name, provider in providers.items():
+            started = monotonic()
+            results[name] = provider.acquire(ToolRequest(workspace=workspace))
+            log.info(
+                "tool_class=%s completed in %.1fs", type(provider).__name__, monotonic() - started
+            )
+        return ToolRun(results)
 
     def prepare(
-        self, repository_ref_id: UUID, kind: AssessmentKind, base_id: UUID | None
+        self, repository_ref_id: UUID, kind: AssessmentKind, diff: DiffRequest | None = None
     ) -> AssessmentSkillInput:
-        raise NotImplementedError(
-            "stub: replaces build_diff_packet.py, resolve_baseline.py, threat-model inputs"
+        """What an assessment of one commit starts from: the repository's findings, its latest
+        threat model, its baseline audit and, in diff mode, the changes since that audit.
+        `DiffRefused` when the diff can't stand in for that audit."""
+        if self._findings is None:
+            raise ConfigError("prepare needs the finding reads (Context wires them)")
+        if diff is not None and not self._require_git().is_checkout(diff.checkout):
+            raise DiffRefused(
+                "target is not a git checkout — no diff is computable against any baseline"
+            )
+        subject = self._inventory.subject(repository_ref_id)
+        line = sorted(default_line(self._inventory.list_refs(subject.repository_id)))
+        with self._uow as uow:
+            modelled = self._latest_for_refs(
+                uow, line, AssessmentKind.THREAT_MODEL, ASSESSMENT_COMPLETED
+            )
+            threat_model = (
+                uow.artifacts.list_for_assessment(modelled.id) if modelled and modelled.id else []
+            )
+            baseline = self._baseline(uow, diff, line)
+        document = self._threat_model_document(modelled)
+        anchor = None
+        if diff is not None:
+            audited = self._inventory.get_ref(baseline.repository_ref_id) if baseline else None
+            if audited is not None and audited.repository_id != subject.repository_id:
+                raise ValidationError(
+                    f"assessment {diff.baseline_assessment_id} is of another repository"
+                )
+            anchor = diff.since or (audited.sha if audited else None)
+            if anchor is None:
+                raise DiffRefused(
+                    f"no valid HEAD code-audit baseline resolvable for {subject.repository_url}"
+                )
+        now = self._clock.now()
+        known = self._findings.baseline(
+            subject.repository_id, baseline.occurred_at if diff and baseline else now
+        )
+        return AssessmentSkillInput(
+            subject=subject,
+            findings=FindingContext(baseline=tuple(known)),
+            prepared_at=now,
+            kind=kind,
+            threat_model=tuple(threat_model),
+            threat_model_document=document,
+            baseline_assessment_id=baseline.id if baseline else None,
+            diff=self._scope(diff, baseline, anchor, known) if diff and anchor else None,
         )
 
+    def threat_model_entry_points(
+        self, repository_ref_id: UUID
+    ) -> tuple[ThreatModelEntryPoint, ...] | None:
+        """The section-3 entry points of the repository's latest threat model on its default
+        line, or None when it has none."""
+        subject = self._inventory.subject(repository_ref_id)
+        line = sorted(default_line(self._inventory.list_refs(subject.repository_id)))
+        with self._uow as uow:
+            modelled = self._latest_for_refs(
+                uow, line, AssessmentKind.THREAT_MODEL, ASSESSMENT_COMPLETED
+            )
+        document = self._threat_model_document(modelled)
+        if document is None:
+            return None
+        return tuple(
+            ThreatModelEntryPoint.model_validate(e) for e in document.get("entry_points") or ()
+        )
+
+    def _threat_model_document(self, modelled: Assessment | None) -> dict[str, Any] | None:
+        if modelled is None:
+            return None
+        if self._publisher is None:
+            raise ConfigError("reading the recorded threat model needs the publisher")
+        for _, row in self._log.documents([modelled], [ThreatModelArtifact.schema]):
+            assert row.id is not None
+            return json.loads(self._publisher.read(row.id, ThreatModelArtifact).payload)
+        return None
+
+    def _baseline(
+        self, uow: AssessmentsUnitOfWork, diff: DiffRequest | None, line: list[UUID]
+    ) -> Assessment | None:
+        if diff is not None and diff.baseline_assessment_id is not None:
+            return self._read(uow.assessments.get(diff.baseline_assessment_id))
+        return self._latest_for_refs(uow, line, AssessmentKind.SECURE_CODE, ASSESSMENT_COMPLETED)
+
+    def _latest_for_refs(
+        self, uow: AssessmentsUnitOfWork, refs: Collection[UUID], kind: str, status: str
+    ) -> Assessment | None:
+        rows = [
+            uow.assessments.latest_for_refs(refs, spelling, status)
+            for spelling in self._kind_spellings(kind)
+        ]
+        found = max(
+            (row for row in rows if row is not None),
+            key=lambda row: (row.occurred_at, row.created_at, row.id),
+            default=None,
+        )
+        return None if found is None else self._read(found)
+
+    def _scope(
+        self,
+        diff: DiffRequest,
+        baseline: Assessment | None,
+        anchor: str,
+        known: Sequence[FindingView],
+    ) -> DiffScope:
+        git, checkout = self._require_git(), diff.checkout
+        if not git.reachable(checkout, anchor):
+            raise DiffRefused(
+                f"anchor {anchor} is not reachable in the clone — the checkout does not contain "
+                "the audited commit"
+            )
+        rows = git.numstat(checkout, anchor)
+        total = sum(map(is_first_party, git.tracked(checkout)))
+        changed = [r for r in rows if is_first_party(r.path)]
+        lines = sum(r.added + r.deleted for r in changed)
+        ratio = len(changed) / total if total else float(bool(changed))
+        if ratio > MAX_CHANGED_FILE_RATIO:
+            raise DiffRefused(
+                f"{len(changed)}/{total} ({ratio:.0%}) of first-party files changed since the "
+                "anchor — the diff invalidates the baseline"
+            )
+        if lines >= CHURN_FULL_LINES:
+            raise DiffRefused(
+                f"C={lines} first-party changed lines >= {CHURN_FULL_LINES} (rescan rule-2 "
+                "threshold) — the diff invalidates the baseline"
+            )
+        files, omitted = self._hunks(checkout, anchor, changed)
+        callers, note, unlisted = self._callers(checkout, {r.path for r in changed})
+        return DiffScope(
+            anchor=anchor,
+            resolution=DiffResolution.OVERRIDE
+            if diff.baseline_assessment_id or diff.since
+            else DiffResolution.AUTO,
+            baseline_assessment_id=baseline.id if baseline else None,
+            changed_lines=lines,
+            sensitive_lines=sum(
+                r.added + r.deleted for r in changed if SENSITIVE_RX.search(r.path)
+            ),
+            deps_manifests_changed=any(is_deps_manifest(r.path) for r in rows),
+            first_party_files=total,
+            changed_ratio=round(ratio, 4),
+            clusters=tuple(
+                DiffCluster(
+                    name=name,
+                    files=tuple(files[p] for p in paths),
+                    callers=tuple(c for c in callers if c.defined_in in paths),
+                    baseline=tuple(
+                        v for v in known if any(touches(loc.path, paths) for loc in v.locations)
+                    ),
+                )
+                for name, paths in clusters(list(files))
+            ),
+            callers_note=note,
+            omitted=(*omitted, *unlisted),
+        )
+
+    def _hunks(
+        self, checkout: Path, anchor: str, changed: Sequence[NumstatRow]
+    ) -> tuple[dict[str, DiffFile], list[str]]:
+        files, omitted, spent = {}, [], 0
+        for row in changed:
+            hunks, truncated = None, False
+            if spent >= MAX_TOTAL_HUNK_BYTES:
+                omitted.append(
+                    f"{row.path}: total packet byte cap ({MAX_TOTAL_HUNK_BYTES}) reached — hunks "
+                    "not embedded; run git diff to view"
+                )
+            else:
+                raw = self._require_git().hunks(checkout, anchor, row.path, HUNK_CONTEXT_LINES)
+                encoded = raw.encode("utf-8", "replace")
+                if truncated := len(encoded) > MAX_FILE_HUNK_BYTES:
+                    raw = encoded[:MAX_FILE_HUNK_BYTES].decode("utf-8", "replace") + (
+                        f"\n... [truncated at {MAX_FILE_HUNK_BYTES} bytes — Read the file for "
+                        "the rest]"
+                    )
+                spent += len(raw.encode("utf-8", "replace"))
+                hunks = raw
+            files[row.path] = DiffFile(
+                path=row.path,
+                added=row.added,
+                deleted=row.deleted,
+                sensitive=bool(SENSITIVE_RX.search(row.path)),
+                hunks=hunks,
+                truncated=truncated,
+            )
+        return files, omitted
+
+    def _callers(
+        self, checkout: Path, changed: set[str]
+    ) -> tuple[list[DiffCaller], str | None, list[str]]:
+        """Reference sites outside the changed set of the symbols the changed files define."""
+        if self._symbols is None:
+            raise ConfigError("diff mode needs the symbol index (Context wires it)")
+        try:
+            facts = self._symbols.enumerate(ToolRequest(workspace=checkout)).data
+        except ServiceError as e:
+            log.warning("symbol index failed error_type=%s", type(e).__name__)
+            return [], "skipped: symbol index build failed — enumerate callers manually", []
+        symbols = [f for f in facts if isinstance(f, SymbolFact)]
+        defined = {(s.name, s.location.path, s.location.line) for s in symbols}
+        names: dict[str, list[str]] = {}
+        unlisted = []
+        for path in sorted(changed):
+            own = list(dict.fromkeys(s.name for s in symbols if s.location.path == path))
+            if len(own) > MAX_SYMBOLS_PER_FILE:
+                unlisted.append(
+                    f"{path}: {len(own) - MAX_SYMBOLS_PER_FILE} symbol(s) beyond the per-file "
+                    "cap unqueried"
+                )
+            names[path] = own[:MAX_SYMBOLS_PER_FILE]
+        sites: dict[str, list[SymbolReference]] = defaultdict(list)
+        for r in self._symbols.references(checkout, {n for ns in names.values() for n in ns}):
+            if r.path not in changed and (r.symbol, r.path, r.line) not in defined:
+                sites[r.symbol].append(r)
+        callers: list[DiffCaller] = []
+        for path, own in names.items():
+            for name in own:
+                for r in sites[name]:
+                    if len(callers) >= MAX_CALLERS:
+                        unlisted.append(
+                            f"caller cap ({MAX_CALLERS}) reached at {path}:{name} — remaining "
+                            "references unlisted"
+                        )
+                        return callers, None, unlisted
+                    callers.append(
+                        DiffCaller(
+                            symbol=name,
+                            defined_in=path,
+                            path=r.path,
+                            line=r.line,
+                            context=r.context,
+                        )
+                    )
+        return callers, None, unlisted
+
+    def _require_git(self) -> GitCheckout:
+        if self._git is None:
+            raise ConfigError("diff mode needs the checkout reader (Context wires it)")
+        return self._git
+
+    def record_scan(
+        self,
+        repository_ref_id: UUID,
+        raw: bytes,
+        format: CandidateFormat,
+        provenance: Provenance,
+        *,
+        include_suppressed: bool = False,
+    ) -> tuple[Assessment, IntakeResult]:
+        """Third-party scanner output (SARIF, Dependabot, govulncheck) as an assessment of the
+        commit and its findings; the same output again is the same assessment and adds nothing."""
+        if self._intake is None:
+            raise ConfigError("record_scan needs finding intake (Context wires it)")
+        if self._intake._uow is not self._uow:
+            raise ConfigError(
+                "record_scan needs assessment and finding intake to share a unit of work"
+            )
+        if self._publisher is not None and self._publisher._uow is not self._uow:
+            raise ConfigError("record_scan needs assessment and publisher to share a unit of work")
+        with self._uow as uow:
+            name, version = candidate_formats.scanner(format.value, raw)
+            ref, repository = self._inventory.resolve(repository_ref_id)
+            candidates = FindingCandidate.parse_many(
+                raw,
+                format,
+                ref.repository_id,
+                repository_url=repository.url,
+                sha=ref.sha,
+                include_suppressed=include_suppressed,
+            )
+            staged = None
+            if self._publisher is not None:
+                self._intake.check(repository.id, candidates)
+                bindings = [
+                    (candidate.label, self._intake.fingerprint(candidate))
+                    for candidate in candidates
+                ]
+                document = FindingIntakeArtifact.from_document(
+                    {
+                        "schema_version": "1.0",
+                        "repository_id": str(repository.id),
+                        "repository_ref_id": str(ref.id),
+                        "repository": repository.url,
+                        "commit": ref.sha,
+                        "bindings": [
+                            {
+                                "label": str(label),
+                                "fingerprint_algo": fingerprint.algo,
+                                "fingerprint": fingerprint.value,
+                            }
+                            for label, fingerprint in bindings
+                        ],
+                    }
+                )
+                staged = self._publisher.stage(document)
+            assessment = uow.assessments.find_scan(repository_ref_id, name, provenance.occurred_at)
+            if assessment is None:
+                assessment = uow.assessments.add(
+                    Assessment(
+                        repository_ref_id=repository_ref_id,
+                        kind=AssessmentKind.SCANNER,
+                        status=ASSESSMENT_COMPLETED,
+                        assessor=name,
+                        assessor_version=version,
+                        occurred_at=provenance.occurred_at,
+                    )
+                )
+                assert assessment.id is not None
+                assessment = uow.assessments.get(assessment.id)
+            assert assessment.id is not None
+            result = self._intake.accept(assessment.id, candidates)
+            if staged is not None:
+                assert self._publisher is not None
+                published = self._publisher.publish_staged(staged)
+                assert published.artifact_id is not None
+                self._log.attach(
+                    assessment.id, published.artifact_id, sha256_hex(staged.artifact.payload)
+                )
+            uow.commit()
+        return assessment, result
+
+    def record_secure_code(
+        self,
+        doc: ReportArtifact,
+        repository_ref_id: UUID,
+        assessor_version: str,
+        provenance: Provenance,
+        *,
+        run_order_id: UUID,
+        principal: Principal,
+    ) -> AssessmentRecordResult:
+        """Record authored secure-code claims as unjudged candidates under the runner's lease."""
+        if self._recording is None:
+            raise ConfigError("secure-code recording requires operations authorization")
+        if self._recording._uow is not self._uow:
+            raise ConfigError("secure-code recording and operations must share a unit of work")
+        ref = self._inventory.get_ref(repository_ref_id)
+        self._recording.check_recording(
+            run_order_id, principal, RecordKind.ASSESSMENT, ref.repository_id, provenance
+        )
+        contracts.validate_json("report#/$defs/canonical_write", doc.payload)
+        self._gate(doc)
+        assessment = Assessment(
+            repository_ref_id=repository_ref_id,
+            run_order_id=run_order_id,
+            kind=AssessmentKind.SECURE_CODE_CANONICAL,
+            status=ASSESSMENT_COMPLETED,
+            assessor="skill:secure-code-audit",
+            assessor_version=assessor_version,
+            occurred_at=provenance.occurred_at,
+        )
+        prepared, artifact = self._prepare_record(
+            doc, assessment, provenance.artifact, canonicalize_priorities=False
+        )
+        with self._recording.recording(
+            order_id=run_order_id,
+            principal=principal,
+            kind=RecordKind.ASSESSMENT,
+            repository_id=ref.repository_id,
+            provenance=provenance,
+        ):
+            recorded, report, intake = self._record_findings(
+                prepared,
+                assessment,
+                artifact,
+                FindingCandidate.of_report(doc.findings, ref.repository_id),
+                hold_moves=True,
+            )
+            assert recorded.id is not None and report.id is not None
+            return AssessmentRecordResult(
+                assessment_id=recorded.id, artifact_id=report.id, intake=intake
+            )
+
     def record(
-        self, doc: AssessmentArtifact, repository_ref_id: UUID, provenance: Provenance
+        self,
+        doc: AssessmentArtifact,
+        repository_ref_id: UUID,
+        kind: AssessmentKind,
+        assessor: str,
+        assessor_version: str,
+        provenance: Provenance,
+        *,
+        status: str = ASSESSMENT_COMPLETED,
+        run_order_id: UUID | None = None,
     ) -> Assessment:
-        raise NotImplementedError("stub: replaces corpus/store_ingest.py, threat_model.py")
+        """An assessment of `kind` on the commit holding `doc`, published here unless provenance
+        names it (whose bytes must be `doc`'s); the same document at the same time is one run.
+        A container, RPM or vuln-scan document's findings (a fuzz report's crashers, each also
+        confirmed by its reproducer) are findings of the assessment; a document failing its gate
+        (`check_audit`) is refused. With `run_order_id`, the assessment is that leased order's
+        result, so the order can be checked for what it recorded."""
+        contracts.validate_enum("assessment_kind", kind)
+        if provenance.artifact is None and self._publisher is None:
+            raise ValidationError("record requires a published artifact reference")
+        self._gate(doc)
+        ref = self._inventory.get_ref(repository_ref_id)
+        assessment = Assessment(
+            repository_ref_id=repository_ref_id,
+            run_order_id=run_order_id,
+            kind=kind,
+            status=status,
+            assessor=assessor,
+            assessor_version=assessor_version,
+            occurred_at=provenance.occurred_at,
+        )
+        doc, artifact = self._prepare_record(doc, assessment, provenance.artifact)
+        with self._bound(run_order_id, ref.repository_id):
+            stated = REPORTED_FINDINGS.get(kind)
+            if stated is None or doc.schema != RECORDED_SCHEMAS[kind]:
+                return self._record(doc, assessment, artifact)[0]
+            candidates = stated(doc, ref.repository_id)
+            if kind != AssessmentKind.FUZZ:
+                return self._record_findings(
+                    doc,
+                    assessment,
+                    artifact,
+                    candidates,
+                    hold_moves=kind in REBASELINED_KINDS,
+                )[0]
+            return self._record_fuzz(doc, assessment, artifact, candidates)
+
+    def _record_fuzz(
+        self,
+        doc: AssessmentArtifact,
+        assessment: Assessment,
+        artifact: ArtifactRef | StagedArtifact[AssessmentArtifact],
+        candidates: Sequence[FindingCandidate],
+    ) -> Assessment:
+        """`_record_findings`, and each crasher's reproducing input confirms its finding (E0)."""
+        assert self._decisions is not None
+        with self._uow.write() as uow:
+            recorded, report, taken = self._record_findings(doc, assessment, artifact, candidates)
+            assert report.id is not None
+            self._decisions.record_reproduced(
+                recorded,
+                report.id,
+                {taken.findings[Label(c.id)]: c.reproducer.sha256 for c in doc.crashers},
+            )
+            uow.commit()
+        return recorded
+
+    def _record_findings(
+        self,
+        doc: AssessmentArtifact,
+        assessment: Assessment,
+        artifact: ArtifactRef | StagedArtifact[AssessmentArtifact],
+        candidates: Sequence[FindingCandidate],
+        *,
+        hold_moves: bool = False,
+    ) -> tuple[Assessment, Artifact, IntakeResult]:
+        """`_record` and the findings the document states, refused before anything is written.
+        With `hold_moves`, a candidate that reports a recorded finding under another identity
+        waits for its rebaseline review (`FindingService.hold_moves`) instead of being admitted."""
+        if self._intake is None:
+            raise ConfigError(f"recording {assessment.kind} findings needs finding intake")
+        if hold_moves and self._findings is None:
+            raise ConfigError(f"recording {assessment.kind} findings needs the finding service")
+        if self._intake._uow is not self._uow:
+            raise ConfigError(
+                "recording findings needs assessment and intake to share a unit of work"
+            )
+        with self._uow as uow:
+            repository_id = self._inventory.get_ref(assessment.repository_ref_id).repository_id
+            self._intake.check(repository_id, candidates)
+            if hold_moves:
+                # Before the audit row: its review then predates it, which is how settling
+                # finds the audits it holds (`FindingService._held`).
+                assert self._findings is not None
+                held = {m.label for m in self._findings.hold_moves(repository_id, candidates)}
+                candidates = [c for c in candidates if c.label not in held]
+            recorded, report = self._record(doc, assessment, artifact)
+            assert recorded.id is not None
+            taken = self._intake.accept(recorded.id, candidates)
+            uow.commit()
+        return recorded, report, taken
+
+    def _prepare_record(
+        self,
+        doc: AssessmentArtifact,
+        assessment: Assessment,
+        artifact: ArtifactRef | None,
+        *,
+        canonicalize_priorities: bool = True,
+    ) -> tuple[AssessmentArtifact, ArtifactRef | StagedArtifact[AssessmentArtifact]]:
+        contracts.validate_enum("assessment_kind", assessment.kind)
+        if (schema := RECORDED_SCHEMAS.get(AssessmentKind(assessment.kind))) is None:
+            raise ConfigError(f"{assessment.kind} assessments are recorded by their owner's door")
+        if doc.schema != schema:
+            raise ValidationError(
+                f"a {assessment.kind} assessment holds a {schema} document, not {doc.schema}"
+            )
+        kind = AssessmentKind(assessment.kind)
+        if kind in REPORTED_FINDINGS and self._intake is None:
+            raise ConfigError(f"recording {kind} findings needs finding intake")
+        if kind == AssessmentKind.FUZZ:
+            if self._decisions is None:
+                raise ConfigError("recording a fuzz run needs finding decisions")
+            if self._decisions._uow is not self._uow:
+                raise ConfigError(
+                    "recording a fuzz run needs assessment and decisions to share a unit of work"
+                )
+            if doc.crashers:
+                self._decisions.require_signable()
+        digest = sha256_hex(doc.payload)
+        written = (
+            doc.with_canonical_priorities()
+            if canonicalize_priorities and artifact is None and isinstance(doc, ReportArtifact)
+            else doc
+        )
+        if artifact is not None:
+            published = self._log.get_artifact(artifact.id)
+            if published.digest != digest:
+                raise IntegrityError(
+                    f"artifact {artifact.id}: doc digest {digest} != published {published.digest}"
+                )
+        existing = self._recorded(
+            assessment, schema, tuple(dict.fromkeys((digest, sha256_hex(written.payload))))
+        )
+        if existing is not None:
+            row = existing[1]
+            assert row.id is not None
+            original = doc if row.digest == digest else written
+            return original, ArtifactRef(id=row.id, name=doc.name, digest=row.digest)
+        if schema == ThreatModelArtifact.schema:
+            contracts.validate_json("threat-model#/$defs/canonical_write", written.payload)
+        elif schema == ReportArtifact.schema:
+            for source in (doc,) if written is doc else (doc, written):
+                document = contracts.validate_json(schema, source.payload)
+                for finding in document["findings"]:
+                    if "validation_status" in finding:
+                        contracts.validate_enum("validity", finding["validation_status"])
+            for collection in ("findings", "remediation_roadmap"):
+                contracts.validate(
+                    f"{schema}#/$defs/canonical_write/allOf/1/properties/{collection}",
+                    document[collection],
+                )
+        if artifact is not None:
+            return doc, artifact
+        if self._publisher is None:
+            raise ConfigError(f"recording {doc.name} needs a publisher to publish it")
+        if self._publisher._uow is not self._uow:
+            raise ConfigError("recording needs assessment and publisher to share a unit of work")
+        return written, self._publisher.stage(written)
+
+    def _recorded(
+        self, assessment: Assessment, schema: str, digests: tuple[str, ...]
+    ) -> tuple[Assessment, Artifact] | None:
+        for digest in digests:
+            for spelling in self._kind_spellings(assessment.kind):
+                for held in self._log.find_recorded(
+                    [assessment.repository_ref_id], spelling, schema, digest
+                ):
+                    assert held[0].id is not None
+                    same_run = self._log.find_at(held[0].id, assessment.occurred_at)
+                    if same_run is None:
+                        continue
+                    if (
+                        assessment.run_order_id is not None
+                        and same_run.run_order_id != assessment.run_order_id
+                    ):
+                        raise ConflictError(
+                            f"assessment {same_run.id} belongs to order "
+                            f"{same_run.run_order_id}, not {assessment.run_order_id}"
+                        )
+                    return self._read(same_run), held[1]
+        return None
+
+    def _record(
+        self,
+        doc: AssessmentArtifact,
+        assessment: Assessment,
+        artifact: ArtifactRef | StagedArtifact[AssessmentArtifact],
+    ) -> tuple[Assessment, Artifact]:
+        digest = sha256_hex(doc.payload)
+        with self._uow as uow:
+            existing = self._recorded(assessment, doc.schema, (digest,))
+            if existing is not None:
+                return existing
+            if isinstance(artifact, StagedArtifact):
+                if self._publisher is None:
+                    raise ConfigError("recording staged bytes needs the original publisher")
+                if artifact.objects[0].sha256 != digest:
+                    raise IntegrityError("staged artifact does not match the recorded document")
+                published = self._publisher.publish_staged(artifact)
+                artifact_id = published.artifact_id
+            else:
+                prepared, reference = self._prepare_record(doc, assessment, artifact)
+                assert isinstance(reference, ArtifactRef)
+                doc, artifact_id = prepared, reference.id
+            recorded, report = self._log.add(assessment, artifact_id, digest)
+            uow.commit()
+        return self._read(recorded), report
+
+    def record_observation(
+        self,
+        doc: RepoStateArtifact,
+        artifact_id: UUID,
+        repository_ref_id: UUID,
+        *,
+        baseline_assessment_id: UUID | None,
+        assessor: str,
+        assessor_version: str,
+        occurred_at: datetime,
+    ) -> Assessment:
+        """A forge observation of the commit, measured against the audit it compared with."""
+        return self._log.add(
+            Assessment(
+                repository_ref_id=repository_ref_id,
+                baseline_assessment_id=baseline_assessment_id,
+                kind=AssessmentKind.REPO_STATE_CANONICAL,
+                status=ASSESSMENT_COMPLETED,
+                assessor=assessor,
+                assessor_version=assessor_version,
+                occurred_at=occurred_at,
+            ),
+            artifact_id,
+            sha256_hex(doc.payload),
+        )[0]
+
+    def check_audit(self, doc: AssessmentArtifact) -> LintReport:
+        """A document's gate past its schema (cloud-config audits, isolation reviews);
+        `record` and `record_audit` refuse a document that fails."""
+        return AUDIT_LINT.run(doc, LintContext())
+
+    def _gate(self, doc: AssessmentArtifact) -> None:
+        if violations := self.check_audit(doc).violations:
+            listed = "; ".join(f"{v.item}: {v.message}" for v in violations)
+            raise ValidationError(f"{doc.name} report fails its gate: {listed}")
+
+    @contextmanager
+    def _bound(self, run_order_id: UUID | None, repository_id: UUID) -> Iterator[None]:
+        """With `run_order_id`, the writes inside run under that order's live lease on this
+        repository (`OperationsService.bound`) and commit with it; without, they are unbound."""
+        if run_order_id is None:
+            yield
+            return
+        if self._recording is None:
+            raise ConfigError("binding an assessment to its order needs operations")
+        if self._recording._uow is not self._uow:
+            raise ConfigError("binding an assessment and operations must share a unit of work")
+        with self._recording.bound(run_order_id, repository_id):
+            yield
+
+    def record_audit(
+        self,
+        doc: CloudConfigAuditArtifact,
+        repository_ref_id: UUID,
+        provenance: Provenance,
+        *,
+        run_order_id: UUID | None = None,
+    ) -> tuple[Assessment, list[Decision]]:
+        """An audit of the commit (degraded when its report lists gaps) with its published report,
+        every finding it states, and its judgment on each as a decision. A provenance without an
+        artifact has the report published here. Re-recording the same run adds nothing."""
+        if self._intake is None or self._decisions is None:
+            raise ConfigError(
+                "record_audit needs finding intake and decisions (Context wires them)"
+            )
+        if self._intake._uow is not self._uow or self._decisions._uow is not self._uow:
+            raise ConfigError(
+                "record_audit needs assessment, intake and decisions to share a unit of work"
+            )
+        ref = self._inventory.get_ref(repository_ref_id)
+        doc = CloudConfigAuditArtifact.parse(doc.payload)
+        self._gate(doc)
+        self._decisions.require_signable()
+        candidates, judgments = audit_candidates(doc, ref.repository_id), audit_judgments(doc)
+        requested = Assessment(
+            repository_ref_id=repository_ref_id,
+            run_order_id=run_order_id,
+            kind=AssessmentKind.CLOUD_CONFIG_CANONICAL,
+            status=ASSESSMENT_DEGRADED if doc.gaps else ASSESSMENT_COMPLETED,
+            assessor=f"skill:{doc.name}",
+            assessor_version=doc.metadata.harness_version,
+            occurred_at=provenance.occurred_at,
+        )
+        prepared, artifact = self._prepare_record(doc, requested, provenance.artifact)
+        with self._bound(run_order_id, ref.repository_id), self._uow.write() as uow:
+            assessment, report, taken = self._record_findings(
+                prepared, requested, artifact, candidates
+            )
+            assert assessment.id is not None and report.id is not None
+            decisions = self._decisions.record_assessed(
+                assessment.id, report.id, [(taken.findings[label], j) for label, j in judgments]
+            )
+            uow.commit()
+        return assessment, decisions
 
     def get(self, assessment_id: UUID) -> Assessment:
-        raise NotImplementedError("stub: assessment read")
+        return self._read(self._log.get(assessment_id))
 
-    def latest(self, repository_ref_id: UUID, kind: AssessmentKind) -> Assessment | None:
-        raise NotImplementedError("stub: replaces corpus/resolver latest report")
+    def latest(
+        self,
+        repository_ref_id: UUID,
+        kind: AssessmentKind,
+        *,
+        status: str | None = None,
+        as_of: datetime | None = None,
+    ) -> Assessment | None:
+        if as_of is not None and as_of.utcoffset() is None:
+            raise ValidationError("as_of must be timezone-aware")
+        spellings = self._kind_spellings(kind)
+        with self._uow as uow:
+            rows = [
+                uow.assessments.latest(repository_ref_id, value, status, as_of=as_of)
+                for value in spellings
+            ]
+            found = max(
+                (row for row in rows if row is not None),
+                key=lambda row: (row.occurred_at, row.created_at, row.id),
+                default=None,
+            )
+            return None if found is None else self._read(found)
+
+    @staticmethod
+    def _kind_spellings(kind: str) -> list[str]:
+        target = contracts.normalize_enum("assessment_kind", kind)
+        return [
+            value
+            for value in contracts.enum_values("assessment-kind")
+            if contracts.normalize_enum("assessment_kind", value) == target
+        ]
+
+    @staticmethod
+    def _read(assessment: Assessment) -> Assessment:
+        normalized = contracts.normalize_enum("assessment_kind", assessment.kind)
+        kind = next(
+            (p.value for p in normalized.pairs if p.enum == "assessment_kind"), assessment.kind
+        )
+        return Assessment.model_validate({**dict(assessment), "kind": kind})
 
     def list(self, filter: AssessmentFilter, page: PageRequest) -> Page[Assessment]:
-        raise NotImplementedError("stub: replaces corpus/resolver.walk_reports")
+        after = page.position()
+        if filter.repository_ref_id is None:
+            raise ValidationError("list requires a repository_ref_id (no index for an open scan)")
+        kinds = self._kind_spellings(filter.kind) if filter.kind is not None else [None]
+        with self._uow as uow:
+            rows = [
+                self._read(row)
+                for kind in kinds
+                for row in uow.assessments.search(
+                    repository_ref_id=filter.repository_ref_id,
+                    kind=kind,
+                    status=filter.status,
+                    limit=page.limit + 1,
+                    after=after,
+                )
+            ]
+        rows.sort(key=lambda a: (a.occurred_at, a.id), reverse=True)
+        return Page.of(rows, page.limit, lambda a: (a.occurred_at, a.id))
 
-    def population(self, as_of: datetime, filter: AssessmentFilter) -> Population:
-        raise NotImplementedError("stub: replaces census/build_census.py, corpus/resolver")
+    def feed_after(self, after: tuple[datetime, UUID] | None, limit: int) -> list[Assessment]:
+        """Assessments recorded after a feed position, oldest first (the ops feed's half)."""
+        with self._uow as uow:
+            return [self._read(row) for row in uow.assessments.feed_after(after, limit)]
 
-    def freshness(self, repository_ref_id: UUID) -> Freshness:
-        raise NotImplementedError("stub: replaces build_rescan_worklist audit_age / churn")
+    def list_for_order(self, run_order_id: UUID) -> list[Assessment]:
+        """The assessments a run order recorded, oldest first."""
+        with self._uow as uow:
+            rows = uow.assessments.list_for_run_order(run_order_id)
+        return sorted((self._read(row) for row in rows), key=lambda a: (a.occurred_at, a.id))
+
+    def latest_recorded(self, repository_id: UUID, kind: AssessmentKind) -> Assessment:
+        """The repository's newest completed or degraded assessment across all its refs."""
+        self._inventory.get_repository(repository_id)
+        with self._uow as uow:
+            found = uow.assessment_reads.latest_for_repository(
+                repository_id,
+                self._kind_spellings(kind),
+                (ASSESSMENT_COMPLETED, ASSESSMENT_DEGRADED),
+            )
+        if found is None:
+            raise NotFoundError(f"no recorded {kind} assessment for repository {repository_id}")
+        return self._read(found)
+
+    def list_for_repository(
+        self, repository_id: UUID, kind: AssessmentKind | None = None
+    ) -> list[Assessment]:
+        """The assessments across every ref of the repository, oldest first."""
+        refs = [r.id for r in self._inventory.list_refs(repository_id) if r.id]
+        kinds = self._kind_spellings(kind) if kind is not None else [None]
+        rows = [self._read(row) for spelling in kinds for row in self._log.list_of(spelling, refs)]
+        return sorted(rows, key=lambda a: (a.occurred_at, a.id))
+
+    def population(
+        self, as_of: datetime, filter: AssessmentFilter, repository_ids: Collection[UUID]
+    ) -> Population:
+        """Of these repositories, what was assessed by `as_of` (of `filter.kind`, any when None):
+        a row per repository and kind, and the repositories never assessed at all."""
+        held = self._held(as_of, filter, repository_ids)
+        rows = [
+            PopulationRow(
+                repository_id=repository_id,
+                kind=kind,
+                latest=default[-1] if default else None,
+                default_line=len(default),
+                branches=len(branch),
+            )
+            for (repository_id, kind), (default, branch) in sorted(held.items(), key=str)
+        ]
+        assessed = {r.repository_id for r in rows}
+        return Population(
+            as_of=as_of,
+            rows=tuple(rows),
+            never_assessed_repository_ids=tuple(
+                sorted(i for i in dict.fromkeys(repository_ids) if i not in assessed)
+            ),
+        )
+
+    def _held(
+        self, as_of: datetime, filter: AssessmentFilter, repository_ids: Collection[UUID]
+    ) -> dict[tuple[UUID, str], tuple[list[Assessment], list[Assessment]]]:
+        """Per (repository, kind): its assessments by `as_of` on the default line and on other
+        branches, oldest first."""
+        if filter.repository_ref_id is not None:
+            raise ValidationError("population and coverage are per repository, not per commit")
+        if as_of.tzinfo is None:
+            raise ValidationError("as_of must be timezone-aware")
+        listed = self._inventory.list_refs_of(repository_ids)
+        refs, line = {r.id: r for r in listed if r.id}, default_line(listed)
+        held: dict[tuple[UUID, str], tuple[list[Assessment], list[Assessment]]] = {}
+        kinds = self._kind_spellings(filter.kind) if filter.kind is not None else [None]
+        rows = [self._read(a) for kind in kinds for a in self._log.list_of(kind, list(refs))]
+        for a in sorted(rows, key=lambda a: (a.occurred_at, a.created_at, a.id)):
+            if a.occurred_at > as_of or (filter.status and a.status != filter.status):
+                continue
+            ref = refs[a.repository_ref_id]
+            default, branch = held.setdefault((ref.repository_id, a.kind), ([], []))
+            (default if ref.id in line else branch).append(a)
+        return held
+
+    def freshness(
+        self,
+        repository_ref_id: UUID | None = None,
+        *,
+        baseline: ObservationTarget | None = None,
+        changed_lines: int | None = None,
+        as_of: datetime | None = None,
+    ) -> Freshness:
+        """How long since the repository's latest completed code audit, and how far it has
+        churned since; measured against `baseline`, else against the ref's repository's."""
+        if baseline is None:
+            if repository_ref_id is None:
+                raise ValidationError(
+                    "freshness requires a repository ref or an observation baseline"
+                )
+            ref = self._inventory.get_ref(repository_ref_id)
+            baseline = self.observation_target(repository_id=ref.repository_id)
+        now = as_of or self._clock.now()
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise ValidationError("freshness requires a timezone-aware clock")
+        audited = parse_audit_date(baseline.audit_date) if baseline.has_audit else None
+        return Freshness(
+            repository_ref_id=repository_ref_id or baseline.repository_ref_id,
+            last_assessed_at=datetime.combine(audited, time()) if audited else None,
+            churn_ratio=changed_lines / baseline.lines_reviewed
+            if changed_lines is not None and baseline.lines_reviewed
+            else None,
+        )
+
+    def latest_on_default_line(
+        self, repository_id: UUID, kind: AssessmentKind
+    ) -> Assessment | None:
+        """The repository's latest completed assessment of `kind` on its default line."""
+        return self.latest_on_default_lines([repository_id], kind).get(repository_id)
+
+    def latest_on_default_lines(
+        self,
+        repository_ids: Collection[UUID],
+        kind: AssessmentKind,
+        as_of: datetime | None = None,
+    ) -> dict[UUID, Assessment]:
+        """Each repository's latest completed assessment of `kind` on its default line; a
+        repository with none is absent. A few statements per batch, not per repository."""
+        if as_of is not None:
+            held = self._held(
+                as_of, AssessmentFilter(kind=kind, status=ASSESSMENT_COMPLETED), repository_ids
+            )
+            return {
+                repository_id: rows[-1] for (repository_id, _), (rows, _) in held.items() if rows
+            }
+        refs = self._inventory.list_refs_of(repository_ids)
+        owner = {r.id: r.repository_id for r in refs}
+        with self._uow as uow:
+            rows = uow.assessments.latest_per_ref(
+                default_line(refs), self._kind_spellings(kind), ASSESSMENT_COMPLETED
+            )
+        latest: dict[UUID, Assessment] = {}
+        for row in sorted(rows, key=lambda row: (row.occurred_at, row.created_at, row.id)):
+            latest[owner[row.repository_ref_id]] = self._read(row)
+        return latest
+
+    def audit_scope(self, audit_assessment_id: UUID) -> AuditScope:
+        """What a code audit's report says it covered; all unknown when it holds no report."""
+        report = self.report(audit_assessment_id)
+        return AuditScope() if report is None else AuditScope.of_report(report)
+
+    def report(self, assessment_id: UUID) -> ReportArtifact | None:
+        """The report document the assessment holds; None when it holds none."""
+        if self._publisher is None:
+            raise ConfigError("reading an audit's report needs the publisher")
+        audit = self._log.get(assessment_id)
+        for _, row in self._log.documents([audit], [ReportArtifact.schema]):
+            assert row.id is not None
+            return self._publisher.read(row.id, ReportArtifact)
+        return None
+
+    def intake_bindings(self, assessment_id: UUID) -> AssessmentIntakeBindings:
+        """Original report or triage row labels bound by their own native intake owner."""
+        with self._uow:
+            assessment = self.get(assessment_id)
+            if assessment.kind == AssessmentKind.TRIAGE:
+                if self._decisions is None:
+                    raise ConfigError("triage intake bindings need finding decisions")
+                return self._decisions.intake_bindings(assessment_id)
+            if assessment.kind != AssessmentKind.SECURE_CODE_CANONICAL:
+                raise ValidationError(
+                    f"assessment {assessment_id} is not a secure-code or triage assessment"
+                )
+            if self._intake is None or self._findings is None:
+                raise ConfigError(
+                    "intake bindings need finding intake and reads (Context wires them)"
+                )
+            doc = self.report(assessment_id)
+            if doc is None:
+                raise NotFoundError(f"assessment {assessment_id} has no report artifact")
+            repository_id = self._inventory.get_ref(assessment.repository_ref_id).repository_id
+            admitted = {
+                occurrence.finding_id
+                for occurrence in self._findings.occurrences(assessment_id=assessment_id)
+            }
+            bindings: dict[Label, UUID] = {}
+            for candidate in FindingCandidate.of_report(doc.findings, repository_id):
+                finding_id = self._intake.match(repository_id, candidate)
+                if finding_id is None or finding_id not in admitted:
+                    raise IntegrityError(
+                        f"assessment {assessment_id}: report label {candidate.label} "
+                        "does not identify an admitted finding"
+                    )
+                bindings[candidate.label] = finding_id
+            return AssessmentIntakeBindings(findings=bindings)
+
+    def observation_target(
+        self, *, repository_id: UUID | None = None, repo_url: str | None = None
+    ) -> ObservationTarget:
+        """Resolve what an observation measures: the repository, its latest audit,
+        and the commit that audit pinned (the ref it occurred on)."""
+        if (repository_id is None) == (repo_url is None):
+            raise ValidationError("supply exactly one repository id or URL")
+        with self._uow:
+            repo = (
+                self._inventory.get_repository(repository_id)
+                if repository_id is not None
+                else self._inventory.find_repository(repo_url)
+            )
+            if repo is None:
+                raise NotFoundError(f"repository not in inventory: {repository_id or repo_url}")
+            latest = None
+            for ref in self._inventory.list_refs(repo.id):
+                # a degraded or failed run is never read as clean (the DDL rule)
+                found = self.latest(ref.id, AssessmentKind.SECURE_CODE, status=ASSESSMENT_COMPLETED)
+                if found is not None and (
+                    latest is None or found.occurred_at > latest[1].occurred_at
+                ):
+                    latest = (ref, found)
+        if latest is None:
+            return ObservationTarget(repository_id=repo.id, repo_url=repo.url, has_audit=False)
+        ref, audit = latest
+        return ObservationTarget(
+            repository_id=repo.id,
+            repo_url=repo.url,
+            has_audit=True,
+            audit_date=audit.occurred_at.astimezone(UTC).date().isoformat(),
+            pinned_sha=ref.sha,
+            repository_ref_id=ref.id,
+            audit_assessment_id=audit.id,
+        )
 
     def threats(self, filter: ThreatFilter, page: PageRequest) -> Page[Threat]:
-        raise NotImplementedError("stub: replaces threat_current, threat-register parse_model")
+        """The threats each repository's latest completed threat model states, newest model
+        first; narrowed by status and ATT&CK technique."""
+        after = page.position()
+        scope = AssessmentFilter(kind=AssessmentKind.THREAT_MODEL, status=ASSESSMENT_COMPLETED)
+        _, documents = self._latest_documents(
+            scope, filter.repository_ids, ThreatModelArtifact, filter.as_of
+        )
+        at = {a.id: a.occurred_at for _, a, _ in documents}
+        rows = sorted(
+            (
+                t
+                for repository_id, a, doc in documents
+                for t in Threat.of(a, repository_id, json.loads(doc.payload))
+                if (not filter.statuses or t.status in filter.statuses)
+                and (filter.technique is None or filter.technique in {x.id for x in t.techniques})
+                and (after is None or (a.occurred_at, t.id) < after)
+            ),
+            key=lambda t: (at[t.assessment_id], t.id),
+            reverse=True,
+        )
+        return Page.of(rows[: page.limit + 1], page.limit, lambda t: (at[t.assessment_id], t.id))
 
-    def coverage(self, filter: AssessmentFilter) -> list[CoverageRow]:
-        raise NotImplementedError("stub: replaces build_coverage_gap_rollup.py")
+    def attack_scenarios(
+        self, repository_ids: Collection[UUID], as_of: datetime | None = None
+    ) -> list[AttackScenario]:
+        """The attack scenarios each repository's latest completed threat model narrates, in the
+        model's order; a model without any adds none."""
+        scope = AssessmentFilter(kind=AssessmentKind.THREAT_MODEL, status=ASSESSMENT_COMPLETED)
+        _, documents = self._latest_documents(scope, repository_ids, ThreatModelArtifact, as_of)
+        return [
+            AttackScenario(
+                assessment_id=a.id,  # type: ignore[arg-type]
+                repository_id=repository_id,
+                label=Label(s["id"]),
+                threat=s.get("threat"),
+                steps=tuple(s["steps"]),
+            )
+            for repository_id, a, doc in sorted(documents, key=lambda d: str(d[0]))
+            for s in json.loads(doc.payload).get("attack_scenarios") or ()
+        ]
 
-    def privileges(self, filter: AssessmentFilter) -> list[PrivilegeProfile]:
-        raise NotImplementedError("stub: replaces operator_privilege, load_least_priv")
+    def tenant_boundaries(
+        self, repository_ids: Collection[UUID], as_of: datetime | None = None
+    ) -> list[TenantBoundary]:
+        """The tenant boundaries each repository's latest completed threat model states (its
+        section 10), in the model's order; a single-tenant model adds none."""
+        scope = AssessmentFilter(kind=AssessmentKind.THREAT_MODEL, status=ASSESSMENT_COMPLETED)
+        _, documents = self._latest_documents(scope, repository_ids, ThreatModelArtifact, as_of)
+        return [
+            b
+            for repository_id, a, doc in sorted(documents, key=lambda d: str(d[0]))
+            for b in TenantBoundary.of(a, repository_id, json.loads(doc.payload))
+        ]
+
+    def rate_threats(self, model: Mapping[str, Any]) -> ThreatRatings:
+        """Each threat's OWASP risk_rating rebuilt from its factor scores (scores, levels,
+        severity); a threat with no rating is left alone. `model` may be a draft."""
+        if self._rating is None:
+            raise ConfigError("rate_threats needs the rating policy (Context wires it)")
+        rated = copy.deepcopy(dict(model))
+        changed, failed = [], {}
+        for threat in rated.get("threats") or ():
+            if not (stated := threat.get("risk_rating")):
+                continue
+            label = Label(threat.get("id", "?"))
+            if not isinstance(stated, Mapping):
+                failed[label] = "risk_rating must be an object"
+                continue
+            try:
+                factors = OwaspFactors.of_stated(stated)
+            except pydantic.ValidationError as e:
+                failed[label] = "; ".join(_reason(err) for err in e.errors())
+                continue
+            rating = self._rating.rate(RatingInputs(factors=factors))
+            if (rebuilt := rating.stated(factors, stated.get("rationale"))) != stated:
+                changed.append(label)
+                threat["risk_rating"] = rebuilt
+        return ThreatRatings(model=rated, changed=tuple(changed), failed=failed)
+
+    def _latest_documents(
+        self,
+        filter: AssessmentFilter,
+        repository_ids: Collection[UUID],
+        artifact: type[A],
+        as_of: datetime | None = None,
+    ) -> tuple[int, list[tuple[UUID, Assessment, A]]]:
+        """How many repositories have an assessment in scope on their default line, and the
+        `artifact` documents their latest one holds, with the repository each belongs to."""
+        if self._publisher is None:
+            raise ConfigError(f"reading {artifact.schema} documents needs the publisher")
+        held = self._held(as_of or self._clock.now(), filter, repository_ids)
+        latest = {d[-1].id: r for (r, _), (d, _) in held.items() if d}
+        assessments = [d[-1] for d, _ in held.values() if d]
+        documents = []
+        for a, row in self._log.documents(assessments, [artifact.schema]):
+            assert row.id is not None
+            documents.append((latest[a.id], a, self._publisher.read(row.id, artifact)))
+        return len(latest), documents
+
+    def coverage(self, filter: AssessmentFilter, repository_ids: Collection[UUID]) -> Coverage:
+        """What the repositories' latest default-line audits (`filter.kind`, secure-code when
+        None; degraded runs included) say they could not examine, as gap families."""
+        if self._publisher is None:
+            raise ConfigError("coverage needs the report reader (Context wires it)")
+        scope = filter.model_copy(update={"kind": filter.kind or AssessmentKind.SECURE_CODE})
+        latest, documents = self._latest_documents(scope, repository_ids, ReportArtifact)
+        families: dict[tuple[str, str], list[tuple[UUID, ReportGap]]] = defaultdict(list)
+        for repository_id, _, doc in documents:
+            for gap in report_gaps(json.loads(doc.payload)):
+                families[gap.tool, gap.system].append((repository_id, gap))
+        gaps = [
+            CoverageGap(
+                tool=tool,
+                system=system,
+                repositories=len(repos := list(dict.fromkeys(r for r, _ in found))),
+                items=sum(counts)
+                if (counts := [g.count for _, g in found if g.count is not None])
+                else None,
+                signals=dict(Counter(g.signal for _, g in found)),
+                example_repository_ids=tuple(repos[:MAX_GAP_EXAMPLES]),
+            )
+            for (tool, system), found in families.items()
+        ]
+        gaps.sort(key=lambda g: (-g.repositories, g.tool, g.system))
+        return Coverage(
+            examined=len({a.id for _, a, _ in documents}), total=latest, gaps=tuple(gaps)
+        )
+
+    def privileges(
+        self,
+        filter: AssessmentFilter,
+        repository_ids: Collection[UUID],
+        as_of: datetime | None = None,
+    ) -> list[PrivilegeProfile]:
+        """Each repository's declared privileges, from its latest completed default-line
+        priv-profile by `as_of` (else now; `filter.status` overrides completed)."""
+        if filter.kind is not None and filter.kind not in self._kind_spellings(
+            AssessmentKind.PRIV_PROFILE_CANONICAL
+        ):
+            raise ValidationError(f"privileges reads priv-profile assessments, not {filter.kind}")
+        scope = filter.model_copy(
+            update={
+                "kind": AssessmentKind.PRIV_PROFILE_CANONICAL,
+                "status": filter.status or ASSESSMENT_COMPLETED,
+            }
+        )
+        _, documents = self._latest_documents(scope, repository_ids, PrivProfileArtifact, as_of)
+        return [
+            PrivilegeProfile.of(a, repository_id, json.loads(doc.payload))
+            for repository_id, a, doc in documents
+        ]
+
+    def isolation_reviews(
+        self, repository_ids: Collection[UUID], as_of: datetime | None = None
+    ) -> list[tuple[UUID, Assessment, IsolationReviewArtifact]]:
+        """Each repository's latest completed default-line isolation review by the cutoff."""
+        _, documents = self._latest_documents(
+            AssessmentFilter(
+                kind=AssessmentKind.ISOLATION_REVIEW_CANONICAL, status=ASSESSMENT_COMPLETED
+            ),
+            repository_ids,
+            IsolationReviewArtifact,
+            as_of,
+        )
+        return documents
+
+    def cloud_config_audits(
+        self, repository_ids: Collection[UUID], as_of: datetime | None = None
+    ) -> list[tuple[UUID, Assessment, CloudConfigAuditArtifact]]:
+        """Each repository's latest default-line declared audit, including explicit gaps."""
+        _, documents = self._latest_documents(
+            AssessmentFilter(kind=AssessmentKind.CLOUD_CONFIG_CANONICAL),
+            repository_ids,
+            CloudConfigAuditArtifact,
+            as_of,
+        )
+        return documents
+
+    def fuzz_reports(
+        self, repository_ids: Collection[UUID], as_of: datetime | None = None
+    ) -> list[tuple[UUID, Assessment, FuzzReportArtifact]]:
+        """Each repository's latest completed fuzz report per target by `as_of` (else now), on
+        any commit (a campaign fuzzes the audited one), with its repository; newest first."""
+        if self._publisher is None:
+            raise ConfigError("reading fuzz reports needs the publisher (Context wires it)")
+        scope = AssessmentFilter(kind=AssessmentKind.FUZZ, status=ASSESSMENT_COMPLETED)
+        held = self._held(as_of or self._clock.now(), scope, repository_ids)
+        repository_of = {a.id: r for (r, _), lines in held.items() for line in lines for a in line}
+        latest: dict[tuple[UUID, str], tuple[UUID, Assessment, FuzzReportArtifact]] = {}
+        runs = [a for lines in held.values() for line in lines for a in line]
+        for a, doc in self._publisher.documents(runs, FuzzReportArtifact):
+            repository_id = repository_of[a.id]
+            latest.setdefault((repository_id, doc.target.id), (repository_id, a, doc))
+        return list(latest.values())
+
+
+def _reason(err: Any) -> str:
+    msg = str(err["msg"]).removeprefix("Value error, ")
+    return f"{'.'.join(map(str, err['loc']))}: {msg}" if err["loc"] else msg

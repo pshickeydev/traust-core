@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+from collections.abc import Collection
 from datetime import datetime, timedelta
 from typing import Protocol
 from uuid import UUID
 
 import sqlalchemy as sa
 
-from traust_core.v1.models.operations import RunOrder
+from traust_core.v1.errors import NotFoundError
+from traust_core.v1.models.operations import OPEN_ORDER_STATES, OrderState, RunOrder
 from traust_core.v1.repositories.tables import (
     TRAUST_OPS,
     MutableRecordRepository,
@@ -26,7 +28,8 @@ RUN_ORDER = TableSpec(
         uuid_column("artifact_id", nullable=True),
         text_column("rule", nullable=True),
         text_column("event_source", nullable=True),
-        text_column("lane"),
+        text_column("asset"),
+        text_column("lane", nullable=True),
         text_column("state"),
         sa.Column("priority", sa.Integer, nullable=False),
         text_column("reason", nullable=True),
@@ -35,64 +38,164 @@ RUN_ORDER = TableSpec(
         timestamp_column("lease_expires_at", nullable=True),
         timestamp_column("started_at", nullable=True),
         timestamp_column("finished_at", nullable=True),
+        uuid_column("work_item_id", nullable=True),
+        text_column("fork_url", nullable=True),
+        text_column("fork_branch", nullable=True),
+        timestamp_column("fork_scheduled_at", nullable=True),
     ),
 )
 
-# run_order.state values the queue mechanics depend on (contracts enum, to add).
-QUEUED = "queued"
-LEASED = "leased"
-
 
 class RunOrderRepository(MutableRecordRepository[RunOrder], Protocol):
-    def claim(self, worker: str, now: datetime, lease_for: timedelta) -> RunOrder | None:
-        """Lease the next queued order (priority, then age); None when the queue is empty."""
+    def claim(
+        self,
+        worker: str,
+        now: datetime,
+        lease_for: timedelta,
+        assets: Collection[str] | None = None,
+        *,
+        order_id: UUID | None = None,
+    ) -> RunOrder | None:
+        """Lease the next queued order, or only the selected queued order when named."""
         ...
 
-    def release_expired(self, now: datetime) -> int: ...
+    def get_for_update(self, order_id: UUID) -> RunOrder:
+        """Read and row-lock an order until the transaction ends."""
+        ...
+
+    def requeue_expired(self, now: datetime) -> int: ...
     def list_for_batch(self, run_batch_id: UUID) -> list[RunOrder]: ...
-    def list_for_repository(self, repository_id: UUID, state: str) -> list[RunOrder]: ...
+    def list_for_repository(self, repository_id: UUID, state: OrderState) -> list[RunOrder]: ...
+    def find_open(self, asset: str, repository_id: UUID | None) -> RunOrder | None:
+        """An open order (planned through leased) for an asset and repository, if any."""
+        ...
+
+    def find_by_work_item(self, work_item_id: UUID) -> RunOrder | None:
+        """The order running a work item, if any (remediate_finding orders name theirs)."""
+        ...
+
+    def scheduling_orders(self, work_item_ids: Collection[UUID]) -> dict[UUID, RunOrder]:
+        """Each work item's scheduling order: the oldest carrying both fork facts."""
+        ...
+
+    def subjects(
+        self,
+        asset: str,
+        states: Collection[OrderState],
+        finished_after: datetime | None = None,
+        reason: str | None = None,
+    ) -> set[UUID | None]:
+        """Repositories (None = fleet-wide) with an order of `asset` in `states`."""
+        ...
+
+    def subject_has_order(
+        self,
+        assets: Collection[str],
+        repository_id: UUID,
+        states: Collection[OrderState],
+    ) -> bool:
+        """Whether one subject has any order of these assets in these states (bounded read)."""
+        ...
+
+    def search(
+        self,
+        *,
+        states: Collection[OrderState] = (),
+        asset: str | None = None,
+        repository_id: UUID | None = None,
+        repository_ids: Collection[UUID] = (),
+        run_batch_id: UUID | None = None,
+        work_item: bool = False,
+        limit: int,
+        after: tuple[datetime, UUID] | None = None,
+        oldest_first: bool = False,
+    ) -> list[RunOrder]: ...
+
+    def finished_between(
+        self,
+        asset: str,
+        states: Collection[OrderState],
+        start: datetime,
+        end: datetime,
+        *,
+        repository_id: UUID | None = None,
+        run_batch_id: UUID | None = None,
+    ) -> list[tuple[OrderState, datetime]]:
+        """(state, finished_at) of the asset's orders in `states` finished in [start, end)."""
+        ...
+
+    def feed_after(
+        self, after: tuple[datetime, UUID] | None, states: Collection[OrderState], limit: int
+    ) -> list[RunOrder]:
+        """Orders in `states` changed after `(updated_at, id)`, oldest change first."""
+        ...
+
+    def last_routed(self) -> datetime | None:
+        """created_at of the newest routed order (lane set); None when nothing was routed."""
+        ...
 
 
 class SqlRunOrderRepository(SqlMutableRepository[RunOrder]):
     spec = RUN_ORDER
     record = RunOrder
 
-    def claim(self, worker: str, now: datetime, lease_for: timedelta) -> RunOrder | None:
+    def claim(
+        self,
+        worker: str,
+        now: datetime,
+        lease_for: timedelta,
+        assets: Collection[str] | None = None,
+        *,
+        order_id: UUID | None = None,
+    ) -> RunOrder | None:
         c = self.table.c
+        queued = c.state == OrderState.QUEUED
+        if assets is not None:
+            queued = sa.and_(queued, c.asset.in_(sorted(assets)))
         # SKIP LOCKED on Postgres; SQLite serialises writers and drops FOR UPDATE.
-        next_id = (
-            sa.select(c.id)
-            .where(c.state == QUEUED)
-            .order_by(c.priority, c.created_at, c.id)
-            .limit(1)
-            .with_for_update(skip_locked=True)
-            .scalar_subquery()
-        )
+        selected = sa.select(c.id).where(queued)
+        if order_id is not None:
+            selected = selected.where(c.id == order_id)
+        else:
+            selected = selected.order_by(c.priority, c.created_at, c.id).limit(1)
+        next_id = selected.with_for_update(skip_locked=True).scalar_subquery()
         stmt = (
             sa.update(self.table)
-            .where(c.id == next_id, c.state == QUEUED)
-            .values(state=LEASED, lease_holder=worker, lease_expires_at=now + lease_for)
+            .where(c.id == next_id, queued)
+            .values(
+                state=OrderState.LEASED,
+                lease_holder=worker,
+                lease_expires_at=now + lease_for,
+                started_at=now,
+            )
             .returning(c.id)
         )
         claimed = self._execute(f"claim for {worker}", stmt).scalar_one_or_none()
         return None if claimed is None else self.get(claimed)
 
-    def release_expired(self, now: datetime) -> int:
-        """Return expired leases to the queue; the count released."""
+    def get_for_update(self, order_id: UUID) -> RunOrder:
+        stmt = self._select().where(self.table.c.id == order_id).with_for_update()
+        row = self._execute(f"lock {order_id}", stmt).mappings().one_or_none()
+        if row is None:
+            raise NotFoundError(f"run_order {order_id}")
+        return self._to_record(row)
+
+    def requeue_expired(self, now: datetime) -> int:
+        """Return expired leases to the queue; the count requeued."""
         c = self.table.c
         stmt = (
             sa.update(self.table)
-            .where(c.state == LEASED, c.lease_expires_at < now)
-            .values(state=QUEUED, lease_holder=None, lease_expires_at=None)
+            .where(c.state == OrderState.LEASED, c.lease_expires_at < now)
+            .values(state=OrderState.QUEUED, lease_holder=None, lease_expires_at=None)
         )
-        return self._execute(f"release expired at {now}", stmt).rowcount
+        return self._execute(f"requeue expired at {now}", stmt).rowcount
 
     def list_for_batch(self, run_batch_id: UUID) -> list[RunOrder]:
         return self._many(
             f"list for batch {run_batch_id}", self.table.c.run_batch_id == run_batch_id
         )
 
-    def list_for_repository(self, repository_id: UUID, state: str) -> list[RunOrder]:
+    def list_for_repository(self, repository_id: UUID, state: OrderState) -> list[RunOrder]:
         c = self.table.c
         return self._many(
             f"list {state} for {repository_id}",
@@ -100,3 +203,160 @@ class SqlRunOrderRepository(SqlMutableRepository[RunOrder]):
             c.state == state,
             order_by=(c.priority,),
         )
+
+    def find_open(self, asset: str, repository_id: UUID | None) -> RunOrder | None:
+        c = self.table.c
+        subject = (
+            c.repository_id.is_(None) if repository_id is None else c.repository_id == repository_id
+        )
+        stmt = (
+            self._select().where(c.asset == asset, c.state.in_(OPEN_ORDER_STATES), subject).limit(1)
+        )
+        row = self._execute(f"find open {asset} for {repository_id}", stmt).mappings().first()
+        return None if row is None else self._to_record(row)
+
+    def find_by_work_item(self, work_item_id: UUID) -> RunOrder | None:
+        """The order that scheduled the work item's effort: one carrying both fork facts before
+        any other order naming it, then the oldest."""
+        c = self.table.c
+        stmt = (
+            self._select()
+            .where(c.work_item_id == work_item_id)
+            .order_by(c.fork_url.is_(None) | c.fork_branch.is_(None), c.created_at, c.id)
+            .limit(1)
+        )
+        row = self._execute(f"find order for work item {work_item_id}", stmt).mappings().first()
+        return None if row is None else self._to_record(row)
+
+    def scheduling_orders(self, work_item_ids: Collection[UUID]) -> dict[UUID, RunOrder]:
+        c = self.table.c
+        first: dict[UUID, RunOrder] = {}
+        for batch in self._batches(work_item_ids):
+            rank = (
+                sa.func.row_number()
+                .over(partition_by=c.work_item_id, order_by=(c.created_at, c.id))
+                .label("rank")
+            )
+            ranked = (
+                sa.select(self.table, rank)
+                .where(
+                    c.work_item_id.in_(batch), c.fork_url.is_not(None), c.fork_branch.is_not(None)
+                )
+                .subquery()
+            )
+            stmt = sa.select(*(ranked.c[col.name] for col in c)).where(ranked.c.rank == 1)
+            rows = self._execute(f"scheduling orders of {len(batch)} work items", stmt)
+            first.update(
+                (o.work_item_id, o)  # type: ignore[misc]
+                for o in map(self._to_record, rows.mappings())
+            )
+        return first
+
+    def search(
+        self,
+        *,
+        states: Collection[OrderState] = (),
+        asset: str | None = None,
+        repository_id: UUID | None = None,
+        repository_ids: Collection[UUID] = (),
+        run_batch_id: UUID | None = None,
+        work_item: bool = False,
+        limit: int,
+        after: tuple[datetime, UUID] | None = None,
+        oldest_first: bool = False,
+    ) -> list[RunOrder]:
+        c = self.table.c
+        conditions = [
+            cond
+            for value, cond in (
+                (states, c.state.in_(list(states))),
+                (asset, c.asset == asset),
+                (repository_id, c.repository_id == repository_id),
+                (repository_ids, c.repository_id.in_(list(repository_ids))),
+                (run_batch_id, c.run_batch_id == run_batch_id),
+                (work_item, c.work_item_id.is_not(None)),
+            )
+            if value
+        ]
+        return self._page(
+            "search", *conditions, limit=limit, after=after, oldest_first=oldest_first
+        )
+
+    def finished_between(
+        self,
+        asset: str,
+        states: Collection[OrderState],
+        start: datetime,
+        end: datetime,
+        *,
+        repository_id: UUID | None = None,
+        run_batch_id: UUID | None = None,
+    ) -> list[tuple[OrderState, datetime]]:
+        c = self.table.c
+        where = [
+            c.asset == asset,
+            c.state.in_(list(states)),
+            c.finished_at >= start,
+            c.finished_at < end,
+        ]
+        if repository_id is not None:
+            where.append(c.repository_id == repository_id)
+        if run_batch_id is not None:
+            where.append(c.run_batch_id == run_batch_id)
+        stmt = sa.select(c.state, c.finished_at).where(*where).order_by(c.finished_at)
+        rows = self._execute(f"finished {asset} {start}..{end}", stmt)
+        return [(OrderState(state), at) for state, at in rows]
+
+    def subjects(
+        self,
+        asset: str,
+        states: Collection[OrderState],
+        finished_after: datetime | None = None,
+        reason: str | None = None,
+    ) -> set[UUID | None]:
+        c = self.table.c
+        where = [c.asset == asset, c.state.in_(list(states))]
+        if finished_after is not None:
+            where.append(c.finished_at > finished_after)
+        if reason is not None:
+            where.append(c.reason == reason)
+        stmt = sa.select(c.repository_id).where(*where).distinct()
+        return set(self._execute(f"subjects of {asset}", stmt).scalars())
+
+    def subject_has_order(
+        self,
+        assets: Collection[str],
+        repository_id: UUID,
+        states: Collection[OrderState],
+    ) -> bool:
+        c = self.table.c
+        stmt = (
+            self._select()
+            .where(
+                c.asset.in_(list(assets)),
+                c.state.in_(list(states)),
+                c.repository_id == repository_id,
+            )
+            .limit(1)
+        )
+        row = self._execute(f"order of {sorted(assets)} for {repository_id}", stmt).first()
+        return row is not None
+
+    def feed_after(
+        self, after: tuple[datetime, UUID] | None, states: Collection[OrderState], limit: int
+    ) -> list[RunOrder]:
+        c = self.table.c
+        return self._page(
+            "feed",
+            c.state.in_(list(states)),
+            limit=limit,
+            after=after,
+            at="updated_at",
+            oldest_first=True,
+        )
+
+    def last_routed(self) -> datetime | None:
+        c = self.table.c
+        stmt = sa.select(sa.func.max(c.created_at)).where(c.lane.is_not(None))
+        latest: datetime | None = self._execute("last routed", stmt).scalar_one()
+        return latest

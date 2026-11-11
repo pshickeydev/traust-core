@@ -11,7 +11,7 @@ import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql, sqlite
 
 from tests.v1.conftest import SQL_BACKENDS, database
-from traust_core.v1.errors import ConflictError, NotFoundError
+from traust_core.v1.errors import ConflictError, NotFoundError, RepositoryError
 from traust_core.v1.models.base import AppendOnly, Entity
 from traust_core.v1.repositories import (
     SqlRepository,
@@ -202,6 +202,29 @@ def test_duplicate_natural_key_raises_conflict(uow: RecordUnitOfWork) -> None:
         u.rollback()
 
 
+def test_failed_query_does_not_echo_untrusted_operation_or_bound_parameter(
+    uow: RecordUnitOfWork,
+) -> None:
+    secret = "synthetic-only-never-a-real-credential"
+    with uow as unit, pytest.raises(RepositoryError) as caught:
+        unit.records._execute(
+            f"lookup {secret}",
+            sa.text("SELECT 1 FROM missing_table WHERE credential = :credential"),
+            {"credential": secret},
+        )
+    assert secret not in str(caught.value)
+
+
+def test_database_conflict_does_not_echo_unique_value(uow: RecordUnitOfWork) -> None:
+    secret = "synthetic-only-never-a-real-credential"
+    with uow as unit:
+        unit.records.add(Record(name=secret, status="open"))
+        unit.commit()
+    with uow as unit, pytest.raises(ConflictError) as caught:
+        unit.records.add(Record(name=secret, status="open"))
+    assert secret not in str(caught.value)
+
+
 def test_update_returns_the_saved_record_and_maintains_updated_at(uow: RecordUnitOfWork) -> None:
     with uow as u:
         saved = u.records.add(Record(name="a", status="open"))
@@ -266,3 +289,90 @@ def test_saved_record_round_trips_by_id(uow: RecordUnitOfWork) -> None:
     with uow as u:
         reread = u.records.get(saved.id)
     assert reread == saved
+
+
+def test_unit_of_work_is_reentrant(engine) -> None:
+    from traust_core.v1.repositories.sql import SqlUnitOfWork
+
+    outer = SqlUnitOfWork(engine)
+    with outer as first:
+        with outer as second:  # a collaborating service re-enters the same unit
+            assert second is first
+            assert second.connection is first.connection
+        # the nested exit must not close the session connection
+        assert first.connection.execute(sa.text("SELECT 1")).scalar() == 1
+    # only the outermost exit closes
+    from traust_core.v1.errors import RepositoryError
+
+    with pytest.raises(RepositoryError):
+        _ = first.connection
+
+
+def test_only_the_outermost_commit_commits(uow: RecordUnitOfWork) -> None:
+    with uow as outer:
+        with uow as inner:  # a collaborating service commits its part
+            saved = inner.records.add(Record(name="joined", status="open"))
+            inner.commit()
+        outer.rollback()  # the owner abandons the whole transaction
+    assert saved.id is not None
+    with uow as u, pytest.raises(NotFoundError):
+        u.records.get(saved.id)
+
+    with uow as outer:
+        with uow as inner:
+            saved = inner.records.add(Record(name="joined", status="open"))
+        outer.commit()
+    with uow as u:
+        assert u.records.get(saved.id) == saved
+
+
+def test_caught_nested_failure_remains_uncommittable_after_a_successful_nested_scope(
+    uow: RecordUnitOfWork,
+) -> None:
+    with uow:
+        with pytest.raises(RuntimeError), uow:
+            failed = uow.records.add(Record(name="failed", status="open"))
+            raise RuntimeError("nested operation failed after writing")
+        with uow:
+            uow.commit()
+        for _ in range(2):
+            with pytest.raises(RepositoryError, match="rollback"):
+                uow.commit()
+
+    assert failed.id is not None
+    with uow, pytest.raises(NotFoundError):
+        uow.records.get(failed.id)
+
+
+@pytest.mark.parametrize("recovery", ["rollback", "reenter"])
+def test_failed_nested_transaction_recovers_only_after_rollback(
+    uow: RecordUnitOfWork, recovery: str
+) -> None:
+    with uow:
+        with pytest.raises(RuntimeError), uow:
+            failed = uow.records.add(Record(name="failed", status="open"))
+            raise RuntimeError("nested operation failed after writing")
+        with pytest.raises(RepositoryError, match="rollback"):
+            uow.commit()
+        if recovery == "rollback":
+            uow.rollback()
+            saved = uow.records.add(Record(name="recovered", status="open"))
+            uow.commit()
+    if recovery == "reenter":
+        with uow:
+            saved = uow.records.add(Record(name="recovered", status="open"))
+            uow.commit()
+
+    assert failed.id is not None and saved.id is not None
+    with uow:
+        assert uow.records.get(saved.id) == saved
+        with pytest.raises(NotFoundError):
+            uow.records.get(failed.id)
+
+
+@pytest.mark.parametrize("backend", SQL_BACKENDS)
+def test_a_driver_error_from_ddl_is_a_repository_error(backend: str, tmp_path: Path) -> None:
+    with database(backend, tmp_path, metadata) as engine:
+        apply_schema(engine, ["CREATE TABLE ddl_twice (id INTEGER)"])
+        with pytest.raises(RepositoryError, match="apply schema failed"):
+            apply_schema(engine, ["ALTER TABLE ddl_twice ADD COLUMN id TEXT"])

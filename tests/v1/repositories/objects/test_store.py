@@ -1,8 +1,11 @@
+from collections.abc import Iterator
 from pathlib import Path
 
+import boto3
 import pytest
+from moto import mock_aws
 
-from traust_core.v1.errors import IntegrityError, NotFoundError, ValidationError
+from traust_core.v1.errors import IntegrityError, NotFoundError, RepositoryError, ValidationError
 from traust_core.v1.repositories import (
     InMemoryObjectStore,
     LocalObjectStore,
@@ -10,13 +13,20 @@ from traust_core.v1.repositories import (
     ObjectRef,
     ObjectStore,
 )
+from traust_core.v1.repositories.objects.s3 import S3ObjectStore
 
 KEY = ObjectKey.parse("reports/org/repo/scan.json")
 
 
-@pytest.fixture(params=["memory", "local"])
-def store(request: pytest.FixtureRequest, tmp_path: Path) -> ObjectStore:
-    return InMemoryObjectStore() if request.param == "memory" else LocalObjectStore(tmp_path)
+@pytest.fixture(params=["memory", "local", "s3"])
+def store(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[ObjectStore]:
+    if request.param == "s3":
+        with mock_aws():
+            client = boto3.client("s3", region_name="us-east-1")
+            client.create_bucket(Bucket="traust")
+            yield S3ObjectStore("traust", client=client)
+        return
+    yield InMemoryObjectStore() if request.param == "memory" else LocalObjectStore(tmp_path)
 
 
 def test_put_then_get_round_trips(store: ObjectStore) -> None:
@@ -55,6 +65,21 @@ def test_bad_keys_are_rejected(raw: str) -> None:
 def test_local_store_leaves_no_temp_files(tmp_path: Path) -> None:
     LocalObjectStore(tmp_path).put(KEY, b"x")
     assert [p.name for p in (tmp_path / "reports/org/repo").iterdir()] == ["scan.json"]
+
+
+def test_local_store_failed_put_with_failing_cleanup_raises_repository_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # a write failure after temp-file creation, where cleanup fails too:
+    # the original OSError must still surface as the RepositoryError's cause
+    def refused(self: Path, *args: object, **kw: object) -> None:
+        raise OSError("refused")
+
+    monkeypatch.setattr(Path, "replace", refused)
+    monkeypatch.setattr(Path, "unlink", refused)
+    with pytest.raises(RepositoryError) as raised:
+        LocalObjectStore(tmp_path).put(KEY, b"x")
+    assert isinstance(raised.value.__cause__, OSError)
 
 
 def test_dot_named_repos_are_valid_keys() -> None:

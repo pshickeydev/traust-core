@@ -9,24 +9,39 @@ export TRAUST_TEST_DATABASE_URL
 
 
 PYTHON ?= python3
+LOCAL ?= .local
+LOCAL_CONFIG ?= $(LOCAL)/traust.yaml
+K6_VERSION ?= v0.54.0
+K6 ?= .perf/bin/k6
 
-.PHONY: help setup sync hooks lint lint-fix test test-integration test-repositories coverage coverage-html coverage-all db-up db-down
+.PHONY: help setup sync hooks lint lint-fix test test-changed test-integration test-repositories coverage coverage-html coverage-all perf perf-api perf-api-baseline perf-api-breakpoint k6 api-check openapi serve local-config serve-local token db-up db-down
 
 help:
 	@echo "Targets ($(notdir $(CURDIR))):"
 	@echo "  make setup            — uv sync + install git hooks (run once per clone)"
 	@echo "  make lint             — ruff check + format --check"
 	@echo "  make lint-fix         — ruff --fix + format"
-	@echo "  make test             — unit tests (no integration)"
+	@echo "  make test             — unit tests, no integration (parallel via pytest-xdist)"
+	@echo "  make test-changed     — testmon-selected unit tests (first run builds .testmondata)"
 	@echo "  make test-integration — integration tests against Postgres (make db-up first)"
 	@echo "  make test-repositories — repository layer on SQLite and Postgres (make db-up first)"
 	@echo "  make coverage         — unit tests with coverage (term), fails under 80%"
 	@echo "  make coverage-html    — unit tests with coverage (term + htmlcov/)"
 	@echo "  make coverage-all     — unit + integration with coverage (needs make db-up)"
+	@echo "  make perf             — query plans at production volume on Postgres (make db-up first)"
+	@echo "  make perf-api         — k6 load over the REST API at fixture volume (make db-up first)"
+	@echo "  make perf-api-baseline — run perf-api and overwrite perf/api/baseline.json"
+	@echo "  make perf-api-breakpoint — reader ramp to find where the API stops holding (not gated)"
+	@echo "  make k6               — fetch the pinned k6 binary into .perf/bin (perf-api dep)"
+	@echo "  make api-check        — build the REST API's OpenAPI document (.openapi/openapi.json)"
+	@echo "  make openapi          — build the OpenAPI document and show where Swagger UI serves it"
+	@echo "  make serve            — traust-server on 127.0.0.1:8080 (CONFIG=path for a config file)"
+	@echo "  make serve-local      — traust-server with a local development config ($(LOCAL_CONFIG), SQLite)"
+	@echo "  make token NAME=…     — a token for serve-local into $(LOCAL)/NAME.token (MACHINE=1 for a runner)"
 	@echo "  make db-up / db-down  — shared Postgres container ($(DB_CONTAINER)), same as contracts and ledger"
 
 setup: sync hooks
-	@echo "ready — git hooks enabled (.githooks): lint on commit, conventional subject, lint + coverage on push"
+	@echo "ready — git hooks enabled (.githooks): lint on commit, conventional subject, lint + testmon-selected tests on push (FULL=1 for the complete suite; coverage gate in CI)"
 
 hooks:
 	git config core.hooksPath .githooks
@@ -44,19 +59,51 @@ lint-fix:
 	uv run ruff format .
 
 test:
-	uv run pytest tests/ -q -m "not integration"
+	uv run pytest tests/ -q -n auto -m "not integration"
+
+test-changed:
+	uv run pytest tests/ -q -n auto -m "not integration" --testmon-forceselect
 
 test-integration:
-	uv run --extra postgres pytest tests/ -q -m integration
+	uv run --extra postgres pytest tests/ -q -n auto -m integration
 
 test-repositories:
-	uv run --extra postgres pytest tests/v1/repositories/tables -q -m "integration or not integration"
+	uv run --extra postgres pytest tests/v1/repositories/tables -q -n auto -m "integration or not integration"
 
 coverage:
-	uv run pytest tests/ --cov=traust_core --cov-report=term-missing -q -m "not integration"
+	uv run pytest tests/ --cov=traust_core --cov-report=term-missing -q -n auto --dist worksteal -m "not integration"
 
 coverage-html:
 	uv run pytest tests/ --cov=traust_core --cov-report=term-missing --cov-report=html -q -m "not integration"
+
+perf:
+	uv run --extra postgres pytest perf/ -q
+	@echo "Plans for the PR: .perf/report.md"
+
+k6: $(K6)
+$(K6):
+	@mkdir -p $(dir $(K6))
+	@os=$$(uname -s | tr '[:upper:]' '[:lower:]'); arch=$$(uname -m); \
+		case "$$arch" in x86_64) arch=amd64;; aarch64|arm64) arch=arm64;; esac; \
+		case "$$os" in darwin) os=macos; ext=zip;; linux) os=linux; ext=tar.gz;; \
+			*) echo "unsupported OS: $$os"; exit 1;; esac; \
+		pkg=k6-$(K6_VERSION)-$$os-$$arch; \
+		url=https://github.com/grafana/k6/releases/download/$(K6_VERSION)/$$pkg.$$ext; \
+		echo "fetching $$url"; tmp=$$(mktemp -d); \
+		curl -sSL -o "$$tmp/k6.$$ext" "$$url"; \
+		if [ "$$ext" = zip ]; then unzip -q "$$tmp/k6.$$ext" -d "$$tmp"; \
+		else tar -xzf "$$tmp/k6.$$ext" -C "$$tmp"; fi; \
+		mv "$$tmp/$$pkg/k6" "$(K6)"; chmod +x "$(K6)"; rm -rf "$$tmp"; \
+		"$(K6)" version
+
+perf-api: k6
+	uv run --extra postgres --extra rest $(PYTHON) -m perf.api.run
+
+perf-api-baseline: k6
+	uv run --extra postgres --extra rest $(PYTHON) -m perf.api.run --update-baseline
+
+perf-api-breakpoint: k6
+	uv run --extra postgres --extra rest $(PYTHON) -m perf.api.run --breakpoint
 
 coverage-all:
 	uv run --extra postgres pytest tests/ --cov=traust_core --cov-report=term-missing --cov-report=html -q
@@ -66,7 +113,7 @@ db-up:
 	@if podman container exists $(DB_CONTAINER) 2>/dev/null; then \
 		echo "$(DB_CONTAINER) already running"; \
 	else \
-		podman run --name $(DB_CONTAINER) --rm -d \
+		podman run --name $(DB_CONTAINER) --rm -d --shm-size=256m \
 			-e POSTGRES_USER=$(DB_USER) \
 			-e POSTGRES_PASSWORD=$(DB_PASSWORD) \
 			-e POSTGRES_DB=$(DB_NAME) \
@@ -84,4 +131,26 @@ db-up:
 
 db-down:
 	@podman stop $(DB_CONTAINER) 2>/dev/null || true
+
+api-check:
+	@mkdir -p .openapi
+	uv run python -c "import json, tempfile; from pathlib import Path; from traust_core.v1.context import Config, Context; from traust_core.v1.rest.app import create_app; spec = create_app(Context(Config(home=Path(tempfile.mkdtemp())))).openapi(); assert spec['paths'], 'no routes'; Path('.openapi/openapi.json').write_text(json.dumps(spec, indent=2)); print(f\"{len(spec['paths'])} paths -> .openapi/openapi.json\")"
+
+openapi: api-check
+	@echo "Swagger UI: 'make serve', then http://127.0.0.1:$${PORT:-8080}/docs (ReDoc /redoc, raw /openapi.json)"
+
+serve:
+	uv run traust-server $(if $(CONFIG),--config $(CONFIG))
+
+# Development only: SQLite under $(LOCAL)/home and this machine's local issuer trusted.
+local-config:
+	@test -f $(LOCAL_CONFIG) || { mkdir -p $(LOCAL) && printf 'home: %s\nidentity: { trust_local: true }\n' "$(abspath $(LOCAL))/home" > $(LOCAL_CONFIG) && echo "wrote $(LOCAL_CONFIG)"; }
+
+serve-local: local-config
+	uv run traust-server --config $(LOCAL_CONFIG)
+
+token: local-config
+	@test -n "$(NAME)" || { echo "usage: make token NAME=me@example.com (a person) | NAME=runner-1 MACHINE=1 (a runner)" >&2; exit 2; }
+	@uv run traust-server --config $(LOCAL_CONFIG) token "$(NAME)" $(if $(MACHINE),--machine) > $(LOCAL)/$(NAME).token
+	@echo "$(LOCAL)/$(NAME).token"
 

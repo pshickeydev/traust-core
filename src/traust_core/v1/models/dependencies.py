@@ -6,17 +6,154 @@ detail live in artifacts (scanner output, impact analysis), not columns.
 
 from __future__ import annotations
 
-from datetime import datetime
+import math
+import re
+from collections import Counter
+from collections.abc import Mapping, Sequence
+from datetime import date, datetime
 from enum import StrEnum
-from typing import NewType
+from typing import Any, NamedTuple, NewType, Self
 from uuid import UUID
 
+from pydantic import Field, JsonValue, computed_field
+
+from traust_core.v1.errors import NotFoundError, ValidationError
+from traust_core.v1.models.artifacts import ImpactAnalysisArtifact
 from traust_core.v1.models.base import AppendOnly, Entity, Model
+from traust_core.v1.models.common import RepoPath
 from traust_core.v1.models.findings import SkillInput
+from traust_core.v1.models.integrity import sha256_hex
+from traust_core.v1.models.vocabulary import (
+    DependencyEvidenceLevel,
+    Ecosystem,
+    ImpactBinaryLinkedLibrary,
+    ImpactBinaryStringScan,
+    ImpactBinarySymbolScan,
+    ImpactClassification,
+    ImpactGovulncheck,
+    ImpactManifestScan,
+    ImpactSbomScan,
+    ImpactSourceImportScan,
+    ImpactSymbolUsageScan,
+    ImpactTier,
+    ManifestCoverageReason,
+    ScannerSeverity,
+)
 
 AdvisoryIdentifier = NewType("AdvisoryIdentifier", str)
 Version = NewType("Version", str)
 FeedName = NewType("FeedName", str)
+
+# The impact-analysis schema's pattern: a known prefix, no slashes, dots or spaces.
+_ADVISORY_ID = re.compile(r"(?:CVE|GHSA|MAL|PYSEC|GO|RUSTSEC|OSV)-[A-Za-z0-9][A-Za-z0-9-]{0,63}")
+_SEMVER = re.compile(r"v?(\d+)\.(\d+)\.(\d+)")
+_LEADING_NUMERIC = re.compile(r"\d+(?:\.\d+)*")
+_SEMVER_PRERELEASE = re.compile(r"-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)(?:\+.*)?")
+_NUMERIC_ID = re.compile(r"[0-9]+")
+# PEP 440's pre, post and dev segments, in their spellings and separators.
+_PEP440_SUFFIX = re.compile(
+    r"(?:[-_.]?(?P<pre>a|b|c|rc|alpha|beta|pre|preview)[-_.]?(?P<pre_n>[0-9]+)?)?"
+    r"(?:-(?P<post_implicit>[0-9]+)|[-_.]?(?P<post>post|rev|r)[-_.]?(?P<post_n>[0-9]+)?)?"
+    r"(?:[-_.]?(?P<dev>dev)[-_.]?(?P<dev_n>[0-9]+)?)?"
+    r"(?:\+[a-z0-9.]*)?"
+)
+_PEP440_PRE_RANK = {"a": 0, "alpha": 0, "b": 1, "beta": 1}
+_SEMVER_ECOSYSTEMS = frozenset({Ecosystem.GO, Ecosystem.NPM, Ecosystem.CARGO, Ecosystem.NUGET})
+
+
+_PYPI_SEPARATORS = re.compile(r"[-_.]+")
+_DECLARED_SEVERITY = {
+    "critical": "critical",
+    "high": "high",
+    "moderate": "medium",
+    "medium": "medium",
+    "low": "low",
+}
+
+
+def package_name(ecosystem: Ecosystem, name: str) -> str:
+    """The name a package is stored under: PyPI names compare normalised (PEP 503), npm lower."""
+    if ecosystem == Ecosystem.PYPI:
+        return _PYPI_SEPARATORS.sub("-", name).lower()
+    return name.lower() if ecosystem == Ecosystem.NPM else name
+
+
+def is_advisory_identifier(raw: str) -> bool:
+    return _ADVISORY_ID.fullmatch(raw) is not None
+
+
+def parse_advisory_identifier(raw: str) -> AdvisoryIdentifier:
+    if not is_advisory_identifier(raw):
+        raise ValidationError(f"not an advisory id: {raw!r}")
+    return AdvisoryIdentifier(raw)
+
+
+class VersionKey(NamedTuple):
+    """A version's release numbers, then where it sits among that release's pre- and
+    post-releases (`stage`); compares as a tuple, and `()` sorts below every key."""
+
+    release: tuple[int, ...]
+    stage: tuple[int | tuple[int, int | str], ...] = (0,)
+
+
+def _semver_stage(rest: str, fold: bool) -> tuple[int | tuple[int, int | str], ...]:
+    """SemVer 2 precedence: a pre-release sorts below its release, identifiers compare
+    numerically when numeric, else lexically (case-insensitively when `fold`: NuGet), numeric
+    first; build metadata is ignored."""
+    m = _SEMVER_PRERELEASE.fullmatch(rest)
+    if not m:
+        return (0,)
+    ids = (m.group(1).lower() if fold else m.group(1)).split(".")
+    return (-1, *((0, int(i)) if _NUMERIC_ID.fullmatch(i) else (1, i) for i in ids))
+
+
+def _pep440_stage(rest: str) -> tuple[int, ...]:
+    """PEP 440 order within one release: dev < pre (a < b < rc) < final < post, and a
+    pre-release's own post and dev segments order within it (2.0rc1 < 2.0rc1.post1.dev1
+    < 2.0rc1.post1)."""
+    m = _PEP440_SUFFIX.fullmatch(rest.lower())
+    if not m:
+        return (0,)
+    dev = (0,) if m["dev"] is None else (-1, int(m["dev_n"] or 0))
+    post = (
+        (0,)
+        if not (m["post_implicit"] or m["post"])
+        else (1, int(m["post_implicit"] or m["post_n"] or 0))
+    )
+    if m["pre"]:
+        return (-1, _PEP440_PRE_RANK.get(m["pre"], 2), int(m["pre_n"] or 0), *post, *dev)
+    if m["post_implicit"] or m["post"]:
+        return (1, int(m["post_implicit"] or m["post_n"] or 0), *dev)
+    return (-2, int(m["dev_n"] or 0)) if m["dev"] else (0,)
+
+
+def version_key(version: str, ecosystem: Ecosystem) -> VersionKey | None:
+    """A comparable key, or None when the version can't be ordered (never guessed). Pre- and
+    post-releases order per SemVer (Go, npm, Cargo, NuGet) and PEP 440 (PyPI); other
+    ecosystems order by their leading release numbers only."""
+    v = version.strip()
+    if ecosystem == Ecosystem.GO:
+        m = _SEMVER.match(v)
+        parts = tuple(int(g) for g in m.groups()) if m else None
+    else:
+        if ecosystem == Ecosystem.PYPI:
+            v = v.split("!", 1)[-1]
+        if ecosystem in (Ecosystem.NPM, Ecosystem.CARGO, Ecosystem.PYPI):
+            v = v.removeprefix("v").removeprefix("V")
+        m = _LEADING_NUMERIC.match(v)
+        parts = tuple(int(x) for x in m.group().split(".")) if m else None
+        if parts and ecosystem in (Ecosystem.NPM, Ecosystem.CARGO):
+            parts = parts[:3]
+    if not m or not parts:
+        return None
+    while len(parts) > 1 and parts[-1] == 0:
+        parts = parts[:-1]
+    rest = v[m.end() :]
+    if ecosystem in _SEMVER_ECOSYSTEMS:
+        return VersionKey(parts, _semver_stage(rest, ecosystem == Ecosystem.NUGET))
+    if ecosystem == Ecosystem.PYPI:
+        return VersionKey(parts, _pep440_stage(rest))
+    return VersionKey(parts)
 
 
 class Package(Entity):
@@ -38,6 +175,35 @@ class Dependency(AppendOnly):
     direct: bool
 
 
+class RefDependency(Model):
+    """A package at one version in an SBOM: a commit's manifest or an image's."""
+
+    dependency: Dependency
+    package: Package
+
+
+class NoManifestSbomError(NotFoundError):
+    """The commit has no manifest SBOM ingested: its dependencies are unknown, not none."""
+
+    def __init__(self, repository_ref_id: UUID) -> None:
+        super().__init__(
+            f"ref {repository_ref_id}: no manifest SBOM ingested (scan the checkout with syft, "
+            "then ExposureService.ingest_sbom)"
+        )
+        self.repository_ref_id = repository_ref_id
+
+
+class NoImageSbomError(NotFoundError):
+    """The image digest has no SBOM ingested: its packages are unknown, not none."""
+
+    def __init__(self, digest: str) -> None:
+        super().__init__(
+            f"image {digest}: no SBOM ingested (scan the image with syft, then "
+            "ExposureService.ingest_image_sbom)"
+        )
+        self.digest = digest
+
+
 class Image(AppendOnly):
     digest: str
     platform: str | None = None
@@ -56,6 +222,249 @@ class AdvisoryPackage(Entity):
     package_id: UUID
 
 
+class SbomEntry(Model):
+    ecosystem: Ecosystem
+    name: str
+    version: Version
+    direct: bool
+
+
+class SbomContents(Model):
+    """The packages an SBOM document lists; `skipped` counts components with no modeled
+    ecosystem or no version, which can't be stored."""
+
+    entries: tuple[SbomEntry, ...]
+    skipped: int = 0
+
+    @property
+    def digest(self) -> str:
+        """Of the normalized package list, not the document, whose bytes change every run."""
+        lines = sorted({f"{e.ecosystem}\t{e.name}\t{e.version}\t{e.direct}" for e in self.entries})
+        return sha256_hex("\n".join(lines).encode())
+
+
+class AffectedSpan(Model):
+    """One affected span of an advisory; introduced "0" means every earlier version."""
+
+    introduced: Version
+    fixed: Version | None = None
+    last_affected: Version | None = None
+
+    def contains(self, key: VersionKey, ecosystem: Ecosystem) -> bool | None:
+        low = () if self.introduced == "0" else version_key(self.introduced, ecosystem)
+        if low is None:
+            return None
+        if key < low:
+            return False
+        for bound, inclusive in ((self.fixed, False), (self.last_affected, True)):
+            if bound is not None:
+                high = version_key(bound, ecosystem)
+                return None if high is None else (key <= high if inclusive else key < high)
+        return True
+
+    def __str__(self) -> str:
+        low = [] if self.introduced == "0" else [f">={self.introduced}"]
+        high = (
+            [f"<{self.fixed}"]
+            if self.fixed
+            else [f"<={self.last_affected}"]
+            if self.last_affected
+            else []
+        )
+        return " ".join(low + high) or "*"
+
+
+class AffectedPackage(Model):
+    """What an advisory says about one package: its affected spans and listed versions."""
+
+    ecosystem: Ecosystem
+    name: str
+    spans: tuple[AffectedSpan, ...] = ()
+    versions: tuple[Version, ...] = ()
+    imports: tuple[str, ...] = ()
+    symbols: tuple[str, ...] = ()
+    # The alias record that published each symbol, when it came from one; in-process only, so
+    # documents carrying an advisory's packages keep their contract shape.
+    symbol_sources: dict[str, str] = Field(default_factory=dict, exclude=True)
+
+    def affects(self, version: Version) -> bool | None:
+        """None when the version (or a bound it meets) can't be ordered: undecided, not safe."""
+        if version in self.versions:
+            return True
+        key = version_key(version, self.ecosystem)
+        if key is None:
+            return None
+        verdicts = {span.contains(key, self.ecosystem) for span in self.spans}
+        return True if True in verdicts else None if None in verdicts else False
+
+    def fixed_in(self, installed: Version | None) -> Version | None:
+        """The fix for `installed`: the lowest fix of its own span, else the lowest above it,
+        skipping fixes a span marks affected again. Unorderable: the first fix stated."""
+        fixes = [s.fixed for s in self.spans if s.fixed]
+        if not fixes:
+            return None
+        have = version_key(installed, self.ecosystem) if installed else None
+        keyed = [(version_key(f, self.ecosystem), f) for f in fixes]
+        if have is None or all(k is None for k, _ in keyed):
+            return fixes[0]
+
+        def above(
+            pairs: list[tuple[VersionKey | None, Version]],
+        ) -> list[tuple[VersionKey, Version]]:
+            return sorted((k, f) for k, f in pairs if k is not None and k > have)
+
+        own = above(
+            [
+                (version_key(s.fixed, self.ecosystem), s.fixed)
+                for s in self.spans
+                if s.fixed and s.contains(have, self.ecosystem)
+            ]
+        )
+        for pool in (own, above(keyed)):
+            clean = [
+                f for k, f in pool if not any(s.contains(k, self.ecosystem) for s in self.spans)
+            ]
+            if clean:
+                return clean[0]
+        return own[0][1] if own else None
+
+    @property
+    def vulnerable_range(self) -> str:
+        return " || ".join(str(s) for s in self.spans)
+
+
+def malicious_id(identifier: str) -> bool:
+    """An OSV malicious-packages id (MAL-): malware by its identifier alone."""
+    return identifier.startswith("MAL-")
+
+
+_CVSS_AV = {"N": 0.85, "A": 0.62, "L": 0.55, "P": 0.2}
+_CVSS_AC = {"L": 0.77, "H": 0.44}
+_CVSS_PR_UNCHANGED = {"N": 0.85, "L": 0.62, "H": 0.27}
+_CVSS_PR_CHANGED = {"N": 0.85, "L": 0.68, "H": 0.5}
+_CVSS_UI = {"N": 0.85, "R": 0.62}
+_CVSS_CIA = {"H": 0.56, "L": 0.22, "N": 0.0}
+
+
+def _cvss_roundup(value: float) -> float:
+    i = round(value * 100000)
+    return i / 100000.0 if i % 10000 == 0 else (math.floor(i / 10000) + 1) / 10.0
+
+
+def cvss_base_score(vector: str) -> float | None:
+    """A `CVSS:3.0/` or `CVSS:3.1/` vector's base score (FIRST CVSS v3.1); None for any other."""
+    if not vector.startswith(("CVSS:3.0/", "CVSS:3.1/")):
+        return None
+    try:
+        m = dict(part.split(":", 1) for part in vector.split("/")[1:])
+        changed = m["S"] == "C"
+        pr = (_CVSS_PR_CHANGED if changed else _CVSS_PR_UNCHANGED)[m["PR"]]
+        iss = 1 - (1 - _CVSS_CIA[m["C"]]) * (1 - _CVSS_CIA[m["I"]]) * (1 - _CVSS_CIA[m["A"]])
+        impact = 7.52 * (iss - 0.029) - 3.25 * (iss - 0.02) ** 15 if changed else 6.42 * iss
+        exploitability = 8.22 * _CVSS_AV[m["AV"]] * _CVSS_AC[m["AC"]] * pr * _CVSS_UI[m["UI"]]
+    except (KeyError, ValueError):
+        return None
+    if impact <= 0:
+        return 0.0
+    total = 1.08 * (impact + exploitability) if changed else impact + exploitability
+    return _cvss_roundup(min(total, 10))
+
+
+class AdvisoryRecord(Model):
+    """An advisory as its source states it; ranges live here and in the impact artifact,
+    never in columns. `advisory_id` is set once the record is stored."""
+
+    advisory_id: UUID | None = None
+    identifier: AdvisoryIdentifier
+    aliases: tuple[AdvisoryIdentifier, ...] = ()
+    upstream: tuple[AdvisoryIdentifier, ...] = ()
+    published_at: datetime | None = None
+    summary: str = ""
+    details: str = ""
+    withdrawn: bool = False
+    cvss_vectors: tuple[str, ...] = ()
+    declared_severity: str | None = None
+    malicious: bool = False
+    affected: tuple[AffectedPackage, ...] = ()
+    unmodeled_ecosystems: tuple[str, ...] = ()
+    references: tuple[str, ...] = ()
+    fix_references: tuple[str, ...] = ()
+    fixed_commits: tuple[str, ...] = ()  # commit URLs of GIT ranges' `fixed` events
+    source: str
+    package_sources: tuple[str, ...] = ()  # source records contributing affected packages
+
+    @property
+    def severity(self) -> ScannerSeverity:
+        """As the source declares it (GHSA's word), `unrated` when absent. A malicious package is
+        critical: malware carries no CVSS, and its fix is removal."""
+        if self.malicious:
+            return ScannerSeverity.CRITICAL
+        word = (self.declared_severity or "").lower()
+        return ScannerSeverity(_DECLARED_SEVERITY.get(word, "unrated"))
+
+    @property
+    def cvss_score(self) -> float | None:
+        """The highest v3 base score among its vectors; None when none scores."""
+        scores = [s for v in self.cvss_vectors if (s := cvss_base_score(v)) is not None]
+        return max(scores, default=None)
+
+    @property
+    def display_id(self) -> AdvisoryIdentifier:
+        """The CVE alias when there is one, else the source's id (MAL-/GHSA- have no CVE)."""
+        return next((a for a in self.aliases if a.startswith("CVE-")), self.identifier)
+
+    def package(self, ecosystem: Ecosystem, name: str) -> AffectedPackage | None:
+        return next((p for p in self.affected if (p.ecosystem, p.name) == (ecosystem, name)), None)
+
+
+class ExploitSignal(Model):
+    """What EPSS and CISA KEV say about one advisory; None where a feed doesn't list it."""
+
+    identifier: AdvisoryIdentifier
+    epss: float | None = None
+    epss_percentile: float | None = None
+    kev_added: date | None = None
+    kev_ransomware: bool | None = None
+
+
+class ItemSignals(Model):
+    """One artifact item naming CVEs (by its id, fingerprint or OSV id) and what EPSS and KEV
+    say about each."""
+
+    item: str | None
+    signals: tuple[ExploitSignal, ...]
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def max_epss(self) -> float | None:
+        return max((s.epss for s in self.signals if s.epss is not None), default=None)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def kev_any(self) -> bool:
+        return any(s.kev_ransomware is not None for s in self.signals)
+
+
+class ArtifactSignals(Model):
+    """The CVE-bearing items of one artifact's `findings` or `candidates` list (None: neither)."""
+
+    source: str
+    list_key: str | None
+    items_scanned: int
+    items: tuple[ItemSignals, ...]
+
+
+class RepositoryReach(Model):
+    """Products shipping the repository and its owning teams; deployed only when a workload
+    inventory was given (None: unknown, never guessed)."""
+
+    repository: str
+    registered: bool
+    products: tuple[str, ...] = ()
+    owner_teams: tuple[str, ...] = ()
+    deployed: bool | None = None
+
+
 class VexStatus(StrEnum):
     NOT_AFFECTED = "not_affected"
     AFFECTED = "affected"
@@ -63,36 +472,490 @@ class VexStatus(StrEnum):
     UNDER_INVESTIGATION = "under_investigation"
 
 
-# Shapes land with their implementation slice.
-class ImpactEvidence(Model): ...
+class ImpactEvidence(Model):
+    """What each tier observed for one commit, unobserved is None; the impact-analysis
+    schema's evidence block."""
+
+    l1_depends_on: bool | None = None
+    l1_version_in_range: bool | None = None
+    l4_package_imported: bool | None = None
+    l4_packages_found: tuple[str, ...] | None = None
+    govulncheck: ImpactGovulncheck | None = None
+    govulncheck_trace: tuple[str, ...] | None = None
+    feature_pattern_matches: int | None = None
+    binary_string_scan: ImpactBinaryStringScan | None = None
+    needs_manual_trace: bool | None = None
+    notes: str | None = None
+    manifest_scan: ImpactManifestScan | None = None
+    manifest_version: Version | None = None
+    source_import_scan: ImpactSourceImportScan | None = None
+    binary_linked_library: ImpactBinaryLinkedLibrary | None = None
+    evidence_level: DependencyEvidenceLevel | None = None
+    symbol_usage_scan: ImpactSymbolUsageScan | None = None
+    binary_symbol_scan: ImpactBinarySymbolScan | None = None
+    sbom_scan: ImpactSbomScan | None = None
+    sbom_shipped_version: Version | None = None
+
+    def classification(self, ecosystem: Ecosystem = Ecosystem.GO) -> ImpactClassification:
+        """The rubric: reachability (govulncheck) decides `affected`; manifest, import and
+        binary evidence never rise above `likely_affected`; SBOM evidence alone decides nothing."""
+        c, g = ImpactClassification, ImpactGovulncheck
+        # L4 import absence means absence only in Go; elsewhere other libraries load it
+        go = ecosystem == Ecosystem.GO
+        if self.l1_depends_on is False:
+            return c.NOT_IMPORTED
+        if self.l1_version_in_range is False:
+            return c.VERSION_NOT_IN_RANGE
+        if self.govulncheck == g.SYMBOL_REACHABLE:
+            return c.AFFECTED
+        negative = self.govulncheck in (
+            g.PACKAGE_IMPORTED_NOT_OBSERVED,
+            g.MODULE_REQUIRED_NOT_OBSERVED,
+        )
+        if (self.feature_pattern_matches or 0) > 0:
+            return c.LIKELY_AFFECTED if negative else c.AFFECTED
+        if negative or self.binary_string_scan == ImpactBinaryStringScan.PACKAGE_PATH_ABSENT:
+            return c.NOT_OBSERVED
+        if go and self.l4_package_imported is False:
+            return c.NOT_OBSERVED
+        if self.binary_string_scan == ImpactBinaryStringScan.PACKAGE_PATH_PRESENT:
+            return c.LIKELY_AFFECTED
+        if go and self.l4_package_imported is True:
+            return (
+                c.LIKELY_AFFECTED
+                if self.govulncheck is None and self.feature_pattern_matches is None
+                else c.NOT_OBSERVED
+            )
+        if self.symbol_usage_scan == ImpactSymbolUsageScan.SYMBOLS_USED:
+            return c.LIKELY_AFFECTED
+        if self.manifest_scan == ImpactManifestScan.MODULE_PINNED_OUT_OF_RANGE:
+            return c.VERSION_NOT_IN_RANGE
+        if (
+            self.manifest_scan == ImpactManifestScan.MODULE_PINNED_IN_RANGE
+            or self.binary_linked_library == ImpactBinaryLinkedLibrary.LINKED
+        ):
+            return c.LIKELY_AFFECTED
+        imported = self.source_import_scan == ImpactSourceImportScan.IMPORTS_FOUND or (
+            not go and self.l4_package_imported is True
+        )
+        if imported:
+            return c.LIKELY_AFFECTED
+        if self.manifest_scan == ImpactManifestScan.MODULE_NOT_IN_MANIFESTS or (
+            self.binary_linked_library == ImpactBinaryLinkedLibrary.NOT_LINKED
+        ):
+            return c.NOT_OBSERVED
+        return c.INCONCLUSIVE
 
 
-class DependencyIngest(Model): ...
+class UnresolvedManifest(Model):
+    """A dependency manifest the SBOM tool saw but could not resolve: its packages are missing
+    from the SBOM, so they are unknown, never absent."""
+
+    ecosystem: Ecosystem
+    path: RepoPath
+    reason: ManifestCoverageReason
 
 
-class DependencyProvenance(Model): ...
+class DependencyIngest(Model):
+    """A commit's manifest SBOM, read from its checkout by a standard tool and ingested, and
+    the manifests the tool could not resolve."""
+
+    repository_ref_id: UUID
+    sbom: Sbom
+    tool: str
+    tool_version: str | None = None
+    unresolved: tuple[UnresolvedManifest, ...] = ()
 
 
-class ProvenanceCheck(Model): ...
+class PackageVersion(Model):
+    package: Package
+    version: Version
+
+    def __str__(self) -> str:
+        return f"{self.package.ecosystem}/{self.package.name}@{self.version}"
 
 
-class AffectedDependency(Model): ...
+class AdvisoryHits(Model):
+    """Advisory ids for each queried package version, aligned with the query. None: not
+    answered (counted in `issues` by status), never read as no advisories."""
+
+    ids: tuple[tuple[str, ...] | None, ...]
+    issues: dict[str, int] = Field(default_factory=dict)
 
 
-class ImpactFilter(Model): ...
+class PackageAdvisories(Model):
+    """The advisories the source lists for one package version, as it states them now; ids
+    outside the advisory vocabulary and records it lists but won't serve are counted, not hidden."""
+
+    package: str  # "<ecosystem>/<name>@<version>"
+    advisories: tuple[AdvisoryRecord, ...] = ()
+    rejected: tuple[str, ...] = ()
+    details_missing: int = 0
 
 
-class ExposureFilter(Model): ...
+class SweepStatus(StrEnum):
+    COMPLETE = "complete"
+    DEGRADED = "degraded"  # some package versions unanswered, or some advisories not fetched
+    FAILED = "failed"  # nothing answered, or no SBOMs to sweep
 
 
-class ExposureDimension(Model): ...
+class SweptAdvisory(Model):
+    """One advisory touching the recorded SBOMs; `scan` when its commits are few enough to
+    deep-scan (else SBOM evidence only, the rest left to operator staging)."""
+
+    advisory_id: UUID
+    identifier: AdvisoryIdentifier
+    display_id: AdvisoryIdentifier
+    malicious: bool
+    severity: ScannerSeverity
+    summary: str
+    fix_available: bool | None  # None when a touched package has no source detail
+    packages: tuple[str, ...]
+    commits: int
+    scan: bool
 
 
-class ExposureRollup(Model): ...
+class AdvisorySweep(Model):
+    """Which known advisories touch the recorded SBOMs at all: malicious first, then severity,
+    then reach. Routes and inventories only; affectedness is `prepare`'s."""
+
+    status: SweepStatus
+    package_versions: int
+    skipped: int = 0  # held in ecosystems the source can't answer by name (docker, helm)
+    unanswered: tuple[str, ...] = ()  # "<ecosystem>/<name>@<version>", re-run, never clean
+    issues: dict[str, int] = Field(default_factory=dict)
+    details_missing: int = 0
+    rejected: tuple[str, ...] = ()
+    advisories: tuple[SweptAdvisory, ...] = ()
+    detail: str = ""
+
+
+class AdvisoryMatch(StrEnum):
+    """How surely a finding is the advisory it names (`finding.advisory_match`)."""
+
+    CONFIRMED = "confirmed"
+    PROBABLE = "probable"
+
+
+class ProvenanceMatch(Model):
+    """A published advisory whose title matches a finding, published after its first report."""
+
+    identifier: AdvisoryIdentifier
+    title: str
+    published: date
+    lead_days: int
+    score: float
+    match: AdvisoryMatch
+    severity: str | None = None
+
+
+class ProvenanceCheck(Model):
+    """Which published advisory a finding became, best match first. `recorded` is the advisory
+    the finding names; `linked` when this check recorded it; `conflict` when the finding names
+    an advisory the best match isn't (reported, never overwritten)."""
+
+    finding_id: UUID
+    recorded: AdvisoryIdentifier | None = None
+    linked: bool = False
+    conflict: bool = False
+    matches: tuple[ProvenanceMatch, ...] = ()
+
+
+class FixUptakeState(StrEnum):
+    CONSUMED = "consumed"
+    PENDING = "pending"
+    MODULE_ABSENT = "module_absent"
+    NOT_OBSERVED = "not_observed"
+
+
+class ConsumedVersion(Model):
+    """One version of the package a commit carries; `image_id` None is its manifest."""
+
+    image_id: UUID | None = None
+    version: Version
+    consumed: bool | None
+
+
+class FixUptake(Model):
+    """Whether a commit consumes a fix released elsewhere. `module_absent` is not `consumed`:
+    removal usually fixes, but a verifier judges (it may be vendored under another name)."""
+
+    state: FixUptakeState
+    checked: tuple[ConsumedVersion, ...] = ()
+
+
+class AffectedDependency(Model):
+    """A commit or image whose SBOM reaches one of an advisory's packages. `vulnerable`: the
+    advisory names the package itself, else it leads to one (an internal library, a base image).
+    No `repository_ref_id`: an image with no declared provenance."""
+
+    repository_ref_id: UUID | None
+    image_id: UUID | None = None
+    dependency: Dependency
+    vulnerable: bool
+
+
+class ImpactFilter(Model):
+    """Recorded impact analyses, narrowed to one advisory (any alias), commit or verdict."""
+
+    advisory_id: UUID | None = None
+    repository_ref_id: UUID | None = None
+    classification: ImpactClassification | None = None
+
+
+class ExposureFilter(Model):
+    """The latest impact analysis per commit and advisory as of `as_of` (else now), narrowed to
+    one advisory or ecosystem."""
+
+    advisory_id: UUID | None = None
+    ecosystem: Ecosystem | None = None
+    as_of: datetime | None = None
+
+
+class ExposureDimension(StrEnum):
+    ADVISORY = "advisory"
+    PACKAGE = "package"
+    ECOSYSTEM = "ecosystem"
+    REPOSITORY = "repository"
+    PRODUCT = "product"
+    CLASSIFICATION = "classification"
+
+
+# In range with a positive or undecided verdict; the rest are context, never exposure.
+EXPOSED = frozenset(
+    {
+        ImpactClassification.AFFECTED,
+        ImpactClassification.LIKELY_AFFECTED,
+        ImpactClassification.INCONCLUSIVE,
+    }
+)
+
+
+class ExposureCounts(Model):
+    commits: int
+    exposed: int
+    affected: int
+    by_classification: Mapping[ImpactClassification, int]
+
+    @classmethod
+    def of(cls, found: Sequence[ImpactClassification], **fields: Any) -> Self:
+        """The counts of the latest verdicts `found`, one per commit and advisory."""
+        return cls(
+            commits=len(found),
+            exposed=sum(c in EXPOSED for c in found),
+            affected=found.count(ImpactClassification.AFFECTED),
+            by_classification=Counter(found),
+            **fields,
+        )
+
+
+class ExposureRollup(ExposureCounts):
+    """The commits analysed in one group; key is None for commits without that dimension."""
+
+    key: str | None = None
+
+
+class ExposureSeriesPoint(ExposureCounts):
+    """The counts standing at the bucket's end; `analysed` happened within it."""
+
+    bucket: datetime
+    analysed: int
+
+
+class SymbolSource(StrEnum):
+    PUBLISHED = "published"
+    FIX_COMMIT = "fix_commit"
+    JUDGED = "judged"  # read off the fix diff by the skill when nothing was published or mined
+
+
+class SymbolConfidence(StrEnum):
+    HIGH = "high"
+    MEDIUM = "medium"
+
+
+class VulnerableSymbol(Model):
+    """A function the advisory's fix touched, with where it was read: a wrong symbol is worse
+    than none, so callers gate on `confidence` and `source`."""
+
+    symbol: str
+    source: SymbolSource
+    confidence: SymbolConfidence
+    reference: str
+    file: str | None = None
+
+
+class SymbolStatus(StrEnum):
+    RESOLVED = "resolved"
+    NO_FIX_COMMIT = "no_fix_commit"
+    NO_SYMBOLS_IN_DIFF = "no_symbols_in_diff"
+    DEGRADED = "degraded"
+
+
+class SymbolResolution(Model):
+    """An empty result means unresolved, never "no vulnerable symbol": a data-shaped fix
+    (deny-list, validation table, dependency bump) changes no function."""
+
+    status: SymbolStatus
+    symbols: tuple[VulnerableSymbol, ...] = ()
+    fix_commits: tuple[str, ...] = ()
+    note: str | None = None
+
+
+class ImpactQuery(Model):
+    """What an analyzer looks for in a checkout: the advisory's package and symbols."""
+
+    advisory: AdvisoryRecord
+    package: AffectedPackage
+    symbols: tuple[str, ...] = ()
 
 
 class ImpactAnalysis(Model):
-    """Read from the impact-analysis artifact of an assessment."""
+    """An impact assessment of one commit for one advisory, and the finding it filed."""
+
+    assessment_id: UUID
+    artifact_id: UUID
+    repository_ref_id: UUID
+    advisory_id: UUID
+    classification: ImpactClassification
+    finding_id: UUID | None = None
 
 
-class ImpactInput(SkillInput): ...
+class ImpactExportRepo(ImpactAnalysis):
+    """One retained commit/package verdict, with its complete native document."""
+
+    repo: str
+    repository_url: str
+    sha: str
+    ecosystem: Ecosystem | None
+    module: str
+    version: Version | None
+    evidence: ImpactEvidence
+    document: dict[str, JsonValue]
+
+
+class ImpactExport(Model):
+    """An advisory's latest analysis per commit and affected package version, with its native
+    evidence."""
+
+    advisory_id: UUID
+    advisory: AdvisoryIdentifier
+    generated_at: datetime
+    commits: int
+    analyses: int
+    classifications: dict[ImpactClassification, int]
+    repos: tuple[ImpactExportRepo, ...]
+
+
+class ImpactScopeMember(Model):
+    ecosystem: Ecosystem
+    module: str = Field(min_length=1)
+    version: Version | None
+
+
+class ImpactPreparationScope(Model):
+    """The complete package/version set prepared together from one dependency snapshot."""
+
+    digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    members: tuple[ImpactScopeMember, ...] = Field(min_length=1)
+
+
+class ImpactInput(SkillInput):
+    """One commit against one advisory: what its SBOMs hold of the advisory's packages, and
+    the evidence so far."""
+
+    advisory: AdvisoryRecord
+    package: AffectedPackage
+    dependencies: tuple[AffectedDependency, ...]
+    evidence: ImpactEvidence
+    products: tuple[str, ...] = ()
+    tiers: tuple[ImpactTier, ...] = (ImpactTier.L1,)
+    symbols: SymbolResolution | None = None
+    preparation_scope: ImpactPreparationScope | None = None
+
+    @property
+    def installed_version(self) -> Version | None:
+        held = [d.dependency for d in self.dependencies if d.vulnerable]
+        manifest = [d.dependency for d in self.dependencies if d.vulnerable and not d.image_id]
+        installed = manifest or held
+        return Version(installed[0].version) if installed else None
+
+    @property
+    def scope_member(self) -> ImpactScopeMember:
+        return ImpactScopeMember(
+            ecosystem=self.package.ecosystem,
+            module=self.package.name,
+            version=self.installed_version,
+        )
+
+    def document(
+        self, harness_version: str, feature_description: str | None = None
+    ) -> ImpactAnalysisArtifact:
+        """The impact-analysis artifact for this commit, ready for `record`; the feature
+        description (what capability must be in use) is the skill's judgement, kept as given."""
+        classification = self.evidence.classification(self.package.ecosystem)
+        manifest = [d.dependency for d in self.dependencies if d.vulnerable and not d.image_id]
+        version = self.installed_version
+        fixed = self.package.fixed_in(Version(version) if version else None)
+        counted = {c.value: int(c == classification) for c in ImpactClassification}
+        found = self.symbols or SymbolResolution(status=SymbolStatus.NO_FIX_COMMIT)
+        return ImpactAnalysisArtifact.from_document(
+            {
+                "metadata": {
+                    "cve": self.advisory.identifier,
+                    "module": self.package.name,
+                    "ecosystem": self.package.ecosystem.value,
+                    "vulnerable_range": self.package.vulnerable_range,
+                    "fixed_version": fixed,
+                    "vulnerable_symbols": [s.symbol for s in found.symbols],
+                    "vulnerable_packages": list(self.package.imports),
+                    "feature_description": feature_description,
+                    "advisory_sources": [
+                        self.advisory.source,
+                        *self.advisory.package_sources,
+                        *found.fix_commits,
+                    ],
+                    "portfolio_graph_db": None,
+                    "portfolio_graph_version": None,
+                    "harness_version": harness_version,
+                    "generated_at": self.prepared_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "tiers_executed": [t.value for t in self.tiers],
+                    "options": {
+                        "govulncheck": ImpactTier.GOVULNCHECK in self.tiers,
+                        "binary_scan": ImpactTier.BINARY_SCAN in self.tiers,
+                        "sweep": False,
+                    },
+                    **(
+                        {"preparation_scope": self.preparation_scope.model_dump(mode="json")}
+                        if self.preparation_scope is not None
+                        else {}
+                    ),
+                },
+                "summary": {
+                    "repos_in_blast_radius": 1,
+                    "version_in_range": int(
+                        classification
+                        not in (
+                            ImpactClassification.VERSION_NOT_IN_RANGE,
+                            ImpactClassification.NOT_IMPORTED,
+                        )
+                    ),
+                    **counted,
+                    "product_surfaces": list(self.products),
+                },
+                "repos": [
+                    {
+                        "repo": repo_label(self.subject.repository_url),
+                        "products": list(self.products),
+                        "classification": classification.value,
+                        "version": version,
+                        "direct": manifest[0].direct if manifest else None,
+                        "evidence": self.evidence.model_dump(mode="json", exclude_none=True),
+                    }
+                ],
+            }
+        )
+
+
+def repo_label(url: str) -> str:
+    """The impact-analysis schema's repository identifier: `repo:<host>/<path>`."""
+    return "repo:" + url.removeprefix("https://").removeprefix("http://")

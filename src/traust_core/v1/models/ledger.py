@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-from datetime import datetime
 from enum import StrEnum
 from uuid import UUID
 
+from pydantic import computed_field
+
 from traust_core.v1.models.base import AppendOnly, Entity, Model
-from traust_core.v1.models.common import Principal
-from traust_core.v1.models.findings import Decision
 
 
 class Layer(Entity):
@@ -20,6 +19,7 @@ class Layer(Entity):
     merkle_root_signature: str | None = None
     merkle_signing_method: str
     merkle_signature_format: int | None = None
+    merkle_frontier: str | None = None
 
 
 class Event(AppendOnly):
@@ -31,35 +31,55 @@ class Event(AppendOnly):
     event_payload: bytes
 
 
-# Members land with the Ledger slice (from traust-ledger _internal/kinds.py).
-class LedgerEventKind(StrEnum): ...
+class Signing(StrEnum):
+    """How signing a layer's root went (traust-ledger `SignAttempt.status`)."""
 
-
-# Shapes land with their implementation slice.
-class AppendReceipt(Model): ...
-
-
-class VerifyResult(Model): ...
-
-
-class LedgerEvent(Model):
-    event_id: UUID
-    stream_id: UUID
-    kind: LedgerEventKind
-    actor: Principal
-    occurred_at: datetime
-    recorded_at: datetime
-    payload: bytes
-
-    @classmethod
-    def from_decision(cls, decision: Decision, stream_id: UUID) -> LedgerEvent:
-        raise NotImplementedError("stub: replaces ledger events/builders.py, lib/event_time.py")
+    UNCONFIGURED = "unconfigured"
+    SIGNED = "signed"
+    FAILED = "failed"
 
 
 class Checkpoint(Model):
-    stream_id: UUID
-    owner_id: UUID
-    merkle_root: str
-    size: int
-    epoch: int
-    signature: str
+    """A layer after restamping its root; `warning` is what the caller must surface."""
+
+    layer: Layer
+    signing: Signing
+    warning: str | None = None
+
+
+class AppendReceipt(Model):
+    event: Event
+    checkpoint: Checkpoint
+
+
+class VerifyResult(Model):
+    layer_id: UUID
+    errors: tuple[str, ...] = ()
+    warnings: tuple[str, ...] = ()
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def passed(self) -> bool:
+        return not self.errors and not self.warnings
+
+
+class IntegrityCheck(StrEnum):
+    MERKLE = "merkle"
+    SIGNATURE = "signature"
+
+
+class IntegrityProblem(Model):
+    check: IntegrityCheck
+    message: str
+
+
+class DocumentVerification(Model):
+    """Integrity of a historical layer document, without a persisted layer ID."""
+
+    errors: tuple[IntegrityProblem, ...] = ()
+    warnings: tuple[IntegrityProblem, ...] = ()
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def passed(self) -> bool:
+        return not self.errors

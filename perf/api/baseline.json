@@ -1,0 +1,11 @@
+{
+  "claim_p95_ms": 665.13,
+  "list_p95_ms": 556.68,
+  "feed_p95_ms": 607.01,
+  "insight_p95_ms": 3213.24,
+  "claim_rps": 62.45,
+  "list_rps": 30.86,
+  "feed_rps": 28.11,
+  "insight_rps": 0.69,
+  "http_reqs_rate": 184.6
+}

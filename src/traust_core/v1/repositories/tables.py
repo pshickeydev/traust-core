@@ -10,17 +10,20 @@ repository class serves both databases.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import datetime
 from functools import cache
 from typing import Any, ClassVar, Generic, Protocol, TypeVar
 from uuid import UUID
 
 import sqlalchemy as sa
+from sqlalchemy.dialects import postgresql, sqlite
 from sqlalchemy.engine import Connection
 
-from traust_core.v1.errors import NotFoundError
+from traust_core.v1.errors import NotFoundError, RepositoryError
 from traust_core.v1.models.base import AppendOnly, Entity, Model
+from traust_core.v1.models.common import RecordBudget
 from traust_core.v1.repositories.sql import (
     Dialect,
     RecordUuid,
@@ -103,6 +106,8 @@ E = TypeVar("E", bound=Entity)
 R = TypeVar("R", bound=Model)
 
 _BASE = frozenset({"id", "created_at", "updated_at"})
+# Rows per multi-row statement: well under SQLite's bound-parameter limit.
+_BATCH = 500
 
 
 class RecordRepository(Protocol[R]):
@@ -115,7 +120,7 @@ class MutableRecordRepository(RecordRepository[E], Protocol[E]):
 
 
 class SqlTableRepository(SqlRepository, Generic[R]):
-    """add / get for one contract table; subclasses set spec and record."""
+    """Validated add / get for one contract table; subclasses set spec and record."""
 
     spec: ClassVar[TableSpec]
     record: ClassVar[type[Any]]
@@ -125,8 +130,56 @@ class SqlTableRepository(SqlRepository, Generic[R]):
         self.table = (tables or TableFactory.for_bind(connection)).table(self.spec)
 
     def add(self, record: R) -> R:
+        record = self._to_record(record)
         saved = self._insert_record(f"add {self.spec.name}", self.table, self._values(record))
         return record.model_copy(update=saved)
+
+    def _insert(self) -> Callable[[sa.Table], Any]:
+        return postgresql.insert if self._connection.dialect.name == "postgresql" else sqlite.insert
+
+    def _add_missing(self, operation: str, records: Sequence[R], keys: Sequence[str]) -> None:
+        """Insert the records whose natural key isn't stored yet, in bounded batches."""
+        for start in range(0, len(records), _BATCH):
+            batch = [self._values(r) for r in records[start : start + _BATCH]]
+            stmt = (
+                self._insert()(self.table)
+                .values(batch)
+                .on_conflict_do_nothing(index_elements=list(keys))
+            )
+            self._execute(operation, stmt)
+
+    def _get_or_add(
+        self,
+        record: R,
+        keys: Sequence[str],
+        find: Callable[[], R | None],
+        *,
+        index_where: sa.ColumnElement[bool] | None = None,
+    ) -> R:
+        return self._get_or_add_with_status(record, keys, find, index_where=index_where)[0]
+
+    def _get_or_add_with_status(
+        self,
+        record: R,
+        keys: Sequence[str],
+        find: Callable[[], R | None],
+        *,
+        index_where: sa.ColumnElement[bool] | None = None,
+    ) -> tuple[R, bool]:
+        stmt = (
+            self._insert()(self.table)
+            .values(self._values(record))
+            .on_conflict_do_nothing(index_elements=list(keys), index_where=index_where)
+            .returning(*self.table.c)
+        )
+        row = self._execute(f"get or add {self.spec.name}", stmt).mappings().first()
+        if row is not None:
+            return self._to_record(row), True
+        # A separate statement sees the competing insert after it commits on Postgres.
+        existing = find()
+        if existing is None:
+            raise RepositoryError(f"{self.spec.name}: conflicting row disappeared")
+        return existing, False
 
     def get(self, record_id: UUID) -> R:
         found = self._one(f"get {record_id}", self.table.c.id == record_id)
@@ -137,7 +190,7 @@ class SqlTableRepository(SqlRepository, Generic[R]):
     def _values(self, record: R) -> dict[str, Any]:
         return record.model_dump(exclude=_BASE & set(type(record).model_fields))
 
-    def _to_record(self, row: Mapping[str, Any]) -> R:
+    def _to_record(self, row: Mapping[str, Any] | R) -> R:
         return self.record.model_validate(dict(row))  # type: ignore[no-any-return]
 
     def _select(self) -> sa.Select[Any]:
@@ -147,17 +200,70 @@ class SqlTableRepository(SqlRepository, Generic[R]):
         row = self._execute(operation, self._select().where(*where)).mappings().one_or_none()
         return None if row is None else self._to_record(row)
 
+    def _many_in(
+        self,
+        operation: str,
+        column: sa.ColumnElement[Any],
+        values: Collection[Any],
+        *,
+        read_budget: RecordBudget | None = None,
+    ) -> list[R]:
+        """Rows whose `column` is one of `values`, read in bounded batches.
+
+        Batches are merged back into `_many`'s global (created_at, id) order,
+        which per-batch queries cannot preserve when values span batches.
+        """
+        batches = self._batches(values)
+        rows = [
+            row
+            for batch in batches
+            for row in self._many(operation, column.in_(batch), read_budget=read_budget)
+        ]
+        return sorted(rows, key=lambda r: (r.created_at, r.id))
+
+    @staticmethod
+    def _batches(values: Collection[Any]) -> Iterator[list[Any]]:
+        """The distinct values in chunks a multi-value statement can bind."""
+        items = list(dict.fromkeys(values))
+        return (items[start : start + _BATCH] for start in range(0, len(items), _BATCH))
+
     def _many(
         self,
         operation: str,
         *where: sa.ColumnElement[bool],
         order_by: Sequence[sa.ColumnElement[Any]] = (),
+        read_budget: RecordBudget | None = None,
     ) -> list[R]:
         stmt = (
             self._select()
             .where(*where)
             .order_by(*order_by, self.table.c.created_at, self.table.c.id)
         )
+        if read_budget is not None:
+            stmt = stmt.limit(read_budget.remaining + 1)
+        rows = [self._to_record(r) for r in self._execute(operation, stmt).mappings()]
+        if read_budget is not None:
+            read_budget.consume(len(rows))
+        return rows
+
+    def _page(
+        self,
+        operation: str,
+        *where: sa.ColumnElement[bool],
+        limit: int,
+        after: tuple[datetime, UUID] | None,
+        at: str = "created_at",
+        oldest_first: bool = False,
+    ) -> list[R]:
+        """Keyset page by `at`, newest first (oldest first for a feed), resuming after
+        `(at, id)`."""
+        c = self.table.c
+        key = sa.tuple_(c[at], c.id)
+        if after is not None:
+            # A row comparison lets the index seek to the cursor instead of filtering old pages.
+            where = (*where, key > after if oldest_first else key < after)
+        order = (c[at], c.id) if oldest_first else (c[at].desc(), c.id.desc())
+        stmt = self._select().where(*where).order_by(*order).limit(limit)
         return [self._to_record(r) for r in self._execute(operation, stmt).mappings()]
 
 
@@ -167,6 +273,7 @@ class SqlAppendOnlyRepository(SqlTableRepository[A]):
 
 class SqlMutableRepository(SqlTableRepository[E]):
     def update(self, record: E) -> E:
+        record = self._to_record(record)
         if record.id is None:
             raise NotFoundError(f"{self.spec.name}: update needs a saved record")
         saved = self._update_record(

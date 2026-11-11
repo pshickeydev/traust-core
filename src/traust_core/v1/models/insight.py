@@ -1,15 +1,65 @@
 from __future__ import annotations
 
-from datetime import datetime
+from collections.abc import Mapping
+from datetime import date, datetime
+from decimal import Decimal
 from enum import StrEnum
+from typing import Any
 from uuid import UUID
 
+from pydantic import ConfigDict, Field, SerializeAsAny, computed_field
+
+from traust_core.v1.models.assessment import (
+    AttackScenario,
+    Coverage,
+    Population,
+    TenantBoundary,
+    Threat,
+)
 from traust_core.v1.models.base import Model
-from traust_core.v1.models.common import TimeWindow
+from traust_core.v1.models.code_facts import LanguageCount
+from traust_core.v1.models.common import TimeBucket, TimeWindow
+from traust_core.v1.models.compliance import ComplianceRollup, DocVariance
+from traust_core.v1.models.dependencies import ExposureRollup
+from traust_core.v1.models.detection_quality import ComplianceCalibration, CriticalMiss, Scorecard
+from traust_core.v1.models.findings import (
+    Decision,
+    FindingRollup,
+    FindingSeriesPoint,
+    FindingView,
+    Label,
+    Occurrence,
+    ReviewCase,
+)
+from traust_core.v1.models.inventory import InventoryExportRow
+from traust_core.v1.models.operations import SpendAttribution, SpendRollup, ThroughputPoint
+from traust_core.v1.models.pqc import (
+    PqcReadiness,
+    PqcRollup,
+    PqcSite,
+    PqcVendorClaim,
+    PqcWorklistEntry,
+)
+from traust_core.v1.models.validation import ValidationRollup
+from traust_core.v1.models.vocabulary import (
+    ComplianceFramework,
+    IsolationDimension,
+    OwnershipClass,
+    RemediationStatus,
+    RiskRatingBand,
+    ScannerSeverity,
+    Severity,
+    SlaClockStart,
+)
 
 
 class ViewName(StrEnum):
     FINDINGS_ROLLUP = "findings-rollup"
+    INVENTORY_EXPORT = "inventory-export"
+    CONTAINER_FINDINGS = "container-findings"
+    INSECURE_PATTERNS = "insecure-patterns"
+    CRITICAL_MISSES = "critical-misses"
+    BENCHMARK_SCORECARDS = "benchmark-scorecards"
     FINDINGS_TREND = "findings-trend"
     COVERAGE = "coverage"
     LOC = "loc"
@@ -18,21 +68,934 @@ class ViewName(StrEnum):
     EXPOSURE = "exposure"
     VALIDATION_FUZZ = "validation-fuzz"
     PQC = "pqc"
+    PQC_PORTFOLIO = "pqc-portfolio"
+    PQC_VENDORS = "pqc-vendors"
+    PQC_WORKLIST = "pqc-worklist"
     COMPLIANCE = "compliance"
+    COMPLIANCE_PRECISION = "compliance-precision"
     PROGRAM = "program"
     EXECUTIVE_SUMMARY = "executive-summary"
     REVIEW_CARD = "review-card"
     TRIAGE = "triage"
     SARIF = "sarif"
     OSCAL = "oscal"
+    SLA = "sla"
+    REMEDIATION_INDEX = "remediation-index"
+    FRESHNESS = "freshness"
+    DEPENDENCY_REACH = "dependency-reach"
+    PRIVILEGES = "privileges"
+    SCOREBOARD = "scoreboard"
+    CENSUS = "census"
+    SPEND = "spend"
 
 
 # Each view's model is a contracts JSON schema (I4); shapes land with the view's slice.
 class ViewModel(Model): ...
 
 
+class InventoryExport(ViewModel):
+    rows: tuple[InventoryExportRow, ...]
+
+
+class CriticalMisses(ViewModel):
+    window: TimeWindow
+    misses: tuple[CriticalMiss, ...]
+
+
+class BenchmarkScorecards(ViewModel):
+    scorecards: tuple[Scorecard, ...]
+
+
+class PqcWorklist(ViewModel):
+    product_id: UUID | None
+    repository_ref_ids: tuple[UUID, ...] | None
+    chokepoints: tuple[str, ...]
+    entries: tuple[PqcWorklistEntry, ...]
+
+
+class CompliancePrecision(ViewModel):
+    calibration: ComplianceCalibration
+
+
+class ExecutivePanel(StrEnum):
+    ATTACK = "attack"
+    PQC = "pqc"
+    ISOLATION = "isolation"
+    IAC = "iac"
+
+
 class ViewFilter(Model):
+    """Scope (products, teams, category labels), the point in time, and for series a window and
+    bucket; `artifact_id` or `repository_id` names what a single-item view renders."""
+
     product_ids: tuple[UUID, ...] = ()
     team_ids: tuple[UUID, ...] = ()
+    # category-label values (free text until the weakness classification lands); when set,
+    # findings without one of these categories are out of scope
+    categories: tuple[str, ...] = ()
     as_of: datetime | None = None
     window: TimeWindow | None = None
+    bucket: TimeBucket = TimeBucket.MONTH
+    artifact_id: UUID | None = None
+    repository_id: UUID | None = None
+    executive_panels: tuple[ExecutivePanel, ...] = ()
+    assessment_id: UUID | None = None
+    report_stem: str | None = None
+    compare_as_of: datetime | None = None
+    first_party_divisor: Decimal | None = Field(default=None, gt=0, allow_inf_nan=False)
+    repository_ref_ids: tuple[UUID, ...] | None = None
+    pqc_chokepoints: tuple[str, ...] = ()
+    framework: ComplianceFramework | None = None
+    precision_gate: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
+
+
+class SeverityCounts(Model):
+    critical: int = 0
+    high: int = 0
+    medium: int = 0
+    low: int = 0
+    informational: int = 0
+    unrated: int = 0
+
+    @property
+    def total(self) -> int:
+        return (
+            self.critical + self.high + self.medium + self.low + self.informational + self.unrated
+        )
+
+
+class FindingTally(Model):
+    """Disposition-aware counts: only `open` is exposure; the rest say why a finding isn't."""
+
+    open: SeverityCounts = SeverityCounts()
+    hardening: int = 0
+    resolved: int = 0
+    risk_accepted: int = 0
+    false_positive: int = 0
+    execution_proven: int = 0
+    unverified: int = 0
+    decided: int = 0  # findings with at least one decision
+    remediated: SeverityCounts = SeverityCounts()  # the resolved, by severity
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def tracked(self) -> int:
+        """The findings that aren't false positives."""
+        return self.open.total + self.hardening + self.resolved + self.risk_accepted
+
+
+class RepositoryRollup(Model):
+    repository_id: UUID
+    repository_url: str
+    tally: FindingTally
+    hardening_categories: Mapping[str, int] = Field(default_factory=dict)
+
+
+class ProductRollup(Model):
+    product_id: UUID
+    slug: str
+    name: str
+    repositories: int
+    tally: FindingTally
+
+
+class TopFinding(Model):
+    finding_id: UUID
+    repository_url: str
+    title: str
+    severity: Severity | None
+    cvss_score: Decimal | None = None
+    execution_proven: bool = False
+    sla_due: datetime | None = None
+
+
+class ContainerReport(Model):
+    assessment_id: UUID
+    repository_ref_id: UUID
+    occurred_at: datetime
+    image: str
+    title: str
+
+
+class ContainerFinding(Model):
+    view: FindingView
+    occurrences: tuple[Occurrence, ...]
+    history: tuple[Decision, ...] = ()
+
+
+class ContainerFindings(ViewModel):
+    as_of: datetime | None = None
+    repository_id: UUID
+    repository_url: str
+    report_stem: str
+    image_repository: str
+    reports: tuple[ContainerReport, ...]
+    findings: tuple[ContainerFinding, ...]
+    total: FindingTally
+
+
+class FindingsRollup(ViewModel):
+    """Open findings by severity per repository and product; distinct findings in `total`."""
+
+    as_of: datetime | None = None
+    total: FindingTally
+    products: tuple[ProductRollup, ...] = ()
+    repositories: tuple[RepositoryRollup, ...] = ()
+    top: tuple[TopFinding, ...] = ()
+    categories: tuple[FindingRollup, ...] = ()  # per `category` label, largest first
+    attack_scenarios: tuple[AttackScenario, ...] = ()  # a product or team scope's, verbatim
+
+
+class PatternExample(Model):
+    repository_url: str
+    path: str
+    line_start: int | None = None
+    line_end: int | None = None
+    symbol: str | None = None
+
+
+class InsecurePattern(Model):
+    """Findings sharing a primary CWE: occurrences are distinct (repository, path) pairs."""
+
+    cwe: str
+    asvs: str | None = None
+    repositories: int
+    occurrences: int
+    severities: SeverityCounts
+    examples: tuple[PatternExample, ...] = ()
+
+
+class InsecurePatternCut(Model):
+    """One corpus ownership class's patterns, ranked by repositories then occurrences;
+    `without_cwe` counts the findings that carry no CWE and so fit no pattern."""
+
+    ownership: OwnershipClass | None = None
+    without_cwe: int = 0
+    patterns: tuple[InsecurePattern, ...] = ()
+
+
+class InsecurePatterns(ViewModel):
+    """Current findings (false positives dropped) grouped by primary CWE per ownership class."""
+
+    as_of: datetime | None = None
+    cuts: tuple[InsecurePatternCut, ...] = ()
+
+
+class FindingsTrendPoint(FindingSeriesPoint):
+    """A bucket summed over the scope: of the repositories reported by its end, how many had a
+    decision recorded (ledger coverage)."""
+
+    reported: int = 0
+    dispositioned: int = 0
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def fp_rate(self) -> float:
+        """False positives as a share (%) of the decisions recorded within the bucket."""
+        return round(100 * self.false_positives / self.decisions, 1) if self.decisions else 0.0
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def coverage(self) -> float:
+        return round(100 * self.dispositioned / self.reported, 1) if self.reported else 0.0
+
+
+class TrendDirection(Model):
+    """A metric's last bucket against the mean of up to three before it; within the dead band
+    it is flat, else improving or worsening by the metric's good direction."""
+
+    metric: str
+    last: float
+    baseline: float | None = None
+    change_pct: float | None = None  # None when flat on one bucket or rising from zero
+    rising: bool | None = None  # None when flat
+    worsening: bool = False
+
+
+class AcceptedRisk(Model):
+    """An accepted finding on the standing register: unfixed, unmitigated, and who accepted it."""
+
+    finding_id: UUID
+    repository_url: str
+    title: str
+    severity: Severity
+    cvss_score: Decimal | None = None
+    accepted_at: datetime | None = None
+    accepted_by: str | None = None
+    rationale: str | None = None
+
+
+class FindingsTrend(ViewModel):
+    """The scope's findings bucket by bucket, summed over its repositories, each metric's
+    direction, and the accepted-risk register standing at `as_of`."""
+
+    as_of: datetime
+    repositories: int
+    points: tuple[FindingsTrendPoint, ...] = ()
+    directions: tuple[TrendDirection, ...] = ()
+    accepted: tuple[AcceptedRisk, ...] = ()
+
+
+class ProgramMetrics(ViewModel):
+    """What the program spent and ran over a window: spend rollups and per-asset throughput."""
+
+    window: TimeWindow
+    bucket: TimeBucket
+    spend: SpendAttribution
+    by_month: tuple[SpendRollup, ...] = ()
+    by_model: tuple[SpendRollup, ...] = ()
+    by_lane: tuple[SpendRollup, ...] = ()
+    by_skill: tuple[SpendRollup, ...] = ()
+    throughput: Mapping[str, tuple[ThroughputPoint, ...]] = Field(default_factory=dict)
+
+
+class TriageDocument(ViewModel):
+    """A stored triage document, rendered as the triage report."""
+
+    artifact_id: UUID
+    payload: str
+
+
+class OscalAssessmentResults(ViewModel):
+    """A recorded compliance assessment as OSCAL; the JSON model is the OSCAL document itself."""
+
+    model_config = ConfigDict(
+        frozen=True, extra="forbid", populate_by_name=True, serialize_by_alias=True
+    )
+
+    assessment_results: dict[str, Any] = Field(alias="assessment-results")
+
+
+class SarifLog(ViewModel):
+    """A repository's findings as SARIF 2.1.0; the JSON model is the SARIF log itself."""
+
+    model_config = ConfigDict(
+        frozen=True, extra="forbid", populate_by_name=True, serialize_by_alias=True
+    )
+
+    schema_: str = Field(alias="$schema")
+    version: str
+    runs: tuple[dict[str, Any], ...]
+
+
+class PqcScope(Model):
+    """One product's (None = every commit's) latest PQC readiness, by bucket and provenance."""
+
+    product_id: UUID | None = None
+    by_bucket: tuple[PqcRollup, ...] = ()
+    by_provenance: tuple[PqcRollup, ...] = ()
+
+
+class PqcDashboard(ViewModel):
+    scopes: tuple[PqcScope, ...] = ()
+
+
+class PqcRepositoryRow(Model):
+    repository_url: str
+    readiness: PqcReadiness
+
+
+class PqcSiteRow(Model):
+    repository_url: str
+    site: PqcSite
+
+
+class PqcPackageUse(Model):
+    """A crypto package of the scope's manifest SBOMs and the repositories pulling it in."""
+
+    package: str
+    provider: str | None = None
+    repositories: int
+
+
+class PqcProductRow(Model):
+    product: str
+    repositories: int
+    not_ready: int
+    hndl_priority: int
+    clock_2030: int
+    worst_url: str | None = None
+    worst_overall: float | None = None
+
+
+class PqcPortfolioScope(Model):
+    """One product's (None = every commit's) ranked PQC worklists, worst first."""
+
+    product_id: UUID | None = None
+    repositories: tuple[PqcRepositoryRow, ...] = ()
+    sites: tuple[PqcSiteRow, ...] = ()
+    packages: tuple[PqcPackageUse, ...] = ()
+    without_sbom: int = 0
+
+
+class PqcPortfolio(ViewModel):
+    scopes: tuple[PqcPortfolioScope, ...] = ()
+    products: tuple[PqcProductRow, ...] = ()
+
+
+class PqcVendorRow(Model):
+    """A vendor's latest claim and the repositories whose manifests hold its packages (None:
+    it names no package, reached through a provider, toolchain or service)."""
+
+    claim: PqcVendorClaim
+    repositories: int | None = None
+
+
+class PqcVendorRoadmap(ViewModel):
+    """The latest vendor claims worst first, with fleet counts derived from the default-branch
+    manifests (`unmeasured` repositories have none) and the blocked-external repositories."""
+
+    claims_artifact_id: UUID
+    version: int
+    updated: date
+    vendors: tuple[PqcVendorRow, ...] = ()
+    repositories: int
+    unmeasured: int
+    blocked_external: tuple[str, ...] = ()
+
+
+class ExposureDashboard(ViewModel):
+    """Dependency exposure from the latest impact analyses, by advisory, product and verdict."""
+
+    by_advisory: tuple[ExposureRollup, ...] = ()
+    by_product: tuple[ExposureRollup, ...] = ()
+    by_classification: tuple[ExposureRollup, ...] = ()
+
+
+class EcosystemReach(Model):
+    ecosystem: str
+    repositories: int
+    packages: int
+
+
+class PackageReach(Model):
+    """A package and its blast radius: the repositories whose manifests hold it."""
+
+    ecosystem: str
+    name: str
+    repositories: int
+
+
+class DependencyReach(ViewModel):
+    """What the scope's default-branch manifests hold: per ecosystem, the most shared packages,
+    and how many repositories have no manifest SBOM to read."""
+
+    repositories: int
+    unmeasured: int
+    ecosystems: tuple[EcosystemReach, ...] = ()
+    shared: tuple[PackageReach, ...] = ()
+
+
+class PrivilegeRow(Model):
+    """One repository's latest priv-profile as the least-privilege rollup reads it."""
+
+    repository: str
+    assessment_id: UUID
+    workloads: int
+    privileged_workloads: int | None = None
+    rbac_rules: int
+    wildcard_rules: int | None = None
+    scc_requests: tuple[str, ...] = ()
+    flags: Mapping[str, int] = Field(default_factory=dict)
+    containers: int | None = None
+    privileged_containers: int | None = None
+    run_as_non_root_containers: int | None = None
+    namespaces: tuple[str, ...] = ()
+    install_modes: tuple[str, ...] = ()
+    kubebuilder_markers: int | None = None
+    surplus: int | None = None
+    distinct_rule_triples: int
+    distinct_cluster_triples: int
+
+
+class PrivilegesRollup(ViewModel):
+    """Operator least privilege: the scope's latest priv-profiles as of `as_of`, ranked by tier-2
+    surplus, then wildcard rules, then privileged workloads."""
+
+    as_of: datetime | None = None
+    rows: tuple[PrivilegeRow, ...] = ()
+
+
+class FuzzTargetRow(Model):
+    """One target's latest fuzz run: its harnesses by outcome, crashers, coverage and gaps."""
+
+    repository: str
+    target: str
+    language: str
+    assessment_id: UUID
+    occurred_at: datetime
+    engines: tuple[str, ...]
+    outcomes: Mapping[str, int]  # harnesses per run outcome (clean, crashed, failed, not_run)
+    execs: int | None = None  # None when no harness reported executions
+    crashers: int
+    lines_covered: int | None = None  # None: coverage not measured
+    lines_total: int | None = None
+    gaps: int
+
+
+class FuzzCrasherRow(Model):
+    """A crasher a target's latest run recorded, as the producer proposed it."""
+
+    repository: str
+    target: str
+    harness: str
+    crasher: str
+    title: str
+    crash_class: str
+    severity: ScannerSeverity
+    cvss: float | None = None
+    cwes: tuple[str, ...] = ()
+    reproducer_sha256: str
+    confirms_finding_id: UUID | None = None
+
+
+class FuzzGapRow(Model):
+    """A surface a target's latest run left unfuzzed, and why."""
+
+    repository: str
+    target: str
+    surface: str
+    reason: str
+    harness: str | None = None
+    note: str | None = None
+
+
+class ValidationFuzz(ViewModel):
+    """The fuzz campaign: each target's latest recorded run as of `as_of`, its crashers ranked
+    by CVSS then proposed severity, and the surfaces left unfuzzed; and each repository's
+    validated findings by latest verdict (key: the repository URL), most confirmed first."""
+
+    as_of: datetime | None = None
+    targets: tuple[FuzzTargetRow, ...] = ()
+    crashers: tuple[FuzzCrasherRow, ...] = ()
+    gaps: tuple[FuzzGapRow, ...] = ()
+    validation: tuple[ValidationRollup, ...] = ()
+
+
+class Scoreboard(ViewModel):
+    """The leadership scoreboard: headline numbers read off the executive summary, findings
+    trend and threat register as of `as_of`, plus the findings filed in Jira."""
+
+    as_of: datetime
+    repositories: int
+    reported: int
+    dispositioned: int
+    open: SeverityCounts
+    repositories_with_critical: int
+    repositories_with_high: int
+    credential_leaks: int
+    resolved: int
+    risk_accepted: int
+    false_positives: int
+    hardening: int
+    execution_proven: int
+    themes: Mapping[str, int] = Field(default_factory=dict)
+    trend: FindingsTrendPoint | None = None  # the latest bucket
+    threat_models: int
+    threats: int
+    open_threats: int
+    filed: int
+
+
+class CensusCut(Model):
+    """One corpus ownership class's work and distinct vulnerabilities; `ownership` None holds
+    the repositories no product with a registered ownership ships."""
+
+    ownership: OwnershipClass | None = None
+    products: int = 0
+    repositories: int = 0
+    audited: int = 0  # repositories with a default-line secure-code audit
+    audits: int = 0  # default-line secure-code audits (work performed)
+    branch_audits: int = 0
+    distinct: SeverityCounts = SeverityCounts()
+    open: SeverityCounts = SeverityCounts()
+    occurrences: int = 0  # how often default-line assessments reported the distinct ones
+    hardening: int = 0
+    false_positives: int = 0
+    dispositioned: int = 0  # distinct vulnerabilities with a decision recorded
+    branch_confirmed: int = 0  # distinct vulnerabilities a branch re-audit also reported
+    branch_only: int = 0  # vulnerabilities only branch re-audits reported
+
+
+class CensusProduct(Model):
+    product_id: UUID
+    slug: str
+    name: str
+    ownership: OwnershipClass | None = None
+    business_unit: str | None = None
+    repositories: int = 0
+
+
+class CensusLayer(Model):
+    """Findings of a unit kept out of the distinct-vulnerability headline (declared IaC,
+    container images): counted, never folded in."""
+
+    findings: SeverityCounts = SeverityCounts()
+    false_positives: int = 0
+
+
+class Census(ViewModel):
+    """The denominator authority: per corpus ownership class, distinct vulnerabilities (one per
+    finding, default line only) over the scope's repositories as of `as_of`."""
+
+    as_of: datetime
+    repositories: int
+    reported: int
+    dispositioned: int
+    never_assessed: int
+    cuts: tuple[CensusCut, ...] = ()
+    products: tuple[CensusProduct, ...] = ()
+    cloud_config: CensusLayer = CensusLayer()
+    container: CensusLayer = CensusLayer()
+    unregistered: tuple[str, ...] = ()  # repository URLs no ownership-registered product ships
+
+
+class ComplianceDashboard(ViewModel):
+    by_framework: tuple[ComplianceRollup, ...] = ()
+    by_scope: tuple[ComplianceRollup, ...] = ()
+
+
+class CoverageDashboard(ViewModel):
+    """What the scope's repositories had assessed by `as_of`, and what their audits missed."""
+
+    repositories: int
+    population: Population
+    gaps: Coverage
+
+
+class RankedThreat(Model):
+    """A threat with the band it ranks by: its stated OWASP severity, else the legacy crosswalk."""
+
+    threat: Threat
+    band: RiskRatingBand | None = None
+    crosswalked: bool = False
+
+
+class QuickWin(Model):
+    """A class-closing xs/s mitigation covering unmitigated high or critical threats."""
+
+    repository_id: UUID
+    mitigation: str
+    effort: str
+    covers: tuple[str, ...]
+    band: RiskRatingBand
+    blocked_external: bool | None = None
+
+
+class RankedBoundary(Model):
+    """A tenant boundary with what ranks it: its failed and partial dimensions (weighing 2
+    and 1) and the open threats it tags."""
+
+    boundary: TenantBoundary
+    weakness: int
+    failed: tuple[IsolationDimension, ...] = ()
+    partial: tuple[IsolationDimension, ...] = ()
+    open_threats: tuple[Label, ...] = ()
+
+
+class ThreatRegister(ViewModel):
+    """The scope's threats from each repository's latest threat model as of `as_of`, ranked."""
+
+    as_of: datetime
+    repository_urls: Mapping[UUID, str]
+    models: int
+    threats: tuple[RankedThreat, ...] = ()
+    quick_wins: tuple[QuickWin, ...] = ()
+    tenant_boundaries: tuple[RankedBoundary, ...] = ()  # weakest first
+    open_variances: tuple[DocVariance, ...] = ()
+
+
+class TechniqueCoverage(Model):
+    """One technique's evidence: threats that model it, findings whose category implies it."""
+
+    technique_id: str
+    name: str
+    tactics: tuple[str, ...] = ()
+    modeled: int = 0
+    derived: int = 0
+    score: int  # the Navigator score: 3 observed, 2 modeled, 1 weakness-derived
+
+
+class AttackCoverage(ViewModel):
+    """The scope's ATT&CK coverage as of `as_of`: modeled (latest threat models' techniques) and
+    derived (finding categories through the pack's category map), never blended."""
+
+    # NEED(validation: confirmed chains' ATT&CK refs via ValidationService): the observed class.
+    as_of: datetime
+    attack_version: str
+    mapping_version: str
+    attribution: str
+    repositories: int
+    threat_models: int
+    threats_with_techniques: int
+    findings_mapped: int
+    techniques: tuple[TechniqueCoverage, ...] = ()  # highest score first, then id
+    dropped: Mapping[str, int] = Field(default_factory=dict)  # cited ids not live in the release
+    navigator_layer: Mapping[str, Any] = Field(default_factory=dict)  # ATT&CK Navigator 4.5
+
+
+class RepositoryLoc(Model):
+    """A repository's measured lines at its default-branch commit; `unmeasured` says why not."""
+
+    repository_id: UUID
+    repository_url: str
+    repository_ref_id: UUID | None = None
+    code_delta: int | None = None
+    total_delta: int | None = None
+    code: int | None = None
+    total: int | None = None
+    primary: str | None = None
+    languages: tuple[LanguageCount, ...] = ()
+    unmeasured: str | None = None
+
+
+class LanguageTotal(Model):
+    name: str
+    code: int
+    repositories: int
+    documentation: bool
+
+
+class LocComparison(Model):
+    as_of: datetime
+    code: int
+    total: int
+    measured_repositories: int
+    comparable_repositories: int
+    code_delta: int
+    total_delta: int
+
+
+class LocDashboard(ViewModel):
+    """Lines of code the scope's repositories hold, by language and repository, largest first."""
+
+    code: int
+    as_of: datetime | None = None
+    comparison: LocComparison | None = None
+    first_party_divisor: Decimal | None = None
+    first_party_estimate: Decimal | None = None
+    total: int
+    reported: int = 0  # repositories with findings reported, for the population block
+    dispositioned: int = 0  # of those, with a decision recorded
+    languages: tuple[LanguageTotal, ...] = ()
+    repositories: tuple[RepositoryLoc, ...] = ()
+
+
+class RemediationRow(Model):
+    """One work item: its product (None when no product is named), where its fix lives once
+    reported, and where it stands."""
+
+    product: str | None = None
+    repository_url: str
+    work_item_id: UUID
+    status: RemediationStatus
+    findings: int
+    fork_url: str | None = None
+    fix_branch: str | None = None
+    tracker: str | None = None
+
+
+class RemediationIndex(ViewModel):
+    """Work items of the scope's repositories per product, oldest first, counted by status."""
+
+    rows: tuple[RemediationRow, ...] = ()
+    by_status: Mapping[str, int] = Field(default_factory=dict)
+
+
+class LanguageSeverity(Model):
+    """Open findings of the repositories whose primary language this is."""
+
+    language: str
+    repositories: int
+    open: SeverityCounts
+
+
+class LeastPrivilege(Model):
+    """Declared-privilege posture from the latest priv-profiles; posture, never finding counts."""
+
+    profiles: int
+    privileged: int
+    scc_requesting: int
+    wildcard_repositories: int
+    wildcard_rules: int
+    flags: Mapping[str, int] = Field(default_factory=dict)
+
+
+class IsolationReviewRow(Model):
+    repository: str
+    assessment_id: UUID
+    service: str
+    posture: str
+    interfaces: int
+    gaps: int
+    dimensions: Mapping[str, int] = Field(default_factory=dict)
+
+
+class IsolationSummary(Model):
+    reviews: tuple[IsolationReviewRow, ...] = ()
+    threat_register: ThreatRegister
+
+
+class DeclaredIacTarget(Model):
+    repository: str
+    assessment_id: UUID
+    target: str
+    unsuppressed: int
+    suppressed: int
+    needs_review: int
+    ledgered: int
+    severities: SeverityCounts
+
+
+class DeclaredIac(Model):
+    repositories: int
+    assessments: int
+    findings: CensusLayer
+    targets: tuple[DeclaredIacTarget, ...] = ()
+
+
+class ExecutiveSummary(ViewModel):
+    """The leadership roll-up; `exposure` is fleet-wide, None for a product or team scope."""
+
+    rollup: FindingsRollup
+    credential_leaks: tuple[TopFinding, ...] = ()
+    themes: Mapping[str, int] = Field(default_factory=dict)
+    hardening_themes: Mapping[str, int] = Field(default_factory=dict)
+    languages: tuple[LanguageSeverity, ...] = ()
+    privileges: LeastPrivilege
+    exposure: tuple[ExposureRollup, ...] | None = None
+    attack: AttackCoverage | None = None
+    pqc: PqcPortfolio | None = None
+    pqc_unavailable: str | None = None
+    isolation: IsolationSummary | None = None
+    iac: DeclaredIac | None = None
+
+
+class ReviewCard(Model):
+    """One case waiting on a person, with its finding and the false-positive call it weighs."""
+
+    case: ReviewCase
+    finding: FindingView
+    refutation: Decision | None = None
+
+
+class ReviewCards(ViewModel):
+    """The scope's review queue as countersign cards, oldest first."""
+
+    cards: tuple[ReviewCard, ...] = ()
+
+
+class SlaTarget(Model):
+    resolve_days: int | None
+    acknowledge_days: int | None = None
+
+
+class SlaCvssFloor(Model):
+    threshold: Decimal
+    resolve_days: int
+
+
+class SlaProfile(Model):
+    """Resolve clocks per severity: null days = tracked, never overdue; an absent severity is
+    outside the profile unless the CVSS floor catches it."""
+
+    default: bool = False
+    description: str | None = None
+    slas: Mapping[Severity, SlaTarget]
+    cvss_floor_days: SlaCvssFloor | None = None
+
+
+class SlaPolicySource(Model):
+    name: str
+    url: str | None = None
+    retrieved: date
+    note: str | None = None
+
+
+class SlaPolicy(Model):
+    """The contracts `sla-policy` document: SLAs are policy data, never code."""
+
+    policy_name: str
+    source: SlaPolicySource
+    severity_mapping: Mapping[str, Severity]
+    clock_start: SlaClockStart = SlaClockStart("first_routed_or_filed")
+    profiles: Mapping[str, SlaProfile]
+
+
+class SlaClockBasis(StrEnum):
+    FILED = "filed"
+    FIRST_EVENT = "first_event"
+    AUDIT_DATE = "audit_date"
+
+
+class SlaCounts(Model):
+    """Every in-scope finding lands in one count; unclocked and out-of-scope are shown, never
+    dropped."""
+
+    open_in_sla: int = 0
+    open_overdue: int = 0
+    open_no_sla: int = 0
+    unclocked: int = 0
+    accepted: int = 0
+    resolved_met: int = 0
+    resolved_breached: int = 0
+    resolved_unclocked: int = 0
+    out_of_profile_scope: int = 0
+
+
+class SlaTeamRow(Model):
+    team: str
+    overdue: int
+    critical: int
+    worst_days: int
+
+
+class SlaEscalation(Model):
+    finding_id: UUID
+    repository_url: str
+    severity: Severity | None
+    title: str
+    teams: tuple[str, ...]
+    due: datetime
+    days_overdue: int
+    clock_basis: SlaClockBasis
+
+
+class SlaProfileView(Model):
+    profile: str
+    description: str | None = None
+    counts: SlaCounts
+    resolved_compliance_pct: float | None = None
+    median_days_to_resolve: Mapping[ScannerSeverity, int] = Field(default_factory=dict)
+    overdue_by_severity: Mapping[ScannerSeverity, int] = Field(default_factory=dict)
+    teams: tuple[SlaTeamRow, ...] = ()
+    escalations: tuple[SlaEscalation, ...] = ()
+
+
+class SlaDashboard(ViewModel):
+    """Owner-response clocks over the scope's findings, one block per policy profile (the
+    default first): different clocks over the same findings."""
+
+    policy_name: str
+    source: SlaPolicySource
+    clock_start: SlaClockStart
+    as_of: datetime
+    profiles: tuple[SlaProfileView, ...]
+
+
+class RenderedView(Model):
+    """A view built and rendered; nothing is stored, the caller writes `<stem>.md/.html/.json`."""
+
+    view: ViewName
+    stem: str
+    model: SerializeAsAny[ViewModel]
+    markdown: str
+    html: str
+    csv: str | None = None  # the view's export table, when it has one
+
+
+class RefreshResult(Model):
+    """Each view rendered, and why each other view failed."""
+
+    rendered: Mapping[ViewName, RenderedView] = Field(default_factory=dict)
+    failed: Mapping[ViewName, str] = Field(default_factory=dict)

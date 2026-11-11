@@ -1,23 +1,53 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from typing import Protocol
+from enum import StrEnum
+from pathlib import Path
+from typing import NewType, Protocol, runtime_checkable
+
+import pydantic
 
 from traust_core.v1.models.artifacts import ArtifactDocument
 from traust_core.v1.models.base import Model
 
-
-# Shapes land with the first Lint rule set (triage citation gate).
-class LintRuleId(Model): ...
+LintRuleId = NewType("LintRuleId", str)
 
 
-class LintContext(Model): ...
+class LintAction(StrEnum):
+    """What a violation asks of the skill; a lint routes, it never concludes."""
+
+    RE_VOTE = "re_vote"
+    REVIEW = "review"
 
 
-class Violation(Model): ...
+@runtime_checkable
+class CitationFiles(Protocol):
+    def resolve(self, cited: str) -> Path | None: ...
+
+    def matches(self, cited: str) -> list[Path]: ...
+
+    def line_count(self, path: Path) -> int | None: ...
 
 
-class LintReport(Model): ...
+class LintContext(Model):
+    model_config = pydantic.ConfigDict(frozen=True, extra="forbid", arbitrary_types_allowed=True)
+
+    files: CitationFiles | None = None
+
+
+class Violation(Model):
+    rule: LintRuleId
+    item: str
+    message: str
+    action: LintAction
+
+
+class LintReport(Model):
+    violations: tuple[Violation, ...] = ()
+
+    @property
+    def passed(self) -> bool:
+        return not self.violations
 
 
 class LintRule(Protocol):
@@ -31,8 +61,5 @@ class Lint:
         self._rules = rules
 
     def run(self, subject: ArtifactDocument, context: LintContext) -> LintReport:
-        raise NotImplementedError(
-            "stub: replaces check_citations, lint_verdict_citations,"
-            " validate_compliance_assessment, validate_isolation_review,"
-            " rbac_bucket_proposal_check, reporting/lint.py"
-        )
+        rules = self._rules.get(type(subject), ())
+        return LintReport(violations=tuple(v for r in rules for v in r.check(subject, context)))

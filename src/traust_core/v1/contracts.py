@@ -9,19 +9,25 @@ from importlib import resources
 from importlib.metadata import distribution
 from pathlib import Path
 from types import MappingProxyType, ModuleType
-from typing import Any, Literal
+from typing import Any, Literal, TypeAlias, cast
 
 from jsonschema import Draft202012Validator, FormatChecker
+from jsonschema import ValidationError as SchemaViolation
 from referencing import Registry, Resource
+from traust_contracts.config import config_completeness_audit as _config_completeness_audit
+from traust_contracts.v1 import risk_rating as risk_rating  # OWASP arithmetic, one owner
 from traust_contracts.v1.ledger import sql as ledger_sql
 from traust_contracts.v1.ops import sql as ops_sql
 from traust_contracts.v1.storage import sql as storage_sql
+from traust_contracts.v1.timestamps import TimestampError as TimestampError
+from traust_contracts.v1.timestamps import to_rfc3339 as to_rfc3339
 
 from traust_core.v1.errors import ConfigError, DocumentError, Issue
 
 Dialect = Literal["sqlite", "postgres"]
 Area = Literal["traust", "traust_ops", "traust_ledger"]
 AREAS: tuple[Area, ...] = ("traust", "traust_ops", "traust_ledger")
+JsonValue: TypeAlias = str | int | float | bool | list["JsonValue"] | dict[str, "JsonValue"] | None
 
 
 @cache
@@ -40,12 +46,12 @@ def _read_json(path: Path) -> dict[str, Any]:
         raise ConfigError(f"traust-contracts has no {path.relative_to(_root())}") from None
 
 
-def _schema_dir() -> Path:
+def schema_dir() -> Path:
     return _root() / "artifacts_schema/v1"
 
 
 def schema_path(name: str) -> Path:
-    return _schema_dir() / f"{name}.schema.json"
+    return schema_dir() / f"{name}.schema.json"
 
 
 def schema(name: str) -> dict[str, Any]:
@@ -53,7 +59,7 @@ def schema(name: str) -> dict[str, Any]:
 
 
 def schema_names() -> list[str]:
-    return sorted(p.name.removesuffix(".schema.json") for p in _schema_dir().glob("*.json"))
+    return sorted(p.name.removesuffix(".schema.json") for p in schema_dir().glob("*.json"))
 
 
 def enum_values(name: str) -> tuple[str, ...]:
@@ -63,7 +69,30 @@ def enum_values(name: str) -> tuple[str, ...]:
 @cache
 def enum(name: str) -> type[StrEnum]:
     class_name = "".join(p.capitalize() for p in name.replace("_", "-").split("-"))
-    members = {v.upper().replace("-", "_").replace(" ", "_"): v for v in enum_values(name)}
+    document = _read_json(_root() / "enums/v1" / f"{name}.json")
+    groups: dict[str, list[str]] = {}
+    for value in document["values"]:
+        member = value.upper().replace("-", "_").replace(" ", "_")
+        groups.setdefault(member, []).append(value)
+    members = {}
+    for member, values in groups.items():
+        if len(values) == 1:
+            members[member] = values[0]
+            continue
+        legacy = [v for v in values if v in document.get("deprecated", {})]
+        canonical = [v for v in values if v not in legacy]
+        if len(canonical) != 1 or not legacy:
+            raise ConfigError(f"ambiguous enum members in {name}: {values!r}")
+        target = EnumValue(document["name"], canonical[0])
+        if any(target not in normalize_enum(document["name"], v).pairs for v in legacy):
+            raise ConfigError(f"unrelated enum members in {name}: {values!r}")
+        for index, value in enumerate(legacy):
+            key = member if index == 0 else f"{member}_LEGACY_{index + 1}"
+            members[key] = value
+        key = f"{member}_CANONICAL"
+        if key in groups or key in members:
+            raise ConfigError(f"ambiguous canonical member in {name}: {key}")
+        members[key] = canonical[0]
     return StrEnum(class_name, members)  # type: ignore[return-value]
 
 
@@ -110,6 +139,18 @@ def normalize_enum(name: str, value: str) -> EnumNormalization:
     return EnumNormalization((EnumValue(name, value),))
 
 
+def validate_enum(name: str, value: str) -> None:
+    """Reject unknown and deprecated raw values at a new-write boundary."""
+    normalized = normalize_enum(name, value)
+    if (
+        value not in enum_values(name.replace("_", "-"))
+        or normalized.dropped
+        or normalized.pairs != (EnumValue(name, value),)
+        or value in _enum_normalization_registry()[name]
+    ):
+        raise DocumentError(name, [Issue("$", f"not a canonical value: {value!r}")])
+
+
 def resolve(schema_name: str, node: Mapping[str, Any]) -> list[tuple[str, Mapping[str, Any]]]:
     if "$ref" in node:
         file, _, pointer = node["$ref"].partition("#")
@@ -126,7 +167,7 @@ def resolve(schema_name: str, node: Mapping[str, Any]) -> list[tuple[str, Mappin
 @cache
 def _registry() -> Registry:
     resources_ = []
-    for path in _schema_dir().glob("*.schema.json"):
+    for path in schema_dir().glob("*.schema.json"):
         resource = Resource.from_contents(json.loads(path.read_text()))
         resources_ += [(path.name, resource), (resource.id() or path.name, resource)]
     return Registry().with_resources(resources_)
@@ -134,20 +175,86 @@ def _registry() -> Registry:
 
 @cache
 def _validator(name: str) -> Draft202012Validator:
-    return Draft202012Validator(schema(name), registry=_registry(), format_checker=FormatChecker())
+    schema_name, separator, pointer = name.partition("#")
+    document = schema(schema_name)
+    if separator:
+        document = {"$ref": f"{document['$id']}#{pointer}"}
+    return Draft202012Validator(document, registry=_registry(), format_checker=FormatChecker())
 
 
 def validate(name: str, document: Any) -> None:
-    errors = sorted(_validator(name).iter_errors(document), key=lambda e: list(e.absolute_path))
+    _check(name, _validator(name), document)
+
+
+def schema_errors(name: str, document: Any) -> list[tuple[tuple[str | int, ...], str]]:
+    """Every violation of the named artifact schema as (path, message), in document order."""
+    return [(tuple(e.absolute_path), e.message) for e in _violations(_validator(name), document)]
+
+
+def config_schema(name: str) -> dict[str, Any]:
+    """A `config/v1` schema: files that stay YAML and change by commit (packs, policies)."""
+    return _read_json(_root() / "config/v1" / f"{name}.schema.json")
+
+
+@cache
+def _config_validator(name: str) -> Draft202012Validator:
+    return Draft202012Validator(config_schema(name), format_checker=FormatChecker())
+
+
+def validate_config(name: str, document: Any) -> None:
+    _check(name, _config_validator(name), document)
+
+
+def view_schema(name: str) -> dict[str, JsonValue]:
+    """A `views_schema/v1` contract for an on-demand, non-persisted view."""
+    return cast(
+        dict[str, JsonValue],
+        _read_json(_root() / "views_schema/v1" / f"{name}.schema.json"),
+    )
+
+
+@cache
+def _view_validator(name: str) -> Draft202012Validator:
+    return Draft202012Validator(
+        view_schema(name), registry=_registry(), format_checker=FormatChecker()
+    )
+
+
+def validate_view(name: str, document: JsonValue) -> None:
+    _check(name, _view_validator(name), document)
+
+
+def _violations(validator: Draft202012Validator, document: Any) -> list[SchemaViolation]:
+    return sorted(validator.iter_errors(document), key=lambda e: list(e.absolute_path))
+
+
+def _check(name: str, validator: Draft202012Validator, document: Any) -> None:
+    errors = _violations(validator, document)
     if errors:
         raise DocumentError(
             name, [Issue("/".join(map(str, e.absolute_path)) or "$", e.message) for e in errors]
         )
 
 
+def config_completeness_audit(config_home: Path | None) -> tuple[list[str], list[str]]:
+    """traust-contracts' readiness audit of a deployment config home: `(errors, warnings)`."""
+    try:
+        return _config_completeness_audit(config_home=config_home)
+    except SchemaViolation as e:
+        raise DocumentError(
+            "deployment config", [Issue("/".join(map(str, e.absolute_path)) or "$", e.message)]
+        ) from e
+
+
+def _unique_members(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    if len({key for key, _ in pairs}) != len(pairs):
+        raise ValueError("duplicate JSON member")
+    return dict(pairs)
+
+
 def validate_json(name: str, payload: bytes) -> Any:
     try:
-        document = json.loads(payload)
+        document = json.loads(payload, object_pairs_hook=_unique_members)
     except ValueError as e:
         raise DocumentError(name, [Issue("$", f"not JSON: {e}")]) from None
     validate(name, document)
@@ -168,6 +275,31 @@ def ddl(area: Area, dialect: Dialect) -> list[str]:
     return [
         s for path in ddl_files(area, dialect) for s in loader.bootstrap_statements(dialect, path)
     ]
+
+
+def manifest_sbom_binding_upgrade(dialect: Dialect) -> list[str]:
+    """The additive upgrade for a database whose `repository_ref` predates the manifest scan
+    pointer; apply it only when that column is absent. Old SBOMs keep unknown coverage."""
+    return storage_sql.manifest_sbom_binding_upgrade(dialect)
+
+
+def run_order_fork_scheduled_upgrade(dialect: Dialect) -> list[str]:
+    """The additive upgrade for a database whose `run_order` predates the scheduling stamp;
+    apply it only when that column is absent. Old orders carry no stamp."""
+    return ops_sql.run_order_fork_scheduled_upgrade(dialect)
+
+
+def artifact_run_order_upgrade(dialect: Dialect) -> list[str]:
+    """The additive upgrade for a database whose `artifact` predates the recording order;
+    apply it only when that column is absent. Old artifacts name no order."""
+    return storage_sql.artifact_run_order_upgrade(dialect)
+
+
+def default_named_at_upgrade(dialect: Dialect) -> list[str]:
+    """The additive upgrade for a database whose `repository_ref` predates the default-head
+    naming time; apply it only when that column is absent. Old flags keep an unknown
+    naming time until their line is named again."""
+    return storage_sql.default_named_at_upgrade(dialect)
 
 
 def database_ddl(dialect: Dialect) -> list[str]:

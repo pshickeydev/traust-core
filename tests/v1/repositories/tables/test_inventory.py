@@ -3,8 +3,20 @@
 from __future__ import annotations
 
 from datetime import timedelta
+from uuid import uuid4
 
-from tests.v1.repositories.tables.conftest import SHA, T0, Seed, apart, same_rows
+import pytest
+import sqlalchemy as sa
+
+from tests.v1.repositories.tables.conftest import (
+    SHA,
+    T0,
+    Seed,
+    apart,
+    repository_for,
+    same_rows,
+)
+from traust_core.v1.errors import NotFoundError
 
 B = "b" * 40
 
@@ -87,3 +99,84 @@ def test_closing_ownership_moves_it_out_of_current(seed: Seed) -> None:
     closed = u.ownerships.update(owned.model_copy(update={"valid_to": T0 + timedelta(days=3)}))
     assert u.ownerships.current(owned.repository_id) == []
     assert u.ownerships.as_of(owned.repository_id, T0 + timedelta(days=1)) == [closed]
+
+
+def test_archived_is_unknown_until_observed(seed: Seed) -> None:
+    repos = seed.uow.repositories
+    unobserved, archived = seed.repository(), seed.repository(archived=True)
+    assert repos.get(unobserved.id).archived is None
+    assert repos.get(archived.id).archived is True
+    assert repos.update(unobserved.model_copy(update={"archived": False})).archived is False
+
+
+def test_products_list_by_slug_after_a_position(seed: Seed) -> None:
+    u = seed.uow
+    b, a, c = seed.product(slug="b"), seed.product(slug="a"), seed.product(slug="c")
+    assert u.products.list_after(None, 2) == [a, b]
+    assert u.products.list_after("b", 2) == [c]
+    assert u.products.list_after("c", 2) == []
+
+
+def test_a_private_mirror_is_a_non_public_fork(seed: Seed) -> None:
+    upstream = seed.repository()
+    assert seed.uow.repositories.find_private_mirror(upstream.id) is None
+    seed.repository(upstream_id=upstream.id, public=True)
+    mirror = seed.repository(upstream_id=upstream.id, public=False)
+    seed.repository(public=False)
+    assert seed.uow.repositories.find_private_mirror(upstream.id) == mirror
+    assert seed.uow.repositories.find_private_mirror(mirror.id) is None
+
+
+def test_feed_after_reads_releases_by_record_time_and_resumes_after_ties(seed: Seed) -> None:
+    releases = seed.uow.releases
+    assert releases.feed_after(None, 10) == []
+    product = seed.product()
+    late = seed.release(product)
+    tied = [seed.release(product) for _ in range(3)]
+    table = repository_for(seed.uow, "release").table
+    seed.uow.connection.execute(
+        sa.update(table)
+        .where(table.c.id.in_([r.id for r in tied]))
+        .values(created_at=T0 - timedelta(days=1))
+    )
+    rows = sorted(
+        (r for r in releases.list_for_product(product.id) if r.id != late.id),
+        key=lambda r: str(r.id),
+    )
+    assert releases.feed_after(None, 10) == [*rows, late]
+    assert releases.feed_after(None, 2) == rows[:2]
+    for i, row in enumerate(rows):
+        assert row.created_at is not None and row.id is not None
+        assert releases.feed_after((row.created_at, row.id), 10) == [*rows[i + 1 :], late]
+
+
+def test_refs_list_by_id(seed: Seed) -> None:
+    refs = seed.uow.repository_refs
+    one, two = seed.repository_ref(), seed.repository_ref()
+    seed.repository_ref()
+    assert same_rows(refs.list_by_ids([one.id, two.id]), [one, two])  # type: ignore[list-item]
+    assert refs.list_by_ids([]) == []
+
+
+def test_repositories_list_by_id(seed: Seed) -> None:
+    repositories = seed.uow.repositories
+    one, two = seed.repository(), seed.repository()
+    seed.repository()
+    assert same_rows(repositories.list_by_ids([one.id, two.id]), [one, two])  # type: ignore[list-item]
+    assert repositories.list_by_ids([]) == []
+
+
+def test_a_ref_locked_for_update_is_the_ref_and_a_missing_one_raises(seed: Seed) -> None:
+    ref = seed.repository_ref()
+    assert ref.id is not None
+    assert seed.uow.repository_refs.get_for_update(ref.id) == ref
+    with pytest.raises(NotFoundError):
+        seed.uow.repository_refs.get_for_update(uuid4())
+
+
+def test_repository_get_for_update_finds_the_row_or_raises(seed: Seed) -> None:
+    repository = seed.repository()
+    assert repository.id is not None
+    assert seed.uow.repositories.get_for_update(repository.id) == repository
+    with pytest.raises(NotFoundError, match="repository"):
+        seed.uow.repositories.get_for_update(uuid4())

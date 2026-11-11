@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from contextvars import copy_context
 from datetime import UTC, datetime
 from enum import StrEnum
 from types import TracebackType
@@ -14,6 +16,8 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.compiler import compiles
 
 from traust_core.v1.errors import ConflictError, NotFoundError, RepositoryError
+
+_WRITE_INTENT = "traust_write_intent"
 
 
 class Dialect(StrEnum):
@@ -32,7 +36,7 @@ def _compact_json(value: Any) -> str:
 
 
 def create_database_engine(url: str | sa.URL) -> Engine:
-    engine = sa.create_engine(url, json_serializer=_compact_json)
+    engine = sa.create_engine(url, json_serializer=_compact_json, hide_parameters=True)
     if engine.dialect.name != "sqlite":
         return engine
 
@@ -120,6 +124,25 @@ def _sqlite_now(element: Any, compiler: Any, **kw: Any) -> str:
     return "strftime('%Y-%m-%dT%H:%M:%fZ','now')"
 
 
+class UtcMonth(sa.FunctionElement[str]):
+    """YYYY-MM of a timestamp column, in UTC, on either dialect."""
+
+    type = sa.Text()
+    name = "utc_month"
+    inherit_cache = True
+
+
+@compiles(UtcMonth, "postgresql")
+def _postgres_month(element: Any, compiler: Any, **kw: Any) -> str:
+    return f"to_char({compiler.process(element.clauses, **kw)} AT TIME ZONE 'UTC', 'YYYY-MM')"
+
+
+@compiles(UtcMonth, "sqlite")
+def _sqlite_month(element: Any, compiler: Any, **kw: Any) -> str:
+    # Contracts' TEXT timestamps are already UTC ISO-8601.
+    return f"substr({compiler.process(element.clauses, **kw)}, 1, 7)"
+
+
 def record_columns() -> tuple[sa.Column[UUID], sa.Column[datetime], sa.Column[datetime]]:
     """Mutable base columns: UUIDv4 id; the touch trigger keeps updated_at."""
     return (
@@ -147,14 +170,20 @@ def apply_schema(engine: Engine, statements: Iterable[str]) -> None:
                     cursor.execute(stmt)
             finally:
                 cursor.close()
-    except SQLAlchemyError as e:
-        raise RepositoryError(f"apply schema failed: {e}") from e
+    # The raw cursor raises the driver's own errors, which SQLAlchemy never wraps.
+    except (SQLAlchemyError, engine.dialect.loaded_dbapi.Error) as e:
+        raise RepositoryError("apply schema failed", operation="apply_schema") from e
 
 
 class SqlUnitOfWork:
+    """Re-entrant shared transaction; a failed nested scope makes it rollback-only."""
+
     def __init__(self, engine: Engine) -> None:
         self._engine = engine
         self._connection: Connection | None = None
+        self._depth = 0
+        self._rollback_only = False
+        self._after_commit: list[Callable[[], None]] = []
 
     @property
     def connection(self) -> Connection:
@@ -166,12 +195,38 @@ class SqlUnitOfWork:
         pass
 
     def __enter__(self) -> Self:
-        try:
-            self._connection = self._engine.connect()
-        except SQLAlchemyError as e:
-            raise RepositoryError(f"{type(self).__name__}: connect failed: {e}") from e
-        self._open_repositories()
+        if self._depth == 0:
+            try:
+                self._connection = self._engine.connect()
+            except SQLAlchemyError as e:
+                name = type(self).__name__
+                raise RepositoryError(f"{name}: connect failed", operation=f"{name}.connect") from e
+            self._open_repositories()
+            self.connection.info[_WRITE_INTENT] = False
+            self._rollback_only = False
+        self._depth += 1
         return self
+
+    @contextmanager
+    def write(self) -> Iterator[Self]:
+        """Take SQLite write intent before admission reads; ordinary reads remain unchanged."""
+        with self:
+            connection = self.connection
+            if connection.dialect.name == "sqlite":
+                driver = connection.connection.driver_connection
+                if driver.in_transaction and not connection.info.get(_WRITE_INTENT):
+                    raise RepositoryError(
+                        "SQLite read transaction cannot safely acquire write intent"
+                    )
+                if not driver.in_transaction:
+                    try:
+                        connection.exec_driver_sql("BEGIN IMMEDIATE")
+                    except SQLAlchemyError as error:
+                        raise RepositoryError(
+                            "cannot acquire SQLite write intent", operation="SqlUnitOfWork.write"
+                        ) from error
+                    connection.info[_WRITE_INTENT] = True
+            yield self
 
     def __exit__(
         self,
@@ -179,17 +234,42 @@ class SqlUnitOfWork:
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
+        if exc_type is not None:
+            self._rollback_only = True
+        self._depth -= 1
+        if self._depth > 0:
+            return  # nested use: the outer owner owns the transaction
         try:
             self.rollback()
         finally:
             self.connection.close()
             self._connection = None
 
+    def after_commit(self, event: Callable[[], None]) -> None:
+        """Emit a service outcome only when the owning transaction has committed."""
+        context = copy_context()
+        if self._depth:
+            self._after_commit.append(lambda: context.run(event))
+        else:
+            context.run(event)
+
     def commit(self) -> None:
-        self.connection.commit()
+        """Only the outer owner commits; a failed transaction requires rollback first."""
+        connection = self.connection
+        if self._depth == 1:
+            if self._rollback_only:
+                raise RepositoryError("cannot commit a rollback-only transaction; roll back first")
+            connection.commit()
+            connection.info[_WRITE_INTENT] = False
+            events, self._after_commit = self._after_commit, []
+            for event in events:
+                event()
 
     def rollback(self) -> None:
+        self._after_commit.clear()
         self.connection.rollback()
+        self.connection.info[_WRITE_INTENT] = False
+        self._rollback_only = False
 
 
 class SqlRepository:
@@ -245,8 +325,15 @@ class SqlRepository:
         else:
             bound = dict(params or {})
         try:
-            return self._connection.execute(statement, bound)
+            result = self._connection.execute(statement, bound)
+            if self._connection.dialect.name == "sqlite" and isinstance(
+                statement, sa.sql.dml.UpdateBase
+            ):
+                self._connection.info[_WRITE_INTENT] = True
+            return result
         except IntegrityError as e:
-            raise ConflictError(f"{name}: {operation}: {e.orig}") from e
+            raise ConflictError(f"{name}: constraint violation") from e
         except SQLAlchemyError as e:
-            raise RepositoryError(f"{name}: {operation} failed: {e}") from e
+            raise RepositoryError(
+                f"{name}: database operation failed", operation=f"{name}.execute"
+            ) from e

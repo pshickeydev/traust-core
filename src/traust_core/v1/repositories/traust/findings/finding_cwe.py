@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from collections.abc import Collection
 from typing import Protocol
 from uuid import UUID
 
+from traust_core.v1.models.common import RecordBudget
 from traust_core.v1.models.findings import FindingCwe
 from traust_core.v1.repositories.tables import (
     TRAUST,
@@ -20,6 +22,9 @@ FINDING_CWE = TableSpec(
 class FindingCweRepository(MutableRecordRepository[FindingCwe], Protocol):
     def list_for_finding(self, finding_id: UUID) -> list[FindingCwe]: ...
     def list_for_cwe(self, cwe_id: UUID) -> list[FindingCwe]: ...
+    def list_for_findings(
+        self, finding_ids: Collection[UUID], *, read_budget: RecordBudget | None = None
+    ) -> list[FindingCwe]: ...
 
 
 class SqlFindingCweRepository(SqlMutableRepository[FindingCwe]):
@@ -31,3 +36,10 @@ class SqlFindingCweRepository(SqlMutableRepository[FindingCwe]):
 
     def list_for_cwe(self, cwe_id: UUID) -> list[FindingCwe]:
         return self._many(f"list for cwe {cwe_id}", self.table.c.cwe_id == cwe_id)
+
+    def list_for_findings(
+        self, finding_ids: Collection[UUID], *, read_budget: RecordBudget | None = None
+    ) -> list[FindingCwe]:
+        return self._many_in(
+            "list for findings", self.table.c.finding_id, finding_ids, read_budget=read_budget
+        )

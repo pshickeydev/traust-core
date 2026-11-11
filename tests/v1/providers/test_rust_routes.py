@@ -1,0 +1,391 @@
+"""The axum and actix-web route x guard matrix: layer order, nesting, extractors, actix scopes
+and route macros, and the gaps for what isn't enumerated."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from traust_core.v1.providers import rust_routes
+from traust_core.v1.providers.route_guards import route_guards
+from traust_core.v1.providers.tree import tree_files
+
+
+def _write(root: Path, rel: str, text: str) -> None:
+    path = root / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+
+
+def _enum(root: Path) -> dict:
+    return route_guards(tree_files(root)).model_dump(mode="json")
+
+
+def _route(result: dict, method: str, pattern: str) -> dict:
+    [row] = [r for r in result["routes"] if r["method"] == method and r["pattern"] == pattern]
+    return row
+
+
+def _patterns(result: dict, family: str) -> set[tuple[str, str]]:
+    return {(r["method"], r["pattern"]) for r in result["routes"] if r["family"] == family}
+
+
+def test_axum_layer_guards_only_the_routes_added_before_it(tmp_path):
+    _write(
+        tmp_path,
+        "src/main.rs",
+        "use axum::{routing::get, Router, middleware};\n"
+        "fn app() -> Router {\n    Router::new()\n"
+        '        .route("/items", get(list).post(create))\n'
+        "        .route_layer(middleware::from_fn(require_auth))\n"
+        '        .route("/health", get(health))\n}\n'
+        "async fn list() {}\nasync fn create() {}\nasync fn health() {}\n",
+    )
+    result = _enum(tmp_path)
+    assert _patterns(result, "axum") == {("GET", "/items"), ("POST", "/items"), ("GET", "/health")}
+    assert _route(result, "POST", "/items")["scope_guards"] == ["require_auth"]
+    health = _route(result, "GET", "/health")
+    assert health["scope_guards"] == [] and health["judgement_required"] and health["asymmetry"]
+    assert result["coverage_gaps"] == []
+
+
+def test_axum_nest_and_merge_across_modules_with_prefixes(tmp_path):
+    _write(
+        tmp_path,
+        "src/api.rs",
+        "use axum::{routing::{get, delete}, Router};\n"
+        "pub fn router() -> Router<AppState> {\n"
+        '    Router::<AppState>::new().route("/users/:id", get(user).delete(remove))\n}\n'
+        'pub fn admin() -> Router { Router::new().route("/stats", get(stats)) }\n',
+    )
+    _write(
+        tmp_path,
+        "src/main.rs",
+        "use axum::Router;\n"
+        "fn app() -> Router {\n"
+        "    let admin = api::admin().layer(RequireAuthorizationLayer::bearer(token));\n"
+        "    Router::new()\n"
+        '        .nest("/api", api::router())\n'
+        '        .nest("/admin", admin)\n'
+        "        .layer(CorsLayer::permissive())\n}\n",
+    )
+    result = _enum(tmp_path)
+    assert _patterns(result, "axum") == {
+        ("GET", "/api/users/:id"),
+        ("DELETE", "/api/users/:id"),
+        ("GET", "/admin/stats"),
+    }
+    assert _route(result, "GET", "/admin/stats")["scope_guards"] == [
+        "RequireAuthorizationLayer::bearer",
+        "token",
+    ]
+    # CORS sets headers, it never refuses
+    assert _route(result, "GET", "/api/users/:id")["scope_guards"] == []
+    assert _route(result, "GET", "/api/users/:id")["registration"]["path"] == "src/api.rs"
+
+
+def test_axum_extractors_and_method_router_layers_guard_a_route(tmp_path):
+    _write(
+        tmp_path,
+        "src/main.rs",
+        "use axum::{routing::{get, post}, Router};\n"
+        "fn app() -> Router {\n    Router::new()\n"
+        '        .route("/me", get(me))\n'
+        '        .route("/upload", post(upload).layer(from_fn(verify_token)))\n'
+        '        .route("/session", get(session_info))\n}\n'
+        "async fn me(AuthUser(user): AuthUser, State(s): State<AppState>) -> String { todo!() }\n"
+        "async fn upload() {}\n"
+        "async fn session_info(session: Session) {}\n",
+    )
+    result = _enum(tmp_path)
+    me = _route(result, "GET", "/me")
+    assert me["guards"] == ["extractor:AuthUser"] and me["handler"]["line"] == 8
+    assert _route(result, "POST", "/upload")["guards"] == ["verify_token"]
+    # a session extractor reads state, it never refuses a request
+    assert _route(result, "GET", "/session")["guards"] == []
+
+
+def test_actix_scopes_wrap_every_service_and_macros_carry_paths(tmp_path):
+    _write(
+        tmp_path,
+        "src/main.rs",
+        "use actix_web::{get, post, web, App, HttpServer};\n"
+        '#[get("/users/{id}")]\nasync fn user(id: web::Path<u32>) -> String { todo!() }\n'
+        '#[post("/users")]\n#[protect("ADMIN")]\nasync fn create() -> String { todo!() }\n'
+        '#[get("/health")]\nasync fn health() -> String { todo!() }\n'
+        "fn main() {\n    HttpServer::new(|| {\n        App::new()\n"
+        "            .service(health)\n"
+        '            .service(web::scope("/v1").wrap(HttpAuthentication::bearer(validator))'
+        ".service(user).service(create))\n"
+        '            .route("/ping", web::get().to(ping))\n    });\n}\n'
+        'async fn ping() -> &\'static str { "pong" }\n',
+    )
+    result = _enum(tmp_path)
+    assert _patterns(result, "actix-web") == {
+        ("GET", "/health"),
+        ("GET", "/v1/users/{id}"),
+        ("POST", "/v1/users"),
+        ("GET", "/ping"),
+    }
+    user = _route(result, "GET", "/v1/users/{id}")
+    assert user["scope_guards"] == ["HttpAuthentication::bearer"]
+    assert _route(result, "POST", "/v1/users")["guards"] == ['#[protect("ADMIN")]']
+    assert _route(result, "GET", "/health")["scope_guards"] == []
+    assert _route(result, "GET", "/ping")["handler"]["expr"] == "ping"
+
+
+def test_actix_configure_resources_and_unregistered_macros(tmp_path):
+    _write(
+        tmp_path,
+        "src/routes.rs",
+        "use actix_web::{get, web};\n"
+        '#[get("/orphan")]\nasync fn orphan() -> String { todo!() }\n'
+        "pub fn config(cfg: &mut web::ServiceConfig) {\n"
+        '    cfg.service(web::resource("/items").route(web::get().to(list)).route(web::post()'
+        ".to(add)));\n}\n"
+        "async fn list(claims: Claims) {}\nasync fn add() {}\n",
+    )
+    _write(
+        tmp_path,
+        "src/main.rs",
+        "use actix_web::App;\nfn app() { App::new().configure(routes::config); }\n",
+    )
+    result = _enum(tmp_path)
+    assert _route(result, "GET", "/items")["guards"] == ["extractor:Claims"]
+    assert _route(result, "POST", "/items")["guards"] == []
+    orphan = _route(result, "GET", "/orphan")
+    assert orphan["unguard_markers"] == [rust_routes.ACTIX_UNREGISTERED]
+    assert orphan["judgement_required"]
+
+
+def test_a_route_path_from_a_constant_is_dynamic(tmp_path):
+    _write(
+        tmp_path,
+        "src/main.rs",
+        "use axum::{routing::get, Router};\n"
+        "fn app() -> Router { Router::new().route(PATHS.health, get(health)) }\n"
+        "async fn health() {}\n",
+    )
+    [row] = _enum(tmp_path)["routes"]
+    assert row["pattern_dynamic"] and row["pattern"] == "PATHS.health"
+
+
+def test_without_the_rust_grammar_routes_are_a_named_gap(tmp_path, monkeypatch):
+    monkeypatch.setattr(rust_routes, "parser", lambda: None)
+    _write(
+        tmp_path,
+        "src/main.rs",
+        'use axum::Router;\nfn app() -> Router { Router::new().route("/x", get(x)) }\n',
+    )
+    result = _enum(tmp_path)
+    [gap] = result["coverage_gaps"]
+    assert gap["system"] == "axum" and "tree-sitter-rust" in gap["reason"]
+    assert result["routes"] == []
+
+
+def test_a_framework_used_with_no_recognized_route_is_a_gap(tmp_path):
+    _write(tmp_path, "src/lib.rs", "use actix_web::HttpResponse;\npub fn ok() -> HttpResponse {}\n")
+    [gap] = _enum(tmp_path)["coverage_gaps"]
+    assert gap["system"] == "actix-web" and "UNENUMERATED" in gap["reason"]
+
+
+def test_session_and_identity_middleware_loads_state_but_doesnt_guard(tmp_path):
+    _write(
+        tmp_path,
+        "src/main.rs",
+        "use actix_web::{web, App};\n"
+        "fn app() {\n    App::new()\n"
+        "        .wrap(IdentityMiddleware::default())\n"
+        "        .wrap(SessionMiddleware::builder(CookieSessionStore::default(), key)"
+        ".cookie_secure(false).build())\n"
+        '        .route("/", web::get().to(index))\n'
+        '        .route("/login", web::post().to(login))\n}\n'
+        "async fn index(user: Option<Identity>) {}\n"
+        "async fn login(form: web::Form<AuthPayload>, session: Session) { session.insert(1); }\n",
+    )
+    result = _enum(tmp_path)
+    assert _route(result, "GET", "/")["scope_guards"] == []
+    assert _route(result, "GET", "/")["guards"] == ["extractor:Identity"]
+    # a login form's payload type and a session write are not guards
+    assert _route(result, "POST", "/login")["guards"] == []
+
+
+def test_nested_routers_resolve_by_module_and_carry_their_mount(tmp_path: Path) -> None:
+    _write(tmp_path, "Cargo.toml", '[package]\nname = "app"\nversion = "0.1.0"\n')
+    _write(
+        tmp_path,
+        "src/main.rs",
+        "use axum::{middleware, routing::get, Router};\nmod auth;\nmod notes;\nmod tags;\n"
+        "pub fn app() -> Router {\n"
+        '    Router::new().nest("/api/notes", notes::routes()).nest("/api/tags", tags::routes())\n'
+        "        .route_layer(middleware::from_fn(auth::require_auth))\n}\n",
+    )
+    _write(tmp_path, "src/auth.rs", "pub async fn require_auth() {}\n")
+    # each module's `routes` and `show`: names shared across modules resolve to their own
+    for module, extra in (("notes", "AuthUser"), ("tags", "AdminUser")):
+        _write(
+            tmp_path,
+            f"src/{module}.rs",
+            "use axum::{routing::get, Router};\n"
+            "pub fn routes() -> Router {\n"
+            "    let router = Router::new();\n"
+            '    let router = router.route("/:id", get(show));\n'
+            "    router\n}\n"
+            f"pub async fn show(user: {extra}) {{}}\n",
+        )
+    result = _enum(tmp_path)
+    assert _patterns(result, "axum") == {("GET", "/api/notes/:id"), ("GET", "/api/tags/:id")}
+    assert _route(result, "GET", "/api/notes/:id")["guards"] == ["extractor:AuthUser"]
+    assert _route(result, "GET", "/api/tags/:id")["guards"] == ["extractor:AdminUser"]
+    assert _route(result, "GET", "/api/notes/:id")["scope_guards"] == ["auth::require_auth"]
+
+
+def test_a_method_router_layer_wraps_only_the_methods_before_it(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "src/main.rs",
+        "use axum::{middleware, routing::get, Router};\n"
+        "pub fn app() -> Router {\n"
+        '    Router::new().route("/a", get(a).route_layer(middleware::from_fn(require_auth))'
+        ".delete(b))\n}\nasync fn a() {}\nasync fn b() {}\n",
+    )
+    result = _enum(tmp_path)
+    assert _route(result, "GET", "/a")["guards"] == ["require_auth"]
+    assert _route(result, "DELETE", "/a")["guards"] == []
+
+
+def test_a_state_layer_naming_roles_is_no_guard(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "src/main.rs",
+        "use axum::{routing::get, Extension, Router};\n"
+        "pub fn app() -> Router {\n"
+        '    Router::new().route("/a/:id", get(a))\n'
+        "        .layer(Extension(vec![Role::Admin, Role::Member]))\n"
+        "}\nasync fn a() {}\n",
+    )
+    row = _route(_enum(tmp_path), "GET", "/a/:id")
+    assert row["guards"] == [] and row["scope_guards"] == [] and row["judgement_required"]
+
+
+def test_a_nested_router_in_a_mod_rs_is_found_without_cargo(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "src/main.rs",
+        "use axum::Router;\nmod api;\n"
+        'pub fn app() -> Router {\n    Router::new().nest("/api", api::routes())\n}\n',
+    )
+    _write(
+        tmp_path,
+        "src/api/mod.rs",
+        "use axum::{routing::get, Router};\n"
+        'pub fn routes() -> Router {\n    Router::new().route("/notes/:id", get(show))\n}\n'
+        "async fn show() {}\n",
+    )
+    _write(tmp_path, "src/web.rs", "pub fn routes() {}\n")
+    assert ("GET", "/api/notes/:id") in _patterns(_enum(tmp_path), "axum")
+
+
+def test_a_router_used_by_several_tests_is_listed_once(tmp_path: Path) -> None:
+    tests = "".join(
+        f"#[tokio::test]\nasync fn t{i}() {{\n    let app = app();\n"
+        "    let resp = app.clone().oneshot(req()).await.unwrap();\n}\n"
+        for i in range(3)
+    )
+    _write(
+        tmp_path,
+        "src/main.rs",
+        "use axum::{routing::get, Router};\n"
+        'pub fn app() -> Router {\n    Router::new().route("/a/:id", get(a))\n}\n'
+        "async fn a() {}\n" + tests,
+    )
+    rows = [r for r in _enum(tmp_path)["routes"] if r["family"] == "axum"]
+    assert [(r["method"], r["pattern"]) for r in rows] == [("GET", "/a/:id")]
+
+
+def test_routers_that_reuse_one_router_list_its_routes_once(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "src/main.rs",
+        "use axum::{routing::get, Router};\n"
+        'pub fn app() -> Router { Router::new().route("/a/:id", get(a)) }\n'
+        "async fn a() {}\n"
+        "#[tokio::test] async fn one() { let app = app(); let x = app.layer(T1); }\n"
+        "#[tokio::test] async fn two() { let app = app(); let y = app.layer(T1); }\n",
+    )
+    assert [r["pattern"] for r in _enum(tmp_path)["routes"]] == ["/a/:id"]
+
+
+def test_a_fail_open_use_of_a_shared_router_stays_listed(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "src/main.rs",
+        "use axum::{middleware, routing::get, Router};\n"
+        'pub fn api() -> Router { Router::new().route("/a/:id", get(a)) }\n'
+        "async fn a() {}\n"
+        "pub fn app() -> Router {\n    let base = api();\n"
+        "    let closed = base.route_layer(middleware::from_fn(require_auth));\n"
+        "    let open = base.route_layer(middleware::from_fn(require_auth)).layer(AllowAnyLayer);\n"
+        "    closed.merge(open)\n}\n",
+    )
+    rows = [r for r in _enum(tmp_path)["routes"] if r["pattern"] == "/a/:id"]
+    assert any(r["unguard_markers"] and r["judgement_required"] for r in rows)
+
+
+def test_two_handlers_registered_on_one_line_are_both_listed(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "src/main.rs",
+        "use axum::{routing::get, Router};\n"
+        'pub fn v1() -> Router { Router::new().route("/n/:id", get(h1)) } '
+        'pub fn v2() -> Router { Router::new().route("/n/:id", get(h2)) }\n'
+        "async fn h1() {}\nasync fn h2() {}\n",
+    )
+    assert sorted(r["handler"]["expr"] for r in _enum(tmp_path)["routes"]) == ["h1", "h2"]
+
+
+def test_an_imported_handler_keeps_its_extractor_without_cargo(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "src/main.rs",
+        "use axum::{routing::get, Router};\nmod handlers;\nuse handlers::show;\n"
+        'pub fn app() -> Router { Router::new().route("/n/:id", get(show)) }\n',
+    )
+    _write(tmp_path, "src/handlers.rs", "pub async fn show(user: AuthUser) {}\n")
+    row = _route(_enum(tmp_path), "GET", "/n/:id")
+    assert row["guards"] == ["extractor:AuthUser"]
+    assert row["handler"]["path"] == "src/handlers.rs"
+
+
+def test_auth_named_server_state_is_no_extractor_guard(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "src/main.rs",
+        "use axum::{routing::get, Extension, Router};\nuse std::sync::Arc;\n"
+        "pub fn app() -> Router {\n"
+        '    Router::new().route("/a/:id", get(a)).route("/b/:id", get(b))\n}\n'
+        "async fn a(Extension(svc): Extension<Arc<AuthService>>) {}\n"
+        "async fn b(Extension(user): Extension<AuthUser>) {}\n",
+    )
+    result = _enum(tmp_path)
+    assert _route(result, "GET", "/a/:id")["guards"] == []
+    assert _route(result, "GET", "/b/:id")["guards"] == ["extractor:AuthUser"]
+
+
+def test_a_router_shadowed_in_an_inner_block_is_not_the_outer_one(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "src/main.rs",
+        "use axum::{middleware, routing::get, Router};\n"
+        "pub fn app() -> Router {\n"
+        '    let router = Router::new().route("/a/:id", get(a));\n'
+        "    {\n"
+        '        let router = Router::new().route("/b/:id", get(b));\n'
+        "        spawn(router);\n"
+        "    }\n"
+        "    let app = router.route_layer(middleware::from_fn(require_auth));\n"
+        "    app\n}\n"
+        "async fn a() {}\nasync fn b() {}\n",
+    )
+    result = _enum(tmp_path)
+    assert _route(result, "GET", "/a/:id")["scope_guards"] == ["require_auth"]
+    assert _route(result, "GET", "/b/:id")["scope_guards"] == []

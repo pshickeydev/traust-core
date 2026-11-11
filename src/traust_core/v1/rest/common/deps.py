@@ -1,0 +1,54 @@
+from __future__ import annotations
+
+from typing import Annotated
+
+from fastapi import Depends, Request
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import SecretStr
+
+from traust_core.v1.context import Context, Services
+from traust_core.v1.errors import AuthenticationError
+from traust_core.v1.models.identity import Credential, Principal
+from traust_core.v1.providers.correlation import enrich_correlation
+from traust_core.v1.rest.common.problems import safe_order_id
+
+_bearer = HTTPBearer(auto_error=False)
+
+
+def context(request: Request) -> Context:
+    return request.app.state.context  # type: ignore[no-any-return]
+
+
+def services(ctx: Annotated[Context, Depends(context)]) -> Services:
+    """One unit of work per request: requests never share a transaction."""
+    return ctx.services()
+
+
+def principal(
+    request: Request,
+    ctx: Annotated[Context, Depends(context)],
+    bearer: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer)],
+) -> Principal:
+    """The verified caller; no or a bad bearer token is a 401."""
+    if bearer is None:
+        raise AuthenticationError("a bearer token is required")
+    if ctx.identity is None:
+        raise AuthenticationError("this deployment verifies no callers (no identity section)")
+    caller = ctx.identity.authenticate(Credential(token=SecretStr(bearer.credentials)))
+    request.state.actor_kind = caller.kind
+    return caller
+
+
+async def _correlated_principal(
+    request: Request,
+    caller: Annotated[Principal, Depends(principal)],
+) -> Principal:
+    order_id = safe_order_id(request)
+    if order_id is not None:
+        request.state.order_id = order_id
+    enrich_correlation(order_id=order_id, actor_kind=caller.kind)
+    return caller
+
+
+Caller = Annotated[Principal, Depends(_correlated_principal)]
+CoreServices = Annotated[Services, Depends(services)]

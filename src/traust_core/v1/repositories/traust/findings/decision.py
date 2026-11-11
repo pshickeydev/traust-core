@@ -1,10 +1,20 @@
 from __future__ import annotations
 
+from collections.abc import Collection
 from datetime import datetime
-from typing import Protocol
+from heapq import merge
+from typing import Any, Protocol
 from uuid import UUID
 
-from traust_core.v1.models.findings import Decision
+import sqlalchemy as sa
+from pydantic import TypeAdapter
+from sqlalchemy.dialects.postgresql import insert as postgres_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+from traust_core.v1.errors import RepositoryError
+from traust_core.v1.models.common import RecordBudget
+from traust_core.v1.models.findings import Decision, validity_spellings
+from traust_core.v1.models.vocabulary import ActorKind, DecisionReason, Severity, Validity
 from traust_core.v1.repositories.tables import (
     TRAUST,
     RecordRepository,
@@ -33,24 +43,77 @@ DECISION = TableSpec(
         text_column("severity", nullable=True),
         text_column("source_channel", nullable=True),
         text_column("actor", nullable=True),
+        text_column("rationale", nullable=True),
+        text_column("ticket", nullable=True),
+        sa.Column("auto_accept_tier", sa.Boolean, nullable=False),
         timestamp_column("occurred_at"),
     ),
     append_only=True,
 )
 
+_WRITE_SEVERITY = TypeAdapter(Severity | None)
+
 
 class DecisionRepository(RecordRepository[Decision], Protocol):
+    def add_statement(self, decision: Decision) -> Decision: ...
+
     def find_by_statement(self, finding_id: UUID, statement_key: str) -> Decision | None:
         """The idempotency key: a retried or re-spelled statement is the same decision."""
         ...
 
     def list_for_finding(self, finding_id: UUID) -> list[Decision]: ...
+    def list_for_assessments(self, assessment_ids: Collection[UUID]) -> list[Decision]: ...
+    def list_for_findings(
+        self,
+        finding_ids: Collection[UUID],
+        until: datetime | None = None,
+        *,
+        read_budget: RecordBudget | None = None,
+    ) -> list[Decision]:
+        """Decisions on these findings, those made after `until` left out."""
+        ...
+
     def list_since(self, since: datetime, limit: int) -> list[Decision]: ...
+    def list_finding_ids_with_claims(self) -> list[UUID]: ...
+
+    def list_finding_ids_with_validity(self, validity: Validity) -> list[UUID]:
+        """Findings any decision ever judged `validity`: the candidates for that folded answer."""
+        ...
+
+    def list_finding_ids_for_review(self) -> list[UUID]:
+        """Findings refuted by a machine without auto-accept, or both refuted and confirmed: the
+        candidates for a fold that needs a person (the fold decides)."""
+        ...
 
 
 class SqlDecisionRepository(SqlAppendOnlyRepository[Decision]):
     spec = DECISION
     record = Decision
+
+    def _values(self, record: Decision) -> dict[str, Any]:
+        severity = _WRITE_SEVERITY.validate_python(record.severity)
+        values = super()._values(record)
+        values["severity"] = severity
+        return values
+
+    def add_statement(self, decision: Decision) -> Decision:
+        decision = self._to_record(decision)
+        insert = postgres_insert if self._connection.dialect.name == "postgresql" else sqlite_insert
+        stmt = (
+            insert(self.table)
+            .values(**self._values(decision))
+            .on_conflict_do_nothing(
+                index_elements=[self.table.c.finding_id, self.table.c.statement_key]
+            )
+            .returning(*self.table.c)
+        )
+        row = self._execute("add statement", stmt).mappings().one_or_none()
+        if row is not None:
+            return self._to_record(row)
+        existing = self.find_by_statement(decision.finding_id, decision.statement_key)
+        if existing is None:
+            raise RepositoryError("decision statement conflicted without a visible original row")
+        return existing
 
     def find_by_statement(self, finding_id: UUID, statement_key: str) -> Decision | None:
         c = self.table.c
@@ -64,6 +127,37 @@ class SqlDecisionRepository(SqlAppendOnlyRepository[Decision]):
             f"list for {finding_id}", c.finding_id == finding_id, order_by=(c.occurred_at,)
         )
 
+    def list_for_assessments(self, assessment_ids: Collection[UUID]) -> list[Decision]:
+        """In judgement order, read in batches so a long id list stays under the bind limit."""
+        rows = self._many_in(
+            f"list for {len(assessment_ids)} assessments",
+            self.table.c.assessment_id,
+            assessment_ids,
+        )
+        return sorted(rows, key=lambda d: (d.occurred_at, d.created_at, d.id))  # type: ignore[arg-type]
+
+    def list_for_findings(
+        self,
+        finding_ids: Collection[UUID],
+        until: datetime | None = None,
+        *,
+        read_budget: RecordBudget | None = None,
+    ) -> list[Decision]:
+        """Decisions on these findings, those made after `until` left out, in judgement order;
+        read in bounded batches so a whole scope's ids cannot exceed the bind limit."""
+        c = self.table.c
+        pages = (
+            self._many(
+                f"list for {len(finding_ids)} findings",
+                c.finding_id.in_(batch),
+                *([] if until is None else [c.occurred_at <= until]),
+                order_by=(c.occurred_at,),
+                read_budget=read_budget,
+            )
+            for batch in self._batches(finding_ids)
+        )
+        return list(merge(*pages, key=lambda d: (d.occurred_at, d.created_at, d.id)))
+
     def list_since(self, since: datetime, limit: int) -> list[Decision]:
         c = self.table.c
         stmt = (
@@ -73,3 +167,40 @@ class SqlDecisionRepository(SqlAppendOnlyRepository[Decision]):
             .limit(limit)
         )
         return [self._to_record(r) for r in self._execute(f"since {since}", stmt).mappings()]
+
+    def list_finding_ids_with_validity(self, validity: Validity) -> list[UUID]:
+        c = self.table.c
+        spellings = validity_spellings(validity)
+        stmt = sa.select(c.finding_id).where(c.validity.in_(spellings)).distinct()
+        return list(self._execute(f"findings judged {validity}", stmt).scalars())
+
+    def list_finding_ids_with_claims(self) -> list[UUID]:
+        c = self.table.c
+        stmt = (
+            sa.select(c.finding_id)
+            .where(c.reason == DecisionReason.BASELINE_REWRITE, c.artifact_id.is_not(None))
+            .distinct()
+        )
+        return list(self._execute("findings with retained claims", stmt).scalars())
+
+    def list_finding_ids_for_review(self) -> list[UUID]:
+        c = self.table.c
+        # any spelling validity_spellings reads as confirmed — a historical
+        # true_positive/hardening confirmation contradicts a machine refutation exactly
+        # as a canonical one does ("never silently resolved")
+        confirmed = sa.select(c.finding_id).where(
+            c.validity.in_(validity_spellings(Validity.CONFIRMED))
+        )
+        machine = sa.and_(
+            sa.not_(c.auto_accept_tier),
+            sa.or_(c.actor.is_(None), sa.not_(c.actor.startswith(f"{ActorKind.HUMAN}:"))),
+        )
+        stmt = (
+            sa.select(c.finding_id)
+            .where(
+                c.validity == str(Validity.FALSE_POSITIVE),
+                sa.or_(machine, c.finding_id.in_(confirmed)),
+            )
+            .distinct()
+        )
+        return list(self._execute("findings for review", stmt).scalars())

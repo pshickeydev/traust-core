@@ -1,0 +1,448 @@
+from __future__ import annotations
+
+import hashlib
+from decimal import Decimal
+from pathlib import Path
+
+import pytest
+import yaml
+
+from traust_core.v1.context import Config, Context
+from traust_core.v1.errors import ConfigError, NotFoundError, ValidationError
+from traust_core.v1.models.operations import ModelName
+from traust_core.v1.providers.model_catalog import (
+    ConnectionConfig,
+    ConnectionType,
+    CredentialConfig,
+    CredentialSource,
+    Harness,
+    RegistryModelCatalog,
+    RoleRouting,
+    TokenUsage,
+)
+
+REGISTRY = Path(__file__).parents[2] / "fixtures" / "operations" / "model-registry.yaml"
+CONNECTIONS = (
+    Path(__file__).parents[2] / "fixtures" / "operations" / "model-registry-connections.yaml"
+)
+
+
+@pytest.fixture
+def catalog(tmp_path: Path) -> RegistryModelCatalog:
+    ctx = Context(Config(home=tmp_path))
+    ctx.register_model_catalog(REGISTRY)
+    assert isinstance(ctx.model_catalog, RegistryModelCatalog)
+    return ctx.model_catalog
+
+
+@pytest.mark.parametrize(
+    ("model", "usage", "cost"),
+    [
+        # 1M in at $4 + 1M out at $20
+        ("claude-opus-5-5", TokenUsage(tokens_in=10**6, tokens_out=10**6), "24"),
+        # cache reads at the model's own multiplier (0.05), writes at 1.25x input
+        (
+            "claude-opus-5-5",
+            TokenUsage(tokens_in=0, tokens_out=0, cache_read=10**6, cache_creation=10**6),
+            "5.2",
+        ),
+        # the standard 0.1 cache-read multiplier when the model sets none
+        ("claude-opus-5", TokenUsage(tokens_in=0, tokens_out=0, cache_read=10**6), "0.5"),
+        # a prompt at the threshold stays on base rates
+        ("claude-haiku-5-5", TokenUsage(tokens_in=100_000, tokens_out=10**6), "0.51"),
+        # over it (input plus cache), every token of the request bills at the long-prompt rates
+        (
+            "claude-haiku-5-5",
+            TokenUsage(tokens_in=50_000, tokens_out=10**6, cache_read=50_001),
+            "2.52750005",
+        ),
+        ("claude-opus-5", TokenUsage(tokens_in=0, tokens_out=0), "0"),
+    ],
+)
+def test_cost_prices_each_request_at_list_rates(
+    catalog: RegistryModelCatalog, model: str, usage: TokenUsage, cost: str
+) -> None:
+    assert catalog.cost(ModelName(model), usage) == Decimal(cost)
+
+
+@pytest.mark.parametrize(
+    ("model", "error", "match"),
+    [
+        ("claude-unknown", NotFoundError, "not in the model registry"),
+        ("claude-unpriced", ConfigError, "has no price"),
+    ],
+)
+def test_cost_refuses_a_model_it_cannot_price(
+    catalog: RegistryModelCatalog, model: str, error: type[Exception], match: str
+) -> None:
+    with pytest.raises(error, match=match):
+        catalog.cost(ModelName(model), TokenUsage(tokens_in=1, tokens_out=1))
+
+
+def test_resolve_carries_rates_and_the_unverified_flag(catalog: RegistryModelCatalog) -> None:
+    spec = catalog.resolve(ModelName("claude-opus-5"))
+    assert (spec.provider, spec.tier, spec.price_per_mtok_in, spec.price_verified) == (
+        "anthropic",
+        "opus-class",
+        Decimal(5),
+        False,
+    )
+    haiku = catalog.resolve(ModelName("claude-haiku-5-5"))
+    assert haiku.price_verified and haiku.long_prompt is not None
+    assert haiku.long_prompt.above_tokens == 100_000
+    assert catalog.check().ready
+    assert "unpriced: ['claude-unpriced']" in catalog.check().detail
+
+
+@pytest.mark.parametrize(
+    ("text", "match"),
+    [
+        ("version: [", "model registry"),
+        ("version: 1\n", "model registry"),  # schema: tiers, providers, roles missing
+    ],
+)
+def test_an_unreadable_or_invalid_registry_is_a_config_error(
+    tmp_path: Path, text: str, match: str
+) -> None:
+    path = tmp_path / "model-registry.yaml"
+    path.write_text(text)
+    with pytest.raises(ConfigError, match=match):
+        Context(Config(home=tmp_path)).register_model_catalog(path)
+
+
+def test_a_missing_registry_is_a_config_error(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError, match="model registry"):
+        Context(Config(home=tmp_path)).register_model_catalog(tmp_path / "absent.yaml")
+
+
+# Shaped like traust's config/model-registry.yaml roles (2026-10-26), models renamed.
+ROLES_REGISTRY = """\
+version: 1
+updated: "2026-10-26"
+tiers:
+  haiku-class: {description: cheapest}
+  sonnet-class: {description: balanced}
+  opus-class: {description: strong}
+  mythos-class: {description: strongest}
+providers:
+  anthropic:
+    data_handling: approved (test fixture)
+    models:
+      m-haiku: {tier: haiku-class, batch_eligible: false}
+      m-sonnet: {tier: sonnet-class, batch_eligible: false}
+      m-opus: {tier: opus-class, batch_eligible: false}
+      m-opus-b: {tier: opus-class, batch_eligible: false}
+      m-mythos: {tier: mythos-class, batch_eligible: false}
+roles:
+  fact-judge:
+    floor: sonnet-class
+    approved: [m-sonnet, m-opus, m-opus-b, m-mythos]
+    candidates: []
+    ledger_validity_writer: false
+  deep-audit:
+    floor: mythos-class
+    approved: [m-mythos]
+    candidates: [m-fable]
+    ledger_validity_writer: true
+  quick-look:
+    floor: haiku-class
+    approved: [m-mythos, m-haiku]
+    candidates: []
+    ledger_validity_writer: false
+"""
+
+
+def _catalog(tmp_path: Path, text: str) -> RegistryModelCatalog:
+    path = tmp_path / "model-registry.yaml"
+    path.write_text(text)
+    ctx = Context(Config(home=tmp_path))
+    ctx.register_model_catalog(path)
+    assert isinstance(ctx.model_catalog, RegistryModelCatalog)
+    return ctx.model_catalog
+
+
+@pytest.fixture
+def roles(tmp_path: Path) -> RegistryModelCatalog:
+    return _catalog(tmp_path, ROLES_REGISTRY)
+
+
+@pytest.mark.parametrize(
+    ("role", "tier", "model"),
+    [
+        ("fact-judge", None, "m-sonnet"),  # the first approved model at the floor
+        ("fact-judge", "sonnet-class", "m-sonnet"),
+        ("fact-judge", "opus-class", "m-opus"),  # the first approved at an exact tier
+        ("fact-judge", "mythos-class", "m-mythos"),
+        ("deep-audit", None, "m-mythos"),
+        ("quick-look", None, "m-haiku"),  # approved order doesn't beat the tier
+        ("quick-look", "sonnet-class", "m-mythos"),  # none there: the lowest approved above
+    ],
+)
+def test_resolve_role_takes_an_approved_model_at_the_tier_asked(
+    roles: RegistryModelCatalog, role: str, tier: str | None, model: str
+) -> None:
+    assert roles.resolve_role(role, tier) == model
+
+
+@pytest.mark.parametrize(
+    ("role", "tier", "error", "message"),
+    [
+        (
+            "nobody",
+            None,
+            NotFoundError,
+            "unknown role 'nobody' — roles: ['deep-audit', 'fact-judge', 'quick-look']",
+        ),
+        ("fact-judge", "gpt-class", NotFoundError, "unknown tier 'gpt-class'"),
+        (
+            "fact-judge",
+            "haiku-class",
+            ValidationError,
+            "tier haiku-class is below role 'fact-judge' floor sonnet-class — "
+            "tier-downs below the floor are never allowed",
+        ),
+    ],
+)
+def test_resolve_role_refuses_an_unknown_role_or_tier_and_any_tier_down(
+    roles: RegistryModelCatalog, role: str, tier: str | None, error: type[Exception], message: str
+) -> None:
+    with pytest.raises(error) as caught:
+        roles.resolve_role(role, tier)
+    assert str(caught.value) == message
+
+
+def test_resolve_role_with_nothing_approved_high_enough_says_so(tmp_path: Path) -> None:
+    catalog = _catalog(
+        tmp_path, ROLES_REGISTRY.replace("approved: [m-mythos, m-haiku]", "approved: [m-haiku]")
+    )
+    with pytest.raises(ValidationError, match="role 'quick-look': no approved model at or above"):
+        catalog.resolve_role("quick-look", "opus-class")
+
+
+def test_the_unverified_flag_binds_to_gateway_ids_that_carry_slashes(tmp_path: Path) -> None:
+    # Gateway model ids carry a provider prefix (`rits/zai-org/glm-5-3`); the flag must still bind.
+    text = ROLES_REGISTRY.replace(
+        "m-haiku: {tier: haiku-class, batch_eligible: false}",
+        "rits/zai-org/glm-5-3: {tier: haiku-class, batch_eligible: false}  # price unverified",
+    ).replace("approved: [m-mythos, m-haiku]", "approved: [m-mythos, rits/zai-org/glm-5-3]")
+    catalog = _catalog(tmp_path, text)
+    assert catalog.resolve(ModelName("rits/zai-org/glm-5-3")).price_verified is False
+    assert catalog.resolve(ModelName("m-sonnet")).price_verified is True
+
+
+def test_list_roles_is_sorted_by_name(roles: RegistryModelCatalog) -> None:
+    assert [(r.name, r.floor, r.approved) for r in roles.list_roles()] == [
+        ("deep-audit", "mythos-class", ("m-mythos",)),
+        ("fact-judge", "sonnet-class", ("m-sonnet", "m-opus", "m-opus-b", "m-mythos")),
+        ("quick-look", "haiku-class", ("m-mythos", "m-haiku")),
+    ]
+
+
+def test_validate_names_every_registry_inconsistency(tmp_path: Path) -> None:
+    text = (
+        ROLES_REGISTRY.replace(
+            "m-haiku: {tier: haiku-class, batch_eligible: false}",
+            "m-x: {tier: x-class, batch_eligible: false}",
+        )
+        .replace("approved: [m-sonnet, m-opus", "approved: [m-gone, m-sonnet, m-opus")
+        .replace("approved: [m-mythos]", "approved: [m-opus, m-mythos]")
+        .replace(
+            "floor: haiku-class\n    approved: [m-mythos, m-haiku]",
+            "floor: nano-class\n    approved: [m-old]",
+        )
+    )
+    assert _catalog(tmp_path, text).validate() == [
+        "model m-x: unknown tier x-class",
+        "role fact-judge: model m-gone not in any provider",
+        "role deep-audit: model m-fable not in any provider",
+        "role deep-audit: approved model m-opus (opus-class) is below the floor mythos-class",
+        "role quick-look: unknown floor nano-class",
+        "role quick-look: model m-old not in any provider",
+    ]
+
+
+def test_validate_of_a_consistent_registry_is_empty(tmp_path: Path) -> None:
+    text = ROLES_REGISTRY.replace("candidates: [m-fable]", "candidates: []")
+    assert _catalog(tmp_path, text).validate() == []
+
+
+def test_a_tier_outside_the_tier_order_cannot_be_ranked(tmp_path: Path) -> None:
+    text = ROLES_REGISTRY.replace("tiers:\n", "tiers:\n  tiny-class: {description: test}\n")
+    catalog = _catalog(
+        tmp_path,
+        text.replace(
+            "m-haiku: {tier: haiku-class, batch_eligible: false}",
+            "m-haiku: {tier: tiny-class, batch_eligible: false}",
+        ),
+    )
+    with pytest.raises(ValidationError, match="tier 'tiny-class' has no rank"):
+        catalog.validate()
+
+
+def test_stamp_carries_the_registry_sha_and_the_role_floor(
+    tmp_path: Path, roles: RegistryModelCatalog
+) -> None:
+    raw = (tmp_path / "model-registry.yaml").read_bytes()
+    stamp = roles.stamp("fact-judge", ModelName("m-opus"))
+    assert stamp.model_dump(exclude_none=True) == {
+        "role": "fact-judge",
+        "model": "m-opus",
+        "registry_sha": hashlib.sha256(raw).hexdigest()[:12],
+        "floor": "sonnet-class",
+    }
+
+
+def test_stamp_of_an_unknown_role_omits_the_floor(roles: RegistryModelCatalog) -> None:
+    stamp = roles.stamp("nobody", ModelName("m-opus"))
+    assert set(stamp.model_dump(exclude_none=True)) == {"role", "model", "registry_sha"}
+
+
+def test_the_registry_sha_is_of_the_file_bytes_not_its_decoded_text(tmp_path: Path) -> None:
+    raw = ROLES_REGISTRY.replace("\n", "\r\n").encode()
+    path = tmp_path / "model-registry.yaml"
+    path.write_bytes(raw)
+    ctx = Context(Config(home=tmp_path))
+    ctx.register_model_catalog(path)
+    assert ctx.model_catalog is not None
+    stamp = ctx.model_catalog.stamp("fact-judge", ModelName("m-opus"))
+    assert stamp.registry_sha == hashlib.sha256(raw).hexdigest()[:12]
+
+
+# Provider connections: a section's connection block names the wire it speaks, its endpoint,
+# its harness and its credential; a section without one keeps the default routing.
+GATEWAY = ConnectionConfig(
+    type=ConnectionType.OPENAI_COMPATIBLE,
+    base_url="https://enmaas.example.invalid/v1",
+    harness=Harness.OMP,
+    credential=CredentialConfig(
+        source=CredentialSource.SECRET, name="sci-enmaas-model", key="GATEWAY_API_KEY"
+    ),
+)
+
+
+@pytest.fixture
+def connected(tmp_path: Path) -> RegistryModelCatalog:
+    return _catalog(tmp_path, CONNECTIONS.read_text())
+
+
+def test_resolve_routing_delivers_the_model_its_provider_and_its_connection(
+    connected: RegistryModelCatalog,
+) -> None:
+    assert connected.resolve_routing("deep-work") == RoleRouting(
+        model=ModelName("glm-5-3"), provider="rits", connection=GATEWAY
+    )
+
+
+def test_a_provider_without_a_connection_block_keeps_the_default_routing(
+    connected: RegistryModelCatalog,
+) -> None:
+    routing = connected.resolve_routing("fact-judge")
+    assert (routing.model, routing.provider) == (ModelName("claude-haiku-5-5"), "anthropic")
+    assert routing.connection == ConnectionConfig(
+        type=ConnectionType.ANTHROPIC,
+        credential=CredentialConfig(source=CredentialSource.ENV),
+    )
+    assert routing.connection.supported
+
+
+def test_the_gemini_type_is_accepted_but_not_yet_served_by_the_worker(
+    connected: RegistryModelCatalog,
+) -> None:
+    routing = connected.resolve_routing("vision")
+    assert routing.connection.type is ConnectionType.GEMINI
+    assert routing.connection.supported is False
+
+
+def test_resolve_routing_follows_the_resolved_model_not_the_role(
+    connected: RegistryModelCatalog,
+) -> None:
+    """The tier asked decides the model, and the model's provider section decides the routing."""
+    assert connected.resolve_routing("mixed").provider == "anthropic"
+    assert connected.resolve_routing("mixed", "opus-class") == RoleRouting(
+        model=ModelName("glm-5-3"), provider="rits", connection=GATEWAY
+    )
+
+
+@pytest.mark.parametrize("swap", [False, True], ids=["as-declared", "sections-swapped"])
+def test_a_model_listed_by_two_providers_refuses_the_load(tmp_path: Path, swap: bool) -> None:
+    """Either section's connection could serve a model two sections list, so registration
+    fails rather than resolving by declaration order."""
+    text = CONNECTIONS.read_text().replace(
+        "      claude-opus-5-5:   {tier: opus-class,  batch_eligible: false}",
+        "      claude-opus-5-5:   {tier: opus-class,  batch_eligible: false}\n"
+        "      glm-5-3:           {tier: opus-class,  batch_eligible: false}",
+    )
+    if swap:
+        document = yaml.safe_load(text)
+        document["providers"] = dict(reversed(list(document["providers"].items())))
+        text = yaml.safe_dump(document)
+    with pytest.raises(
+        ConfigError,
+        match=r"model glm-5-3 is listed by both (anthropic and rits|rits and anthropic)",
+    ):
+        _catalog(tmp_path, text)
+
+
+def test_resolve_routing_refuses_what_resolve_role_refuses(
+    connected: RegistryModelCatalog,
+) -> None:
+    with pytest.raises(NotFoundError, match="unknown role 'nobody'"):
+        connected.resolve_routing("nobody")
+    with pytest.raises(ValidationError, match="no approved model at or above"):
+        connected.resolve_routing("fact-judge", "opus-class")
+
+
+@pytest.mark.parametrize(
+    ("connection", "match"),
+    [
+        # a compatible type is an endpoint override: it needs the endpoint
+        (
+            "type: openai-compatible\ncredential: {source: env}",
+            "connection type openai-compatible needs a base_url",
+        ),
+        # a proprietary type serves at its default endpoint
+        (
+            "type: anthropic\nbase_url: https://gw.example.invalid\ncredential: {source: env}",
+            "connection type anthropic takes no base_url",
+        ),
+        # a secret credential delivers nothing without the Secret's name and key
+        (
+            "type: anthropic-compatible\nbase_url: https://gw.example.invalid\n"
+            "credential: {source: secret, name: sci-enmaas-model}",
+            "a secret credential needs the Secret's name and key",
+        ),
+        (
+            "type: anthropic-compatible\nbase_url: https://gw.example.invalid\n"
+            "credential: {source: secret, key: GATEWAY_API_KEY}",
+            "a secret credential needs the Secret's name and key",
+        ),
+        # unknown members of the closed sets
+        (
+            "type: bedrock\ncredential: {source: env}",
+            r"unknown connection type 'bedrock'",
+        ),
+        (
+            "type: openai-compatible\nbase_url: https://gw.example.invalid\n"
+            "harness: aider\ncredential: {source: env}",
+            r"unknown connection harness 'aider'",
+        ),
+        (
+            "type: openai-compatible\nbase_url: https://gw.example.invalid\n"
+            "credential: {source: vault}",
+            r"unknown connection credential source 'vault'",
+        ),
+    ],
+)
+def test_an_unroutable_connection_refuses_the_config_load(
+    tmp_path: Path, connection: str, match: str
+) -> None:
+    block = "      " + connection.replace("\n", "\n      ")
+    text = CONNECTIONS.read_text().replace(
+        "      type: openai-compatible\n"
+        "      base_url: https://enmaas.example.invalid/v1\n"
+        "      harness: omp\n"
+        "      credential: {source: secret, name: sci-enmaas-model, key: GATEWAY_API_KEY}",
+        block,
+    )
+    with pytest.raises(ConfigError, match=match):
+        _catalog(tmp_path, text)

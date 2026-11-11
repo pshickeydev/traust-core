@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import json
 from abc import ABC
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from enum import StrEnum
 from pathlib import Path
 from typing import Any, ClassVar, Self
 
@@ -101,6 +102,11 @@ def describe(nodes: Sequence[Node], depth: int = 0, max_depth: int = 4) -> list[
     return lines
 
 
+class RenderFormat(StrEnum):
+    MARKDOWN = "md"
+    HTML = "html"
+
+
 class ArtifactDocument(ABC):
     name: ClassVar[str]
     schema: ClassVar[str]
@@ -132,6 +138,17 @@ class ArtifactDocument(ABC):
         return cls(payload, contracts.validate_json(cls.schema, payload))
 
     @classmethod
+    def schema_type(cls) -> type[ArtifactDocument]:
+        """Read role aliases through their common contract type."""
+        return next(
+            base
+            for base in reversed(cls.__mro__)
+            if base is not ArtifactDocument
+            and issubclass(base, ArtifactDocument)
+            and base.schema == cls.schema
+        )
+
+    @classmethod
     def schema_path(cls) -> Path:
         return contracts.schema_path(cls.schema)
 
@@ -145,11 +162,30 @@ class ArtifactDocument(ABC):
     def from_document(cls, document: Mapping[str, Any]) -> Self:
         contracts.validate(cls.schema, document)
         payload = (json.dumps(document, indent=2, ensure_ascii=False) + "\n").encode()
-        return cls(payload, document)
+        return cls(payload, json.loads(payload))
 
     @property
     def payload(self) -> bytes:
         return self._payload
+
+    def text_fragments(self, *, sections: tuple[str, ...] | None = None) -> Iterator[str]:
+        """Decoded text-policy context, optionally scoped to declared document sections."""
+        document = (
+            self._document
+            if sections is None
+            else {name: self._document[name] for name in sections if name in self._document}
+        )
+        yield json.dumps(document, ensure_ascii=False)
+        pending: list[Any] = [document]
+        while pending:
+            value = pending.pop()
+            if isinstance(value, str):
+                yield value
+            elif isinstance(value, Mapping):
+                pending.extend(value)
+                pending.extend(value.values())
+            elif isinstance(value, list):
+                pending.extend(value)
 
     def __getattr__(self, field: str) -> Any:
         return getattr(self._view, field)
@@ -158,8 +194,24 @@ class ArtifactDocument(ABC):
         return sorted({*super().__dir__(), *dir(self._view)})
 
 
+class ReportArtifact(ArtifactDocument, name="report", schema="report"):
+    def with_canonical_priorities(self) -> Self:
+        """The report as a new write: deprecated roadmap priority spellings (P3) become p3."""
+        roadmap = self._document["remediation_roadmap"]
+        canonical = [_canonical_priority(item) for item in roadmap]
+        if canonical == roadmap:
+            return self
+        return self.from_document({**self._document, "remediation_roadmap": canonical})
+
+
+def _canonical_priority(item: Mapping[str, Any]) -> Mapping[str, Any]:
+    pairs = contracts.normalize_enum("roadmap_priority", item["priority"]).pairs
+    priority = next((p.value for p in pairs if p.enum == "roadmap_priority"), item["priority"])
+    return item if priority == item["priority"] else {**item, "priority": priority}
+
+
 class SecurityAuditArtifact(
-    ArtifactDocument,
+    ReportArtifact,
     name="security-audit",
     schema="report",
     kind=ResultKind.SECURITY_AUDIT,
@@ -168,7 +220,7 @@ class SecurityAuditArtifact(
 
 
 class FindingsCurrentArtifact(
-    ArtifactDocument,
+    ReportArtifact,
     name="findings-current",
     schema="report",
     kind=ResultKind.FINDINGS_CURRENT,
@@ -191,6 +243,16 @@ class ThreatModelArtifact(
 
 class ValidationArtifact(
     ArtifactDocument, name="validation", schema="validation", kind=ResultKind.VALIDATION
+): ...
+
+
+class ValidationPlanArtifact(
+    ArtifactDocument, name="validation-plan", schema="validation-plan"
+): ...
+
+
+class ValidationAuthorizationArtifact(
+    ArtifactDocument, name="validation-authorization", schema="validation-authorization"
 ): ...
 
 
@@ -222,14 +284,36 @@ class PrivProfileArtifact(
 class AdapterResultArtifact(ArtifactDocument, name="adapter-result", schema="adapter-result"): ...
 
 
+class RepoStateArtifact(
+    ArtifactDocument, name="repo-state", schema="repo-state", kind=ResultKind.REPO_STATE
+): ...
+
+
+class CodeFactsArtifact(ArtifactDocument, name="code-facts", schema="code-facts"): ...
+
+
+class ManifestCoverageArtifact(
+    ArtifactDocument, name="manifest-coverage", schema="manifest-coverage"
+): ...
+
+
+class RunManifestArtifact(ArtifactDocument, name="run-manifest", schema="run-manifest"): ...
+
+
 class IsolationReviewArtifact(
     ArtifactDocument, name="isolation-review", schema="isolation-review"
 ): ...
 
 
+class VulnFindingsArtifact(ArtifactDocument, name="vuln-findings", schema="vuln-findings"): ...
+
+
 class ImpactAnalysisArtifact(
     ArtifactDocument, name="impact-analysis", schema="impact-analysis"
 ): ...
+
+
+class FuzzReportArtifact(ArtifactDocument, name="fuzz-report", schema="fuzz-report"): ...
 
 
 class PqcFactsArtifact(ArtifactDocument, name="pqc-facts", schema="pqc-facts"): ...
@@ -239,6 +323,11 @@ class PqcReadinessArtifact(ArtifactDocument, name="pqc-readiness", schema="pqc-r
 
 
 class PqcBlockersArtifact(ArtifactDocument, name="pqc-blockers", schema="pqc-blockers"): ...
+
+
+class PqcVendorClaimsArtifact(
+    ArtifactDocument, name="pqc-vendor-claims", schema="pqc-vendor-claims"
+): ...
 
 
 class PqcDecisionTreeArtifact(
@@ -257,6 +346,16 @@ class ComplianceScopeArtifact(
 ): ...
 
 
+class ComplianceMappingArtifact(
+    ArtifactDocument, name="compliance-mapping", schema="compliance-mapping"
+): ...
+
+
+class CorpusRegistryArtifact(
+    ArtifactDocument, name="corpus-registry", schema="corpus-registry"
+): ...
+
+
 class ComplianceAssessmentArtifact(
     ArtifactDocument, name="compliance-assessment", schema="compliance-assessment"
 ): ...
@@ -265,29 +364,124 @@ class ComplianceAssessmentArtifact(
 class DocVarianceArtifact(ArtifactDocument, name="doc-variance", schema="doc-variance"): ...
 
 
+class AdrRegistryArtifact(ArtifactDocument, name="adr-registry", schema="adr-registry"): ...
+
+
+class OrgParametersArtifact(ArtifactDocument, name="org-parameters", schema="org-parameters"): ...
+
+
+class SlaPolicyArtifact(ArtifactDocument, name="sla-policy", schema="sla-policy"): ...
+
+
+class ProductDefinitionsMapArtifact(
+    ArtifactDocument, name="product-definitions-map", schema="product-definitions-map"
+): ...
+
+
 class BenchmarkTargetArtifact(
     ArtifactDocument, name="benchmark-target", schema="benchmark-target"
 ): ...
 
 
+# The adopter facts a pack asset can require (pack schema `requires.facts`), by artifact name;
+# preflight checks each is recorded.
+RECORDED_FACTS: tuple[type[ArtifactDocument], ...] = (
+    AdrRegistryArtifact,
+    BenchmarkTargetArtifact,
+    OrgParametersArtifact,
+    ProductDefinitionsMapArtifact,
+    SlaPolicyArtifact,
+)
+
+
+class BelowRangePacketsArtifact(
+    ArtifactDocument, name="below-range-packets", schema="below-range-packets"
+): ...
+
+
+class BelowRangeVerdictsArtifact(
+    ArtifactDocument, name="below-range-verdicts", schema="below-range-verdicts"
+): ...
+
+
+class CveReplayArtifact(ArtifactDocument, schema="cve-replay"): ...
+
+
+class FindingClaimArtifact(ArtifactDocument, schema="finding-claim"): ...
+
+
+class FindingIntakeArtifact(ArtifactDocument, schema="finding-intake"): ...
+
+
+class RepoLivenessArtifact(ArtifactDocument, schema="repo-liveness"): ...
+
+
+class SessionTask(ArtifactDocument, schema="session-task"): ...
+
+
+class SessionResult(ArtifactDocument, schema="session-result"): ...
+
+
 AssessmentArtifact = (
-    SecurityAuditArtifact
+    ReportArtifact
     | CloudConfigAuditArtifact
+    | VulnFindingsArtifact
     | ThreatModelArtifact
     | PrivProfileArtifact
     | IsolationReviewArtifact
+    | RepoStateArtifact
+    | CodeFactsArtifact
+    | FuzzReportArtifact
 )
 PqcArtifact = PqcFactsArtifact | PqcReadinessArtifact | PqcDecisionTreeArtifact
 
-ANALYSIS_ARTIFACTS: tuple[type[ArtifactDocument], ...] = (
+ARTIFACT_TYPES: tuple[type[ArtifactDocument], ...] = (
+    ReportArtifact,
     SecurityAuditArtifact,
     FindingsCurrentArtifact,
     FindingsLayerArtifact,
     TriageArtifact,
     ThreatModelArtifact,
     ValidationArtifact,
+    ValidationPlanArtifact,
+    ValidationAuthorizationArtifact,
     VerificationArtifact,
     CloudConfigAuditArtifact,
     PrivProfileArtifact,
+    AdapterResultArtifact,
+    RepoStateArtifact,
+    CodeFactsArtifact,
+    ManifestCoverageArtifact,
+    RunManifestArtifact,
+    IsolationReviewArtifact,
+    VulnFindingsArtifact,
+    ImpactAnalysisArtifact,
+    FuzzReportArtifact,
+    PqcFactsArtifact,
+    PqcReadinessArtifact,
+    PqcBlockersArtifact,
+    PqcVendorClaimsArtifact,
+    PqcDecisionTreeArtifact,
+    RemediationArtifact,
+    FleetFixArtifact,
+    ComplianceScopeArtifact,
+    ComplianceMappingArtifact,
+    CorpusRegistryArtifact,
+    ComplianceAssessmentArtifact,
+    DocVarianceArtifact,
+    AdrRegistryArtifact,
+    OrgParametersArtifact,
+    SlaPolicyArtifact,
+    ProductDefinitionsMapArtifact,
+    BenchmarkTargetArtifact,
+    BelowRangePacketsArtifact,
+    BelowRangeVerdictsArtifact,
+    CveReplayArtifact,
+    FindingClaimArtifact,
+    FindingIntakeArtifact,
+    RepoLivenessArtifact,
+    SessionTask,
+    SessionResult,
 )
-ARTIFACT_FOR_KIND = {a.kind: a for a in ANALYSIS_ARTIFACTS if a.kind is not None}
+ANALYSIS_ARTIFACTS = tuple(artifact for artifact in ARTIFACT_TYPES if artifact.kind is not None)
+ARTIFACT_FOR_SCHEMA = {artifact.schema: artifact.schema_type() for artifact in ARTIFACT_TYPES}

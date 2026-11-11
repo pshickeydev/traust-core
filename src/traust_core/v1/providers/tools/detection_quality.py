@@ -1,0 +1,387 @@
+"""The opengrep rule packs and canary repositories `DetectionQualityService` scores against, and
+the one-rule corpus sweep. A supplemental pack and a swept repository are both workspaces from
+the checkout service, pinned to a commit — never a clone of a default branch."""
+
+from __future__ import annotations
+
+import re
+import shutil
+import tempfile
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlsplit
+
+from pydantic import ValidationError as InvalidModel
+
+from traust_core.v1.errors import ConfigError, NotFoundError, ServiceError, ValidationError
+from traust_core.v1.models.detection_quality import (
+    CanaryInjection,
+    CanaryKind,
+    CanaryRepo,
+    CanarySource,
+    RuleId,
+    RulePack,
+    RuleRef,
+    SeededFinding,
+)
+from traust_core.v1.models.rule_mining import RepoSweep, RuleFile, RuleHit, SweepRepo
+from traust_core.v1.models.values import GitSha, HttpsRepoUrl
+from traust_core.v1.models.vocabulary import FindingKind
+from traust_core.v1.providers.base import Readiness, on_path
+from traust_core.v1.providers.config_matrix import YamlLoader
+from traust_core.v1.providers.process import ProcessRunner
+from traust_core.v1.providers.sources import CheckoutRequest, Checkouts, Workspace
+from traust_core.v1.providers.tools.opengrep import (
+    SupplementalPack,
+    execute_scan,
+    pinned_rules_source,
+    rules_root,
+)
+
+GIT_TIMEOUT = 120.0
+TRAUST_PACK = "traust"
+_CWE = re.compile(r"CWE-\d+", re.IGNORECASE)
+# Never a command the repository's own config names (fsmonitor, hooks).
+_HARDENED = ("-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null")
+
+
+class OpengrepRulePacks:
+    """The traust pack and each allowlisted supplement (read on first use), as rule ids with their
+    languages and metadata CWEs."""
+
+    name = "opengrep"
+
+    def __init__(
+        self,
+        pack: Path,
+        version: str,
+        supplements: Callable[[], Sequence[SupplementalPack]],
+        checkouts: Checkouts,
+        load: YamlLoader,
+    ) -> None:
+        self._pack = pack
+        self._version = version
+        self._supplements = supplements
+        self._checkouts = checkouts
+        self._load = load
+
+    def check(self) -> Readiness:
+        if self._pack.is_dir():
+            return Readiness(ready=True)
+        return Readiness(ready=False, detail=f"rule pack {self._pack} is not a directory")
+
+    def packs(self) -> list[RulePack]:
+        own = rule_refs(self._pack, self._load)
+        traust = RulePack(name=TRAUST_PACK, version=self._version, rules=tuple(own.values()))
+        return [traust, *map(self._supplement, self._supplements())]
+
+    def cached(self, name: str, source: str) -> RulePack:
+        """A pinned pack's rules, read through the checkout service: the mirror fetches it on
+        first read and serves it after."""
+        try:
+            url, ref = pinned_rules_source(source)
+        except ValueError as e:
+            raise ConfigError(f"rule pack {name}: {e}") from e
+        with self._at(url, ref) as workspace:
+            found = rule_refs(rules_root(url, workspace.path), self._load)
+        return RulePack(name=name, version=ref, rules=tuple(found.values()))
+
+    def _supplement(self, supplement: SupplementalPack) -> RulePack:
+        try:
+            url, ref = pinned_rules_source(supplement.source)
+        except ValueError as e:
+            raise ConfigError(f"rule pack {supplement.name}: {e}") from e
+        with self._at(url, ref) as workspace:
+            found = rule_refs(rules_root(url, workspace.path), self._load)
+        if missing := sorted(set(supplement.rules) - set(found)):
+            raise ValidationError(
+                f"rule pack {supplement.name}@{ref[:12]}: allowlisted rules not in the pack: "
+                + ", ".join(missing)
+            )
+        return RulePack(
+            name=supplement.name,
+            version=ref,
+            rules=tuple(found[r] for r in dict.fromkeys(supplement.rules)),
+        )
+
+    @contextmanager
+    def _at(self, url: str, ref: str) -> Iterator[Workspace]:
+        """The pinned rules repository as a read-only workspace, released on exit."""
+        workspace = self._checkouts.checkout(
+            CheckoutRequest(
+                repo=HttpsRepoUrl.parse(url, [urlsplit(url).hostname or ""]), ref=GitSha.parse(ref)
+            )
+        ).data
+        try:
+            yield workspace
+        finally:
+            self._checkouts.release(workspace)
+
+
+class OpengrepRuleSweep:
+    """One rule over many repositories: each pinned to its audited commit through the checkout
+    service, or a local `dir:` checkout scanned in place, through core's opengrep scan."""
+
+    name = "opengrep-sweep"
+
+    def __init__(self, pack: Path, keep_env: Sequence[str], checkouts: Checkouts) -> None:
+        self._pack = pack
+        self._keep_env = tuple(keep_env)
+        self._checkouts = checkouts
+
+    def check(self, binary: str) -> Readiness:
+        return on_path(binary)
+
+    def scan(self, repo: SweepRepo, rule: RuleFile, binary: str, timeout: int) -> RepoSweep:
+        """The rule's hits in one repository, or the error that stopped it (never raised)."""
+        found = RepoSweep(slug=repo.slug, url=repo.url)
+        # A local checkout needs the explicit dir: prefix: a URL that happens to name an existing
+        # path must never alias to it.
+        workspace = None
+        if repo.url.startswith("dir:"):
+            target = Path(repo.url[4:]).expanduser().resolve()
+            if not target.is_dir():
+                return found.model_copy(
+                    update={"url": None, "error": f"dir: target missing: {repo.url}"}
+                )
+        elif repo.url.startswith("http"):
+            if not repo.sha:
+                return found.model_copy(
+                    update={
+                        "error": "clone_failed",
+                        "detail": "no pinned commit: a remote sweep names the commit it scans",
+                    }
+                )
+            try:
+                workspace = self._checkouts.checkout(
+                    CheckoutRequest(
+                        repo=HttpsRepoUrl.parse(repo.url, [urlsplit(repo.url).hostname or ""]),
+                        ref=GitSha.parse(repo.sha),
+                    )
+                ).data
+                target = workspace.path
+            except (ServiceError, NotFoundError, ValidationError) as e:
+                return found.model_copy(update={"error": "clone_failed", "detail": str(e)})
+        else:
+            return found.model_copy(
+                update={"error": "unsupported url (use https://… or dir:<path>)"}
+            )
+        runner = ProcessRunner(
+            [Path(binary).name], keep_env=self._keep_env, timeout_seconds=float(timeout)
+        )
+        try:
+            report = execute_scan(
+                target,
+                [str(rule.path)],
+                pack=self._pack,
+                runner=runner,
+                checkouts=self._checkouts,
+                timeout=timeout,
+                opengrep_bin=binary,
+            )
+        except TimeoutError:
+            return found.model_copy(update={"error": "scan_timeout"})
+        except RuntimeError:
+            return found.model_copy(update={"error": "opengrep_no_json"})
+        finally:
+            if workspace is not None:
+                self._checkouts.release(workspace)
+        return found.model_copy(
+            update={
+                "files_scanned": report["stats"]["files_scanned"],
+                "engine_errors": report["stats"]["errors"],
+                "facts": tuple(RuleHit.model_validate(f) for f in report["facts"]),
+            }
+        )
+
+    def trial(
+        self, rule: str, target: Path | Mapping[str, str], binary: str, timeout: int
+    ) -> RepoSweep:
+        """An unstaged rule's hits over a checkout, or over `target` files written to a
+        temporary tree (names are bare file names)."""
+        with tempfile.TemporaryDirectory(prefix="proposal-") as tmp:
+            root = Path(tmp)
+            path = root / "rule.yaml"
+            path.write_text(rule, encoding="utf-8")
+            if isinstance(target, Path):
+                scanned = target
+            else:
+                scanned = root / "tree"
+                scanned.mkdir()
+                for name, text in target.items():
+                    if Path(name).name != name:
+                        raise ValidationError(f"trial file {name!r} must be a bare file name")
+                    (scanned / name).write_text(text, encoding="utf-8")
+            repo = SweepRepo(slug="trial", url=f"dir:{scanned}")
+            staged = RuleFile(path=path, ids=(), unauthored=False)
+            return self.scan(repo, staged, binary, timeout)
+
+
+def rule_refs(root: Path, load: YamlLoader) -> dict[str, RuleRef]:
+    """Every rule under `root`, by id; opengrep test targets (`*.test.yaml`, tests/) and hidden
+    directories hold no rules, and a YAML file with no `rules:` list is not a rule file."""
+    found: dict[str, RuleRef] = {}
+    for path in sorted([*root.rglob("*.yaml"), *root.rglob("*.yml")]):
+        parts = path.relative_to(root).parts
+        if ".test." in path.name or "tests" in parts or any(p.startswith(".") for p in parts):
+            continue
+        try:
+            doc = _one_document(load, path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, ValidationError) as e:
+            raise ValidationError(f"rule file {path}: unreadable: {e}") from e
+        if not (isinstance(doc, dict) and isinstance(doc.get("rules"), list)):
+            continue
+        for rule in doc["rules"]:
+            if not (isinstance(rule, dict) and rule.get("id")):
+                raise ValidationError(f"rule file {path}: a rule has no id")
+            meta = rule.get("metadata") or {}
+            cwe = meta.get("cwe") or ()
+            cwes = _CWE.findall(" ".join(map(str, [cwe] if isinstance(cwe, str) else cwe)))
+            kind = meta.get("kind", FindingKind.VULNERABILITY)
+            if kind not in set(FindingKind):
+                raise ValidationError(f"rule file {path}: rule {rule['id']}: unknown kind {kind!r}")
+            found[str(rule["id"])] = RuleRef(
+                id=RuleId(str(rule["id"])),
+                languages=tuple(str(lang) for lang in rule.get("languages") or ()),
+                cwes=tuple(dict.fromkeys(c.upper() for c in cwes)),
+                kind=FindingKind(kind),
+            )
+    return found
+
+
+# Fixed identity and date, so a canary's HEAD SHA depends only on its tree's content.
+_CANARY_GIT_ENV = {
+    "GIT_AUTHOR_NAME": "canary-builder",
+    "GIT_AUTHOR_EMAIL": "canary@invalid",
+    "GIT_COMMITTER_NAME": "canary-builder",
+    "GIT_COMMITTER_EMAIL": "canary@invalid",
+    "GIT_AUTHOR_DATE": "2026-01-01T00:00:00 +0000",
+    "GIT_COMMITTER_DATE": "2026-01-01T00:00:00 +0000",
+    # The builder's own git config (autocrlf, signing, templates) must not reach the commit.
+    "GIT_CONFIG_GLOBAL": "/dev/null",
+    "GIT_CONFIG_NOSYSTEM": "1",
+}
+# Only committed content: bytecode caches would make the SHA depend on who last ran Python.
+_NOT_COMMITTED = shutil.ignore_patterns("__pycache__", "*.pyc")
+
+
+class GitCanaryMaterializer:
+    """Canary and seeded-fixture sources (`<name>/{canary,seed}.yaml + tree/`), each committed
+    into a fresh local repository; the answer key never enters it."""
+
+    name = "canary-git"
+
+    def __init__(
+        self, sources_dir: Path, repos_dir: Path, git: ProcessRunner, load: YamlLoader
+    ) -> None:
+        self._sources = sources_dir
+        self._repos = repos_dir
+        self._git = git
+        self._load = load
+
+    def check(self) -> Readiness:
+        if not self._sources.is_dir():
+            return Readiness(ready=False, detail=f"no canary sources at {self._sources}")
+        return on_path("git")
+
+    def sources(self) -> list[CanarySource]:
+        if not self._sources.is_dir():
+            raise ConfigError(f"no canary sources at {self._sources}")
+        return [
+            canary_source(d, self._sources.name, self._load)
+            for d in sorted(self._sources.iterdir())
+            if any((d / k.answer_key).is_file() for k in CanaryKind)
+        ]
+
+    def materialize(self, source: CanarySource) -> CanaryRepo:
+        tree = self._sources / source.name / "tree"
+        if not tree.is_dir():
+            raise ValidationError(f"canary {source.name}: no tree/ at {tree}")
+        dest = (self._repos / source.name).resolve()
+        if dest.exists():
+            shutil.rmtree(dest)
+        self._repos.mkdir(parents=True, exist_ok=True)
+        # Links stay links: following one would commit a file from outside the source tree.
+        shutil.copytree(tree, dest, symlinks=True, ignore=_NOT_COMMITTED)
+        for args in (
+            ("init", "-q", "-b", "main"),
+            ("add", "-A"),
+            # Never signed: a signature carries its own timestamp, so the SHA would differ per run.
+            ("-c", "commit.gpgsign=false", "commit", "-q", "-m", f"import {source.name}"),
+        ):
+            self._run_git(dest, *args)
+        sha = self._run_git(dest, "rev-parse", "HEAD").strip()
+        return CanaryRepo(repo_url=f"file://{dest}", sha=sha)
+
+    def _run_git(self, repo: Path, *args: str) -> str:
+        argv = ["git", "-C", str(repo), *_HARDENED, *args]
+        return self._git.run(argv, env=_CANARY_GIT_ENV).stdout.decode()
+
+
+def canary_source(directory: Path, sources_name: str, load: YamlLoader) -> CanarySource:
+    """One `<name>/` source directory: its answer key, and the files of tree/ that get committed."""
+    keys = [k for k in CanaryKind if (directory / k.answer_key).is_file()]
+    if len(keys) != 1:
+        raise ValidationError(f"canary {directory.name}: both canary.yaml and seed.yaml — use one")
+    kind = keys[0]
+    try:
+        meta: Any = _one_document(load, (directory / kind.answer_key).read_text(encoding="utf-8"))
+    except (OSError, ValidationError) as e:
+        raise ValidationError(f"canary {directory.name}: unreadable {kind.answer_key}: {e}") from e
+    try:
+        if meta["name"] != directory.name:
+            raise ValidationError(
+                f"canary {directory.name}: {kind.answer_key} names {meta['name']!r}, "
+                "not its directory"
+            )
+        expected = meta["expected"] if isinstance(meta["expected"], list) else [meta["expected"]]
+        injection = meta.get("injection")
+        tree = directory / "tree"
+        if not tree.is_dir():
+            raise ValidationError(f"canary {directory.name}: no tree/ beside its answer key")
+        if any(".git" in p.relative_to(tree).parts for p in tree.rglob(".git")):
+            raise ValidationError(
+                f"canary {directory.name}: a .git entry inside tree/ would configure the git "
+                "that commits it"
+            )
+        return CanarySource(
+            name=directory.name,
+            kind=kind,
+            recipe=f"{sources_name}/{directory.name}",
+            expected=tuple(
+                SeededFinding(
+                    cwes=tuple(str(c) for c in e["cwes"]),
+                    paths=tuple(e["paths"]),
+                    severity=e["severity"],
+                    title=e.get("title", ""),
+                )
+                for e in expected
+            ),
+            tree=tuple(
+                sorted(
+                    p.relative_to(tree).as_posix()
+                    for p in tree.rglob("*")
+                    if (p.is_file() or p.is_symlink())
+                    and "__pycache__" not in p.relative_to(tree).parts
+                    and p.suffix != ".pyc"
+                )
+            ),
+            language=meta.get("language"),
+            injection=CanaryInjection(
+                injection_class=injection["class"], tokens=tuple(injection["tokens"])
+            )
+            if injection
+            else None,
+        )
+    except (OSError, KeyError, TypeError, InvalidModel) as e:
+        raise ValidationError(f"canary {directory.name}: unreadable {kind.answer_key}: {e}") from e
+
+
+def _one_document(load: YamlLoader, text: str) -> object:
+    """`yaml.safe_load`: None for no document, and more than one is unreadable."""
+    documents = load(text)
+    if len(documents) > 1:
+        raise ValidationError("expected a single document, found more than one")
+    return documents[0] if documents else None

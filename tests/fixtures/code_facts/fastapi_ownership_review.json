@@ -1,0 +1,338 @@
+[
+ {
+  "case": "c1",
+  "files": {
+   "app/r.py": "\nfrom typing import Annotated\nfrom fastapi import APIRouter, Depends, HTTPException, Request, Header, Query\nfrom sqlmodel import select, delete, or_\nfrom app.auth import CurrentUser, get_current_user\nfrom app.models import Item, User, Holiday, Tag\nrouter = APIRouter()\n\ndef requested_owner(owner: int = Query(...), current_user: User = Depends(get_current_user)) -> int:\n    return owner\n\nOwner = Annotated[int, Depends(requested_owner)]\n\n@router.get(\"/a/{item_id}\")\ndef a(item_id: int, session, current_user: CurrentUser, owner: Owner):\n    statement = select(Item).where(Item.id == item_id, Item.owner_id == owner)\n    item = session.exec(statement).first()\n    if item is None:\n        raise HTTPException(404)\n    return item\n\n@router.delete(\"/b/{item_id}\")\ndef b(item_id: int, session, current_user: CurrentUser, owner: int = Depends(requested_owner)):\n    item = session.get(Item, item_id)\n    if item.owner_id != owner:\n        raise HTTPException(403)\n    session.delete(item)\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/{item_id}",
+    "ownership": "caller-blind",
+    "why": "a dependency that only depends on authentication"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/b/{item_id}",
+    "ownership": "caller-blind",
+    "why": "the same, compared in shape 2"
+   }
+  ]
+ },
+ {
+  "case": "c2",
+  "files": {
+   "app/svc.py": "\nfrom fastapi import Depends, HTTPException\nfrom app.auth import CurrentUser, get_current_user\nfrom app.models import Item, User\n\ndef get_owned_item(session, item_id: int, current_user: CurrentUser):\n    item = session.get(Item, item_id)\n    if item is None or item.owner_id != current_user.id:\n        raise HTTPException(404)\n    return item\n\ndef get_owned_item2(session, item_id: int, user: User = Depends(get_current_user)):\n    item = session.get(Item, item_id)\n    if item is None or item.owner_id != user.id:\n        raise HTTPException(404)\n    return item\n",
+   "app/r.py": "\nfrom typing import Annotated\nfrom fastapi import APIRouter, Depends, HTTPException, Request, Header, Query\nfrom sqlmodel import select, delete, or_\nfrom app.auth import CurrentUser, get_current_user\nfrom app.models import Item, User, Holiday, Tag\nrouter = APIRouter()\n\nfrom app import svc\n\n@router.delete(\"/a/{item_id}\")\ndef a(item_id: int, session, current_user: CurrentUser, owner_id: int):\n    target = session.get(User, owner_id)\n    item = svc.get_owned_item(session, item_id, target)\n    session.delete(item)\n\n@router.delete(\"/b/{item_id}\")\ndef b(item_id: int, session, current_user: CurrentUser, owner_id: int):\n    target = session.get(User, owner_id)\n    item = svc.get_owned_item2(session, item_id, user=target)\n    session.delete(item)\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/a/{item_id}",
+    "ownership": "caller-blind",
+    "why": "a helper's Depends parameter handed another user"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/b/{item_id}",
+    "ownership": "caller-blind",
+    "why": "the same through an Annotated alias"
+   }
+  ]
+ },
+ {
+  "case": "c3",
+  "files": {
+   "app/r.py": "\nfrom typing import Annotated\nfrom fastapi import APIRouter, Depends, HTTPException, Request, Header, Query\nfrom sqlmodel import select, delete, or_\nfrom app.auth import CurrentUser, get_current_user\nfrom app.models import Item, User, Holiday, Tag\nrouter = APIRouter()\n\n@router.delete(\"/a/{item_id}\")\ndef a(item_id: int, session, current_user: CurrentUser):\n    result = session.exec(select(Item).where(Item.id == item_id, Item.owner_id == current_user.id))\n    if not result:\n        raise HTTPException(404)\n    session.exec(delete(Item).where(Item.id == item_id))\n\n@router.delete(\"/b/{item_id}\")\ndef b(item_id: int, session, current_user: CurrentUser):\n    stmt = select(Item).where(Item.id == item_id, Item.owner_id == current_user.id)\n    if stmt is None:\n        raise HTTPException(404)\n    session.exec(delete(Item).where(Item.id == item_id))\n\n@router.delete(\"/c/{item_id}\")\ndef c(item_id: int, session, current_user: CurrentUser):\n    q = session.query(Item).filter_by(id=item_id, owner_id=current_user.id)\n    if not q:\n        raise HTTPException(404)\n    session.query(Item).filter_by(id=item_id).delete()\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/a/{item_id}",
+    "ownership": "unchecked",
+    "why": "a result set is always truthy"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/b/{item_id}",
+    "ownership": "unchecked",
+    "why": "the query object, not a row"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/c/{item_id}",
+    "ownership": "unchecked",
+    "why": "an unfetched query"
+   }
+  ]
+ },
+ {
+  "case": "c4",
+  "files": {
+   "app/notes.py": "\nclass Note:\n    def __init__(self, owner_id: int, text: str):\n        self.owner_id = owner_id\n        self.text = text\n\n_NOTES: dict[int, Note] = {}\n",
+   "app/models2.py": "\nfrom sqlalchemy import Column, Integer, String, Table, MetaData\nfrom sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column\n\nclass Base(DeclarativeBase):\n    owner_id: Mapped[int] = mapped_column()\n\nclass Doc(Base):\n    __tablename__ = \"docs\"\n    title: Mapped[str] = mapped_column()\n\nmetadata = MetaData()\nclass Secret(DeclarativeBase):\n    __table__ = Table(\"secrets\", metadata, Column(\"id\", Integer), Column(\"owner_id\", Integer))\n",
+   "app/r.py": "\nfrom typing import Annotated\nfrom fastapi import APIRouter, Depends, HTTPException, Request, Header, Query\nfrom sqlmodel import select, delete, or_\nfrom app.auth import CurrentUser, get_current_user\nfrom app.models import Item, User, Holiday, Tag\nrouter = APIRouter()\n\nfrom app.notes import _NOTES\nfrom app.models2 import Doc, Secret\n\n@router.get(\"/notes/{note_id}\")\ndef note(note_id: int, current_user: CurrentUser):\n    return _NOTES[note_id]\n\n@router.delete(\"/notes/{note_id}\")\ndef drop(note_id: int, current_user: CurrentUser):\n    _NOTES.pop(note_id)\n\n@router.get(\"/docs/{doc_id}\")\ndef doc(doc_id: int, session, current_user: CurrentUser):\n    return session.get(Doc, doc_id)\n\n@router.get(\"/secrets/{sid}\")\ndef secret(sid: int, session, current_user: CurrentUser):\n    return session.get(Secret, sid)\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/notes/{note_id}",
+    "ownership": "caller-blind",
+    "why": "fields set in __init__"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/notes/{note_id}",
+    "ownership": "caller-blind",
+    "why": "the same"
+   },
+   {
+    "method": "GET",
+    "pattern": "/docs/{doc_id}",
+    "ownership": "caller-blind",
+    "why": "the owner is on a checkout base"
+   },
+   {
+    "method": "GET",
+    "pattern": "/secrets/{sid}",
+    "ownership": "caller-blind",
+    "why": "a __table__ we don't read"
+   }
+  ]
+ },
+ {
+  "case": "c5",
+  "files": {
+   "app/r.py": "\nfrom typing import Annotated\nfrom fastapi import APIRouter, Depends, HTTPException, Request, Header, Query\nfrom sqlmodel import select, delete, or_\nfrom app.auth import CurrentUser, get_current_user\nfrom app.models import Item, User, Holiday, Tag\nrouter = APIRouter()\n\nfrom types import SimpleNamespace\n\n@router.delete(\"/a/{item_id}\", dependencies=[Depends(get_current_user)])\ndef a(item_id: int, request: Request, session, owner: int):\n    request = SimpleNamespace(user=SimpleNamespace(id=owner))\n    item = session.get(Item, item_id)\n    if item.owner_id != request.user.id:\n        raise HTTPException(403)\n    session.delete(item)\n\n@router.delete(\"/b/{item_id}\", dependencies=[Depends(get_current_user)])\ndef b(item_id: int, request: Request, session, owner: int):\n    request.scope[\"user\"] = SimpleNamespace(id=owner)\n    item = session.get(Item, item_id)\n    if item.owner_id != request.user.id:\n        raise HTTPException(403)\n    session.delete(item)\n\n@router.delete(\"/c/{item_id}\")\ndef c(item_id: int, session, current_user: CurrentUser, owner: int):\n    u = current_user\n    u.id = owner\n    item = session.get(Item, item_id)\n    if item.owner_id != current_user.id:\n        raise HTTPException(403)\n    session.delete(item)\n\ndef check(session, item_id: int, request: Request):\n    item = session.get(Item, item_id)\n    if item.owner_id != request.user.id:\n        raise HTTPException(403)\n    return item\n\n@router.delete(\"/d/{item_id}\")\ndef d(item_id: int, session, current_user: CurrentUser, owner: int):\n    fake = SimpleNamespace(user=SimpleNamespace(id=owner))\n    item = check(session, item_id, fake)\n    session.delete(item)\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/a/{item_id}",
+    "ownership": "caller-blind",
+    "why": "the request rebound"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/b/{item_id}",
+    "ownership": "caller-blind",
+    "why": "the request's user written"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/c/{item_id}",
+    "ownership": "caller-blind",
+    "why": "the caller written through an alias"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/d/{item_id}",
+    "ownership": "caller-blind",
+    "why": "a fake request handed to a helper"
+   }
+  ]
+ },
+ {
+  "case": "c6",
+  "files": {
+   "app/r.py": "\nfrom typing import Annotated\nfrom fastapi import APIRouter, Depends, HTTPException, Request, Header, Query\nfrom sqlmodel import select, delete, or_\nfrom app.auth import CurrentUser, get_current_user\nfrom app.models import Item, User, Holiday, Tag\nrouter = APIRouter()\n\nclass ItemLoader:\n    def __init__(self, item_id: int, session):\n        session.exec(delete(Item).where(Item.id == item_id))\n\ndef wipe(item_id: int, session):\n    session.exec(delete(Item).where(Item.id == item_id))\n\ndef outer(x = Depends(wipe)):\n    return x\n\n@router.get(\"/a/{item_id}\")\ndef a(item_id: int, session, current_user: CurrentUser, loader: ItemLoader = Depends()):\n    item = session.get(Item, item_id)\n    if item.owner_id != current_user.id:\n        raise HTTPException(403)\n    return item\n\n@router.get(\"/b/{item_id}\")\ndef b(item_id: int, session, current_user: CurrentUser, loader = Depends(ItemLoader)):\n    item = session.get(Item, item_id)\n    if item.owner_id != current_user.id:\n        raise HTTPException(403)\n    return item\n\n@router.get(\"/c/{item_id}\")\ndef c(item_id: int, session, current_user: CurrentUser, o = Depends(outer)):\n    item = session.get(Item, item_id)\n    if item.owner_id != current_user.id:\n        raise HTTPException(403)\n    return item\n\nsub = APIRouter(prefix=\"/r/{item_id}\", dependencies=[Depends(wipe)])\n@sub.get(\"/x\")\ndef x(item_id: int, session, current_user: CurrentUser):\n    item = session.get(Item, item_id)\n    if item.owner_id != current_user.id:\n        raise HTTPException(403)\n    return item\nrouter.include_router(sub)\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/{item_id}",
+    "ownership": "unknown",
+    "why": "a class dependency taking the id"
+   },
+   {
+    "method": "GET",
+    "pattern": "/b/{item_id}",
+    "ownership": "unknown",
+    "why": "the same as Depends(Class)"
+   },
+   {
+    "method": "GET",
+    "pattern": "/c/{item_id}",
+    "ownership": "unchecked",
+    "why": "a sub-dependency deleting first"
+   },
+   {
+    "method": "GET",
+    "pattern": "/r/{item_id}/x",
+    "ownership": "unchecked",
+    "why": "a router-level dependency deleting first"
+   }
+  ]
+ },
+ {
+  "case": "c7",
+  "files": {
+   "app/models3.py": "\nfrom sqlmodel import Field, SQLModel\nclass Comment(SQLModel, table=True):\n    id: int = Field(primary_key=True)\n    item_id: int\n    user_id: int\n",
+   "app/r.py": "\nfrom typing import Annotated\nfrom fastapi import APIRouter, Depends, HTTPException, Request, Header, Query\nfrom sqlmodel import select, delete, or_\nfrom app.auth import CurrentUser, get_current_user\nfrom app.models import Item, User, Holiday, Tag\nrouter = APIRouter()\n\nfrom app.models3 import Comment\n\n@router.delete(\"/a/{item_id}\")\ndef a(item_id: int, session, current_user: CurrentUser):\n    item = (\n        session.query(Item)\n        .join(Comment, Comment.item_id == Item.id)\n        .filter_by(user_id=current_user.id)\n        .filter(Item.id == item_id)\n        .first()\n    )\n    if item is None:\n        raise HTTPException(404)\n    session.delete(item)\n\n@router.delete(\"/b/{item_id}\")\ndef b(item_id: int, session, current_user: CurrentUser):\n    stmt = select(Item).where(Item.id == item_id, Item.owner_id == current_user.id).union(\n        select(Item).where(Item.public == True)\n    )\n    found = session.exec(stmt).first()\n    if found is None:\n        raise HTTPException(404)\n    session.exec(delete(Item).where(Item.id == item_id))\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/a/{item_id}",
+    "ownership": "unchecked",
+    "why": "filter_by after a join narrows the joined table"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/b/{item_id}",
+    "ownership": "unchecked",
+    "why": "a union widens the query"
+   }
+  ]
+ },
+ {
+  "case": "c10",
+  "files": {
+   "app/r.py": "\nfrom typing import Annotated\nfrom fastapi import APIRouter, Depends, HTTPException, Request, Header, Query\nfrom sqlmodel import select, delete, or_\nfrom app.auth import CurrentUser, get_current_user\nfrom app.models import Item, User, Holiday, Tag\nrouter = APIRouter()\n\n@router.delete(\"/a/{item_id}\")\ndef a(item_id: int, session, current_user: CurrentUser, target: int | None = None):\n    item = session.get(Item, item_id)\n    if item is None or item.owner_id != current_user.id:\n        raise HTTPException(404)\n    if target is None:\n        target = item_id\n    session.exec(delete(Item).where(Item.id == target))\n\n@router.delete(\"/b/{item_id}\")\ndef b(item_id: int, session, current_user: CurrentUser):\n    stmt = select(Item).where(Item.id == item_id, Item.owner_id == current_user.id)\n    item = session.exec(stmt).first() or Item(owner_id=current_user.id)\n    if item is None:\n        raise HTTPException(404)\n    session.exec(delete(Item).where(Item.id == item_id))\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/a/{item_id}",
+    "ownership": "unchecked",
+    "why": "a parameter falling back to the id"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/b/{item_id}",
+    "ownership": "unchecked",
+    "why": "a fetched row or a fallback object"
+   }
+  ]
+ },
+ {
+  "case": "c11",
+  "files": {
+   "app/r.py": "\nfrom typing import Annotated\nfrom fastapi import APIRouter, Depends, HTTPException, Request, Header, Query\nfrom sqlmodel import select, delete, or_\nfrom app.auth import CurrentUser, get_current_user\nfrom app.models import Item, User, Holiday, Tag\nrouter = APIRouter()\n\n@router.get(\"/a/{item_id}\")\ndef a(item_id: int, session, current_user: CurrentUser, owner: int | None = None):\n    if owner is None:\n        owner = current_user.id\n    item = session.exec(select(Item).where(Item.id == item_id, Item.owner_id == owner)).first()\n    if item is None:\n        raise HTTPException(404)\n    return item\n\n@router.delete(\"/b/{item_id}\")\ndef b(item_id: int, session, current_user: CurrentUser, owner: int | None = None):\n    item = session.get(Item, item_id)\n    if not owner:\n        owner = current_user.id\n    if item.owner_id != owner:\n        raise HTTPException(403)\n    session.delete(item)\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/{item_id}",
+    "ownership": "unchecked",
+    "why": "a parameter falling back to the caller"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/b/{item_id}",
+    "ownership": "unchecked",
+    "why": "the same in shape 2"
+   }
+  ]
+ },
+ {
+  "case": "c12",
+  "files": {
+   "app/m4.py": "\nfrom sqlmodel import Field, SQLModel\nclass Document(SQLModel, table=True):\n    id: int = Field(primary_key=True)\n    body: str\n\nclass Share(SQLModel, table=True):\n    id: int = Field(primary_key=True)\n    doc_id: int = Field(foreign_key=\"document.id\")\n    user_id: int\n",
+   "app/r.py": "\nfrom typing import Annotated\nfrom fastapi import APIRouter, Depends, HTTPException, Request, Header, Query\nfrom sqlmodel import select, delete, or_\nfrom app.auth import CurrentUser, get_current_user\nfrom app.models import Item, User, Holiday, Tag\nrouter = APIRouter()\n\nfrom app.m4 import Document\n\n@router.get(\"/docs/{doc_id}\")\ndef doc(doc_id: int, session, current_user: CurrentUser):\n    return session.get(Document, doc_id)\n\n@router.delete(\"/c/{item_id}\")\ndef c(item_id: int, session, current_user: CurrentUser, owner: int | None = None):\n    if not owner:\n        owner = current_user.id\n    item = session.get(Item, item_id)\n    if item.owner_id != owner:\n        raise HTTPException(403)\n    session.delete(item)\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/docs/{doc_id}",
+    "ownership": "caller-blind",
+    "why": "shared through a foreign key"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/c/{item_id}",
+    "ownership": "unchecked",
+    "why": "a falsy fallback to the caller"
+   }
+  ]
+ },
+ {
+  "case": "c13",
+  "files": {
+   "app/r.py": "\nfrom typing import Annotated\nfrom fastapi import APIRouter, Depends, HTTPException, Request, Header, Query\nfrom sqlmodel import select, delete, or_\nfrom app.auth import CurrentUser, get_current_user\nfrom app.models import Item, User, Holiday, Tag\nrouter = APIRouter()\n\ndef owned(item_id: int, session, current_user: CurrentUser):\n    item = session.get(Item, item_id)\n    if item is None or item.owner_id != current_user.id:\n        raise HTTPException(404)\n\n@router.delete(\"/a/{item_id}\", dependencies=[Depends(owned)])\n@router.delete(\"/legacy/{item_id}\")\ndef remove(item_id: int, session, current_user: CurrentUser):\n    session.exec(delete(Item).where(Item.id == item_id))\n\ndef remove2(item_id: int, session, current_user: CurrentUser):\n    session.exec(delete(Item).where(Item.id == item_id))\n\nrouter.add_api_route(\"/b/{item_id}\", remove2, methods=[\"DELETE\"], dependencies=[Depends(owned)])\nrouter.add_api_route(\"/b-legacy/{item_id}\", remove2, methods=[\"DELETE\"])\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/a/{item_id}",
+    "ownership": "checked",
+    "why": "its own route dependency"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/legacy/{item_id}",
+    "ownership": "caller-blind",
+    "why": "the same handler on a route without it"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/b/{item_id}",
+    "ownership": "checked",
+    "why": "add_api_route with the dependency"
+   },
+   {
+    "method": "DELETE",
+    "pattern": "/b-legacy/{item_id}",
+    "ownership": "caller-blind",
+    "why": "and without"
+   }
+  ]
+ },
+ {
+  "case": "c14",
+  "files": {
+   "app/r.py": "\nfrom typing import Annotated\nfrom fastapi import APIRouter, Depends, HTTPException, Request, Header, Query\nfrom sqlmodel import select, delete, or_\nfrom app.auth import CurrentUser, get_current_user\nfrom app.models import Item, User, Holiday, Tag\nrouter = APIRouter()\n\nimport thirdparty\n\n@router.delete(\"/a/{item_id}\")\ndef a(item_id: int, session, current_user: CurrentUser):\n    item = thirdparty.repo.get_and_delete(session, item_id)\n    if item.owner_id != current_user.id:\n        raise HTTPException(403)\n    return item\n\n@router.get(\"/b/{item_id}\")\ndef b(item_id: int, session, current_user: CurrentUser):\n    item = _ITEMS[item_id]\n    _ITEMS[item_id] = None\n    return item\n\n@router.post(\"/c/{item_id}\")\ndef c(item_id: int, session, current_user: CurrentUser):\n    stmt = insert(Tag).values(project_id=item_id, owner_id=current_user.id)\n    session.exec(stmt)\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/a/{item_id}",
+    "ownership": "unknown",
+    "why": "a read-named call we can't follow"
+   },
+   {
+    "method": "POST",
+    "pattern": "/c/{item_id}",
+    "ownership": "unchecked",
+    "why": "an insert by the id"
+   }
+  ]
+ },
+ {
+  "case": "c15",
+  "files": {
+   "app/safe.py": "\nfrom sqlmodel import select\nfrom app.models import Item\nclass ItemService:\n    def get(self, session, owner, item_id):\n        return session.exec(select(Item).where(Item.id == item_id, Item.owner_id == owner)).first()\n",
+   "app/legacy.py": "\nfrom app.models import Item\nclass LegacyItemService:\n    def get(self, session, owner, item_id):\n        return session.get(Item, item_id)\n",
+   "app/svc.py": "\nfrom app.legacy import LegacyItemService\nitem_service = LegacyItemService()\n",
+   "app/r.py": "\nfrom typing import Annotated\nfrom fastapi import APIRouter, Depends, HTTPException, Request, Header, Query\nfrom sqlmodel import select, delete, or_\nfrom app.auth import CurrentUser, get_current_user\nfrom app.models import Item, User, Holiday, Tag\nrouter = APIRouter()\n\nfrom app.svc import item_service\n\n@router.get(\"/a/{item_id}\")\ndef a(item_id: int, session, current_user: CurrentUser):\n    return item_service.get(session, current_user.id, item_id)\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/{item_id}",
+    "ownership": "unchecked",
+    "why": "an aliased import of another class"
+   }
+  ]
+ },
+ {
+  "case": "c16",
+  "files": {
+   "app/r.py": "\nfrom typing import Annotated\nfrom fastapi import APIRouter, Depends, HTTPException, Request, Header, Query\nfrom sqlmodel import select, delete, or_\nfrom app.auth import CurrentUser, get_current_user\nfrom app.models import Item, User, Holiday, Tag\nrouter = APIRouter()\n\ndef wipe(item_id: int, session):\n    session.exec(delete(Item).where(Item.id == item_id))\n\ndef wipe(item_id: int, session):\n    session.exec(delete(Item).where(Item.id == item_id))\n\ndef wipe1(item_id: int, session):\n    session.exec(delete(Item).where(Item.id == item_id))\n\n@router.get(\"/a/{item_id}\")\ndef a(item_id: int, session, current_user: CurrentUser, w = Depends(wipe)):\n    item = session.get(Item, item_id)\n    if item.owner_id != current_user.id:\n        raise HTTPException(403)\n    return item\n\n@router.get(\"/b/{item_id}\", dependencies=[Depends(dependency=wipe1)])\ndef b(item_id: int, session, current_user: CurrentUser):\n    item = session.get(Item, item_id)\n    if item.owner_id != current_user.id:\n        raise HTTPException(403)\n    return item\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/{item_id}",
+    "ownership": "unknown",
+    "why": "a dependency defined twice"
+   },
+   {
+    "method": "GET",
+    "pattern": "/b/{item_id}",
+    "ownership": "unchecked",
+    "why": "Depends(dependency=\u2026)"
+   }
+  ]
+ }
+]

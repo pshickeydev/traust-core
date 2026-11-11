@@ -1,0 +1,601 @@
+from __future__ import annotations
+
+import json
+import logging
+from collections import Counter, defaultdict
+from collections.abc import Iterable, Sequence
+from datetime import UTC, datetime
+from typing import TypeVar, overload
+from urllib.parse import urlsplit
+from uuid import UUID
+
+from traust_core.v1.errors import (
+    ConfigError,
+    ConflictError,
+    IntegrityError,
+    NotFoundError,
+    ValidationError,
+)
+from traust_core.v1.models.artifacts import (
+    ArtifactDocument,
+    PqcFactsArtifact,
+    PqcReadinessArtifact,
+    PqcVendorClaimsArtifact,
+)
+from traust_core.v1.models.assessment import (
+    ASSESSMENT_COMPLETED,
+    Assessment,
+    AssessmentKind,
+)
+from traust_core.v1.models.code_facts import CryptoProbeId
+from traust_core.v1.models.common import Provenance, ToolRequest, every_item
+from traust_core.v1.models.findings import FindingContext, SubjectRef
+from traust_core.v1.models.integrity import sha256_hex
+from traust_core.v1.models.inventory import RepositoryFilter, RepositoryRef
+from traust_core.v1.models.pqc import (
+    PqcBlocker,
+    PqcDimension,
+    PqcFilter,
+    PqcPrescan,
+    PqcReadiness,
+    PqcReadinessInput,
+    PqcRollup,
+    PqcRoute,
+    PqcScanState,
+    PqcSite,
+    PqcVendorClaims,
+    PqcWorklistEntry,
+    PqcWorklistRoute,
+    PqcWorklistTier,
+)
+from traust_core.v1.models.values import HttpsRepoUrl
+from traust_core.v1.models.vocabulary import ComparisonStatus
+from traust_core.v1.providers.clock import Clock, SystemClock
+from traust_core.v1.providers.crypto import long_validity
+from traust_core.v1.providers.pqc import PqcScanner
+from traust_core.v1.repositories.traust.assessments import AssessmentsUnitOfWork
+from traust_core.v1.services.artifact_publishing import ArtifactPublisher, AssessmentLog
+from traust_core.v1.services.code_facts import CodeFactsService
+from traust_core.v1.services.findings import FindingService
+from traust_core.v1.services.lint import Lint, LintContext, LintReport
+from traust_core.v1.services.portfolio import PortfolioService
+from traust_core.v1.services.pqc import facts as pqc_facts
+from traust_core.v1.services.pqc import readiness as pqc_readiness
+
+log = logging.getLogger(__name__)
+
+READINESS_LINT = Lint({PqcReadinessArtifact: [pqc_readiness.ReadinessWriteRules()]})
+_KIND = AssessmentKind.PQC_READINESS
+_SCANNER = "pqc-scan"
+_SKILL = "skill:pqc-readiness"
+_WORKLIST_ORDER = {tier: index for index, tier in enumerate(PqcWorklistTier)}
+
+D = TypeVar("D", bound=ArtifactDocument)
+
+
+class WorklistPriorityPolicy:
+    _CRYPTO_CWES = frozenset(
+        {
+            "CWE-256",
+            "CWE-259",
+            "CWE-261",
+            "CWE-295",
+            "CWE-296",
+            "CWE-297",
+            "CWE-310",
+            "CWE-311",
+            "CWE-312",
+            "CWE-319",
+            "CWE-321",
+            "CWE-322",
+            "CWE-323",
+            "CWE-324",
+            "CWE-325",
+            "CWE-326",
+            "CWE-327",
+            "CWE-328",
+            "CWE-329",
+            "CWE-330",
+            "CWE-331",
+            "CWE-335",
+            "CWE-338",
+            "CWE-347",
+            "CWE-522",
+            "CWE-540",
+            "CWE-547",
+            "CWE-757",
+            "CWE-798",
+            "CWE-916",
+            "CWE-1240",
+        }
+    )
+
+    def __init__(self, chokepoints: tuple[str, ...] = ()) -> None:
+        if any(not fragment.strip() for fragment in chokepoints):
+            raise ValidationError("a PQC chokepoint is a nonblank URL fragment")
+        self._chokepoints = tuple(fragment.strip().lower() for fragment in chokepoints)
+
+    def tier(self, repository: str, cwes: Iterable[str]) -> PqcWorklistTier:
+        if any(fragment in repository.lower() for fragment in self._chokepoints):
+            return PqcWorklistTier.CHOKEPOINT
+        if any(cwe.upper().split(":")[0].strip() in self._CRYPTO_CWES for cwe in cwes):
+            return PqcWorklistTier.CRYPTO_CWE
+        return PqcWorklistTier.TAIL
+
+
+class PqcService:
+    def __init__(
+        self,
+        uow: AssessmentsUnitOfWork,
+        code_facts: CodeFactsService,
+        portfolio: PortfolioService,
+        publisher: ArtifactPublisher,
+        scanner: PqcScanner | None = None,
+        clock: Clock | None = None,
+        *,
+        findings: FindingService,
+    ) -> None:
+        self._uow = uow
+        self._log = AssessmentLog(uow)
+        self._code_facts = code_facts
+        self._portfolio = portfolio
+        self._publisher = publisher
+        self._scanner = scanner
+        self._clock = clock or SystemClock()
+        self._findings = findings
+
+    def prescan(self, repository_ref_id: UUID, request: ToolRequest | None) -> PqcPrescan:
+        """Layer 1 for the commit: the pinned scan plus the crypto census over its checkout, or
+        its manifest SBOM's crypto packages alone (`request` None, sbom-only). A commit already
+        scanned by the current pack on the same basis is not scanned again."""
+        scanner = self._require_scanner()
+        stamps = scanner.stamps()
+        subject = self._portfolio.inventory.subject(repository_ref_id)
+        latest = self._latest(repository_ref_id, PqcFactsArtifact)
+        if latest is not None:
+            assessment, doc = latest
+            current = pqc_facts.read_stamps(doc).same_pack(stamps, source=request is not None)
+            basis = doc.coverage.assessment_basis == ("sbom-only" if request is None else "source")
+            if current and basis:
+                return self._prescanned(assessment, doc, scanned=False)
+        if request is None:
+            scan = None
+            facts = pqc_facts.sbom_facts(self._code_facts.packages(repository_ref_id))
+        else:
+            if not (readiness := scanner.check()).ready:
+                raise ConfigError(f"{scanner.name} is not ready: {readiness.detail}")
+            census = [
+                f
+                for f in self._code_facts.crypto(repository_ref_id, request)
+                if f.probe_id != CryptoProbeId.SBOM_COMPONENT
+            ]
+            scan = scanner.scan(request).data
+            if not scan.stamps.same_pack(stamps):
+                raise IntegrityError(f"{scanner.name} scanned with a pack it does not stamp")
+            scan = scan.model_copy(
+                update={"findings": (*scan.findings, *long_validity(request.checkout()))}
+            )
+            facts = pqc_facts.source_facts(scan, census)
+        doc = pqc_facts.facts_document(
+            subject.repository_url, scan.stamps if scan else stamps, facts, scan
+        )
+        done = self._record_facts(subject, doc, self._clock.now(), scanned=True)
+        fact_count = len(facts)
+        self._uow.after_commit(
+            lambda: log.info("prescanned ref %s: %d facts", repository_ref_id, fact_count)
+        )
+        return done if scan is None else done.model_copy(update={"cbom": scan.cbom})
+
+    def prepare(self, repository_ref_id: UUID) -> PqcReadinessInput:
+        """What Layer 2 scores: the commit's latest facts, how much work they need, and the
+        report they would replace. NotFoundError before a prescan."""
+        latest = self._latest(repository_ref_id, PqcFactsArtifact)
+        if latest is None:
+            raise NotFoundError(f"ref {repository_ref_id} has no pqc-facts; prescan it first")
+        assessment, doc = latest
+        facts = pqc_facts.read_facts(doc)
+        prior = self.find(repository_ref_id)
+        stale = self._scanner is not None and not pqc_facts.read_stamps(doc).same_pack(
+            self._scanner.stamps(), source=doc.coverage.assessment_basis == "source"
+        )
+        subject = self._portfolio.inventory.subject(repository_ref_id)
+        return PqcReadinessInput(
+            subject=subject.model_copy(update={"assessment_id": assessment.id}),
+            findings=FindingContext(),
+            prepared_at=self._clock.now(),
+            facts=tuple(facts),
+            no_crypto_detected_assertion=doc.coverage.no_crypto_detected_assertion,
+            route=PqcRoute.UNREFRESHED if stale else pqc_readiness.route(facts, prior),
+            prior=prior,
+        )
+
+    def check(self, doc: PqcReadinessArtifact) -> LintReport:
+        """The readiness gate past its schema; `record` refuses a report that fails."""
+        return READINESS_LINT.run(doc, LintContext())
+
+    @overload
+    def record(
+        self, repository_ref_id: UUID, doc: PqcFactsArtifact, provenance: Provenance
+    ) -> PqcPrescan: ...
+    @overload
+    def record(
+        self, repository_ref_id: UUID, doc: PqcReadinessArtifact, provenance: Provenance
+    ) -> PqcReadiness: ...
+    def record(
+        self,
+        repository_ref_id: UUID,
+        doc: PqcFactsArtifact | PqcReadinessArtifact,
+        provenance: Provenance,
+    ) -> PqcPrescan | PqcReadiness:
+        """Facts produced elsewhere, or a Layer-2 report, as a pqc-readiness assessment of the
+        commit. The same document again adds nothing."""
+        subject = self._portfolio.inventory.subject(repository_ref_id)
+        if isinstance(doc, PqcFactsArtifact):
+            self._require_repository(subject, doc.repository)
+            return self._record_facts(subject, doc, provenance.occurred_at, scanned=False)
+        doc = PqcReadinessArtifact.parse(doc.payload)
+        self._require_repository(subject, doc.metadata.repository)
+        if doc.metadata.commit not in (None, subject.sha):
+            raise ValidationError(
+                f"report commit {doc.metadata.commit} is not ref {repository_ref_id}'s "
+                f"{subject.sha}"
+            )
+        assessment = self._existing(repository_ref_id, doc)
+        if assessment is None:
+            if violations := self.check(doc).violations:
+                listed = "; ".join(f"{v.item}: {v.message}" for v in violations)
+                raise ValidationError(f"pqc-readiness report fails its gate: {listed}")
+            assessment = self._add(
+                repository_ref_id,
+                doc,
+                _SKILL,
+                doc.metadata.tool.adapter_version or "",
+                provenance.occurred_at,
+            )
+        assert assessment.id is not None
+        return pqc_readiness.readiness(
+            doc, assessment.id, repository_ref_id, assessment.occurred_at
+        )
+
+    def find(self, repository_ref_id: UUID) -> PqcReadiness | None:
+        """The commit's latest readiness: its newest report, or a zero-hit scanned since."""
+        found = self._readiness([repository_ref_id])
+        return found[0] if found else None
+
+    def summary(self, filter: PqcFilter, group_by: PqcDimension) -> list[PqcRollup]:
+        """Latest readiness per commit in scope, rolled up by bucket or dominant provenance."""
+        groups: dict[str, list[PqcReadiness]] = {}
+        for r in self.list_readiness(filter):
+            key = (r.bucket or "unbucketed") if group_by == PqcDimension.BUCKET else r.dominant
+            groups.setdefault(str(key), []).append(r)
+        rollups = []
+        for key, members in sorted(groups.items()):
+            counts: dict[str, int] = {}
+            for rem in (rem for r in members for rem in r.remediations):
+                counts[rem.category] = counts.get(rem.category, 0) + 1
+            rollups.append(
+                PqcRollup(
+                    key=key,
+                    repositories=len(members),
+                    mean_overall=round(sum(r.overall for r in members) / len(members), 1),
+                    clock_2030=sum(r.has_2030_clock_items for r in members),
+                    hndl_priority=sum(r.hndl_priority for r in members),
+                    blocked=sum(r.is_blocked() for r in members),
+                    remediations=dict(sorted(counts.items())),
+                )
+            )
+        return rollups
+
+    def blockers(self, filter: PqcFilter) -> list[PqcBlocker]:
+        """The remediations of each in-scope commit's latest readiness, in /patch's vocabulary."""
+        return [
+            b
+            for r in self.list_readiness(filter)
+            for b in pqc_readiness.blockers(r)
+            if (not filter.categories or b.remediation.category in filter.categories)
+            and (filter.patchable is None or b.patchable == filter.patchable)
+        ]
+
+    def list_readiness(self, filter: PqcFilter) -> list[PqcReadiness]:
+        """The latest readiness of each in-scope commit that has one."""
+        refs = self._refs(filter)
+        found = self._readiness(refs) if refs is None or refs else []
+        return [r for r in found if not filter.buckets or r.bucket in filter.buckets]
+
+    def scan_states(self, filter: PqcFilter) -> list[PqcScanState]:
+        """Every in-scope commit's newest facts scan, an unscanned commit included."""
+        refs = self._refs(filter)
+        if refs is None:
+            repositories = every_item(
+                lambda page: self._portfolio.list_repositories(RepositoryFilter(), page)
+            )
+            ids = [r.id for r in repositories if r.id]
+            refs = [r.id for r in self._portfolio.inventory.list_refs_of(ids) if r.id]
+        newest = self._newest(refs, [PqcFactsArtifact]) if refs else {}
+        stamps = self._scanner.stamps() if self._scanner is not None and newest else None
+        states = []
+        for ref_id in refs:
+            held = newest.get(ref_id, {}).get(PqcFactsArtifact.schema)
+            if held is None:
+                states.append(PqcScanState(repository_ref_id=ref_id))
+                continue
+            assessment, artifact_id = held
+            doc = self._publisher.read(artifact_id, PqcFactsArtifact)
+            states.append(
+                PqcScanState(
+                    repository_ref_id=ref_id,
+                    assessment_id=assessment.id,
+                    basis=doc.coverage.assessment_basis,
+                    current=None
+                    if stamps is None
+                    else pqc_facts.read_stamps(doc).same_pack(
+                        stamps, source=doc.coverage.assessment_basis == "source"
+                    ),
+                )
+            )
+        return states
+
+    def worklist(
+        self, filter: PqcFilter, *, chokepoints: tuple[str, ...] = ()
+    ) -> tuple[PqcWorklistEntry, ...]:
+        """One ranked entry per in-scope repository, including unassessed inventory; no scans."""
+        if filter.buckets or filter.categories or filter.patchable is not None:
+            raise ValidationError("PQC worklist supports only product and repository-ref scope")
+        priority = WorklistPriorityPolicy(chokepoints)
+        ref_ids = self._refs(filter)
+        if ref_ids is None:
+            repositories = list(
+                every_item(lambda page: self._portfolio.list_repositories(RepositoryFilter(), page))
+            )
+            selected = self._portfolio.inventory.list_refs_of(
+                [repository.id for repository in repositories if repository.id]
+            )
+        else:
+            selected = self._portfolio.inventory.list_refs_by_ids(ref_ids)
+            repositories = self._portfolio.inventory.list_repositories(
+                sorted({ref.repository_id for ref in selected}, key=str)
+            )
+        if not repositories:
+            return ()
+        refs: defaultdict[UUID, list[RepositoryRef]] = defaultdict(list)
+        for ref in selected:
+            refs[ref.repository_id].append(ref)
+        states = {
+            state.repository_ref_id: state
+            for state in self.scan_states(
+                PqcFilter(repository_ref_ids=tuple(ref.id for ref in selected if ref.id))
+            )
+        }
+        repository_ids = [repository.id for repository in repositories if repository.id]
+        availability = self._portfolio.liveness_in(repository_ids)
+        findings = self._findings.all_in(repository_ids)
+        entries = []
+        for repository in repositories:
+            assert repository.id is not None
+            ref = max(
+                refs[repository.id],
+                key=lambda row: (
+                    row.is_default,
+                    row.created_at or datetime.min.replace(tzinfo=UTC),
+                    str(row.id),
+                ),
+                default=None,
+            )
+            tier = priority.tier(
+                repository.url,
+                (cwe for finding in findings.get(repository.id, ()) for cwe in finding.cwes),
+            )
+            access = availability[repository.id]
+            route, reason = PqcWorklistRoute.SOURCE, access.reason
+            if ref is None:
+                route, reason = PqcWorklistRoute.ACCESS_REQUEST, "no-registered-commit"
+            elif access.unobserved == ComparisonStatus.NO_CREDENTIALS:
+                route, reason = PqcWorklistRoute.ACCESS_REQUEST, access.unobserved.value
+            elif access.unobserved == ComparisonStatus.UNREACHABLE:
+                route, reason = PqcWorklistRoute.SBOM_ONLY, access.unobserved.value
+            entries.append(
+                PqcWorklistEntry(
+                    repository_id=repository.id,
+                    repository=repository.url,
+                    repository_ref_id=ref.id if ref else None,
+                    sha=ref.sha if ref else None,
+                    priority_tier=tier,
+                    route=route,
+                    access=access,
+                    reason=reason,
+                    scan=states.get(ref.id) if ref else None,
+                    cursor=f"{_WORKLIST_ORDER[tier]}|{repository.url}",
+                )
+            )
+        return tuple(sorted(entries, key=lambda entry: entry.cursor))
+
+    def sites(self, filter: PqcFilter) -> list[PqcSite]:
+        """The group pins and below-default Go toolchains in each in-scope commit's latest facts."""
+        refs = self._refs(filter)
+        if refs is not None and not refs:
+            return []
+        newest = self._newest(refs, [PqcFactsArtifact])
+        return [
+            PqcSite(repository_ref_id=ref_id, kind=kind, fact=fact)
+            for ref_id, held in newest.items()
+            for fact in pqc_facts.read_facts(
+                self._publisher.read(held[PqcFactsArtifact.schema][1], PqcFactsArtifact)
+            )
+            if (kind := pqc_facts.site(fact)) is not None
+        ]
+
+    def record_claims(
+        self, doc: PqcVendorClaimsArtifact, provenance: Provenance
+    ) -> PqcVendorClaims:
+        """The next version of the curated vendor claims; it must raise `version`. The latest
+        again adds nothing."""
+        version = _claims_version(doc)
+        prior = self._publisher.latest_imported(PqcVendorClaimsArtifact)
+        if prior is not None:
+            if prior.document.payload == doc.payload:
+                return _claims(doc, prior.artifact_id)
+            if (latest := _claims_version(prior.document)) >= version:
+                raise ConflictError(
+                    f"pqc-vendor-claims version {version} does not supersede the recorded "
+                    f"version {latest}; a review publishes a higher version"
+                )
+        published = self._publisher.publish_successor(
+            doc, None if prior is None else prior.artifact_id
+        )
+        claims = _claims(doc, published.artifact_id)
+        self._uow.after_commit(
+            lambda: log.info(
+                "recorded pqc-vendor-claims v%d (%s) by run %s",
+                version,
+                published.artifact_id,
+                provenance.run_id,
+            )
+        )
+        return claims
+
+    def vendor_claims(self) -> PqcVendorClaims:
+        """The latest recorded vendor claims; NotFoundError before any is recorded."""
+        latest = self._publisher.latest_imported(PqcVendorClaimsArtifact)
+        if latest is None:
+            raise NotFoundError("no pqc-vendor-claims recorded; record the curated claims first")
+        return _claims(latest.document, latest.artifact_id)
+
+    def _require_scanner(self) -> PqcScanner:
+        if self._scanner is None:
+            raise ConfigError("prescan needs the pqc-scan provider (Context.register_pqc_scanner)")
+        return self._scanner
+
+    @staticmethod
+    def _require_repository(subject: SubjectRef, raw: str) -> None:
+        host = urlsplit(subject.repository_url).hostname or ""
+        if str(HttpsRepoUrl.parse(raw, [host])) != subject.repository_url:
+            raise ValidationError(f"document is for {raw}, not {subject.repository_url}")
+
+    def _record_facts(
+        self, subject: SubjectRef, doc: PqcFactsArtifact, at: datetime, *, scanned: bool
+    ) -> PqcPrescan:
+        ref_id = subject.repository_ref_id
+        existing = self._existing(ref_id, doc)
+        if existing is not None:
+            return self._prescanned(existing, doc, scanned=scanned)
+        stamps = pqc_facts.read_stamps(doc)
+        assessment = self._add(ref_id, doc, _SCANNER, stamps.adapter_version, at)
+        return self._prescanned(assessment, doc, scanned=scanned)
+
+    def _prescanned(
+        self, assessment: Assessment, doc: PqcFactsArtifact, *, scanned: bool
+    ) -> PqcPrescan:
+        assert assessment.id is not None
+        return PqcPrescan(
+            assessment_id=assessment.id,
+            facts=tuple(pqc_facts.read_facts(doc)),
+            scanned=scanned,
+            readiness=pqc_readiness.zero_hit_readiness(
+                assessment.id, assessment.repository_ref_id, assessment.occurred_at
+            )
+            if pqc_readiness.zero_hit(doc)
+            else None,
+        )
+
+    def _existing(self, repository_ref_id: UUID, doc: ArtifactDocument) -> Assessment | None:
+        digest = sha256_hex(doc.payload)
+        recorded = self._log.find_recorded([repository_ref_id], _KIND, doc.schema, digest)
+        return recorded[0][0] if recorded else None
+
+    def _add(
+        self,
+        repository_ref_id: UUID,
+        doc: ArtifactDocument,
+        assessor: str,
+        version: str,
+        at: datetime,
+    ) -> Assessment:
+        published = self._publisher.publish_artifact(doc)
+        assessment, _ = self._log.add(
+            Assessment(
+                repository_ref_id=repository_ref_id,
+                kind=_KIND,
+                status=ASSESSMENT_COMPLETED,
+                assessor=assessor,
+                assessor_version=version,
+                occurred_at=at,
+            ),
+            published.artifact_id,
+            sha256_hex(doc.payload),
+        )
+        recorded = self._existing(repository_ref_id, doc)
+        assert recorded is not None
+        self._uow.after_commit(
+            lambda: log.info(
+                "recorded %s assessment %s of ref %s",
+                type(doc).__name__,
+                assessment.id,
+                repository_ref_id,
+            )
+        )
+        return recorded
+
+    def _newest(
+        self, repository_ref_ids: Sequence[UUID] | None, kinds: Sequence[type[ArtifactDocument]]
+    ) -> dict[UUID, dict[str, tuple[Assessment, UUID]]]:
+        """Per commit, per document kind: the newest assessment holding one, with its artifact."""
+        held = self._log.documents(
+            self._log.list_of(_KIND, repository_ref_ids),
+            [k.schema for k in kinds],  # type: ignore[misc]
+        )
+        newest: dict[UUID, dict[str, tuple[Assessment, UUID]]] = {}
+        for a, row in held:
+            assert row.id is not None
+            newest.setdefault(a.repository_ref_id, {}).setdefault(row.kind, (a, row.id))
+        return newest
+
+    def _latest(self, repository_ref_id: UUID, kind: type[D]) -> tuple[Assessment, D] | None:
+        held = self._newest([repository_ref_id], [kind]).get(repository_ref_id, {}).get(kind.schema)
+        return None if held is None else (held[0], self._publisher.read(held[1], kind))
+
+    def _readiness(self, repository_ref_ids: Sequence[UUID] | None) -> list[PqcReadiness]:
+        # A report stands until re-scored; a verified zero-hit scanned after it is not applicable.
+        found = []
+        newest = self._newest(repository_ref_ids, [PqcReadinessArtifact, PqcFactsArtifact])
+        for ref_id, held in newest.items():
+            report, facts = held.get(PqcReadinessArtifact.schema), held.get(PqcFactsArtifact.schema)
+            if facts is not None and (report is None or _later(facts[0], report[0])):
+                a = facts[0]
+                if pqc_readiness.zero_hit(self._publisher.read(facts[1], PqcFactsArtifact)):
+                    assert a.id is not None
+                    found.append(pqc_readiness.zero_hit_readiness(a.id, ref_id, a.occurred_at))
+                    continue
+            if report is not None:
+                a = report[0]
+                assert a.id is not None
+                doc = self._publisher.read(report[1], PqcReadinessArtifact)
+                found.append(pqc_readiness.readiness(doc, a.id, ref_id, a.occurred_at))
+        return found
+
+    def _refs(self, filter: PqcFilter) -> list[UUID] | None:
+        """The commits in scope; None is every commit."""
+        refs = None if filter.repository_ref_ids is None else list(filter.repository_ref_ids)
+        if filter.product_id is not None:
+            shipped = [r.id for r in self._portfolio.list_product_refs(filter.product_id) if r.id]
+            refs = shipped if refs is None else [r for r in refs if r in set(shipped)]
+        return refs
+
+
+def _claims_version(doc: PqcVendorClaimsArtifact) -> int:
+    """The document's version, once its vendor ids are unique (the schema can't say so)."""
+    body = json.loads(doc.payload)
+    if dupes := sorted(i for i, n in Counter(v["id"] for v in body["vendors"]).items() if n > 1):
+        raise ValidationError(f"pqc-vendor-claims repeats vendor ids: {', '.join(dupes)}")
+    return int(body["version"])
+
+
+def _claims(doc: PqcVendorClaimsArtifact, artifact_id: UUID) -> PqcVendorClaims:
+    body = {k: v for k, v in json.loads(doc.payload).items() if k != "artifact"}
+    return PqcVendorClaims.model_validate({**body, "artifact_id": artifact_id})
+
+
+def _later(a: Assessment, b: Assessment) -> bool:
+    return (a.occurred_at, a.created_at or a.occurred_at) > (
+        b.occurred_at,
+        b.created_at or b.occurred_at,
+    )

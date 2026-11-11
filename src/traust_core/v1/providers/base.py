@@ -1,12 +1,16 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+import hashlib
+import json
+import shutil
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Generic, Protocol, TypeVar
 
 from traust_core.v1.errors import ConfigError
 from traust_core.v1.models.base import Dto
+from traust_core.v1.models.common import Sha256
 
 Req = TypeVar("Req", contravariant=True)
 
@@ -25,12 +29,25 @@ class Readiness(Dto):
     detail: str = ""
 
 
+def on_path(*binaries: str, missing: str = "") -> Readiness:
+    """Ready when every binary is on PATH; the detail names the missing ones, then `missing`."""
+    absent = ", ".join(b for b in binaries if shutil.which(b) is None)
+    return Readiness(ready=not absent, detail=f"{absent}{missing}" if absent else "")
+
+
 class Acquisition(Dto):
     provider: str
     acquired_at: datetime
     version: str | None = None
     source: str | None = None
     stale: bool = False
+    argv_sha256: Sha256 | None = None
+    db_built_at: datetime | None = None
+
+
+def argv_digest(argv: Sequence[str]) -> Sha256:
+    """sha256 of the argv a tool actually ran, over its JSON array (unambiguous across spaces)."""
+    return Sha256(hashlib.sha256(json.dumps(list(argv)).encode()).hexdigest())
 
 
 @dataclass(frozen=True, slots=True)

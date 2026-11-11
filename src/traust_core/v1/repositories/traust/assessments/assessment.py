@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+from collections.abc import Collection, Mapping
+from datetime import datetime
 from typing import Protocol
 from uuid import UUID
 
+import sqlalchemy as sa
+
+from traust_core.v1.errors import NotFoundError
 from traust_core.v1.models.assessment import Assessment
+from traust_core.v1.models.common import RecordBudget
 from traust_core.v1.repositories.tables import (
     TRAUST,
     RecordRepository,
@@ -33,25 +39,168 @@ ASSESSMENT = TableSpec(
 
 
 class AssessmentRepository(RecordRepository[Assessment], Protocol):
-    def latest(self, repository_ref_id: UUID, kind: str) -> Assessment | None: ...
+    def get_for_update(self, assessment_id: UUID) -> Assessment: ...
+    def find_at(self, assessment_id: UUID, occurred_at: datetime) -> Assessment | None: ...
+    def list_at(self, timestamps: Mapping[UUID, datetime]) -> list[Assessment]: ...
+    def find_scan(
+        self, repository_ref_id: UUID, assessor: str, occurred_at: datetime
+    ) -> Assessment | None: ...
+    def latest(
+        self,
+        repository_ref_id: UUID,
+        kind: str,
+        status: str | None = None,
+        *,
+        as_of: datetime | None = None,
+    ) -> Assessment | None: ...
+    def latest_for_refs(
+        self,
+        repository_ref_ids: Collection[UUID],
+        kind: str | Collection[str],
+        status: str | Collection[str],
+    ) -> Assessment | None: ...
+    def latest_per_ref(
+        self, repository_ref_ids: Collection[UUID], kinds: Collection[str], status: str
+    ) -> list[Assessment]: ...
     def list_for_ref(self, repository_ref_id: UUID) -> list[Assessment]: ...
+    def list_for_refs(
+        self,
+        repository_ref_ids: Collection[UUID],
+        kind: str | None = None,
+        *,
+        assessor_version: str | None = None,
+        read_budget: RecordBudget | None = None,
+    ) -> list[Assessment]: ...
     def list_for_run_order(self, run_order_id: UUID) -> list[Assessment]: ...
+    def list_by_ids(
+        self, assessment_ids: Collection[UUID], *, read_budget: RecordBudget | None = None
+    ) -> list[Assessment]: ...
+    def search(
+        self,
+        *,
+        repository_ref_id: UUID | None = None,
+        kind: str | None = None,
+        status: str | None = None,
+        assessor_version: str | None = None,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        limit: int,
+        after: tuple[datetime, UUID] | None = None,
+    ) -> list[Assessment]: ...
+    def feed_after(self, after: tuple[datetime, UUID] | None, limit: int) -> list[Assessment]:
+        """Assessments recorded after `(created_at, id)`, oldest first."""
+        ...
 
 
 class SqlAssessmentRepository(SqlAppendOnlyRepository[Assessment]):
     spec = ASSESSMENT
     record = Assessment
 
-    def latest(self, repository_ref_id: UUID, kind: str) -> Assessment | None:
+    def get_for_update(self, assessment_id: UUID) -> Assessment:
+        stmt = self._select().where(self.table.c.id == assessment_id).with_for_update()
+        row = self._execute(f"lock assessment {assessment_id}", stmt).mappings().one_or_none()
+        if row is None:
+            raise NotFoundError(f"assessment {assessment_id}")
+        return self._to_record(row)
+
+    def find_at(self, assessment_id: UUID, occurred_at: datetime) -> Assessment | None:
+        c = self.table.c
+        stmt = self._select().where(c.id == assessment_id, c.occurred_at == occurred_at)
+        row = self._execute(f"find {assessment_id} at {occurred_at}", stmt).mappings().first()
+        return None if row is None else self._to_record(row)
+
+    def list_at(self, timestamps: Mapping[UUID, datetime]) -> list[Assessment]:
+        if not timestamps:
+            return []
+        c = self.table.c
+        return self._many(
+            f"{len(timestamps)} by id and timestamp",
+            sa.tuple_(c.id, c.occurred_at).in_(list(timestamps.items())),
+        )
+
+    def find_scan(
+        self, repository_ref_id: UUID, assessor: str, occurred_at: datetime
+    ) -> Assessment | None:
         c = self.table.c
         stmt = (
             self._select()
-            .where(c.repository_ref_id == repository_ref_id, c.kind == kind)
-            .order_by(c.occurred_at.desc(), c.created_at.desc())
+            .where(
+                c.repository_ref_id == repository_ref_id,
+                c.kind == "scanner",
+                c.assessor == assessor,
+                c.occurred_at == occurred_at,
+            )
+            .order_by(c.created_at, c.id)
+            .limit(1)
+        )
+        row = self._execute(f"find scan for {repository_ref_id}", stmt).mappings().first()
+        return None if row is None else self._to_record(row)
+
+    def latest(
+        self,
+        repository_ref_id: UUID,
+        kind: str,
+        status: str | None = None,
+        *,
+        as_of: datetime | None = None,
+    ) -> Assessment | None:
+        c = self.table.c
+        conditions = [c.repository_ref_id == repository_ref_id, c.kind == kind]
+        if status is not None:
+            conditions.append(c.status == status)
+        if as_of is not None:
+            conditions.append(c.occurred_at <= as_of)
+        stmt = (
+            self._select()
+            .where(*conditions)
+            .order_by(c.occurred_at.desc(), c.created_at.desc(), c.id.desc())
             .limit(1)
         )
         row = self._execute(f"latest {kind} for {repository_ref_id}", stmt).mappings().first()
         return None if row is None else self._to_record(row)
+
+    def latest_for_refs(
+        self,
+        repository_ref_ids: Collection[UUID],
+        kind: str | Collection[str],
+        status: str | Collection[str],
+    ) -> Assessment | None:
+        if not repository_ref_ids:
+            return None
+        c = self.table.c
+        stmt = (
+            self._select()
+            .where(
+                c.repository_ref_id.in_(list(repository_ref_ids)),
+                c.kind.in_([kind] if isinstance(kind, str) else kind),
+                c.status.in_([status] if isinstance(status, str) else status),
+            )
+            .order_by(c.occurred_at.desc(), c.created_at.desc(), c.id.desc())
+            .limit(1)
+        )
+        op = f"latest {kind} of {len(repository_ref_ids)} refs"
+        row = self._execute(op, stmt).mappings().first()
+        return None if row is None else self._to_record(row)
+
+    def latest_per_ref(
+        self, repository_ref_ids: Collection[UUID], kinds: Collection[str], status: str
+    ) -> list[Assessment]:
+        """Each ref's latest assessment of any of `kinds` with `status`, in bounded batches."""
+        c = self.table.c
+        newest = (c.occurred_at.desc(), c.created_at.desc(), c.id.desc())
+        rank = sa.func.row_number().over(partition_by=c.repository_ref_id, order_by=newest)
+        found: list[Assessment] = []
+        for batch in self._batches(repository_ref_ids):
+            ranked = (
+                self._select()
+                .add_columns(rank.label("rank"))
+                .where(c.repository_ref_id.in_(batch), c.kind.in_(list(kinds)), c.status == status)
+                .subquery()
+            )
+            stmt = sa.select(*(ranked.c[col.name] for col in c)).where(ranked.c.rank == 1)
+            rows = self._execute(f"latest per ref of {len(batch)} refs", stmt).mappings()
+            found.extend(self._to_record(row) for row in rows)
+        return found
 
     def list_for_ref(self, repository_ref_id: UUID) -> list[Assessment]:
         c = self.table.c
@@ -64,4 +213,64 @@ class SqlAssessmentRepository(SqlAppendOnlyRepository[Assessment]):
     def list_for_run_order(self, run_order_id: UUID) -> list[Assessment]:
         return self._many(
             f"list for order {run_order_id}", self.table.c.run_order_id == run_order_id
+        )
+
+    def list_by_ids(
+        self, assessment_ids: Collection[UUID], *, read_budget: RecordBudget | None = None
+    ) -> list[Assessment]:
+        # batched: a whole scope's occurrences and decisions can reference more assessments
+        # than one statement can bind
+        return self._many_in("list by id", self.table.c.id, assessment_ids, read_budget=read_budget)
+
+    def search(
+        self,
+        *,
+        repository_ref_id: UUID | None = None,
+        kind: str | None = None,
+        status: str | None = None,
+        assessor_version: str | None = None,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        limit: int,
+        after: tuple[datetime, UUID] | None = None,
+    ) -> list[Assessment]:
+        """Newest first by occurred_at; `since` inclusive, `until` exclusive."""
+        c = self.table.c
+        conditions = []
+        if since is not None:
+            conditions.append(c.occurred_at >= since)
+        if until is not None:
+            conditions.append(c.occurred_at < until)
+        if repository_ref_id is not None:
+            conditions.append(c.repository_ref_id == repository_ref_id)
+        if kind is not None:
+            conditions.append(c.kind == kind)
+        if status is not None:
+            conditions.append(c.status == status)
+        if assessor_version is not None:
+            conditions.append(c.assessor_version == assessor_version)
+        return self._page("search", *conditions, limit=limit, after=after, at="occurred_at")
+
+    def feed_after(self, after: tuple[datetime, UUID] | None, limit: int) -> list[Assessment]:
+        return self._page("feed", limit=limit, after=after, oldest_first=True)
+
+    def list_for_refs(
+        self,
+        repository_ref_ids: Collection[UUID],
+        kind: str | None = None,
+        *,
+        assessor_version: str | None = None,
+        read_budget: RecordBudget | None = None,
+    ) -> list[Assessment]:
+        c = self.table.c
+        where = [c.repository_ref_id.in_(repository_ref_ids)]
+        if kind is not None:
+            where.append(c.kind == kind)
+        if assessor_version is not None:
+            where.append(c.assessor_version == assessor_version)
+        return self._many(
+            f"list {kind or 'all'} for {len(repository_ref_ids)} refs",
+            *where,
+            order_by=(c.occurred_at,),
+            read_budget=read_budget,
         )

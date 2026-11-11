@@ -1,0 +1,1832 @@
+"""The route x guard matrix. The asymmetry fixtures mirror the AWX miss shape: sibling
+registrations in one file where some carry the guard and some don't. Ported from traust
+tests/test_enumerate_route_guards.py."""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from pathlib import Path
+
+import pytest
+
+from traust_core.v1.errors import ValidationError
+from traust_core.v1.models.code_facts import RouteGuardFact
+from traust_core.v1.providers.clock import FixedClock
+from traust_core.v1.providers.route_guards import RouteGuardMatrix, route_guards
+from traust_core.v1.providers.tools import ToolRequest
+from traust_core.v1.providers.tree import tree_files
+
+
+def _enum(repo: Path) -> dict:
+    return route_guards(tree_files(repo)).model_dump(mode="json")
+
+
+def _by_pattern(result: dict, pattern: str) -> list:
+    return [r for r in result["routes"] if r["pattern"] == pattern]
+
+
+# --------------------------------------------------------------------------
+# go-http
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def go_asym_repo(tmp_path):
+    (tmp_path / "server.go").write_text(
+        "package api\n\n"
+        "func routes(mux *http.ServeMux) {\n"
+        '\tmux.HandleFunc("/api/jobs", requireAuth(handleJobs))\n'
+        '\tmux.HandleFunc("/api/admin", requireAuth(handleAdmin))\n'
+        '\tmux.HandleFunc("/api/callback", handleCallback)\n'
+        "}\n"
+    )
+    return tmp_path
+
+
+def test_go_guarded_and_bare_rows(go_asym_repo):
+    result = _enum(go_asym_repo)
+    [jobs] = _by_pattern(result, "/api/jobs")
+    assert jobs["guards"] == ["requireAuth"]
+    assert jobs["judgement_required"] is False
+    [cb] = _by_pattern(result, "/api/callback")
+    assert cb["guards"] == []
+    assert cb["judgement_required"] is True
+
+
+def test_go_asymmetry_group_detected(go_asym_repo):
+    result = _enum(go_asym_repo)
+    [asym] = result["asymmetries"]
+    assert asym["unguarded"] == ["/api/callback"]
+    assert set(asym["guarded"]) == {"/api/jobs", "/api/admin"}
+    [cb] = _by_pattern(result, "/api/callback")
+    assert cb["asymmetry"] is True
+
+
+def test_go_receiver_scoped_use_middleware(tmp_path):
+    (tmp_path / "router.go").write_text(
+        "package api\n"
+        "func routes(r chi.Router) {\n"
+        "\tr.Use(authMiddleware)\n"
+        '\tr.Get("/things", listThings)\n'
+        "}\n"
+    )
+    result = _enum(tmp_path)
+    [row] = _by_pattern(result, "/things")
+    assert row["scope_guards"] == ["authMiddleware"]
+    assert row["guards"] == []
+    assert row["judgement_required"] is False
+
+
+def test_go_unguard_marker_forces_judgement(tmp_path):
+    (tmp_path / "public.go").write_text(
+        "package api\n"
+        "func routes(r chi.Router) {\n"
+        '\tr.Get("/metrics", skipAuth(metricsHandler))\n'
+        "}\n"
+    )
+    result = _enum(tmp_path)
+    [row] = _by_pattern(result, "/metrics")
+    assert row["judgement_required"] is True
+    assert row["unguard_markers"] == ["skipAuth"]
+
+
+def test_go_test_files_excluded(tmp_path):
+    (tmp_path / "server_test.go").write_text(
+        'func t(mux *http.ServeMux) { mux.HandleFunc("/t", handler) }\n'
+    )
+    assert _enum(tmp_path)["routes"] == []
+
+
+# --------------------------------------------------------------------------
+# django-drf
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def django_repo(tmp_path):
+    app = tmp_path / "app"
+    app.mkdir()
+    (app / "urls.py").write_text(
+        "urlpatterns = [\n"
+        "    path('jobs/', JobView.as_view()),\n"
+        "    path('callback/', CallbackView.as_view()),\n"
+        "    path('legacy/', legacy_view),\n"
+        "]\n"
+    )
+    (app / "views.py").write_text(
+        "class JobView(APIView):\n"
+        "    permission_classes = [IsAuthenticated]\n"
+        "    def get(self, request): ...\n"
+        "\n"
+        "class CallbackView(APIView):\n"
+        "    permission_classes = [AllowAny]\n"
+        "    def post(self, request): ...\n"
+        "\n"
+        "@login_required\n"
+        "def legacy_view(request): ...\n"
+    )
+    return tmp_path
+
+
+def test_django_permission_classes_resolved(django_repo):
+    result = _enum(django_repo)
+    [jobs] = _by_pattern(result, "jobs/")
+    assert jobs["guards"] == ["IsAuthenticated"]
+    assert jobs["judgement_required"] is False
+    assert jobs["handler"]["path"].endswith("views.py")
+
+
+def test_django_allowany_is_judged(django_repo):
+    result = _enum(django_repo)
+    [cb] = _by_pattern(result, "callback/")
+    assert "AllowAny" in cb["unguard_markers"]
+    assert cb["judgement_required"] is True
+
+
+def test_django_decorator_guard(django_repo):
+    result = _enum(django_repo)
+    [legacy] = _by_pattern(result, "legacy/")
+    assert legacy["guards"] == ["login_required"]
+
+
+def test_drf_default_permissions_as_scope_guard(tmp_path):
+    app = tmp_path / "svc"
+    app.mkdir()
+    (app / "settings.py").write_text(
+        "REST_FRAMEWORK = {\n"
+        "    'DEFAULT_PERMISSION_CLASSES': ["
+        "'rest_framework.permissions.IsAuthenticated'],\n"
+        "}\n"
+    )
+    (app / "urls.py").write_text("urlpatterns = [path('items/', ItemView.as_view())]\n")
+    (app / "views.py").write_text("class ItemView(APIView):\n    def get(self, request): ...\n")
+    result = _enum(tmp_path)
+    [row] = _by_pattern(result, "items/")
+    assert row["guards"] == []
+    assert any("IsAuthenticated" in g for g in row["scope_guards"])
+    assert row["judgement_required"] is False
+
+
+def test_django_no_guard_no_default_is_judged(tmp_path):
+    app = tmp_path / "svc"
+    app.mkdir()
+    (app / "urls.py").write_text("urlpatterns = [path('open/', OpenView.as_view())]\n")
+    (app / "views.py").write_text("class OpenView(APIView):\n    def get(self, request): ...\n")
+    result = _enum(tmp_path)
+    [row] = _by_pattern(result, "open/")
+    assert row["judgement_required"] is True
+
+
+# --------------------------------------------------------------------------
+# flask
+# --------------------------------------------------------------------------
+
+
+def _write(root: Path, rel: str, body: str) -> None:
+    p = root / rel
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(body)
+
+
+def _flask(result: dict) -> list:
+    return [r for r in result["routes"] if r["family"] == "flask"]
+
+
+def _row(result: dict, method: str, pattern: str) -> dict:
+    [row] = [r for r in _flask(result) if r["method"] == method and r["pattern"] == pattern]
+    return row
+
+
+@pytest.fixture
+def flask_asym_repo(tmp_path):
+    _write(
+        tmp_path,
+        "app/views.py",
+        "from flask import Blueprint\n"
+        "from .auth import login_required\n\n"
+        "bp = Blueprint('items', __name__)\n\n"
+        "@bp.route('/items', methods=['GET'])\n"
+        "@login_required\n"
+        "def list_items():\n"
+        "    return []\n\n"
+        "@bp.route('/items/<id>', methods=['DELETE'])\n"
+        "@login_required\n"
+        "def delete_item(id):\n"
+        "    return ''\n\n"
+        "@bp.post('/items/import')\n"
+        "def import_items():\n"
+        "    return ''\n",
+    )
+    return tmp_path
+
+
+def test_flask_decorator_routes_and_guards(flask_asym_repo):
+    result = _enum(flask_asym_repo)
+    listing = _row(result, "GET", "/items")
+    assert listing["guards"] == ["login_required"]
+    assert listing["judgement_required"] is False
+    assert listing["handler"]["expr"] == "list_items"
+    assert listing["handler"]["line"] == 8
+    assert listing["registration"]["line"] == 6
+    imp = _row(result, "POST", "/items/import")
+    assert imp["guards"] == [] and imp["scope_guards"] == []
+    assert imp["judgement_required"] is True
+
+
+def test_a_star_import_does_not_shadow_a_guard_the_module_does_not_export(tmp_path):
+    """A checkout module may define a guard's name without exporting it (`__all__` gates
+    what a star import brings in), and the view may import the real guard after the star:
+    the route keeps its flask-login guard instead of reading the checkout's definition."""
+    (tmp_path / "helpers.py").write_text(
+        "from functools import wraps\n"
+        '__all__ = ["something_else"]\n'
+        "def login_required(fn):\n"
+        "    @wraps(fn)\n"
+        "    def wrapped(*args, **kwargs):\n"
+        "        return fn(*args, **kwargs)\n"
+        "    return wrapped\n"
+        "def something_else(): ...\n"
+    )
+    (tmp_path / "app.py").write_text(
+        "from flask import Flask\n"
+        "from helpers import *\n"
+        "from flask_login import login_required\n"
+        "app = Flask(__name__)\n"
+        "@app.route('/items')\n"
+        "@login_required\n"
+        "def list_items(): ...\n"
+    )
+    result = _enum(tmp_path)
+    listing = _row(result, "GET", "/items")
+    assert listing["guards"] == ["login_required"]
+    assert listing["judgement_required"] is False
+
+
+def test_an_explicit_guard_import_after_a_star_import_wins(tmp_path):
+    """A later explicit import rebinds what an earlier star import bound: the route keeps
+    the library guard even when the star source exports a same-named checkout definition."""
+    (tmp_path / "helpers.py").write_text(
+        "from functools import wraps\n"
+        '__all__ = ["login_required"]\n'
+        "def login_required(fn):\n"
+        "    @wraps(fn)\n"
+        "    def wrapped(*args, **kwargs):\n"
+        "        return fn(*args, **kwargs)\n"
+        "    return wrapped\n"
+    )
+    (tmp_path / "app.py").write_text(
+        "from flask import Flask\n"
+        "from helpers import *\n"
+        "from flask_login import login_required\n"
+        "app = Flask(__name__)\n"
+        "@app.route('/items')\n"
+        "@login_required\n"
+        "def list_items(): ...\n"
+    )
+    result = _enum(tmp_path)
+    listing = _row(result, "GET", "/items")
+    assert listing["guards"] == ["login_required"]
+    assert listing["judgement_required"] is False
+
+
+def test_an_uncalled_flask_helper_sharing_a_name_stays_unplaced(tmp_path):
+    """`_called` resolves the definition, not the bare name: an unrelated module calling
+    its own `register()` must not make an uncalled flask route helper look mounted."""
+    (tmp_path / "app.py").write_text(
+        "from flask import Flask\n"
+        "app = Flask(__name__)\n"
+        "def register(application):\n"
+        "    @application.route('/items')\n"
+        "    def list_items(): ...\n"
+    )
+    (tmp_path / "unrelated.py").write_text("def register(thing):\n    return thing\nregister(1)\n")
+    result = _enum(tmp_path)
+    [row] = _by_pattern(result, "/items")
+    assert row["pattern_dynamic"] is True
+
+
+def test_flask_bare_sibling_is_asymmetry(flask_asym_repo):
+    result = _enum(flask_asym_repo)
+    [asym] = [
+        a for a in result["asymmetries"] if a["family"] == "flask" and a["guard_family"] is None
+    ]
+    assert asym["unguarded"] == ["POST /items/import"]
+    assert set(asym["guarded"]) == {"GET /items", "DELETE /items/<id>"}
+    assert _row(result, "POST", "/items/import")["asymmetry"] is True
+
+
+def test_flask_blueprint_before_request_is_baseline(tmp_path):
+    _write(
+        tmp_path,
+        "svc/admin.py",
+        "from flask import Blueprint, abort, g\n\n"
+        "admin = Blueprint('admin', __name__)\n\n"
+        "@admin.before_request\n"
+        "def require_admin_session():\n"
+        "    if not g.user or not g.user.is_admin:\n"
+        "        abort(403)\n\n"
+        "@admin.route('/settings')\n"
+        "def settings():\n"
+        "    return {}\n",
+    )
+    _write(
+        tmp_path,
+        "svc/public.py",
+        "from flask import Blueprint\n\n"
+        "pub = Blueprint('pub', __name__)\n\n"
+        "@pub.route('/status')\n"
+        "def status():\n"
+        "    return 'ok'\n",
+    )
+    result = _enum(tmp_path)
+    # a before_request hook is checkout code: no guard (D37), so the route is judged
+    settings = _row(result, "GET", "/settings")
+    assert settings["guards"] == []
+    assert settings["scope_guards"] == []
+    assert settings["judgement_required"] is True
+    # the baseline is receiver-scoped: another blueprint does not inherit it
+    status = _row(result, "GET", "/status")
+    assert status["scope_guards"] == []
+    assert status["judgement_required"] is True
+
+
+def test_flask_before_request_that_cannot_reject_is_not_a_guard(tmp_path):
+    _write(
+        tmp_path,
+        "svc/views.py",
+        "from flask import Blueprint, g\n\n"
+        "bp = Blueprint('x', __name__)\n\n"
+        "@bp.before_request\n"
+        "def load_session_user():\n"
+        "    g.user = None\n\n"
+        "@bp.route('/x')\n"
+        "def x():\n"
+        "    return ''\n",
+    )
+    row = _row(_enum(tmp_path), "GET", "/x")
+    assert row["scope_guards"] == []
+    assert row["judgement_required"] is True
+
+
+def test_flask_methodview_one_row_per_method(tmp_path):
+    _write(
+        tmp_path,
+        "svc/views.py",
+        "from flask import Flask\n"
+        "from flask.views import MethodView\n"
+        "from flask_jwt_extended import jwt_required\n\n"
+        "app = Flask(__name__)\n\n"
+        "class WidgetAPI(MethodView):\n"
+        "    @jwt_required()\n"
+        "    def get(self, wid):\n"
+        "        return {}\n\n"
+        "    @jwt_required()\n"
+        "    def put(self, wid):\n"
+        "        return {}\n\n"
+        "    def delete(self, wid):\n"
+        "        return ''\n\n"
+        "app.add_url_rule('/widgets/<wid>', view_func=WidgetAPI.as_view('widget'))\n",
+    )
+    result = _enum(tmp_path)
+    rows = [r for r in _flask(result) if r["pattern"] == "/widgets/<wid>"]
+    assert sorted(r["method"] for r in rows) == ["DELETE", "GET", "PUT"]
+    assert all(r["view_class"] == "WidgetAPI" for r in rows)
+    get = _row(result, "GET", "/widgets/<wid>")
+    assert get["guards"] == ["jwt_required"]
+    assert get["handler"]["expr"] == "WidgetAPI.get"
+    delete = _row(result, "DELETE", "/widgets/<wid>")
+    assert delete["guards"] == [] and delete["judgement_required"] is True
+    assert delete["asymmetry"] is True
+
+
+def test_flask_restx_method_decorators_and_inheritance(tmp_path):
+    _write(
+        tmp_path,
+        "svc/base.py",
+        "from flask_restx import Resource\n"
+        "from flask_login import login_required\n\n"
+        "class AuthedResource(Resource):\n"
+        "    method_decorators = [login_required]\n",
+    )
+    _write(
+        tmp_path,
+        "svc/api.py",
+        "from flask_restx import Api, Namespace, Resource\n"
+        "from .base import AuthedResource\n"
+        "from flask_security import roles_required\n\n"
+        "api = Api()\n"
+        "ns = Namespace('reports')\n\n"
+        "@ns.route('/reports')\n"
+        "class Reports(AuthedResource):\n"
+        "    @roles_required('read')\n"
+        "    def get(self):\n"
+        "        return []\n\n"
+        "    @roles_required('write')\n"
+        "    def post(self):\n"
+        "        return {}\n\n"
+        "    def delete(self):\n"
+        "        return ''\n\n"
+        "class Health(Resource):\n"
+        "    def get(self):\n"
+        "        return 'ok'\n\n"
+        "api.add_resource(Health, '/health', '/healthz')\n",
+    )
+    result = _enum(tmp_path)
+    get = _row(result, "GET", "/reports")
+    assert get["guards"] == ["roles_required"]
+    assert get["scope_guards"] == ["login_required"]  # inherited method_decorators
+    # every Reports method carries the inherited authn guard, but only two
+    # of three carry the role check — the odd one out must be judged
+    delete = _row(result, "DELETE", "/reports")
+    assert delete["scope_guards"] == ["login_required"]
+    assert delete["judgement_required"] is True
+    assert delete["guard_family_gaps"] == ["role"]
+    fam = [a for a in result["asymmetries"] if a.get("guard_family") == "role"]
+    assert fam and fam[0]["unguarded"] == ["DELETE /reports"]
+    # add_resource with two paths -> one row per path
+    health = sorted(r["pattern"] for r in _flask(result) if r.get("view_class") == "Health")
+    assert health == ["/health", "/healthz"]
+
+
+def test_flask_restful_method_decorators_dict(tmp_path):
+    _write(
+        tmp_path,
+        "svc/api.py",
+        "from flask_restful import Api, Resource\n"
+        "from flask_security import roles_required\n\n"
+        "api = Api()\n\n"
+        "class Users(Resource):\n"
+        "    method_decorators = {'post': [roles_required('admin')]}\n"
+        "    def get(self):\n"
+        "        return []\n"
+        "    def post(self):\n"
+        "        return {}\n\n"
+        "api.add_resource(Users, '/users')\n",
+    )
+    result = _enum(tmp_path)
+    assert _row(result, "POST", "/users")["scope_guards"] == ["roles_required"]
+    assert _row(result, "GET", "/users")["scope_guards"] == []
+
+
+def test_flask_public_marker_forces_judgement(tmp_path):
+    _write(
+        tmp_path,
+        "svc/views.py",
+        "from flask import Flask\n"
+        "from .auth import public_endpoint, csrf\n\n"
+        "app = Flask(__name__)\n\n"
+        "@app.route('/hook', methods=['POST'])\n"
+        "@public_endpoint\n"
+        "@csrf.exempt\n"
+        "def hook():\n"
+        "    return ''\n",
+    )
+    row = _row(_enum(tmp_path), "POST", "/hook")
+    assert row["unguard_markers"] == ["csrf.exempt", "public_endpoint"]
+    assert row["guards"] == []
+    assert row["judgement_required"] is True
+
+
+def test_flask_add_url_rule_function_view(tmp_path):
+    _write(
+        tmp_path,
+        "svc/views.py",
+        "from flask import Flask\n"
+        "from .auth import login_required\n\n"
+        "app = Flask(__name__)\n\n"
+        "@login_required\n"
+        "def export():\n"
+        "    return ''\n\n"
+        "app.add_url_rule('/export', 'export', export, methods=['POST'])\n",
+    )
+    row = _row(_enum(tmp_path), "POST", "/export")
+    assert row["guards"] == ["login_required"]
+    assert row["handler"]["line"] == 7  # the def line, not the decorator
+
+
+def test_flask_app_hook_scoped_to_its_app_and_registered_blueprints(tmp_path):
+    _write(
+        tmp_path,
+        "svc/app.py",
+        "from flask import Flask, abort, request\n"
+        "from .views import bp\n\n"
+        "app = Flask(__name__)\n\n"
+        "def check_token():\n"
+        "    if not current_user.is_authenticated:\n"
+        "        abort(401)\n\n"
+        "app.before_request(check_token)\n"
+        "app.register_blueprint(bp)\n\n"
+        "@app.route('/me')\n"
+        "def me():\n"
+        "    return {}\n",
+    )
+    _write(
+        tmp_path,
+        "svc/views.py",
+        "from flask import Blueprint\n\n"
+        "bp = Blueprint('v', __name__)\n\n"
+        "@bp.route('/orders')\n"
+        "def orders():\n"
+        "    return []\n",
+    )
+    _write(
+        tmp_path,
+        "tools/other_app.py",
+        "from flask import Flask\n\n"
+        "app = Flask(__name__)\n\n"
+        "@app.route('/debug')\n"
+        "def debug():\n"
+        "    return ''\n",
+    )
+    result = _enum(tmp_path)
+    # a before_request hook is checkout code: no guard (D37), so the routes are judged
+    for pattern in ("/me", "/orders"):
+        row = _row(result, "GET", pattern)
+        assert row["scope_guards"] == [] and row["judgement_required"] is True
+    # a second app in the same tree does not inherit the first app's hook
+    debug = _row(result, "GET", "/debug")
+    assert debug["scope_guards"] == []
+    assert debug["judgement_required"] is True
+
+
+def test_flask_computed_rules_and_lambda_views_are_kept(tmp_path):
+    _write(tmp_path, "svc/paths.py", "EXPORT_PATH = '/api/export'\n")
+    _write(
+        tmp_path,
+        "svc/app.py",
+        "from flask import Flask\n"
+        "from .paths import EXPORT_PATH\n\n"
+        "app = Flask(__name__)\n\n"
+        "def export(fmt):\n"
+        "    return ''\n\n"
+        "app.add_url_rule(rule=EXPORT_PATH, view_func=lambda: export('csv'), methods=['POST'])\n\n"
+        "@app.route(prefixed('/health'))\n"
+        "def health():\n"
+        "    return 'ok'\n",
+    )
+    result = _enum(tmp_path)
+    export = _row(result, "POST", "/api/export")
+    assert export["handler"]["expr"] == "export"
+    assert export["pattern_dynamic"] is False
+    [health] = [r for r in _flask(result) if r["handler"]["expr"] == "health"]
+    assert health["pattern"] == "prefixed('/health')"
+    assert health["pattern_dynamic"] is True
+
+
+def test_flask_rows_under_test_dirs_are_tagged(tmp_path):
+    _write(
+        tmp_path,
+        "tests/fixtures/server.py",
+        "from flask import Flask\n\napp = Flask(__name__)\n\n"
+        "@app.route('/x')\n"
+        "def x():\n"
+        "    return ''\n",
+    )
+    [row] = _flask(_enum(tmp_path))
+    assert row["test_path"] is True
+
+
+def test_flask_not_a_coverage_gap_when_enumerated(flask_asym_repo):
+    result = _enum(flask_asym_repo)
+    assert not [g for g in result["coverage_gaps"] if g["system"] == "flask"]
+    assert len(_flask(result)) == 3
+
+
+def test_flask_unrecognized_registration_is_a_coverage_gap(tmp_path):
+    _write(
+        tmp_path,
+        "svc/app.py",
+        "from flask import Flask\n\napp = Flask(__name__)\nregister_everything(app)\n",
+    )
+    result = _enum(tmp_path)
+    [gap] = [g for g in result["coverage_gaps"] if g["system"] == "flask"]
+    assert "UNENUMERATED" in gap["reason"]
+    assert gap["evidence"] == "svc/app.py"
+
+
+def test_fastapi_verb_decorators_are_not_flask_rows(tmp_path):
+    _write(
+        tmp_path,
+        "svc/main.py",
+        "from fastapi import FastAPI\n\napp = FastAPI()\n\n"
+        "@app.get('/things')\n"
+        "def things():\n"
+        "    return []\n",
+    )
+    result = _enum(tmp_path)
+    assert _flask(result) == []
+    assert [r["pattern"] for r in _family(result, "fastapi")] == ["/things"]
+    assert result["coverage_gaps"] == []
+
+
+def test_fastapi_file_does_not_borrow_a_flask_receiver_name(tmp_path):
+    # the tree has a flask `app`; a separate fastapi module also names its
+    # (subclassed) application `app` — its verb decorators are not flask rows
+    _write(
+        tmp_path,
+        "svc/web.py",
+        "from flask import Flask\n\napp = Flask(__name__)\n\n"
+        "@app.route('/ui')\n"
+        "def ui():\n"
+        "    return ''\n",
+    )
+    _write(
+        tmp_path,
+        "svc/gateway.py",
+        "from fastapi import FastAPI\n\n"
+        "class GatewayApp(FastAPI):\n"
+        "    pass\n\n"
+        "app = GatewayApp()\n\n"
+        "@app.get('/v1/things')\n"
+        "def things():\n"
+        "    return []\n",
+    )
+    result = _enum(tmp_path)
+    assert [r["pattern"] for r in _flask(result)] == ["/ui"]
+
+
+# --------------------------------------------------------------------------
+# fastapi
+# --------------------------------------------------------------------------
+
+
+def _family(result: dict, family: str) -> list:
+    return [r for r in result["routes"] if r["family"] == family]
+
+
+def _route(result: dict, family: str, method: str, pattern: str) -> dict:
+    [row] = [
+        r for r in _family(result, family) if r["method"] == method and r["pattern"] == pattern
+    ]
+    return row
+
+
+FAIL_OPEN_APP = (
+    "from fastapi import Depends, FastAPI, HTTPException\n"
+    "from fastapi.security import HTTPBearer\n\n"
+    "app = FastAPI()\n"
+    "optional_bearer = HTTPBearer(auto_error=False)\n"
+    "bearer = HTTPBearer()\n\n"
+    "def optional_user(creds=Depends(optional_bearer)):\n"
+    "    return lookup(creds) if creds else None\n\n"
+    "def current_user(creds=Depends(optional_bearer)):\n"
+    "    if creds is None:\n"
+    "        raise HTTPException(401)\n"
+    "    return lookup(creds)\n\n"
+    "@app.get('/feed')\n"
+    "def feed(user=Depends(optional_user)):\n    ...\n\n"
+    "@app.post('/posts')\n"
+    "def post(user=Depends(current_user)):\n    ...\n\n"
+    "@app.get('/raw')\n"
+    "def raw(creds=Depends(optional_bearer)):\n    ...\n\n"
+    "@app.delete('/posts/{id}')\n"
+    "def remove(id: int, creds=Depends(bearer)):\n    ...\n"
+)
+
+
+def test_fastapi_fail_open_schemes_are_judged_unless_a_dependency_raises(tmp_path):
+    _write(tmp_path, "svc/main.py", FAIL_OPEN_APP)
+    result = _enum(tmp_path)
+    feed = _route(result, "fastapi", "GET", "/feed")
+    assert feed["guards"] == ["optional_user>optional_bearer"]
+    assert feed["unguard_markers"] == ["optional_user>fail-open:optional_bearer"]
+    assert feed["judgement_required"]
+    # current_user raises on a missing credential: the scheme's fail-open is enforced there
+    post = _route(result, "fastapi", "POST", "/posts")
+    assert post["unguard_markers"] == [] and not post["judgement_required"]
+    raw = _route(result, "fastapi", "GET", "/raw")
+    assert raw["unguard_markers"] == ["fail-open:optional_bearer"]
+    # auto_error defaults to True: the scheme itself refuses
+    assert _route(result, "fastapi", "DELETE", "/posts/{id}")["unguard_markers"] == []
+
+
+def test_fastapi_nested_helper_raise_enforces_only_when_called(tmp_path):
+    _write(
+        tmp_path,
+        "svc/main.py",
+        "from fastapi import Depends, FastAPI, HTTPException\n"
+        "from fastapi.security import HTTPBearer\n\n"
+        "app = FastAPI()\n"
+        "optional_bearer = HTTPBearer(auto_error=False)\n\n"
+        "def enforced_user(creds=Depends(optional_bearer)):\n"
+        "    def reject():\n"
+        "        raise HTTPException(401)\n"
+        "    if creds is None:\n"
+        "        reject()\n"
+        "    return lookup(creds)\n\n"
+        "def lazy_user(creds=Depends(optional_bearer)):\n"
+        "    def reject():\n"
+        "        raise HTTPException(401)\n"
+        "    return lookup(creds) if creds else None\n\n"
+        "@app.get('/a')\n"
+        "def a(user=Depends(enforced_user)):\n    ...\n\n"
+        "@app.get('/b')\n"
+        "def b(user=Depends(lazy_user)):\n    ...\n",
+    )
+    result = _enum(tmp_path)
+    # enforced_user calls its helper: the scheme's fail-open is enforced there
+    a = _route(result, "fastapi", "GET", "/a")
+    assert a["guards"] == ["enforced_user>optional_bearer"]
+    assert a["unguard_markers"] == [] and not a["judgement_required"]
+    # lazy_user never calls its helper: the fail-open marker stands
+    b = _route(result, "fastapi", "GET", "/b")
+    assert b["unguard_markers"] == ["lazy_user>fail-open:optional_bearer"]
+    assert b["judgement_required"]
+
+
+def test_fastapi_route_dependencies_and_bare_sibling(tmp_path):
+    _write(
+        tmp_path,
+        "svc/main.py",
+        "from fastapi import Depends, FastAPI\n\n"
+        "app = FastAPI()\n\n"
+        "def require_admin():\n    ...\n\n"
+        "@app.post('/jobs', dependencies=[Depends(require_admin)])\n"
+        "def create():\n    ...\n\n"
+        "@app.delete('/jobs/{id}', dependencies=[Depends(require_admin)])\n"
+        "def remove(id: int):\n    ...\n\n"
+        "@app.get('/jobs')\n"
+        "def listing():\n    ...\n",
+    )
+    result = _enum(tmp_path)
+    create = _route(result, "fastapi", "POST", "/jobs")
+    assert create["guards"] == ["require_admin"]
+    assert create["judgement_required"] is False
+    listing = _route(result, "fastapi", "GET", "/jobs")
+    assert listing["judgement_required"] is True and listing["asymmetry"] is True
+    [asym] = [a for a in result["asymmetries"] if a["family"] == "fastapi"]
+    assert asym["unguarded"] == ["GET /jobs"]
+
+
+def test_fastapi_dependency_chain_reaches_the_security_scheme(tmp_path):
+    _write(
+        tmp_path,
+        "svc/deps.py",
+        "from fastapi import Depends\n"
+        "from fastapi.security import OAuth2PasswordBearer\n\n"
+        "scheme = OAuth2PasswordBearer(tokenUrl='t')\n\n"
+        "def get_current_user(credentials: str = Depends(scheme)):\n    ...\n",
+    )
+    _write(
+        tmp_path,
+        "svc/items.py",
+        "from typing import Annotated\n"
+        "from fastapi import APIRouter, Depends\n"
+        "from .deps import get_current_user\n\n"
+        "router = APIRouter(prefix='/items')\n\n"
+        "@router.get('/{item_id}')\n"
+        "def read(item_id: int, user: Annotated[str, Depends(get_current_user)]):\n    ...\n\n"
+        "@router.get('/')\n"
+        "def listing(page: int = Depends(paging)):\n    ...\n\n"
+        "def paging():\n    ...\n",
+    )
+    result = _enum(tmp_path)
+    read = _route(result, "fastapi", "GET", "/items/{item_id}")
+    assert read["guards"] == ["get_current_user>scheme"]
+    assert _route(result, "fastapi", "GET", "/items/")["guards"] == []
+
+
+def test_fastapi_annotated_aliases_resolve_from_the_module_that_defines_them(tmp_path):
+    _write(
+        tmp_path,
+        "svc/deps.py",
+        "from typing import Annotated, TypeAlias\n"
+        "from fastapi import Depends\n"
+        "from fastapi.security import OAuth2PasswordBearer\n\n"
+        "scheme = OAuth2PasswordBearer(tokenUrl='t')\n\n"
+        "def get_current_user(credentials: str = Depends(scheme)):\n    ...\n\n"
+        "def get_db():\n    ...\n\n"
+        "CurrentUser = Annotated[dict, Depends(get_current_user)]\n"
+        "Reader: TypeAlias = Annotated[dict, Depends(get_current_user)]\n"
+        "SessionDep = Annotated[object, Depends(get_db)]\n",
+    )
+    _write(
+        tmp_path,
+        "svc/items.py",
+        "from fastapi import APIRouter\n"
+        "from svc import deps\n"
+        "from svc.deps import CurrentUser, SessionDep\n\n"
+        "router = APIRouter(prefix='/items')\n\n"
+        "@router.get('/{item_id}')\n"
+        "def read(item_id: int, session: SessionDep, user: CurrentUser):\n    ...\n\n"
+        "@router.put('/{item_id}')\n"
+        "def change(item_id: int, user: deps.Reader):\n    ...\n\n"
+        "@router.get('/')\n"
+        "def listing(session: SessionDep):\n    ...\n",
+    )
+    result = _enum(tmp_path)
+    assert _route(result, "fastapi", "GET", "/items/{item_id}")["guards"] == [
+        "get_current_user>scheme"
+    ]
+    assert _route(result, "fastapi", "PUT", "/items/{item_id}")["guards"] == [
+        "get_current_user>scheme"
+    ]
+    listing = _route(result, "fastapi", "GET", "/items/")
+    assert listing["guards"] == [] and listing["judgement_required"]
+
+
+def test_fastapi_a_database_session_dependency_is_not_a_guard(tmp_path):
+    _write(
+        tmp_path,
+        "svc/items.py",
+        "from fastapi import APIRouter, Depends\n\n"
+        "router = APIRouter()\n\n"
+        "def get_db_session():\n    ...\n\n"
+        "@router.delete('/items/{item_id}')\n"
+        "def remove(item_id: int, session=Depends(get_db_session)):\n    ...\n",
+    )
+    row = _route(_enum(tmp_path), "fastapi", "DELETE", "/items/{item_id}")
+    assert row["guards"] == [] and row["judgement_required"]
+
+
+def test_fastapi_a_session_check_stays_a_guard(tmp_path):
+    _write(
+        tmp_path,
+        "svc/items.py",
+        "from fastapi import APIRouter, Depends, HTTPException, Request\n\n"
+        "router = APIRouter()\n\n"
+        "def check_session(request: Request):\n"
+        "    if 'sid' not in request.cookies:\n        raise HTTPException(401)\n\n"
+        "def get_db_session():\n    ...\n\n"
+        "@router.get('/items/{item_id}')\n"
+        "def read(item_id: int, s=Depends(check_session), db=Depends(get_db_session)):\n    ...\n",
+    )
+    row = _route(_enum(tmp_path), "fastapi", "GET", "/items/{item_id}")
+    assert row["guards"] == ["check_session"] and not row["judgement_required"]
+
+
+@pytest.mark.parametrize(
+    ("reexport", "import_line"),
+    [
+        ("svc/api/deps.py", "from svc.api.deps import CurrentUser\n"),
+        ("svc/api/__init__.py", "from svc.api import CurrentUser\n"),
+    ],
+)
+def test_fastapi_aliases_are_followed_through_re_exports(tmp_path, reexport, import_line):
+    _write(
+        tmp_path,
+        "svc/auth.py",
+        "from typing import Annotated\n"
+        "from fastapi import Depends\n"
+        "from fastapi.security import OAuth2PasswordBearer\n\n"
+        "scheme = OAuth2PasswordBearer(tokenUrl='t')\n\n"
+        "def get_current_user(credentials: str = Depends(scheme)):\n    ...\n\n"
+        "CurrentUser = Annotated[dict, Depends(get_current_user)]\n",
+    )
+    _write(tmp_path, reexport, "from svc.auth import CurrentUser\n")
+    _write(
+        tmp_path,
+        "svc/items.py",
+        "from fastapi import APIRouter\n" + import_line + "\n"
+        "router = APIRouter()\n\n"
+        "@router.get('/items/{item_id}')\n"
+        "def read(item_id: int, user: CurrentUser):\n    ...\n",
+    )
+    row = _route(_enum(tmp_path), "fastapi", "GET", "/items/{item_id}")
+    assert row["guards"] == ["get_current_user>scheme"]
+
+
+def test_fastapi_re_export_cycles_end(tmp_path):
+    _write(tmp_path, "svc/a.py", "from svc.b import CurrentUser\n")
+    _write(tmp_path, "svc/b.py", "from svc.a import CurrentUser\n")
+    _write(
+        tmp_path,
+        "svc/items.py",
+        "from fastapi import APIRouter\nfrom svc.a import CurrentUser\n\n"
+        "router = APIRouter()\n\n"
+        "@router.get('/items/{item_id}')\n"
+        "def read(item_id: int, user: CurrentUser):\n    ...\n",
+    )
+    assert _route(_enum(tmp_path), "fastapi", "GET", "/items/{item_id}")["guards"] == []
+
+
+def test_fastapi_quoted_annotations_resolve(tmp_path):
+    _write(
+        tmp_path,
+        "svc/items.py",
+        "from typing import Annotated\n"
+        "from fastapi import APIRouter, Depends\n"
+        "from fastapi.security import OAuth2PasswordBearer\n\n"
+        "scheme = OAuth2PasswordBearer(tokenUrl='t')\n"
+        "router = APIRouter()\n\n"
+        "def get_current_user(credentials: str = Depends(scheme)):\n    ...\n\n"
+        "CurrentUser = Annotated[dict, Depends(get_current_user)]\n\n"
+        "@router.get('/a/{item_id}')\n"
+        "def by_alias(item_id: int, user: 'CurrentUser'):\n    ...\n\n"
+        "@router.get('/b/{item_id}')\n"
+        "def inline(item_id: int, user: 'Annotated[dict, Depends(get_current_user)]'):\n    ...\n\n"
+        "@router.get('/c/{item_id}')\n"
+        "def broken(item_id: int, user: 'not an annotation('):\n    ...\n",
+    )
+    result = _enum(tmp_path)
+    for path in ("/a/{item_id}", "/b/{item_id}"):
+        assert _route(result, "fastapi", "GET", path)["guards"] == ["get_current_user>scheme"]
+    assert _route(result, "fastapi", "GET", "/c/{item_id}")["guards"] == []
+
+
+@pytest.mark.parametrize("package", ["flask_restful", "flask_restx", "flask"])
+def test_unparsed_flask_extension_files_are_a_named_gap(tmp_path, package):
+    _write(tmp_path, "svc/api.py", f"from {package} import Resource\n\ndef f(:\n    ...\n")
+    [gap] = [g for g in _enum(tmp_path)["coverage_gaps"] if g["system"] == "python"]
+    assert gap["paths"] == ["svc/api.py"]
+
+
+def test_python_web_files_this_interpreter_cant_parse_are_a_named_gap(tmp_path):
+    _write(tmp_path, "svc/broken.py", "from fastapi import APIRouter\n\ndef f(:\n    ...\n")
+    _write(tmp_path, "svc/also_broken.py", "import fastapi\nclass (:\n")
+    _write(tmp_path, "scripts/tool.py", "def g(:\n    ...\n")
+    _write(tmp_path, "svc/ok.py", "from fastapi import APIRouter\n\nrouter = APIRouter()\n")
+    [gap] = [g for g in _enum(tmp_path)["coverage_gaps"] if g["system"] == "python"]
+    assert gap["count"] == 2
+    assert sorted(gap["paths"]) == ["svc/also_broken.py", "svc/broken.py"]
+    assert gap["evidence"] in gap["paths"] and "UNENUMERATED" in gap["reason"]
+
+
+def test_python_files_that_parse_leave_no_python_gap(tmp_path):
+    _write(tmp_path, "svc/ok.py", "from fastapi import APIRouter\n\nrouter = APIRouter()\n")
+    assert not [g for g in _enum(tmp_path)["coverage_gaps"] if g["system"] == "python"]
+
+
+def test_fastapi_include_router_prefix_and_dependencies_resolve_across_modules(tmp_path):
+    for name in ("users", "health"):
+        _write(
+            tmp_path,
+            f"api/routes/{name}.py",
+            "from fastapi import APIRouter\n\nrouter = APIRouter()\n\n"
+            f"@router.get('/{name}')\n"
+            f"def {name}():\n    ...\n",
+        )
+    _write(
+        tmp_path,
+        "api/main.py",
+        "from fastapi import Depends, FastAPI\n"
+        "from api.routes import health, users\n"
+        "from api.auth import verify_token\n\n"
+        "app = FastAPI()\n"
+        "app.include_router(users.router, prefix='/v1', dependencies=[Depends(verify_token)])\n"
+        "app.include_router(health.router)\n",
+    )
+    _write(tmp_path, "api/auth.py", "def verify_token():\n    ...\n")
+    result = _enum(tmp_path)
+    users = _route(result, "fastapi", "GET", "/v1/users")
+    assert users["scope_guards"] == ["verify_token"]
+    assert users["judgement_required"] is False
+    assert _route(result, "fastapi", "GET", "/health")["judgement_required"] is True
+
+
+def test_fastapi_security_scopes_and_router_dependencies(tmp_path):
+    _write(
+        tmp_path,
+        "svc/app.py",
+        "from fastapi import APIRouter, Depends, FastAPI, Security\n\n"
+        "def current(): ...\n\n"
+        "def require_role(): ...\n\n"
+        "admin = APIRouter(dependencies=[Depends(require_role)])\n\n"
+        "@admin.get('/admin/stats')\n"
+        "def stats(): ...\n\n"
+        "app = FastAPI()\n\n"
+        "@app.get('/me')\n"
+        "def me(user=Security(current, scopes=['me'])): ...\n",
+    )
+    result = _enum(tmp_path)
+    assert _route(result, "fastapi", "GET", "/admin/stats")["scope_guards"] == ["require_role"]
+    assert _route(result, "fastapi", "GET", "/me")["guards"] == ["Security:current[me]"]
+
+
+def test_fastapi_middleware_guards_only_when_it_can_refuse(tmp_path):
+    _write(
+        tmp_path,
+        "svc/app.py",
+        "from fastapi import FastAPI\n"
+        "from starlette.middleware.sessions import SessionMiddleware\n\n"
+        "app = FastAPI()\n"
+        "app.add_middleware(SessionMiddleware, secret_key='x')\n\n"
+        "@app.middleware('http')\n"
+        "async def check_api_key(request, call_next):\n"
+        "    if request.headers.get('x-api-key') != KEY:\n"
+        "        return Response(status_code=401)\n"
+        "    return await call_next(request)\n\n"
+        "@app.middleware('http')\n"
+        "async def timing(request, call_next):\n"
+        "    return await call_next(request)\n\n"
+        "@app.middleware('http')\n"
+        "async def proxy(request, call_next):\n"
+        "    if request.url.path.startswith('/assets'):\n"
+        "        return await forward(request, token=TOKEN)\n"
+        "    return await call_next(request)\n\n"
+        "@app.get('/data')\n"
+        "def data(): ...\n",
+    )
+    row = _route(_enum(tmp_path), "fastapi", "GET", "/data")
+    assert row["scope_guards"] == ["middleware:check_api_key"]
+
+
+def test_fastapi_middleware_shared_response_name_still_rejects(tmp_path):
+    _write(
+        tmp_path,
+        "svc/app.py",
+        "from fastapi import FastAPI\n\n"
+        "app = FastAPI()\n\n"
+        "@app.middleware('http')\n"
+        "async def auth_gate(request, call_next):\n"
+        "    if request.headers.get('x-api-key') == KEY:\n"
+        "        response = await call_next(request)\n"
+        "    else:\n"
+        "        response = Response(status_code=401)\n"
+        "    return response\n\n"
+        "@app.middleware('http')\n"
+        "async def auth_flow(request, call_next):\n"
+        "    response = await call_next(request)\n"
+        "    response.headers['x-tag'] = 'a'\n"
+        "    return response\n\n"
+        "@app.get('/data')\n"
+        "def data(): ...\n",
+    )
+    row = _route(_enum(tmp_path), "fastapi", "GET", "/data")
+    # the rejected branch reuses the pass-through name: the middleware still refuses
+    assert row["scope_guards"] == ["middleware:auth_gate"]
+
+
+def test_fastapi_public_dependency_forces_judgement(tmp_path):
+    _write(
+        tmp_path,
+        "svc/app.py",
+        "from fastapi import Depends, FastAPI\n\napp = FastAPI()\n\n"
+        "@app.get('/ping', dependencies=[Depends(verify_token), Depends(allow_anonymous)])\n"
+        "def ping(): ...\n",
+    )
+    row = _route(_enum(tmp_path), "fastapi", "GET", "/ping")
+    assert row["guards"] == ["verify_token"]
+    assert row["unguard_markers"] == ["allow_anonymous"]
+    assert row["judgement_required"] is True
+
+
+def test_fastapi_add_api_route_websocket_and_method_lists(tmp_path):
+    _write(
+        tmp_path,
+        "svc/app.py",
+        "from fastapi import APIRouter\n\nrouter = APIRouter()\n\n"
+        "def handler(): ...\n\n"
+        "router.add_api_route('/sync', handler, methods=['POST', 'PUT'])\n\n"
+        "@router.websocket('/stream')\n"
+        "async def stream(ws): ...\n\n"
+        "@router.api_route('/any', methods=['GET', 'HEAD'])\n"
+        "def anything(): ...\n",
+    )
+    result = _enum(tmp_path)
+    assert {(r["method"], r["pattern"]) for r in _family(result, "fastapi")} == {
+        ("POST,PUT", "/sync"),
+        ("WS", "/stream"),
+        ("GET,HEAD", "/any"),
+    }
+
+
+def test_fastapi_import_without_registrations_is_a_coverage_gap(tmp_path):
+    _write(tmp_path, "svc/errors.py", "from fastapi import HTTPException\n")
+    [gap] = _enum(tmp_path)["coverage_gaps"]
+    assert gap["system"] == "fastapi"
+    assert gap["evidence"] == "svc/errors.py"
+
+
+# --------------------------------------------------------------------------
+# aiohttp
+# --------------------------------------------------------------------------
+
+
+def test_aiohttp_setup_routes_helper_gets_the_apps_middleware(tmp_path):
+    _write(
+        tmp_path,
+        "svc/routes.py",
+        "from aiohttp import web\n"
+        "from .views import index, admin, profile\n\n"
+        "def setup_routes(app):\n"
+        "    app.router.add_get('/', index)\n"
+        "    app.router.add_post('/admin', admin)\n"
+        "    app.router.add_get('/profile', profile)\n",
+    )
+    _write(
+        tmp_path,
+        "svc/views.py",
+        "from aiohttp_security import check_authorized\n\n"
+        "async def index(request): ...\n\n"
+        "async def admin(request):\n"
+        "    await check_authorized(request)\n"
+        "    return web.Response()\n\n"
+        "async def profile(request):\n"
+        "    user = await authorized_userid(request)\n"
+        "    return web.Response(text=user)\n",
+    )
+    _write(
+        tmp_path,
+        "svc/main.py",
+        "from aiohttp import web\n"
+        "from .routes import setup_routes\n\n"
+        "@web.middleware\n"
+        "async def auth_middleware(request, handler):\n"
+        "    if 'Authorization' not in request.headers:\n"
+        "        raise web.HTTPUnauthorized()\n"
+        "    return await handler(request)\n\n"
+        "@web.middleware\n"
+        "async def auth_logging(request, handler):\n"
+        "    return await handler(request)\n\n"
+        "app = web.Application(middlewares=[auth_middleware, auth_logging])\n"
+        "setup_routes(app)\n",
+    )
+    result = _enum(tmp_path)
+    index = _route(result, "aiohttp", "GET", "/")
+    assert index["scope_guards"] == ["middleware:auth_middleware"]
+    assert _route(result, "aiohttp", "GET", "/profile")["guards"] == []
+    admin = _route(result, "aiohttp", "POST", "/admin")
+    assert admin["guards"] == ["call:check_authorized"]
+    assert admin["handler"]["path"] == "svc/views.py"
+    assert admin["registration"]["path"] == "svc/routes.py"
+
+
+def test_aiohttp_route_table_and_class_view(tmp_path):
+    _write(
+        tmp_path,
+        "svc/app.py",
+        "from aiohttp import web\n\n"
+        "routes = web.RouteTableDef()\n\n"
+        "@routes.get('/items')\n"
+        "async def items(request): ...\n\n"
+        "@routes.view('/jobs')\n"
+        "class Jobs(web.View):\n"
+        "    @login_required\n"
+        "    async def post(self): ...\n\n"
+        "    async def get(self): ...\n\n"
+        "app = web.Application()\n"
+        "app.add_routes(routes)\n",
+    )
+    result = _enum(tmp_path)
+    assert _route(result, "aiohttp", "GET", "/items")["judgement_required"] is True
+    post = _route(result, "aiohttp", "POST", "/jobs")
+    assert post["guards"] == ["login_required"]
+    assert post["view_class"] == "Jobs"
+    assert _route(result, "aiohttp", "GET", "/jobs")["asymmetry"] is True
+
+
+def test_aiohttp_add_routes_list_and_router_alias(tmp_path):
+    _write(
+        tmp_path,
+        "svc/app.py",
+        "from aiohttp import web\n\n"
+        "async def health(request): ...\n\n"
+        "async def update(request): ...\n\n"
+        "app = web.Application()\n"
+        "app.middlewares.append(require_token)\n"
+        "router = app.router\n"
+        "router.add_route('PUT', '/config', update)\n"
+        "app.add_routes([web.get('/health', health)])\n",
+    )
+    result = _enum(tmp_path)
+    assert _route(result, "aiohttp", "PUT", "/config")["scope_guards"] == [
+        "middleware:require_token"
+    ]
+    assert _route(result, "aiohttp", "GET", "/health")["scope_guards"] == [
+        "middleware:require_token"
+    ]
+
+
+def test_aiohttp_client_only_import_is_not_a_server(tmp_path):
+    _write(
+        tmp_path,
+        "svc/client.py",
+        "import aiohttp\n\n"
+        "async def fetch(url):\n"
+        "    async with aiohttp.ClientSession() as s:\n"
+        "        return await s.get(url)\n",
+    )
+    result = _enum(tmp_path)
+    assert result["routes"] == [] and result["coverage_gaps"] == []
+
+
+# --------------------------------------------------------------------------
+# express
+# --------------------------------------------------------------------------
+
+
+def _express(result: dict) -> list:
+    return [r for r in result["routes"] if r["family"] == "express"]
+
+
+def _xroute(result: dict, method: str, pattern: str) -> dict:
+    [row] = [r for r in _express(result) if r["method"] == method and r["pattern"] == pattern]
+    return row
+
+
+def test_express_route_middleware_and_bare_sibling(tmp_path):
+    _write(
+        tmp_path,
+        "server/app.js",
+        "const express = require('express');\n"
+        "const app = express();\n"
+        "app.post('/jobs', requireAuth, createJob);\n"
+        "app.delete('/jobs/:id', requireAuth, deleteJob);\n"
+        "app.get('/jobs', listJobs);\n",
+    )
+    result = _enum(tmp_path)
+    assert _xroute(result, "POST", "/jobs")["guards"] == ["requireAuth"]
+    listing = _xroute(result, "GET", "/jobs")
+    assert listing["judgement_required"] is True and listing["asymmetry"] is True
+    assert result["coverage_gaps"] == []
+
+
+def test_express_use_guards_only_later_registrations(tmp_path):
+    _write(
+        tmp_path,
+        "server/app.ts",
+        "import express from 'express';\n"
+        "const app = express();\n"
+        "app.get('/healthz', (req, res) => res.send('ok'));\n"
+        "app.use(passport.authenticate('jwt'));\n"
+        "app.get('/api/me', (req, res) => res.json(req.user));\n",
+    )
+    result = _enum(tmp_path)
+    assert _xroute(result, "GET", "/healthz")["scope_guards"] == []
+    assert _xroute(result, "GET", "/api/me")["scope_guards"] == ["passport.authenticate"]
+
+
+def test_express_router_mounted_from_another_module_with_prefix(tmp_path):
+    _write(
+        tmp_path,
+        "src/routes/users.ts",
+        "import { Router } from 'express';\n"
+        "const router = Router();\n"
+        "router.get('/:id', getUser);\n"
+        "router.route('/').get(listUsers).post(checkRole('admin'), createUser);\n"
+        "export default router;\n",
+    )
+    _write(
+        tmp_path,
+        "src/app.ts",
+        "import express from 'express';\n"
+        "import users from './routes/users';\n"
+        "const app = express();\n"
+        "app.use('/api/users', verifyToken, users);\n",
+    )
+    result = _enum(tmp_path)
+    get_user = _xroute(result, "GET", "/api/users/:id")
+    assert get_user["scope_guards"] == ["verifyToken"]
+    assert get_user["registration"]["path"] == "src/routes/users.ts"
+    assert _xroute(result, "POST", "/api/users/")["guards"] == ["checkRole"]
+    assert _xroute(result, "GET", "/api/users/")["guards"] == []
+
+
+def test_express_handler_factory_arguments_and_verb_passed_as_a_value(tmp_path):
+    _write(
+        tmp_path,
+        "server/app.ts",
+        "import express from 'express';\n"
+        "const app = express();\n"
+        "const registerHandler = (fn: any, path: string, h: any) => fn.call(app, path, h);\n"
+        "registerHandler(app.get, '/k8s/pod/logs', getPodLogsHandler(options, authorizeFn));\n"
+        "registerHandler(app.get, '/healthz', healthzHandler);\n",
+    )
+    result = _enum(tmp_path)
+    assert _xroute(result, "GET", "/k8s/pod/logs")["guards"] == ["authorizeFn"]
+    assert _xroute(result, "GET", "/healthz")["guards"] == []
+
+
+def test_express_inline_handler_bare_guard_call_and_dynamic_path(tmp_path):
+    _write(
+        tmp_path,
+        "server/app.js",
+        "const express = require('express');\n"
+        "const app = express();\n"
+        "app.post(prefix + '/runs', async (req, res) => {\n"
+        "  await requirePermission(req, 'runs.create');\n"
+        "  const user = await authenticateMaybe(req);\n"
+        "  res.json({});\n"
+        "});\n",
+    )
+    [row] = _express(_enum(tmp_path))
+    assert row["pattern"] == "prefix + '/runs'" and row["pattern_dynamic"] is True
+    assert row["guards"] == ["call:requirePermission"]
+
+
+def test_express_public_marker_forces_judgement(tmp_path):
+    _write(
+        tmp_path,
+        "server/app.js",
+        "const app = require('express')();\n"
+        "const express = require('express');\n"
+        "const api = express.Router();\n"
+        "api.get('/status', requireAuth, allowAnonymous, status);\n",
+    )
+    row = _xroute(_enum(tmp_path), "GET", "/status")
+    assert row["unguard_markers"] == ["allowAnonymous"]
+    assert row["judgement_required"] is True
+
+
+def test_backstage_httprouter_default_auth_and_opened_paths(tmp_path):
+    _write(
+        tmp_path,
+        "plugins/devtools/src/service/router.ts",
+        "import Router from 'express-promise-router';\n"
+        "export async function createRouter(options: RouterOptions) {\n"
+        "  const router = Router();\n"
+        "  router.get('/health', (_req, res) => res.json({ status: 'ok' }));\n"
+        "  router.get('/info', async (req, res) => res.json(await info()));\n"
+        "  return router;\n"
+        "}\n",
+    )
+    _write(
+        tmp_path,
+        "plugins/devtools/src/plugin.ts",
+        "import { coreServices, createBackendPlugin } from '@backstage/backend-plugin-api';\n"
+        "import { createRouter } from './service/router';\n"
+        "export const devtoolsPlugin = createBackendPlugin({\n"
+        "  pluginId: 'devtools',\n"
+        "  register(env) {\n"
+        "    env.registerInit({\n"
+        "      deps: { httpRouter: coreServices.httpRouter },\n"
+        "      async init({ httpRouter }) {\n"
+        "        httpRouter.use(await createRouter({}));\n"
+        "        httpRouter.addAuthPolicy({ path: '/health', allow: 'unauthenticated' });\n"
+        "      },\n"
+        "    });\n"
+        "  },\n"
+        "});\n",
+    )
+    result = _enum(tmp_path)
+    info = _xroute(result, "GET", "/info")
+    assert info["scope_guards"] == ["backstage:httpRouter"]
+    assert info["judgement_required"] is False
+    health = _xroute(result, "GET", "/health")
+    assert health["unguard_markers"] == ["backstage:allow-unauthenticated"]
+    assert health["judgement_required"] is True
+
+
+def test_express_http_clients_are_not_routes(tmp_path):
+    _write(
+        tmp_path,
+        "web/api.ts",
+        "import express from 'express';\n"
+        "const api = axios.create();\n"
+        "api.get('/users', config);\n"
+        "const app = express();\n"
+        "app.get('/users', listUsers);\n",
+    )
+    assert [r["pattern"] for r in _express(_enum(tmp_path))] == ["/users"]
+
+
+def test_express_without_the_parser_is_a_coverage_gap(tmp_path, monkeypatch):
+    from traust_core.v1.providers import express_routes
+
+    monkeypatch.setattr(express_routes, "parsers", lambda: None)
+    (tmp_path / "app.js").write_text(
+        "const express = require('express');\n"
+        "const app = express();\n"
+        "app.get('/things', handler);\n"
+    )
+    result = _enum(tmp_path)
+    [gap] = result["coverage_gaps"]
+    assert gap["system"] == "express" and "tree-sitter-javascript" in gap["reason"]
+    assert result["routes"] == []
+
+
+def test_express_import_without_registrations_is_a_coverage_gap(tmp_path):
+    _write(tmp_path, "lib/types.ts", "import type { Request } from 'express';\n")
+    [gap] = _enum(tmp_path)["coverage_gaps"]
+    assert gap["system"] == "express" and "no route registration" in gap["reason"]
+
+
+# --------------------------------------------------------------------------
+# coverage gaps + output contracts
+# --------------------------------------------------------------------------
+
+
+def test_ordering_puts_judged_and_asymmetry_rows_first(go_asym_repo):
+    result = _enum(go_asym_repo)
+    assert len(result["routes"]) == 3
+    assert sum(r["judgement_required"] for r in result["routes"]) == 1
+    assert sum(r["asymmetry"] for r in result["routes"]) == 1
+    assert result["routes"][0]["pattern"] == "/api/callback"
+
+
+def test_enumerator_returns_one_matrix(go_asym_repo):
+    at = datetime(2026, 10, 25, tzinfo=UTC)
+    result = RouteGuardMatrix(FixedClock(at)).enumerate(ToolRequest(workspace=go_asym_repo))
+    [matrix] = result.data
+    assert isinstance(matrix, RouteGuardFact)
+    assert len(matrix.routes) == 3
+    assert result.acquisition.provider == "route-guards"
+    assert result.acquisition.acquired_at == at
+
+
+def test_empty_tree_is_an_empty_matrix(tmp_path):
+    assert route_guards(tree_files(tmp_path)) == RouteGuardFact()
+
+
+def test_missing_workspace_is_refused(tmp_path):
+    with pytest.raises(ValidationError, match="not a directory"):
+        RouteGuardMatrix(FixedClock(datetime(2026, 10, 25, tzinfo=UTC))).enumerate(
+            ToolRequest(workspace=tmp_path / "absent")
+        )
+
+
+def test_symlinked_files_are_never_read(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "server.go").write_text('func r(m *M) { m.HandleFunc("/x", h) }\n')
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "server.go").symlink_to(outside / "server.go")
+    assert _enum(repo)["routes"] == []
+
+
+def test_unparseable_python_is_skipped(tmp_path):
+    (tmp_path / "views.py").write_text("from flask import Flask\ndef broken(:\n")
+    assert _enum(tmp_path)["routes"] == []
+
+
+def _ownership_gaps(result: dict) -> list[dict]:
+    return [g for g in result["coverage_gaps"] if g["system"].endswith(" ownership")]
+
+
+def test_unclassified_ownership_is_named_per_framework_never_blank(flask_asym_repo: Path) -> None:
+    """Flask has no ownership reader yet: its authenticated id route is a named gap, not a
+    blank `ownership` that reads as nothing to flag."""
+    result = _enum(flask_asym_repo)
+    assert _row(result, "DELETE", "/items/<id>")["ownership"] is None
+    [gap] = _ownership_gaps(result)
+    assert (gap["system"], gap["count"], gap["paths"], gap["evidence"]) == (
+        "flask ownership",
+        1,  # GET /items has no id; POST /items/import is unauthenticated
+        ["app/views.py"],
+        "app/views.py",
+    )
+    assert "UNCLASSIFIED" in gap["reason"] and "CWE-639" in gap["reason"]
+
+
+def test_privileged_and_unguarded_id_routes_are_no_ownership_gap(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "app/views.py",
+        "from flask import Blueprint\n"
+        "from .auth import admin_required\n\n"
+        "bp = Blueprint('items', __name__)\n\n"
+        "@bp.route('/admin/items/<id>', methods=['DELETE'])\n"
+        "@admin_required\n"
+        "def purge(id):\n"
+        "    return ''\n\n"
+        "@bp.get('/public/items/<id>')\n"
+        "def show(id):\n"
+        "    return ''\n",
+    )
+    assert _ownership_gaps(_enum(tmp_path)) == []
+
+
+def test_a_test_path_id_route_is_no_ownership_gap(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "tests/app.py",
+        "from flask import Blueprint\n"
+        "from .auth import login_required\n\n"
+        "bp = Blueprint('items', __name__)\n\n"
+        "@bp.route('/items/<id>', methods=['DELETE'])\n"
+        "@login_required\n"
+        "def delete_item(id):\n"
+        "    return ''\n",
+    )
+    result = _enum(tmp_path)
+    assert [r["test_path"] for r in _flask(result)] == [True]
+    assert _ownership_gaps(result) == []
+
+
+def test_session_middleware_alone_is_no_authenticated_ownership_gap(tmp_path: Path) -> None:
+    (tmp_path / "router.go").write_text(
+        "package api\n"
+        "func routes(r chi.Router, a chi.Router) {\n"
+        "\tr.Use(sessionMiddleware)\n"
+        '\tr.Get("/notes/{id}", getNote)\n'
+        "\ta.Use(authMiddleware)\n"
+        '\ta.Get("/items/{id}", getItem)\n'
+        "}\n"
+    )
+    result = _enum(tmp_path)
+    [gap] = _ownership_gaps(result)
+    assert (gap["system"], gap["count"]) == ("go-http ownership", 1)  # only the auth one
+    assert "no ownership reader for this framework yet" in gap["reason"]
+
+
+def test_a_django_re_path_named_group_is_an_id_route(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "app/urls.py",
+        "from django.urls import re_path\n"
+        "from . import views\n"
+        'urlpatterns = [re_path(r"^items/(?P<id>[0-9]+)/$", views.item)]\n',
+    )
+    _write(
+        tmp_path,
+        "app/views.py",
+        "from django.contrib.auth.decorators import login_required\n\n"
+        "@login_required\n"
+        "def item(request, id): ...\n",
+    )
+    [gap] = _ownership_gaps(_enum(tmp_path))
+    assert (gap["system"], gap["count"]) == ("django-drf ownership", 1)
+
+
+def test_flask_routes_carry_the_prefixes_they_are_mounted_under(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "svc/app.py",
+        "from flask import Blueprint, Flask\n"
+        "from flask_restful import Api as RestfulApi\n"
+        "from flask_restx import Api, Namespace, Resource\n"
+        "app = Flask(__name__)\n"
+        "notes = Blueprint('notes', __name__, url_prefix='/ignored')\n"
+        "admin = Blueprint('admin', __name__, url_prefix='/admin')\n"
+        "nested = Blueprint('nested', __name__, url_prefix='/n')\n"
+        "api_bp = Blueprint('api', __name__, url_prefix='/api/v1')\n"
+        "api = Api(api_bp)\n"
+        "teams = Namespace('teams')\n"
+        "files = Namespace('files', path='/storage')\n"
+        "legacy = RestfulApi(app, prefix='/legacy')\n"
+        "@notes.route('/<int:note_id>')\n"
+        "def note(note_id): ...\n"
+        "@nested.route('/x')\n"
+        "def x(): ...\n"
+        "@teams.route('/<int:team_id>')\n"
+        "class Team(Resource):\n    def get(self, team_id): ...\n"
+        "@files.route('')\n"
+        "class Files(Resource):\n    def get(self): ...\n"
+        "class Old(Resource):\n    def get(self, old_id): ...\n"
+        "api.add_namespace(teams)\n"
+        "api.add_namespace(files)\n"
+        "legacy.add_resource(Old, '/old/<int:old_id>')\n"
+        "admin.register_blueprint(nested)\n"
+        "app.register_blueprint(notes, url_prefix='/notes')\n"
+        "app.register_blueprint(admin)\n"
+        "app.register_blueprint(api_bp)\n",
+    )
+    patterns = {(r["method"], r["pattern"]) for r in _enum(tmp_path)["routes"]}
+    assert patterns == {
+        ("GET", "/notes/<int:note_id>"),  # the registration's url_prefix replaces the blueprint's
+        ("GET", "/admin/n/x"),
+        ("GET", "/api/v1/teams/<int:team_id>"),
+        ("GET", "/api/v1/storage"),
+        ("GET", "/legacy/old/<int:old_id>"),
+    }
+
+
+def test_a_flask_receiver_mounted_two_ways_has_a_dynamic_pattern(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "svc/app.py",
+        "from flask import Blueprint, Flask\n"
+        "app = Flask(__name__)\n"
+        "bp = Blueprint('bp', __name__)\n"
+        "@bp.route('/<int:item_id>')\n"
+        "def item(item_id): ...\n"
+        "app.register_blueprint(bp, url_prefix='/a')\n"
+        "app.register_blueprint(bp, url_prefix='/b')\n",
+    )
+    [row] = _enum(tmp_path)["routes"]
+    assert row["pattern_dynamic"] and row["pattern"].endswith("/<int:item_id>")
+
+
+def test_flask_decorators_count_only_below_the_route_and_hooks_by_their_effect(
+    tmp_path: Path,
+) -> None:
+    _write(
+        tmp_path,
+        "svc/app.py",
+        "from flask import Flask, request\n"
+        "from flask_jwt_extended import jwt_required\n"
+        "app = Flask(__name__)\n"
+        "@login_required\n"
+        "@app.route('/admin')\n"
+        "def admin(): ...\n"
+        "@app.route('/settings')\n"
+        "@login_required\n"
+        "def settings(): ...\n"
+        "@app.route('/feed')\n"
+        "@jwt_required(optional=True)\n"
+        "def feed(): ...\n"
+        "@app.before_request\n"
+        "def load_user():\n"
+        "    if request.endpoint in ('login',):\n"
+        "        return None\n"
+        "    if not current_user():\n"
+        "        abort(401)\n",
+    )
+    rows = {r["pattern"]: r for r in _enum(tmp_path)["routes"]}
+    assert rows["/admin"]["guards"] == [] and rows["/admin"]["judgement_required"]
+    assert rows["/settings"]["guards"] == ["login_required"]
+    assert rows["/feed"]["unguard_markers"] == ["optional:jwt_required"]
+    # a hook that looks at which endpoint it runs for may let some through: no guard
+    assert all("before_request:load_user" not in r["scope_guards"] for r in rows.values())
+
+
+@pytest.mark.parametrize(
+    ("imports", "rebinds", "guards"),
+    [
+        ("from flask_login import login_required as require_login", "", ["require_login"]),
+        # the alias, rebound to an identity decorator, guards nothing
+        ("from flask_login import login_required as require_login", "require_login = id", []),
+        # a known guard's name from a library that isn't an auth library
+        ("from someauth.decorators import login_required as require_login", "", []),
+    ],
+)
+def test_flask_guard_names_read_through_their_import(
+    tmp_path: Path, imports: str, rebinds: str, guards: list[str]
+) -> None:
+    _write(
+        tmp_path,
+        "app/views.py",
+        f"from flask import Flask\n{imports}\napp = Flask(__name__)\n{rebinds}\n"
+        "@app.route('/a')\n@require_login\ndef a(): ...\n",
+    )
+    assert _row(_enum(tmp_path), "GET", "/a")["guards"] == guards
+
+
+def test_flask_an_aliased_requirement_given_nothing_guards_nothing(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "app/views.py",
+        "from flask import Flask\nfrom flask_security import roles_required as need\n"
+        "app = Flask(__name__)\n@app.route('/a')\n@need()\ndef a(): ...\n",
+    )
+    assert _row(_enum(tmp_path), "GET", "/a")["guards"] == []
+
+
+@pytest.mark.parametrize(
+    ("module_deco", "method_deco"), [("", "@login_required"), ("@login_required", "")]
+)
+def test_flask_a_method_never_lends_its_decorators_to_a_view_of_its_name(
+    tmp_path: Path, module_deco: str, method_deco: str
+) -> None:
+    _write(
+        tmp_path,
+        "app/views.py",
+        "from flask import Flask\nfrom flask_login import login_required\napp = Flask(__name__)\n"
+        f"{module_deco}\ndef index(): ...\napp.add_url_rule('/', view_func=index)\n"
+        f"class Other:\n    {method_deco}\n    def index(self): ...\n",
+    )
+    assert _row(_enum(tmp_path), "GET", "/")["guards"] == (
+        ["login_required"] if module_deco else []
+    )
+
+
+def test_flask_a_test_suites_login_switches_leave_real_guards_alone(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "app/views.py",
+        "from flask import Flask\nfrom flask_login import login_required\napp = Flask(__name__)\n"
+        "@app.route('/a')\n@login_required\ndef a(): ...\n",
+    )
+    _write(
+        tmp_path,
+        "tests/test_views.py",
+        "from app.views import app\napp.config['LOGIN_DISABLED'] = True\n",
+    )
+    _write(tmp_path, "tests/stubs.py", "def login_required(f):\n    return f\n")
+    assert _row(_enum(tmp_path), "GET", "/a")["guards"] == ["login_required"]
+
+
+def test_flask_options_split_off_a_guarded_route_is_no_asymmetry(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "app/views.py",
+        "from flask import Flask\nfrom flask_login import login_required\napp = Flask(__name__)\n"
+        "@app.route('/a', methods=['GET', 'OPTIONS'])\n@login_required\ndef a(): ...\n",
+    )
+    result = _enum(tmp_path)
+    options, get = _row(result, "OPTIONS", "/a"), _row(result, "GET", "/a")
+    assert options["guards"] == [] and not options["asymmetry"]
+    assert get["guards"] == ["login_required"]
+    assert result["asymmetries"] == []
+
+
+_LOGIN_VIEW = (
+    "from flask import Flask\nfrom flask_login import login_required\napp = Flask(__name__)\n"
+    "@app.route('/a')\n@login_required\ndef a(): ...\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("rel", "setting", "guards"),
+    [
+        ("app/config.py", "# LOGIN_DISABLED = True\n", ["login_required"]),
+        ("app/config.py", "LOGIN_DISABLED = False\n", ["login_required"]),
+        ("app/config.py", "LOGIN_DISABLED = True\n", []),
+        # a value read at run time may turn it on
+        ("app/config.py", "import os\nLOGIN_DISABLED = os.getenv('X')\n", []),
+        ("app/config.py", "def f(app):\n    app.config.update(LOGIN_DISABLED=True)\n", []),
+        ("app/config.py", "LOGIN_DISABLED = True\nLOGIN_DISABLED = False\n", ["login_required"]),
+        # a block after the last assignment may still turn it on
+        ("app/config.py", "LOGIN_DISABLED = False\nif X:\n    LOGIN_DISABLED = 1\n", []),
+        ("settings.cfg", "# LOGIN_DISABLED = True\n", ["login_required"]),
+        ("settings.cfg", "LOGIN_DISABLED = True\n", []),
+    ],
+)
+def test_flask_login_disabled_is_read_as_a_setting_not_text(
+    tmp_path: Path, rel: str, setting: str, guards: list[str]
+) -> None:
+    _write(tmp_path, "app/views.py", _LOGIN_VIEW)
+    _write(tmp_path, rel, setting)
+    assert _row(_enum(tmp_path), "GET", "/a")["guards"] == guards
+
+
+@pytest.mark.parametrize(
+    ("mount", "pattern"),
+    [
+        ("bp = Blueprint('v', __name__, None, None, None, '/v1')", "/v1/a"),
+        ("bp = Blueprint('v', __name__, url_prefix='/v2')", "/v2/a"),
+    ],
+)
+def test_flask_a_positional_url_prefix_mounts_its_routes(
+    tmp_path: Path, mount: str, pattern: str
+) -> None:
+    _write(
+        tmp_path,
+        "app/views.py",
+        f"from flask import Blueprint\n{mount}\n@bp.route('/a')\ndef a(): ...\n",
+    )
+    assert [r["pattern"] for r in _flask(_enum(tmp_path))] == [pattern]
+
+
+def test_flask_a_positional_restful_api_prefix_mounts_its_resources(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "app/api.py",
+        "from flask import Flask\nfrom flask_restful import Api, Resource\n"
+        "app = Flask(__name__)\napi = Api(app, '/api')\n"
+        "class Items(Resource):\n    def get(self): ...\n"
+        "api.add_resource(Items, '/items')\n",
+    )
+    assert [r["pattern"] for r in _flask(_enum(tmp_path))] == ["/api/items"]
+
+
+@pytest.mark.parametrize(
+    ("called", "dynamic"),
+    [("register(app)\n", False), ("", True), ("saved = register\n", True)],
+)
+def test_flask_routes_a_helper_registers_are_unplaced_when_nothing_calls_it(
+    tmp_path: Path, called: str, dynamic: bool
+) -> None:
+    _write(
+        tmp_path,
+        "app/routes.py",
+        "def register(application):\n    @application.route('/a')\n    def a(): ...\n",
+    )
+    _write(
+        tmp_path,
+        "app/main.py",
+        "from flask import Flask\nfrom app.routes import register\napp = Flask(__name__)\n"
+        + called,
+    )
+    [row] = _flask(_enum(tmp_path))
+    assert row["pattern_dynamic"] is dynamic
+
+
+def test_flask_a_library_import_is_never_a_checkout_definition_elsewhere(tmp_path: Path) -> None:
+    _write(tmp_path, "app/views.py", _LOGIN_VIEW)
+    _write(tmp_path, "app/legacy.py", "def login_required(f):\n    return f\n")
+    assert _row(_enum(tmp_path), "GET", "/a")["guards"] == ["login_required"]
+
+
+def test_flask_a_helper_parameter_is_its_own_receiver_whatever_else_shares_its_name(
+    tmp_path: Path,
+) -> None:
+    _write(
+        tmp_path,
+        "app/main.py",
+        "from flask import Flask\napp = Flask(__name__)\n"
+        "@app.route('/main')\ndef main(): ...\n"
+        "def register(app):\n    @app.route('/a')\n    def a(): ...\n",
+    )
+    rows = {r["pattern"]: r for r in _flask(_enum(tmp_path))}
+    assert rows["/a"]["pattern_dynamic"] and not rows["/main"]["pattern_dynamic"]
+
+
+@pytest.mark.parametrize(("star", "guards"), [("app.other", ["login_required"]), ("app.auth", [])])
+def test_flask_only_a_star_import_binding_the_name_rebinds_a_library_guard(
+    tmp_path: Path, star: str, guards: list[str]
+) -> None:
+    _write(
+        tmp_path,
+        "app/views.py",
+        f"from flask import Flask\nfrom flask_login import login_required\nfrom {star} import *\n"
+        "app = Flask(__name__)\n@app.route('/a')\n@login_required\ndef a(): ...\n",
+    )
+    _write(tmp_path, "app/other.py", "def unrelated(): ...\n")
+    _write(tmp_path, "app/auth.py", "def login_required(f):\n    return f\n")
+    assert _row(_enum(tmp_path), "GET", "/a")["guards"] == guards
+
+
+def test_flask_routes_a_pytest_test_or_fixture_registers_are_placed(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "tests/test_views.py",
+        "import flask\nimport pytest\n"
+        "@pytest.fixture\ndef client(app):\n    @app.route('/f')\n    def f(): ...\n"
+        "def test_index(app):\n    @app.route('/t')\n    def t(): ...\n",
+    )
+    rows = _flask(_enum(tmp_path))
+    assert sorted(r["pattern"] for r in rows) == ["/f", "/t"]
+    assert not any(r["pattern_dynamic"] for r in rows)

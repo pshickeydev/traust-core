@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from collections.abc import Collection
+from datetime import datetime
 from typing import Protocol
 from uuid import UUID
 
+from traust_core.v1.models.common import RecordBudget
 from traust_core.v1.models.inventory import Component
 from traust_core.v1.repositories.tables import (
     TRAUST,
@@ -18,14 +21,29 @@ COMPONENT = TableSpec(
 
 
 class ComponentRepository(MutableRecordRepository[Component], Protocol):
+    def search(self, *, limit: int, after: tuple[datetime, UUID] | None) -> list[Component]: ...
+    def get_or_add(self, record: Component) -> Component: ...
     def find(self, release_id: UUID, repository_ref_id: UUID) -> Component | None: ...
     def list_for_release(self, release_id: UUID) -> list[Component]: ...
     def list_for_ref(self, repository_ref_id: UUID) -> list[Component]: ...
+    def list_for_refs(
+        self, repository_ref_ids: Collection[UUID], *, read_budget: RecordBudget | None = None
+    ) -> list[Component]: ...
 
 
 class SqlComponentRepository(SqlMutableRepository[Component]):
     spec = COMPONENT
     record = Component
+
+    def search(self, *, limit: int, after: tuple[datetime, UUID] | None) -> list[Component]:
+        return self._page("search", limit=limit, after=after)
+
+    def get_or_add(self, record: Component) -> Component:
+        return self._get_or_add(
+            record,
+            ("release_id", "repository_ref_id"),
+            lambda: self.find(record.release_id, record.repository_ref_id),
+        )
 
     def find(self, release_id: UUID, repository_ref_id: UUID) -> Component | None:
         c = self.table.c
@@ -41,4 +59,15 @@ class SqlComponentRepository(SqlMutableRepository[Component]):
     def list_for_ref(self, repository_ref_id: UUID) -> list[Component]:
         return self._many(
             f"list for ref {repository_ref_id}", self.table.c.repository_ref_id == repository_ref_id
+        )
+
+    def list_for_refs(
+        self, repository_ref_ids: Collection[UUID], *, read_budget: RecordBudget | None = None
+    ) -> list[Component]:
+        """The components of any of these commits, read in bounded batches."""
+        return self._many_in(
+            f"list for {len(repository_ref_ids)} refs",
+            self.table.c.repository_ref_id,
+            repository_ref_ids,
+            read_budget=read_budget,
         )

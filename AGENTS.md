@@ -30,7 +30,7 @@ Python 3.11+ library. The platform API lives in `traust_core.v1`. Overview: [REA
 
 - First time in a clone: `make setup` (uv sync + git hooks via `core.hooksPath=.githooks`). Hooks: ruff on staged files (pre-commit), conventional subject (commit-msg), `make lint` + `make coverage` (pre-push). Don't bypass with `--no-verify`
 
-- `make lint-fix` then `make test`; both must pass. CI runs `make coverage`, which fails below 80% line+branch coverage (`fail_under` in `pyproject.toml`); stub bodies (`raise NotImplementedError`) are excluded, so new code must arrive with tests. Database changes also need `make db-up && make test-integration`
+- `make lint-fix` then `make test`; both must pass. `tests/v1/test_architecture.py` holds the placement rules; a failure there means the code is in the wrong layer, not that the allowlist needs widening. CI runs `make coverage`, which fails below 80% line+branch coverage (`fail_under` in `pyproject.toml`); stub bodies (`raise NotImplementedError`) are excluded, so new code must arrive with tests. Database changes also need `make db-up && make test-integration`; a new or changed query also gets a case in `perf/` and a `make perf` run (paste `.perf/report.md` into the PR)
 - Tests that need Postgres are marked `@pytest.mark.integration`; `make test` excludes them
 - Commits: conventional `type(scope): subject`
 - Public repo: no deployment-specific hostnames or figures in code, tests or docs
@@ -43,15 +43,15 @@ Python 3.11+ library. The platform API lives in `traust_core.v1`. Overview: [REA
 
 ## Layers
 
-- `errors` → `contracts` → `models` → `providers` → `repositories` → `rendering` → `services` → `context`; each imports only earlier ones (`tests/v1/test_layering.py`)
+- `errors` → `contracts` → `models` → `providers` → `repositories` → `rendering` → `services` → `context` → `rest`; each imports only earlier ones (`tests/v1/test_layering.py`)
 - One question per folder: `models` what it is and the rules about its own state, `providers` how we reach outside (tools, sources, feeds, process, clock), `repositories` how it is stored, `services` what we do with it (use cases + pure policies), `context` how it is wired
 - Organised by role, then subject: `models/<section>.py` (table models + that section's service types), `repositories/traust/<section>/<table>.py`, `repositories/traust_ops/<table>.py`, `repositories/traust_ledger/<table>.py` (mirroring the contracts namespaces), `repositories/objects/` (bytes), `services/<subject>.py`; a service becomes a package only when it needs several modules (`services/findings/`)
 - `models/base.py`: `Model` (strict, internal), `Dto` (tolerant, boundary data), `Entity` (`id`, `created_at`, `updated_at` — `None` until the database saves it), `AppendOnly` (`id`, `created_at` — rows are never updated)
 - Tests mirror `src`: `tests/v1/<role>/test_<subject>.py`
 - Pack policy (routing rules, cadences, lanes, skills, CLIs) stays in traust
-- traust-core is the hub: every other traust repo depends on it, it depends on none of them. One exception: the traust-ledger client, imported only inside the ledger provider adapter (behind `LedgerClient`). traust-contracts is data, read through `traust_core.v1.contracts`
+- traust-core is the hub: every other traust repo depends on it, it depends on none of them. One exception: traust-ledger, a library of pure ledger functions (canonical bytes, Merkle, signing, verifying), imported only by `services/ledger.py`; traust-ledger never imports core. traust-contracts is data, read through `traust_core.v1.contracts`
 - HTTP is in scope, in two places only: outbound calls live inside providers (forge, feeds, advisory APIs), and the inbound REST API
-- **REST API:** a real service in front of the core services, with **no domain logic of its own** (rules live in the services, so the in-process path behaves the same). It must follow:
+- **REST API:** `traust_core.v1.rest`, the top layer, installed by the `traust-core[rest]` extra and served by `traust-server`. Only `rest/` imports FastAPI, Starlette or uvicorn, and nothing imports `rest/`, so consumers never install them (`tests/v1/test_rest_isolation.py`). One package per domain (`rest/<domain>/`, a module per resource as it grows, listed in `rest/domains.py`); shared plumbing in `rest/common/`; a domain never imports another's routes, it composes through the services (`tests/v1/test_architecture.py`). A real service in front of the core services, with **no domain logic of its own** (rules live in the services, so the in-process path behaves the same). It must follow:
   - resources addressed by ID: `/findings/{finding_id}`, `/findings/{finding_id}/decisions`, `/orders/{order_id}/lease`; plural nouns, verbs only as HTTP methods
   - request and response bodies are the core models (R17), with an OpenAPI spec generated from them
   - one error shape everywhere (`application/problem+json`: type, title, detail, request ID), mapped from `traust_core.v1.errors`
@@ -64,7 +64,7 @@ Python 3.11+ library. The platform API lives in `traust_core.v1`. Overview: [REA
 - traust-contracts is a pinned dependency; read its data through `traust_core.v1.contracts` only, never import `traust_contracts`
 - Nothing from traust-contracts is copied or generated into this repo
 - Artifacts are named types in `models/artifacts.py` (`TriageArtifact`, ...); their fields come from the installed schema, never a hand-written copy
-- Write with `ArtifactPublisher` (exact schema gate); read with `ArtifactPublisher.get(ArtifactId)`. `AnalysisResultsRepository.read(XArtifact, subject)` is legacy (path-keyed) until the Artifacts slice. No `json.load`/`.get()`/`json.dump` on artifacts
+- Write with `ArtifactPublisher` (exact schema gate); read with `ArtifactPublisher.get(ArtifactId)`. No `json.load`/`.get()`/`json.dump` on artifacts
 - Names: `models/artifacts.py` = what an artifact document is (`ArtifactDocument` and its named types); `models/assessment.py::Artifact` = the `artifact` table row; `repositories/objects/store.py` = raw bytes; `services/artifact_publishing.py` = the publish use case. Modules name the subject; the package names the role (no `_service` suffix)
 - Core never tests the DDL: traust-contracts owns and tests its schema. Core tests repository behaviour against it
 - Artifacts produced by the harness or an LLM go through `ArtifactPublisher`; nothing writes `analysis-results` files directly
@@ -121,3 +121,18 @@ Python 3.11+ library. The platform API lives in `traust_core.v1`. Overview: [REA
 - Smallest change that does the job; no drive-by refactors
 - A new public module needs a README row and contract tests before merge
 - Lint: line length 100; ruff E/W/F/I/UP/B/SIM/PTH/RUF
+
+## Where we're headed
+
+- Inside traust-core, new code uses the platform pieces below. Outside traust-core, everything goes through the platform API (`traust-client` or the SDK); old code is deleted by its domain's cut-over plan
+- CI's drift ratchet (`python -m traust_core.v1.checks.ratchet`) fails a new hit (`path:line kind → use <API>`); baselines only shrink
+- Consumer repos (traust, traust-engine) run it from CI with `--rules consumer`: imports of contracts, core below `context` / `models` / `errors`, database drivers, engine internals (only `traust_engine.adapters` is allowed), and legacy state-file names
+
+| Hand-wiring | Inside traust-core, use |
+| --- | --- |
+| `sqlite3.connect` / `psycopg.connect` | `SqlUnitOfWork` / `SqlRepository` |
+| `subprocess` | `ProcessRunner` or a tool provider |
+| `os.getenv` / `os.environ` | `Config` / `Context` |
+| `json.dump` / `write_text(json…)` | `ObjectStore` / `ArtifactPublisher` |
+| `datetime.now()` / `datetime.utcnow()` | `Clock` |
+| `requests` / `httpx` / `urllib.request` | a core provider (`SourceProvider`, `FeedProvider`, tool provider) |

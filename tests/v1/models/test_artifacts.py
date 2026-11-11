@@ -1,12 +1,19 @@
 import json
+from pathlib import Path
 
 import pytest
 
 from tests.v1.fixtures import TRIAGE
 from traust_core.v1 import contracts
 from traust_core.v1.errors import DocumentError
-from traust_core.v1.models.artifacts import ANALYSIS_ARTIFACTS, ArtifactDocument, TriageArtifact
-from traust_core.v1.models.vocabulary import Severity, Verdict
+from traust_core.v1.models.artifacts import (
+    ArtifactDocument,
+    ReportArtifact,
+    RepoStateArtifact,
+    TriageArtifact,
+    ValidationPlanArtifact,
+)
+from traust_core.v1.models.vocabulary import ComparisonStatus, Severity, Verdict
 
 FINDING = {
     "id": "f001",
@@ -21,11 +28,6 @@ def triage(*findings: dict) -> TriageArtifact:
     doc = json.loads(TRIAGE)
     doc["findings"] = list(findings)
     return TriageArtifact.from_document(doc)
-
-
-def test_every_named_artifact_points_at_a_real_contract_schema() -> None:
-    assert {a.schema for a in ANALYSIS_ARTIFACTS} <= set(contracts.schema_names())
-    assert len({a.name for a in ANALYSIS_ARTIFACTS}) == len(ANALYSIS_ARTIFACTS)
 
 
 def test_fields_come_from_the_schema() -> None:
@@ -52,6 +54,24 @@ def test_parse_keeps_exact_bytes_and_rejects_off_contract_documents() -> None:
         TriageArtifact.parse(b'{"findings": [{"id": "x"}]}')
 
 
+def test_validation_plan_uses_the_installed_contract() -> None:
+    plan = ValidationPlanArtifact.from_document(
+        {"target": "example", "scope_binding_mode": "explicit", "chains": [], "steps": []}
+    )
+    assert (plan.target, plan.steps) == ("example", ())
+    assert plan.schema_path().name == "validation-plan.schema.json"
+    with pytest.raises(DocumentError):
+        ValidationPlanArtifact.from_document(
+            {
+                "target": "example",
+                "scope_binding_mode": "explicit",
+                "chains": [],
+                "steps": [],
+                "approval": {"approved_by": "agent"},
+            }
+        )
+
+
 def test_cross_file_refs_resolve_into_the_target_schema() -> None:
     ref = {"$ref": "report.schema.json#/$defs/finding"}
     (schema_name, node), *_ = contracts.resolve("validation", ref)
@@ -75,3 +95,67 @@ def test_describe_lists_fields_with_types_and_requiredness() -> None:
     assert text.splitlines()[0].startswith("TriageArtifact (triage)")
     assert "findings: array of object (required)" in text
     assert "  verdict: one of true_positive|hardening|undetermined|false_positive|duplicate" in text
+
+
+def test_repo_state_observation_reads_its_comparison() -> None:
+    doc = RepoStateArtifact.from_document(
+        {
+            "observed_at": "2026-10-22T09:00:00Z",
+            "status": "ok",
+            "comparison": {
+                "ahead_by": 12,
+                "truncated": False,
+                "changed_lines": 340,
+                "sensitive_changed": True,
+                "sensitive_lines": 25,
+                "deps_only": False,
+            },
+        }
+    )
+    assert doc.status == ComparisonStatus.OK
+    assert (doc.comparison.changed_lines, doc.comparison.sensitive_changed) == (340, True)
+
+
+def test_repo_state_observation_refuses_an_unknown_status() -> None:
+    with pytest.raises(DocumentError):
+        RepoStateArtifact.from_document({"observed_at": "2026-10-22T09:00:00Z", "status": "stale"})
+
+
+def test_comparison_status_is_the_contracts_vocabulary() -> None:
+    assert set(ComparisonStatus) == set(contracts.enum_values("comparison-status"))
+
+
+AUDIT_REPORT = Path(__file__).parents[2] / "fixtures" / "assessments" / "widget-audit-report.json"
+
+
+@pytest.mark.parametrize(
+    ("priority", "written"), [("P0", "p0"), ("P3", "p3"), ("P4", "p4"), ("Critical", "Critical")]
+)
+def test_a_report_writes_deprecated_priority_spellings_canonically(
+    priority: str, written: str
+) -> None:
+    body = json.loads(AUDIT_REPORT.read_bytes())
+    body["remediation_roadmap"][0]["priority"] = priority
+    doc = ReportArtifact.from_document(body).with_canonical_priorities()
+    assert [r.priority for r in doc.remediation_roadmap] == [written]
+
+
+def test_a_report_already_canonical_keeps_its_exact_bytes() -> None:
+    body = json.loads(AUDIT_REPORT.read_bytes())
+    body["remediation_roadmap"][0]["priority"] = "p3"
+    doc = ReportArtifact.parse(json.dumps(body).encode())
+    assert doc.with_canonical_priorities() is doc
+
+
+def test_retained_snapshot_cannot_change_when_its_input_is_reused() -> None:
+    body = json.loads(TRIAGE)
+    body["findings"] = [dict(FINDING)]
+    original = TriageArtifact.from_document(body)
+    payload = original.payload
+    body["findings"][0]["title"] = "A different finding"
+    body["findings"].append({"id": "f002", "title": "Added later", "verdict": "hardening"})
+    assert [(finding.id, finding.title) for finding in original.findings] == [
+        ("f001", "SQL injection in handler")
+    ]
+    assert original.payload == payload
+    assert TriageArtifact.parse(payload).findings[0].title == original.findings[0].title

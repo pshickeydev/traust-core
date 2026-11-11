@@ -10,3 +10,7 @@ dist/
 htmlcov/
 .coverage
 .coverage.*
+.perf/
+.openapi/
+.local/
+.testmondata

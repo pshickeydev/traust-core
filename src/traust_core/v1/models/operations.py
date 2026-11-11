@@ -1,15 +1,25 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from enum import StrEnum
-from typing import NewType
+from functools import cache
+from typing import TYPE_CHECKING, NewType
 from uuid import UUID
 
-from pydantic import Field
+import pydantic
+from pydantic import Field, SerializerFunctionWrapHandler, model_serializer
 
+from traust_core.v1 import contracts
+from traust_core.v1.errors import ValidationError
+from traust_core.v1.models.artifacts import RECORDED_FACTS
+from traust_core.v1.models.artifacts import SessionResult as SessionResult
+from traust_core.v1.models.artifacts import SessionTask as SessionTask
+from traust_core.v1.models.assessment import Assessment
 from traust_core.v1.models.base import AppendOnly, Dto, Entity, Model
+from traust_core.v1.models.common import Cursor, Sha256, TimeWindow, encode_cursor
+from traust_core.v1.models.inventory import Release
 from traust_core.v1.models.vocabulary import BudgetEnforcement
 
 AssetName = NewType("AssetName", str)
@@ -20,6 +30,37 @@ ModelName = NewType("ModelName", str)
 SkillName = NewType("SkillName", str)
 
 
+class RecordKind(StrEnum):
+    """The report kinds a recording order can run as. The stage gates resolve an asset's kind
+    from the recording config alone, so a kind outside this closed set cannot be wired and
+    a misspelling is a type error, not a silently skipped gate."""
+
+    ASSESSMENT = "assessment"
+    TRIAGE = "triage"
+    VALIDATION = "validation"
+    VERIFICATION = "verification"
+    # NEED(contracts: remediation recording section): contracts' recording config has no
+    # remediation key yet; the door shares the triage allowlist until one lands.
+    REMEDIATION = "remediation"
+
+
+# The native remediation-scheduling asset: contracts' recording config has no remediation
+# section yet, so its orders ride the triage allowlist and only this name tells them apart.
+REMEDIATE_FINDING = AssetName("remediate_finding")
+
+# The rules the remediation trigger's orders carry, keyed by the work item that is the
+# effort: "remediation:<id>" (an attempt) and "verify-remediation:<id>" (its verification).
+REMEDIATE_RULE_PREFIX = "remediation:"
+VERIFY_RULE_PREFIX = "verify-remediation:"
+
+
+def is_remediation_rule(rule: str | None) -> bool:
+    """Whether an order's rule is one the remediation trigger mints."""
+    return rule is not None and (
+        rule.startswith(REMEDIATE_RULE_PREFIX) or rule.startswith(VERIFY_RULE_PREFIX)
+    )
+
+
 class Outcome(StrEnum):
     SUCCEEDED = "succeeded"
     DEGRADED = "degraded"
@@ -27,11 +68,28 @@ class Outcome(StrEnum):
     FAILED = "failed"
 
 
+if TYPE_CHECKING:
+    OrderState = StrEnum
+    OrderReason = StrEnum
+    WorkLane = StrEnum
+    RescanEventSource = StrEnum
+    DegradedKey = StrEnum
+    DenyCode = StrEnum
+else:
+    OrderState = contracts.enum("run-order-state")
+    OrderReason = contracts.enum("run-order-reason")
+    WorkLane = contracts.enum("work-lane")
+    RescanEventSource = contracts.enum("rescan-event-source")
+    DegradedKey = contracts.enum("degraded-key")
+    DenyCode = contracts.enum("deny-code")
+
+
 class JobResult(Model):
     outcome: Outcome
     degraded: Mapping[str, int] = Field(default_factory=dict)
-    reason: str | None = None
+    reason: OrderReason | None = None
     written: tuple[str, ...] = ()
+    usage: tuple[ModelUsage, ...] = ()  # the run's measured model usage, settled on completion
 
     @classmethod
     def succeeded(cls, written: tuple[str, ...] = ()) -> JobResult:
@@ -44,11 +102,11 @@ class JobResult(Model):
         return cls(outcome=Outcome.DEGRADED, degraded=dict(degraded), written=written)
 
     @classmethod
-    def refused(cls, reason: str) -> JobResult:
+    def refused(cls, reason: OrderReason) -> JobResult:
         return cls(outcome=Outcome.REFUSED, reason=reason)
 
     @classmethod
-    def failed(cls, reason: str) -> JobResult:
+    def failed(cls, reason: OrderReason) -> JobResult:
         return cls(outcome=Outcome.FAILED, reason=reason)
 
 
@@ -59,10 +117,60 @@ class AssetRequest(Dto):
     params: Mapping[str, str] = Field(default_factory=dict)
 
 
+MODEL_REGISTRY = "model-registry"
+
+
+@cache
+def required_config_keys() -> frozenset[str]:
+    """The config keys a pack asset can require: traust.yaml's top-level keys, plus
+    `model-registry` for model-registry.yaml (pack schema `requires.config`)."""
+    return frozenset(contracts.config_schema("traust")["properties"]) | {MODEL_REGISTRY}
+
+
+class Requirement(Dto):
+    """What an asset's `requires:` block needs before any of its orders run (pack schema);
+    `Context.preflight` checks it and names every gap with its fix."""
+
+    tools: tuple[str, ...] = ()
+    config: tuple[str, ...] = ()
+    facts: tuple[str, ...] = ()
+    feeds: tuple[str, ...] = ()
+    secrets: tuple[str, ...] = ()
+
+    @pydantic.model_validator(mode="before")
+    @classmethod
+    def _known_kinds(cls, data: object) -> object:
+        # `Dto` ignores extras; a typo'd kind (`tool:`, `secret:`) must refuse, not drop.
+        if isinstance(data, Mapping) and (unknown := sorted(set(data) - set(cls.model_fields))):
+            raise ValueError(
+                f"unknown requirement kind(s) {unknown}; valid kinds: {sorted(cls.model_fields)}"
+            )
+        return data
+
+    @pydantic.field_validator("tools", "config", "facts", "feeds", "secrets")
+    @classmethod
+    def _known_and_unique(
+        cls, value: tuple[str, ...], info: pydantic.ValidationInfo
+    ) -> tuple[str, ...]:
+        if any(not entry for entry in value):
+            raise ValueError(f"{info.field_name}: empty requirement")
+        if len(set(value)) != len(value):
+            raise ValueError(f"{info.field_name}: duplicate requirement")
+        if info.field_name == "config":
+            unknown = sorted(set(value) - required_config_keys())
+            if unknown:
+                raise ValueError(f"config: not traust.yaml keys: {unknown}")
+        if info.field_name == "facts":
+            unknown = sorted(set(value) - {f.name for f in RECORDED_FACTS})
+            if unknown:
+                raise ValueError(f"facts: not recorded-fact names: {unknown}")
+        return value
+
+
 class Refusal(Dto):
     subject: str
     lane: LaneName
-    reason: str
+    reason: str | None = None
 
 
 class Route(Dto):
@@ -71,42 +179,361 @@ class Route(Dto):
     reason: str
 
 
-# Members land with the Operations slice (contracts run-order-state, to add).
-class OrderState(StrEnum): ...
+# PENDING(contracts degraded-key): a completed order's measured usage, by model, that could not be
+# priced (no model registry, or a model it doesn't know); core-owned like the gap reasons.
+SPEND_UNPRICED = "spend-unpriced"
+
+
+OPEN_ORDER_STATES = (
+    OrderState.PLANNED,
+    OrderState.AWAITING_APPROVAL,
+    OrderState.QUEUED,
+    OrderState.LEASED,
+)
+
+
+class OrderRequest(Model):
+    """What admission puts on the queue: one asset for one partition, routed or not."""
+
+    asset: AssetName
+    priority: int
+    repository_id: UUID | None = None
+    run_batch_id: UUID | None = None
+    lane: LaneName | None = None
+    rule: str | None = None
+    event_source: str | None = None
+    # Fork facts are no part of a request: only scheduling (OpsService.schedule_fix) sets them,
+    # after its ForkPolicy and branch checks, so the generic orders door can't steer a fix.
+    work_item_id: UUID | None = None  # the remediation work item the order runs, if any
+
+
+class DenyIssue(Model):
+    """One typed reason a policy gate refused an action (problem+json `issues[]`)."""
+
+    code: DenyCode
+    detail: str
+
+
+class PreflightRequest(Model):
+    """May this stage run on this subject now, under the config generation the caller holds."""
+
+    asset: AssetName
+    repository_id: UUID
+    config_generation: str | None = None
+    lane: LaneName | None = None
+
+
+class PreflightResult(Model):
+    allowed: bool
+    asset: AssetName
+    repository_id: UUID
+    config_generation: str | None = None
+    lane: LaneName | None = None
+
+
+class StartRecordingRequest(Model):
+    order: OrderRequest
+    lease_seconds: int = Field(gt=0, le=24 * 60 * 60)
+
+
+class RecordingStartScope(Model):
+    """Server-owned explicit-start capability for one verified machine principal."""
+
+    principal: str = Field(min_length=1)
+    assets: tuple[AssetName, ...] = ()
+    repository_ids: tuple[UUID, ...] = ()
 
 
 # Shapes land with their implementation slice.
-class OrderProgress(Model): ...
+class OrderProgress(Model):
+    """Where a running order has got to (steps done, shards done), so a re-lease resumes."""
+
+    step: int | None = Field(default=None, ge=0)
+    shards_done: tuple[str, ...] = ()
 
 
-class SchedulePlan(Model): ...
+class SessionFile(Model):
+    path: str
+    bytes: int = Field(ge=0)
+    sha256: Sha256
 
 
-class OrderFilter(Model): ...
+class SessionOutput(Model):
+    path: str
+    sha256: Sha256 | None
+    artifact_id: UUID | None
 
 
-class ThroughputPoint(Model): ...
+class SessionRecord(Model):
+    skill: SkillName
+    mode: str
+    executor_session: str | None
+    models: Mapping[str, ModelName]
+    task_sha256: Sha256
+    inputs: tuple[SessionFile, ...]
+    output: SessionOutput
+
+    def __init__(self, **data: object) -> None:
+        super().__init__(**data)
+        contracts.validate("run-manifest#/$defs/session", self.model_dump(mode="json"))
+        if any(a.path >= b.path for a, b in zip(self.inputs, self.inputs[1:], strict=False)):
+            raise ValidationError("session inputs must have unique, sorted paths")
 
 
-class SpendSource(Model): ...
+class ConfigDigest(Model):
+    """A config document in force when an order was planned; `pack:<name>` is the pack version."""
+
+    name: str
+    digest: Sha256
+    artifact_id: UUID | None = None
 
 
-class SpendAttribution(Model): ...
+class OrderApproval(Model):
+    """Who let a human-gated order run, and when (the run manifest's `approval`)."""
+
+    approver: str
+    approved_at: datetime
 
 
-class BudgetVerdict(Model): ...
+class OrderManifest(Model):
+    """What an order's run manifest says about the config it was planned with and its approval."""
+
+    config: tuple[ConfigDigest, ...] = ()
+    approval: OrderApproval | None = None
+    sessions: tuple[SessionRecord, ...] = ()
+    degraded: Mapping[str, int] = Field(default_factory=dict)
+
+    @model_serializer(mode="wrap")
+    def serialize(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        document = handler(self)
+        if not self.sessions:
+            document.pop("sessions", None)
+        if not self.degraded:
+            document.pop("degraded", None)
+        return document
 
 
-class SpendFilter(Model): ...
+class SchedulePlan(Model):
+    """Assets to run now, one queued order each (a dashboard refresh: one order per view)."""
+
+    assets: tuple[AssetName, ...] = Field(min_length=1)
+    priority: int
+    repository_id: UUID | None = None
+    run_batch_id: UUID | None = None
+    lane: LaneName | None = None
 
 
-class SpendDimension(Model): ...
+class OrderFilter(Model):
+    """`window` bounds a timeline by finished_at; `list` pages by created_at and refuses it.
+    `repository_ids` selects several repositories in one indexed query (a page's worth)."""
+
+    states: tuple[OrderState, ...] = ()
+    asset: AssetName | None = None
+    repository_id: UUID | None = None
+    repository_ids: tuple[UUID, ...] = ()
+    run_batch_id: UUID | None = None
+    window: TimeWindow | None = None
 
 
-class SpendRollup(Model): ...
+FINISHED_ORDER_STATES = (
+    OrderState.SUCCEEDED,
+    OrderState.DEGRADED,
+    OrderState.REFUSED,
+    OrderState.WITHHELD,
+    OrderState.FAILED,
+)
 
 
-class StaleItem(Model): ...
+class ThroughputPoint(Model):
+    """Orders finished within one bucket, by outcome (every outcome in scope, zero-filled)."""
+
+    bucket: datetime
+    finished: Mapping[OrderState, int]
+
+    @property
+    def total(self) -> int:
+        return sum(self.finished.values())
+
+
+class ModelUsage(Model):
+    """One model request's token usage, and the skill running then, as a transcript reader
+    parsed them."""
+
+    provider: ProviderName
+    model: ModelName
+    occurred_at: datetime
+    tokens_in: int = Field(ge=0)
+    tokens_out: int = Field(ge=0)
+    cache_read: int = Field(default=0, ge=0)
+    cache_creation: int = Field(default=0, ge=0)
+    skill: SkillName | None = None
+    session: str | None = None  # the transcript's session id, for per-session counts
+
+
+class LaneCost(Model):
+    """A lane's settled cost per order over a window: the median of its orders' recorded spend."""
+
+    lane: LaneName
+    orders: int
+    events: int
+    median_usd: Decimal
+
+
+class SpendSource(Model):
+    """Parsed model usage from one source (e.g. a workstation's session transcripts)."""
+
+    name: str
+    usages: tuple[ModelUsage, ...] = ()
+
+
+class TokenUsage(Dto):
+    """One request's tokens, or a group's summed; the catalog prices cache reads/writes and long
+    prompts per request."""
+
+    tokens_in: int
+    tokens_out: int
+    cache_read: int = 0
+    cache_creation: int = 0
+
+
+class UsageDimension(StrEnum):
+    """What `SpendService.usage_summary` sums a source's usage by."""
+
+    DAY = "day"
+    SKILL = "skill"
+    MODEL = "model"
+
+
+class UsageRollup(Model):
+    """A source's usage summed over one group. A key is None when the summary doesn't group by it;
+    grouped by skill, None is usage no skill claims. `long_prompt` is the part from requests over
+    their model's long-prompt threshold; `cost_usd` prices the models with a list price (None when
+    none has one) and `unpriced` names the rest."""
+
+    day: date | None = None
+    skill: SkillName | None = None
+    model: ModelName | None = None
+    tokens: TokenUsage
+    long_prompt: TokenUsage | None = None
+    messages: int
+    sessions: int
+    cost_usd: Decimal | None
+    unpriced: tuple[ModelName, ...] = ()
+
+
+class SpendDimension(StrEnum):
+    MONTH = "month"
+    LANE = "lane"
+    PROVIDER = "provider"
+    MODEL = "model"
+    SKILL = "skill"
+    REPOSITORY = "repository"  # of the run order the spend was recorded against
+
+
+class SpendFilter(Model):
+    window: TimeWindow
+    lane: LaneName | None = None
+    attributed: bool | None = None
+
+
+class SpendRollup(Model):
+    """Spend summed over one group; key is None for spend without that dimension (no lane)."""
+
+    key: str | None = None
+    events: int
+    tokens_in: int
+    tokens_out: int
+    cost_usd: Decimal
+
+
+class SpendBreakdown(Model):
+    """Spend split by skill or lane: a row per key, `unattributed` (no key, always present) and
+    the ungrouped `total` they must sum to."""
+
+    filter: SpendFilter
+    by: SpendDimension
+    rows: tuple[SpendRollup, ...]
+    unattributed: SpendRollup
+    total: SpendRollup
+
+    @property
+    def lossless(self) -> bool:
+        """The split drops and invents nothing: rows plus unattributed equal the total."""
+        parts = (*self.rows, self.unattributed)
+        return all(
+            sum(getattr(r, f) for r in parts) == getattr(self.total, f)
+            for f in ("events", "tokens_in", "tokens_out", "cost_usd")
+        )
+
+
+class SpendAttribution(Model):
+    window: TimeWindow
+    attributed_usd: Decimal
+    unattributed_usd: Decimal
+
+    @property
+    def total_usd(self) -> Decimal:
+        return self.attributed_usd + self.unattributed_usd
+
+
+class Invoice(Model):
+    """A month's billed amount, the spend view's estimates are reconciled against."""
+
+    period: str = Field(pattern=r"^\d{4}-(0[1-9]|1[0-2])$")
+    amount_usd: Decimal
+    note: str = ""
+
+
+class BudgetStatus(StrEnum):
+    WITHIN = "within"
+    OVER = "over"
+    NO_BUDGET = "no_budget"
+
+
+# The enforcement levels under which admission may withhold a lane's orders: shared by
+# BudgetVerdict.binding and the ops policy gates so the two cannot drift.
+WITHHOLDING_ENFORCEMENT: tuple[BudgetEnforcement, ...] = (
+    BudgetEnforcement.ADVISORY,
+    BudgetEnforcement.ENFORCED,
+)
+
+
+class BudgetVerdict(Model):
+    """One lane's month-to-date spend plus an estimate, judged against its budget."""
+
+    lane: LaneName
+    status: BudgetStatus
+    enforcement: BudgetEnforcement | None = None
+    spent_usd: Decimal
+    estimate_usd: Decimal | None
+    budget_usd: Decimal | None = None
+
+    @property
+    def binding(self) -> bool:
+        """Admission may withhold: over, enforcing, and the cost is known."""
+        return (
+            self.status is BudgetStatus.OVER
+            and self.enforcement in WITHHOLDING_ENFORCEMENT
+            and self.estimate_usd is not None
+        )
+
+
+class Freshness(StrEnum):
+    """Worst first: the order a drift report leads with."""
+
+    STALE = "stale"
+    UNAVAILABLE = "unavailable"
+    PENDING = "pending"
+    FRESH = "fresh"
+
+
+class StaleItem(Model):
+    """One checked input: fresh, stale, never produced yet (pending) or not checkable."""
+
+    item: str
+    status: Freshness
+    detail: str = ""
+    refresh: str | None = None
 
 
 class RunBatch(Entity):
@@ -124,8 +551,9 @@ class RunOrder(Entity):
     artifact_id: UUID | None = None
     rule: str | None = None
     event_source: str | None = None
-    lane: str
-    state: str
+    asset: str
+    lane: str | None = None
+    state: OrderState
     priority: int
     reason: str | None = None
     requested_by: str
@@ -133,13 +561,52 @@ class RunOrder(Entity):
     lease_expires_at: datetime | None = None
     started_at: datetime | None = None
     finished_at: datetime | None = None
+    work_item_id: UUID | None = None  # the remediation work item the order runs, if any
+    fork_url: str | None = None  # the mirror the effort runs on (remediate_finding only)
+    fork_branch: str | None = None  # its fix branch
+    fork_scheduled_at: datetime | None = None  # when scheduling set them, checked
+
+
+FEED_ORDER_STATES = (*FINISHED_ORDER_STATES, OrderState.AWAITING_APPROVAL)
+
+
+class FeedEvent(Model):
+    """One change on the ops feed: an order reaching a `FEED_ORDER_STATES` state (with its
+    reason), a new assessment, or a recorded release. Exactly one is set."""
+
+    order: RunOrder | None = None
+    assessment: Assessment | None = None
+    release: Release | None = None
+
+    @property
+    def position(self) -> tuple[datetime, UUID]:
+        """The feed's order: when it changed, then id."""
+        if self.order is not None:
+            at, record_id = self.order.updated_at, self.order.id
+        else:
+            record = self.assessment or self.release
+            assert record is not None
+            at, record_id = record.created_at, record.id
+        assert at is not None and record_id is not None
+        return at, record_id
+
+    @property
+    def cursor(self) -> Cursor:
+        """Where the feed resumes after this event."""
+        return encode_cursor(*self.position)
 
 
 class SpendEvent(AppendOnly):
     run_order_id: UUID | None = None
+    repository_id: UUID | None = None
+    repository_label: str | None = None
+    loc: int | None = Field(default=None, ge=0, strict=True)
+    batch: str | None = None
+    note: str | None = None
     provider: str
     model: str
     skill: str | None = None
+    lane: str | None = None
     tokens_in: int
     tokens_out: int
     cost_usd: Decimal
@@ -165,5 +632,14 @@ class Budget(Model):
     monthly_usd: Decimal
     enforcement: BudgetEnforcement
 
-    def verdict(self, spent: Decimal, estimate: Decimal) -> BudgetVerdict:
-        raise NotImplementedError("stub: replaces budget_shadow.shadow_verdict")
+    def verdict(self, spent: Decimal, estimate: Decimal | None) -> BudgetVerdict:
+        # Unknown cost is judged on measured spend alone, and `binding` stays false.
+        projected = spent if estimate is None else spent + estimate
+        return BudgetVerdict(
+            lane=self.lane,
+            status=BudgetStatus.OVER if projected > self.monthly_usd else BudgetStatus.WITHIN,
+            enforcement=self.enforcement,
+            spent_usd=spent,
+            estimate_usd=estimate,
+            budget_usd=self.monthly_usd,
+        )

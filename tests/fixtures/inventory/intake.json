@@ -1,0 +1,28 @@
+{
+  "source": "Sanitized from hybrid-platforms-inputs release-payload and ownership CSVs: product, version, URLs, ref names and teams replaced; full commit SHAs are synthetic test inputs because the CSV names branches.",
+  "product": {
+    "slug": "example-platform",
+    "name": "Example Platform",
+    "version": "1.0"
+  },
+  "repositories": [
+    {
+      "url": "https://github.com/example/component-1",
+      "ref": "release-1.0",
+      "sha": "0000000000000000000000000000000000000001",
+      "team": "team-1"
+    },
+    {
+      "url": "https://github.com/example/component-2",
+      "ref": "release-1.0",
+      "sha": "0000000000000000000000000000000000000002",
+      "team": "team-2"
+    },
+    {
+      "url": "https://github.com/example/component-3",
+      "ref": "release-1.0",
+      "sha": "0000000000000000000000000000000000000003",
+      "team": "team-3"
+    }
+  ]
+}

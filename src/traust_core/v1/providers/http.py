@@ -1,0 +1,229 @@
+from __future__ import annotations
+
+import hashlib
+import http.client
+import json
+import logging
+import random
+import re
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from collections.abc import Callable, Iterator, Mapping
+from dataclasses import dataclass
+from datetime import UTC
+from email.utils import parsedate_to_datetime
+from typing import Any, BinaryIO, TypeVar
+
+from traust_core.v1.errors import ServiceError, ValidationError
+from traust_core.v1.providers.clock import Clock, SystemClock
+from traust_core.v1.providers.correlation import REQUEST_ID_HEADER, current_correlation
+
+T = TypeVar("T")
+_NEXT = re.compile(r'<([^>]+)>\s*;\s*rel="?next"?')
+log = logging.getLogger(__name__)
+
+
+def _target_hash(url: str) -> str:
+    return hashlib.sha256(url.encode()).hexdigest()[:16]
+
+
+def _refused(url: str, status: int, operation: str) -> ServiceError:
+    return ServiceError(
+        f"{url}: HTTP {status}",
+        status=status,
+        operation=operation,
+        target_hash=_target_hash(url),
+    )
+
+
+def _log_http(
+    method: str,
+    target_hash: str,
+    outcome: str,
+    attempts: int,
+    started: float,
+    status: int | None = None,
+) -> None:
+    duration_ms = (time.perf_counter() - started) * 1000
+    message = "http %s %s target_hash=%s attempts=%d duration_ms=%.1f"
+    args = (method, outcome, target_hash, attempts, duration_ms)
+    extra = {
+        "operation": f"http.{method.lower()}",
+        "target_hash": target_hash,
+        "outcome": outcome,
+        "attempts": attempts,
+        "duration_ms": duration_ms,
+        "status": status,
+    }
+    (log.info if outcome == "completed" else log.warning)(message, *args, extra=extra)
+
+
+@dataclass(frozen=True, slots=True)
+class RetryPolicy:
+    max_attempts: int = 4
+    timeout_seconds: float = 120.0
+    backoff_base_seconds: float = 1.0
+    max_wait_seconds: float = 60.0
+    jitter_seconds: float = 0.0
+
+
+class _Refused(Exception):
+    def __init__(self, status: int, body: bytes) -> None:
+        super().__init__(status)
+        self.status, self.body = status, body
+
+
+class HttpFetcher:
+    """Outbound HTTP for providers: Retry-After on 429, capped backoff on
+    5xx/timeouts, fail at once on any other 4xx."""
+
+    def __init__(
+        self,
+        user_agent: str,
+        policy: RetryPolicy | None = None,
+        *,
+        clock: Clock | None = None,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        self._user_agent = user_agent
+        self._policy = policy or RetryPolicy()
+        self._clock = clock or SystemClock()
+        self._sleep = sleep
+
+    def get(self, url: str, headers: Mapping[str, str] | None = None) -> bytes:
+        try:
+            return self._send(url, None, headers=headers)
+        except _Refused as e:
+            raise _refused(url, e.status, "http.get") from e
+
+    def pages(self, url: str, headers: Mapping[str, str] | None = None) -> Iterator[bytes]:
+        """Each page's body, following the `Link: <…>; rel="next"` header (RFC 8288)."""
+        next_url: str | None = url
+        while next_url is not None:
+            page = next_url
+            try:
+                body, link = self._send(
+                    page, None, read=lambda r: (r.read(), r.headers.get("Link")), headers=headers
+                )
+            except _Refused as e:
+                raise _refused(page, e.status, "http.get") from e
+            yield body
+            found = _NEXT.search(link or "")
+            next_url = found.group(1) if found else None
+
+    def fetch(self, url: str, limit: int) -> tuple[bytes, str]:
+        """(body, the URL it was served from after redirects); at most `limit` + 1 bytes are read,
+        so a caller can tell a body over its cap."""
+        try:
+            return self._send(url, None, read=lambda r: (r.read(limit + 1), r.geturl()))
+        except _Refused as e:
+            raise _refused(url, e.status, "http.get") from e
+
+    def stream(
+        self, url: str, consume: Callable[[BinaryIO], T], headers: Mapping[str, str] | None = None
+    ) -> T:
+        """`consume` reads the body as it arrives (never held in memory); on a retry it is called
+        again from the start, so it must begin from a clean slate."""
+        try:
+            return self._send(url, None, read=consume, headers=headers)
+        except _Refused as e:
+            raise _refused(url, e.status, "http.get") from e
+
+    def post_json(self, url: str, doc: object) -> bytes:
+        try:
+            return self._send(url, json.dumps(doc).encode(), "application/json")
+        except _Refused as e:
+            raise _refused(url, e.status, "http.post") from e
+
+    def post_form(self, url: str, form: Mapping[str, str]) -> tuple[int, bytes]:
+        """POST a form: (200, body), or a 4xx's (status, body), where OAuth puts its error codes."""
+        try:
+            return 200, self._send(url, urllib.parse.urlencode(form).encode())
+        except _Refused as e:
+            return e.status, e.body
+
+    def _send(
+        self,
+        url: str,
+        data: bytes | None,
+        content_type: str | None = None,
+        *,
+        read: Callable[[Any], Any] = lambda r: r.read(),
+        headers: Mapping[str, str] | None = None,
+    ) -> Any:
+        policy = self._policy
+        method = "POST" if data is not None else "GET"
+        target_hash = _target_hash(url)
+        started = time.perf_counter()
+        last, throttled = "", False
+        headers = {**(headers or {}), "User-Agent": self._user_agent}
+        if correlation := current_correlation():
+            headers[REQUEST_ID_HEADER] = correlation.request_id
+        if content_type:
+            headers["Content-Type"] = content_type
+        for attempt in range(policy.max_attempts):
+            req = urllib.request.Request(url, data, headers=headers)
+            try:
+                with urllib.request.urlopen(req, timeout=policy.timeout_seconds) as r:
+                    result = read(r)
+                _log_http(method, target_hash, "completed", attempt + 1, started)
+                return result
+            except urllib.error.HTTPError as e:
+                # retrying a 403/404 just burns the rate-limit window
+                if e.code != 429 and not 500 <= e.code < 600:
+                    _log_http(method, target_hash, "refused", attempt + 1, started, e.code)
+                    raise _Refused(e.code, e.read() if e.fp else b"") from e
+                last, throttled = f"HTTP {e.code}", e.code == 429
+                after = self._retry_after(e.headers.get("Retry-After") if e.headers else None)
+                delay = (
+                    self._backoff(attempt) if after is None else min(after, policy.max_wait_seconds)
+                )
+            except (
+                urllib.error.URLError,
+                TimeoutError,
+                OSError,
+                http.client.IncompleteRead,
+            ) as e:
+                last, throttled = str(e), False
+                delay = self._backoff(attempt)
+            if attempt + 1 < policy.max_attempts:
+                self._sleep(delay)
+        _log_http(method, target_hash, "failed", policy.max_attempts, started)
+        raise ServiceError(
+            f"{url}: gave up after {policy.max_attempts} attempts ({last})",
+            status=429 if throttled else None,
+            operation=f"http.{method.lower()}",
+            target_hash=target_hash,
+        )
+
+    def _backoff(self, attempt: int) -> float:
+        p = self._policy
+        wait = min(p.backoff_base_seconds * 2**attempt, p.max_wait_seconds)
+        return wait + (random.uniform(0, p.jitter_seconds) if p.jitter_seconds else 0.0)
+
+    def _retry_after(self, value: str | None) -> float | None:
+        """Retry-After as delta-seconds or an HTTP-date; None when absent or unparseable."""
+        if not value:
+            return None
+        value = value.strip()
+        if value.isdigit():
+            return float(value)
+        try:
+            when = parsedate_to_datetime(value)
+        except (TypeError, ValueError):
+            return None
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=UTC)
+        return max(0.0, (when - self._clock.now()).total_seconds())
+
+
+def failure_status(e: ServiceError | ValidationError) -> str:
+    """The comparison-status words, after the fetcher's retries: still throttled is
+    quota-deferred; a refused request or a bad answer is an error; else unreachable."""
+    if isinstance(e, ServiceError) and e.status == 429:
+        return "quota-deferred"
+    if isinstance(e, ValidationError) or e.status is not None:
+        return "error"
+    return "unreachable"

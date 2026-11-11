@@ -15,16 +15,38 @@ ORDER = [
     "rendering",
     "services",
     "context",
+    "rest",
 ]
 THIRD_PARTY = {
     "errors": set(),
     "contracts": {"jsonschema", "referencing", "traust_contracts"},
-    "models": {"pydantic"},
-    "providers": {"pydantic"},
-    "repositories": {"sqlalchemy", "psycopg", "pydantic"},
+    "models": {
+        "pydantic",
+        "pydantic_core",
+    },  # pydantic_core: custom-type core schema (HttpsRepoUrl)
+    # each pair has one module (test_architecture); tree_sitter* are the grammars
+    "providers": {
+        "pydantic",
+        "jwt",
+        "cryptography",
+        "tree_sitter",
+        "tree_sitter_javascript",
+        "tree_sitter_typescript",
+        "tree_sitter_java",
+        "tree_sitter_rust",
+        "tree_sitter_ruby",
+    },
+    "repositories": {"sqlalchemy", "psycopg", "pydantic", "boto3", "botocore"},  # boto*: [s3] extra
     "rendering": {"pydantic"},
-    "services": {"pydantic"},
+    "services": {"pydantic", "traust_ledger"},  # one module: test_architecture
     "context": {"pydantic", "yaml", "sqlalchemy"},
+    "rest": {
+        "pydantic",
+        "pydantic_core",
+        "fastapi",
+        "starlette",
+        "uvicorn",
+    },  # the [rest] extra; pydantic_core: custom-type core schema (UtcDatetime)
 }
 
 
