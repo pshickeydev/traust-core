@@ -34,6 +34,8 @@ def review_queue(
     """Fold states and pending review items needing a person, oldest first, cursor-paged:
     of one repository, of several (`repository_ids`, one read over the set), or of the
     whole scope."""
+    if repository_ids and len(repository_ids) > MAX_REPOSITORY_IDS:
+        raise ValidationError(f"queue at most {MAX_REPOSITORY_IDS} repositories per request")
     filter = ReviewFilter(
         status=status,
         reason=reason,

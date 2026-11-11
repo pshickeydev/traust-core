@@ -116,11 +116,8 @@ class FindingReview:
             elif filter.repository_ids:
                 # The batch shape: one indexed read over the set (a page's worth of
                 # repositories, the `repository_ids` filter `OrderFilter` set) instead of
-                # one listing per repository — the pending items and decision candidates
-                # outside the set never load.
+                # one listing per repository.
                 findings = uow.findings.list_for_repositories(filter.repository_ids)
-                wanted = {finding.id for finding in findings}
-                pending = [item for item in pending if item.finding_id in wanted]
             else:
                 pending = self.pending()
                 candidates = uow.decisions.list_finding_ids_for_review()
@@ -133,6 +130,32 @@ class FindingReview:
                     self._read(item)
                     for item in uow.review_items.pending_for_findings(
                         {finding.id for finding in findings if finding.id}
+                    )
+                ]
+            facts = FindingFacts.load(uow, findings, until=None)
+        repository = {finding.id: finding.repository_id for finding in findings}
+        cases = [
+            ReviewCase(
+                kind=ReviewCaseKind.NEEDS_REVIEW,
+                finding_id=item.finding_id,
+                repository_id=repository[item.finding_id],
+                since=item.created_at,
+                review_item=item,
+            )
+            for item in pending
+            if item.finding_id in repository
+        ]
+        for finding in findings:
+            assert finding.id is not None
+            disposition = facts.disposition(finding.id, None)
+            if disposition is not None and (kind := _attention(disposition)) is not None:
+                cases.append(
+                    ReviewCase(
+                        kind=kind,
+                        finding_id=finding.id,
+                        repository_id=finding.repository_id,
+                        since=disposition.last_decision_at,
+                        disposition=disposition,
                     )
                 ]
             facts = FindingFacts.load(uow, findings, until=None)
