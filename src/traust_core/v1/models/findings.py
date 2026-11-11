@@ -222,73 +222,11 @@ class FindingFilter(Model):
 class FindingSetFilter(Model):
     """Several repositories' findings in one listing (the `repository_ids` batch shape
     `OrderFilter` set: a page's worth of repositories, not a whole estate), as of a point in
-    time, narrowed by the worklist's own cut: the census exposure classification and the
-    effective-severity set. `list_in`'s folded-disposition narrows are still absent — the
-    single-repository `FindingFilter`'s own rule — but the row rules a cross-repository
-    worklist pages by belong here, so the listing and its count keep them server-side
-    instead of handing a consumer every row to filter itself.
-
-    The keep rule mirrors the classification SCI's worklist derived per row before the
-    push-down (its coreExposureClass, the same policy the SDK's current_finding_detail
-    view states): false_positive and hardening are validity states, closed is an
-    affirmative resolution, everything else is open. A severity set matches the view's
-    effective severity — a finding without one matches no severity cut, exactly as a
-    consumer mapping the view onto a row with no effective severity kept it out."""
+    time. The folded-disposition narrows are deliberately absent — `all_in`'s own rule —
+    callers filter with the view's own rules."""
 
     repository_ids: tuple[UUID, ...]
     as_of: datetime | None = None
-    exposure: str | None = None
-    severity: tuple[str, ...] = ()
-
-    def keeps(self, view: FindingView) -> bool:
-        if self.exposure is not None and view.exposure() != self.exposure:
-            return False
-        if self.severity:
-            rated = view.effective_severity.value.lower() if view.effective_severity else ""
-            if rated not in self.severity:
-                return False
-        return True
-
-
-class FindingExposure(StrEnum):
-    """The census classification a cross-repository worklist cuts by (see
-    `FindingSetFilter`): the worklist's exposure vocabulary, which is narrower than
-    `FindingState` — the worklist's "closed" merges resolved and risk_accepted, and its
-    "open" keeps everything not affirmatively closed, including `not_affected`."""
-
-    OPEN = "open"
-    HARDENING = "hardening"
-    FALSE_POSITIVE = "false_positive"
-    CLOSED = "closed"
-
-
-class FindingSort(StrEnum):
-    """The columns a cross-repository listing orders by. `newest` is the listing's own
-    keyset discipline (cursor-paged, bounded per page); the others are served as one
-    sorted window per request — a bounded top-K fold over the set, so a consumer pages a
-    worklist without walking every row itself. Columns the fold holds (severity, cvss,
-    title, finding id) are here; columns a consumer joins outside core's model (its own
-    repository or product spellings) are not — those stay the consumer's sort."""
-
-    NEWEST = "newest"
-    SEVERITY = "severity"
-    CVSS = "cvss"
-    TITLE = "title"
-    FINDING_ID = "finding_id"
-
-
-class SortDirection(StrEnum):
-    """Which way a sorted listing orders its column; the id tiebreak is asc either way."""
-
-    ASC = "asc"
-    DESC = "desc"
-
-
-class FindingCount(Model):
-    """The filtered total a paged listing's pager reads: one number, from one bounded
-    fold that holds no views."""
-
-    total: int
 
 
 class FindingRollup(Model):

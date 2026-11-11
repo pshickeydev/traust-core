@@ -44,10 +44,6 @@ def list_remediations(
     """Scheduled remediations, oldest first, a page at a time: at a status, on a repository,
     on a finding, or across several repositories (`repository_ids`, one read over the set —
     the batch shape the orders filter set; every filter given applies)."""
-    if repository_ids and len(repository_ids) > MAX_REPOSITORY_IDS:
-        raise ValidationError(
-            f"list remediations for at most {MAX_REPOSITORY_IDS} repositories per request"
-        )
     return scheduling.list(
         PageRequest(limit=limit, cursor=cursor),
         status=status,
