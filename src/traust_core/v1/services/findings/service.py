@@ -662,20 +662,6 @@ class FindingService:
         estate's views are never held at once."""
         self._fold(repository_ids, as_of, census=True, count=count)
 
-    def census(
-        self,
-        repository_ids: Collection[UUID],
-        count: Callable[[Sequence[FindingCensusRow]], None],
-        as_of: datetime | None = None,
-    ) -> None:
-        """Fold the scope's findings as census rows — the counted facts without the views'
-        weight: one narrow column set per table, the disposition folded over tuples, one
-        bounded batch of whole repositories at a time. What `census_fold` counts, at a
-        fraction of its cost; a consumer that reads view fields census_fold still serves."""
-        with self._uow as uow:
-            for rows in self._census.rows(uow, repository_ids, as_of):
-                count(rows)
-
     def _fold(
         self,
         repository_ids: Collection[UUID],

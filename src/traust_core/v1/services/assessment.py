@@ -1014,29 +1014,14 @@ class AssessmentService:
         return sorted(rows, key=lambda a: (a.occurred_at, a.id))
 
     def list_for_repositories(
-        self,
-        repository_ids: Collection[UUID],
-        kind: AssessmentKind | None,
-        page: PageRequest,
-    ) -> Page[Assessment]:
-        """The assessments across every ref of these repositories, newest first and
-        cursor-paged under the collection listing's own discipline: the batched
-        `list` — one query per table over the set, never one per repository. A
-        consumer that wants the whole history follows the cursor (the SDK's
-        paged iterators do)."""
-        after = page.position()
+        self, repository_ids: Collection[UUID], kind: AssessmentKind | None = None
+    ) -> list[Assessment]:
+        """The assessments across every ref of these repositories, oldest first: the batched
+        `list_for_repository` — one query per table over the set, never one per repository."""
         refs = [r.id for r in self._inventory.list_refs_of(repository_ids) if r.id]
         kinds = self._kind_spellings(kind) if kind is not None else [None]
-        with self._uow as uow:
-            rows = [
-                self._read(row)
-                for spelling in kinds
-                for row in uow.assessments.search(
-                    repository_ref_ids=refs, kind=spelling, limit=page.limit + 1, after=after
-                )
-            ]
-        rows.sort(key=lambda a: (a.occurred_at, a.id), reverse=True)
-        return Page.of(rows, page.limit, lambda a: (a.occurred_at, a.id))
+        rows = [self._read(row) for spelling in kinds for row in self._log.list_of(spelling, refs)]
+        return sorted(rows, key=lambda a: (a.occurred_at, a.id))
 
     def population(
         self, as_of: datetime, filter: AssessmentFilter, repository_ids: Collection[UUID]
@@ -1092,8 +1077,7 @@ class AssessmentService:
             else:
                 runs_of[1] += count
         latest: dict[tuple[UUID, str], Assessment] = {}
-        for row in newest:
-            a = self._read(row)  # the canonical kind spelling, as every served assessment carries
+        for a in newest:
             key = (owner[a.repository_ref_id], self._canonical_kind(a.kind))
             seen = latest.get(key)
             if seen is None or (a.occurred_at, a.created_at, a.id) > (
@@ -1102,7 +1086,7 @@ class AssessmentService:
                 seen.id,
             ):
                 latest[key] = a
-        return {key: (latest.get(key), *runs[key]) for key in sorted(runs, key=str)}
+        return {key: (latest.get(key), *runs[key]) for key in runs}
 
     def _held(
         self, as_of: datetime, filter: AssessmentFilter, repository_ids: Collection[UUID]
@@ -1372,14 +1356,7 @@ class AssessmentService:
             for (repository_id, _), (a, _, _) in held.items()
             if a is not None and a.id is not None
         }
-        # newest first with the id breaking timestamp ties: the documents read keeps its own
-        # stable (occurred_at, created_at) order, so the groups' SQL row order never decides
-        # which repository a family's examples name first
-        assessments = sorted(
-            (a for a, _, _ in held.values() if a is not None),
-            key=lambda a: (a.occurred_at, a.created_at, a.id),
-            reverse=True,
-        )
+        assessments = [a for a, _, _ in held.values() if a is not None]
         documents = []
         for a, row in self._log.documents(assessments, [artifact.schema]):
             assert row.id is not None
