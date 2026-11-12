@@ -256,13 +256,7 @@ class FindingService:
         self._census = FindingCensus(rating, objects)
         self._objects = objects
         self._shared_depth = 0
-        self._shared_loads: dict[
-            tuple[frozenset[UUID], datetime | None],
-            tuple[
-                dict[UUID, list[Finding]],
-                list[tuple[list[tuple[UUID, list[Finding]]], FindingFacts]],
-            ],
-        ] = {}
+        self._shared_loads: dict[tuple[frozenset[UUID], datetime | None], list[_ScopeLoad]] = {}
         types = dict.fromkeys(
             artifact.schema_type()
             for artifact in (
