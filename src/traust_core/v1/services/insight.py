@@ -4999,7 +4999,7 @@ class CensusView:
                 str(c.audits),
                 str(c.distinct.total),
                 str(c.open.total),
-                *_counts(c.open)[:5],
+                *_counts(c.open, unrated=True)[:6],
                 str(c.hardening),
                 str(c.false_positives),
                 str(c.occurrences),
@@ -5020,7 +5020,7 @@ class CensusView:
             (
                 name,
                 str(layer.findings.total),
-                *_counts(layer.findings)[:5],
+                *_counts(layer.findings, unrated=True)[:6],
                 str(layer.false_positives),
             )
             for name, layer in (
@@ -5047,6 +5047,7 @@ class CensusView:
                         "medium",
                         "low",
                         "info",
+                        "unrated",
                         "hardening",
                         "false positives",
                         "occurrences",
@@ -5060,8 +5061,8 @@ class CensusView:
                     [
                         (
                             p.slug,
-                            str(p.ownership or "-"),
-                            p.business_unit or "-",
+                            str(p.ownership or "—"),
+                            p.business_unit or "—",
                             str(p.repositories),
                         )
                         for p in model.products
@@ -5099,6 +5100,7 @@ class CensusView:
                             "medium",
                             "low",
                             "info",
+                            "unrated",
                             "false positives",
                         ),
                         rows=tuple(layers),
