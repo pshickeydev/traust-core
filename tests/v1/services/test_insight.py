@@ -124,8 +124,18 @@ class FakeFindings:
             for repository_id in repository_ids
         }
 
-    def census_fold(self, repository_ids: Any, count: Any, as_of: Any = None) -> None:
+    def census_fold(
+        self, repository_ids: Any, count: Any, as_of: Any = None, *, cwes: bool = False
+    ) -> None:
         count(self.all_in(repository_ids, as_of))
+
+    def census(self, repository_ids: Any, count: Any, as_of: Any = None) -> None:
+        # the views a fake holds, as the census rows the rollup counts: the production
+        # adapter (`_census_row`), so the fake stays the fold's own shape
+        from traust_core.v1.services.insight import _census_row
+
+        wanted = set(repository_ids)
+        count([_census_row(v) for v in self.views if v.finding.repository_id in wanted])
 
 
 class NoThreatModels:
@@ -587,14 +597,14 @@ def test_a_rollup_outside_its_contract_is_refused_by_the_build(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     view = FindingsRollupView(FakeFindings([]), FakePortfolio(), NoThreatModels())  # type: ignore[arg-type]
-    real = insight_module._rollup
+    real = insight_module._Counted.rollup
 
     def drifted(*args: Any) -> FindingsRollup:
         rollup = real(*args)
         tally = rollup.total.model_copy(update={"hardening": -1})
         return rollup.model_copy(update={"total": tally})
 
-    monkeypatch.setattr(insight_module, "_rollup", drifted)
+    monkeypatch.setattr(insight_module._Counted, "rollup", drifted)
     with pytest.raises(DocumentError) as error:
         view.build(ViewFilter())
     assert "total/hardening" in {issue.path for issue in error.value.issues}
