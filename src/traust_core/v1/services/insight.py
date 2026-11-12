@@ -2463,7 +2463,9 @@ class RemediationIndexView:
             for r in repository_ids
             for item in items.get(r, ())
         )
-        return RemediationIndex(rows=rows, by_status=dict(Counter(r.status for r in rows)))
+        model = RemediationIndex(rows=rows, by_status=dict(Counter(r.status for r in rows)))
+        contracts.validate_view(self.name, model.model_dump(mode="json"))
+        return model
 
     def report(self, model: RemediationIndex, generated_at: datetime) -> Report:
         summary = f"{len(model.rows)} work items" + (
@@ -2486,8 +2488,8 @@ class RemediationIndexView:
                                 str(r.work_item_id),
                                 r.status,
                                 str(r.findings),
-                                r.fork_url or "-",
-                                r.fix_branch or "-",
+                                r.fork_url or "—",
+                                r.fix_branch or "—",
                             )
                             for r in model.rows
                             if r.product == product
