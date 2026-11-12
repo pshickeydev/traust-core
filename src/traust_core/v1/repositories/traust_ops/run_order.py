@@ -87,9 +87,9 @@ class RunOrderRepository(MutableRecordRepository[RunOrder], Protocol):
         `mirror_affinity` (the next-order selection only; a named order is claimed as
         asked) skips a queued order whose repository another worker's live lease holds —
         its node already fetched the repository's mirror — and one whose (asset,
-        repository) pair an open order still gates (planned or awaiting approval), so
-        the claim answers the question the runners once read every open order to ask:
-        what can this worker take right now?"""
+        repository) pair an open non-queued order occupies, so the claim answers the
+        question the runners once read every open order to ask: what can this worker
+        take right now?"""
         ...
 
     def get_for_update(self, order_id: UUID) -> RunOrder:
@@ -195,31 +195,16 @@ class SqlRunOrderRepository(SqlMutableRepository[RunOrder]):
             # the claim): a repository another worker's live lease holds is skipped —
             # its node already fetched the mirror, and the queued orders on that
             # repository wait for the holder — and so is a queued order whose (asset,
-            # repository) pair an open order still gates (planned or awaiting
-            # approval: a pair at its budget gate keeps its queued sibling waiting).
-            # A leased sibling is no gate — the holder's own lease never blocks it
-            # (the mirror is already on the holder's node) and another worker's
-            # lease on the repository is the held rule's own case — so a runner that
-            # re-queues work for an asset it already holds can take the next order.
-            # The claim's sweep has just requeued expired leases in this
-            # transaction, so every LEASED row's hold is live. The other rows are
-            # read through an alias so the subquery correlates against the
-            # candidate row, not itself, and each exclusion is a shape its own
-            # index serves: the repository hold by (repository_id, state), the
-            # gated pair only for fleet-wide candidates (the outer half of the AND
-            # is a per-candidate constant, so a repository-scoped candidate never
-            # pays the fleet arm's scan).
-            #
-            # Inherited, not introduced: under READ COMMITTED two concurrent claims
-            # can each lease a different queued order of one repository (each sees
-            # only committed leases, and SKIP LOCKED steers them to different rows),
-            # so the repository's mirror is fetched twice. The engine's pre-walk had
-            # the same window, wider — its listing preceded its claim by a whole
-            # walk. Closing it needs a repository-scoped lock (an advisory xact lock
-            # per candidate repository, or locking all the repository's open rows),
-            # a contention tradeoff of its own; the affinity is a fetch-dedup
-            # optimization, never a correctness rule, so the rare race costs the
-            # duplicate fetch the rule usually avoids.
+            # repository) pair an open non-queued order occupies (a planned order at
+            # its budget gate keeps its sibling waiting). The claim's sweep has just
+            # requeued expired leases in this transaction, so every LEASED row's hold
+            # is live; the holder's own lease never blocks it (the mirror is already
+            # on the holder's node). The other rows are read through an alias so the
+            # subquery correlates against the candidate row, not itself, and each
+            # exclusion is a shape its own index serves: the repository pair by
+            # (repository_id, state), the fleet-wide pair only for fleet-wide
+            # candidates (the outer half of the AND is a per-candidate constant, so
+            # a repository-scoped candidate never pays the fleet arm's scan).
             other = self.table.alias()
             held = (
                 sa.select(1)
@@ -230,27 +215,27 @@ class SqlRunOrderRepository(SqlMutableRepository[RunOrder]):
                 )
                 .exists()
             )
-            gated_states = (OrderState.PLANNED, OrderState.AWAITING_APPROVAL)
-            gated_pair = (
+            busy_states = [state for state in OPEN_ORDER_STATES if state != OrderState.QUEUED]
+            busy_pair = (
                 sa.select(1)
                 .where(
-                    other.c.state.in_(gated_states),
+                    other.c.state.in_(busy_states),
                     other.c.asset == c.asset,
                     other.c.repository_id == c.repository_id,
                 )
                 .exists()
             )
-            gated_fleet = (
+            busy_fleet = (
                 sa.select(1)
                 .where(
-                    other.c.state.in_(gated_states),
+                    other.c.state.in_(busy_states),
                     other.c.asset == c.asset,
                     other.c.repository_id.is_(None),
                 )
                 .exists()
             )
             queued = sa.and_(
-                queued, ~held, ~gated_pair, ~sa.and_(c.repository_id.is_(None), gated_fleet)
+                queued, ~held, ~busy_pair, ~sa.and_(c.repository_id.is_(None), busy_fleet)
             )
         # SKIP LOCKED on Postgres; SQLite serialises writers and drops FOR UPDATE.
         selected = sa.select(c.id).where(queued)
