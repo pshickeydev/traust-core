@@ -133,32 +133,6 @@ class FindingReview:
                     )
                 ]
             facts = FindingFacts.load(uow, findings, until=None)
-        repository = {finding.id: finding.repository_id for finding in findings}
-        cases = [
-            ReviewCase(
-                kind=ReviewCaseKind.NEEDS_REVIEW,
-                finding_id=item.finding_id,
-                repository_id=repository[item.finding_id],
-                since=item.created_at,
-                review_item=item,
-            )
-            for item in pending
-            if item.finding_id in repository
-        ]
-        for finding in findings:
-            assert finding.id is not None
-            disposition = facts.disposition(finding.id, None)
-            if disposition is not None and (kind := _attention(disposition)) is not None:
-                cases.append(
-                    ReviewCase(
-                        kind=kind,
-                        finding_id=finding.id,
-                        repository_id=finding.repository_id,
-                        since=disposition.last_decision_at,
-                        disposition=disposition,
-                    )
-                ]
-            facts = FindingFacts.load(uow, findings, until=None)
             repository = {finding.id: finding.repository_id for finding in findings}
             cases = [
                 ReviewCase(
