@@ -1221,13 +1221,13 @@ class FindingsRollupView:
             counted.census,
             filter.as_of,  # type: ignore[misc,arg-type]
         )
-        rollup = counted.rollup()
-        if not (filter.product_ids or filter.team_ids):
-            return rollup
-        scenarios = self._assessment.attack_scenarios(
-            [r.repository_id for r in rollup.repositories], filter.as_of
-        )
-        return rollup.model_copy(update={"attack_scenarios": tuple(scenarios)})
+        if filter.product_ids or filter.team_ids:
+            scenarios = self._assessment.attack_scenarios(
+                [r.repository_id for r in rollup.repositories], filter.as_of
+            )
+            rollup = rollup.model_copy(update={"attack_scenarios": tuple(scenarios)})
+        contracts.validate_view(self.name, rollup.model_dump(mode="json"))
+        return rollup
 
     def report(self, model: FindingsRollup, generated_at: datetime) -> Report:
         t = model.total
