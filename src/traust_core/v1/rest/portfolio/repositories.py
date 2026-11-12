@@ -125,43 +125,17 @@ def list_products_of(repository_id: UUID, portfolio: Portfolio, _: Caller) -> li
     return portfolio.list_products_of(repository_id)
 
 
-@router.put("/v1/repositories/{repository_id}/url", responses=PROBLEMS(401, 403, 404, 409, 422))
-def correct_repository_url(
-    repository_id: UUID, body: UrlCorrection, portfolio: Portfolio, _: Person
-) -> Repository:
-    """Correct a moved repository's URL (foundry plan repo-unreachable): the row keeps its
-    identity — every finding stays attached, so the fingerprints survive the move — and the
-    change is recorded as the upstream link on the vacated URL's row, the same edge the
-    fork resolution reads. The disposition, if any, holds until the verify succeeds."""
-    return portfolio.correct_repository_url(
-        repository_id, HttpsRepoUrl.parse(body.url, portfolio.inventory.hosts)
-    )
-
-
-@router.post("/v1/repositories/{repository_id}/verify", responses=PROBLEMS(401, 403, 404, 422))
-def verify_repository(
-    repository_id: UUID, portfolio: Portfolio, _: Person
-) -> RepositoryVerification:
-    """The on-demand observation (foundry plan repo-unreachable): the same path the
-    repo_state asset runs, exposed as the door the SCI API calls for the console's verify
-    button. On success the disposition clears and the repository re-enters the planner's
-    universe; on a gone-class failure it holds with the new evidence; a transient failure
-    holds it untouched."""
-    facts = portfolio.verify_repository(repository_id)
-    return RepositoryVerification(facts=facts, repository=portfolio.get_repository(repository_id))
-
-
-# The refs collection: every recorded ref of several repositories in one
-# listing — the batched `list_refs`, read in bounded batches — so a consumer
-# resolving each repository's refs (a scanned ref's SHA, a default line) reads
-# one call per bounded set instead of one listing per repository. The batch
-# findings listing's own shape (a collection narrowed by a query parameter);
-# a page's worth of repository ids per call, and no ids is a refusal, never
-# a firehose of every ref.
-@router.get("/v1/refs", responses=PROBLEMS(401, 422))
-def list_refs_for_repositories(
+# Declared before /v1/refs/{repository_ref_id}: a literal path must not be captured as
+# a ref id the UUID parse would refuse.
+@router.get("/v1/refs/in", responses=PROBLEMS(401, 422))
+def list_refs_in(
     portfolio: Portfolio, _: Caller, repository_ids: Annotated[list[UUID] | None, Query()] = None
 ) -> list[RepositoryRef]:
+    """Every recorded ref of several repositories in one listing — the batched
+    `list_refs`, read in bounded batches — so a consumer resolving each repository's
+    refs (a scanned ref's SHA, a default line) reads one call per bounded set instead
+    of one listing per repository. A page's worth of repository ids per call, like the
+    orders filter; no ids is a refusal, never a firehose of every ref."""
     if not repository_ids:
         raise ValidationError("list refs for named repositories; the set is required")
     if len(repository_ids) > MAX_REPOSITORY_IDS:
