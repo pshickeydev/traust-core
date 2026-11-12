@@ -257,10 +257,9 @@ The remaining correctness changes are:
 - `ViewName.REMEDIATION_INDEX` is validated by
   `contracts.validate_view("remediation-index", document)` before `build` returns; an unforked
   or unreported work item's fork and fix branch render as `—`.
-- `ViewName.SLA` is validated by `contracts.validate_view("sla", document)` before `build`
-  returns. A median days-to-resolve can be negative when a finding was resolved before its
-  clock started (filed after the fix); the contract allows it. An unrated escalation's
-  severity renders as `—`.
+- `ViewName.CENSUS` is validated by `contracts.validate_view("census", document)` before
+  `build` returns. An unrated finding counts in the cuts' and layers' `unrated` severity
+  (it was dropped before: the fold keys it by `str(None)`, which the severity mapping skipped).
 - `ViewName.COMPLIANCE_PRECISION` wraps the existing
   `DetectionQualityService.calibrate_compliance` result under `calibration`. Its packaged
   view schema reuses the canonical compliance-assessment framework vocabulary through
