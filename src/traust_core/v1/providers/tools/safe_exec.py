@@ -196,8 +196,8 @@ BASE_KEEP_ENV = (
     "NO_PROXY",
 )
 
-# Upload, file-read and config forms turn a lab probe into local-file exfiltration
-# (assessment 2026-07-31 live-F5); a probe never needs them.
+# Upload, file-read and config forms turn a lab probe into local-file exfiltration;
+# a probe never needs them.
 CURL_DENY_FLAGS = frozenset(
     {
         "-F",
@@ -216,7 +216,7 @@ CURL_DENY_FLAGS = frozenset(
 )
 
 # Cluster and credential overrides never belong in target-derived commands: the adapter supplies
-# the context (assessment 2026-07-31 live-F1/F2; the execute layer is the other fence).
+# the context; the execute layer is the other fence.
 KUBE_DENY_FLAGS = frozenset(
     {
         "--kubeconfig",
@@ -499,7 +499,7 @@ def _check_curl_argv(argv: list[str]) -> str:
             return (
                 f"curl flag {flag!r} is denied under safe_exec "
                 "(local-file read/upload/config — exfiltration "
-                "primitives; assessment 2026-07-31 F5)"
+                "primitives)"
             )
         if tok.startswith(("-d@", "--data@")):
             return "curl -d@<file> is denied under safe_exec"
@@ -531,7 +531,7 @@ def _check_kube_argv(argv: list[str]) -> str:
             return (
                 f"kubectl/oc flag {flag!r} is denied under safe_exec "
                 "— target-derived commands run only against the "
-                "engagement-pinned context (assessment 2026-07-31 F2)"
+                "engagement-pinned context"
             )
     return ""
 
