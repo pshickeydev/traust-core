@@ -2793,6 +2793,13 @@ class ThreatRegisterView:
         self._clock = clock
 
     def build(self, filter: ViewFilter) -> ThreatRegister:
+        model = self.compose(filter)
+        contracts.validate_view(self.name, model.model_dump(mode="json"))
+        return model
+
+    def compose(self, filter: ViewFilter) -> ThreatRegister:
+        """The register before its contract check, for a composite that reads only its counts
+        (the scoreboard): drift in a field it never reads must not fail it."""
         as_of = filter.as_of or self._clock.now()
         _, _, repositories = _scope(self._portfolio, filter)
         urls: dict[UUID, str] = {r.id: r.url for r in repositories}  # type: ignore[misc]
@@ -2822,7 +2829,7 @@ class ThreatRegisterView:
             ),
         )
         open_variances = DocVarianceFilter(disposition=DocVarianceDisposition("open"))
-        model = ThreatRegister(
+        return ThreatRegister(
             as_of=as_of,
             repository_urls=urls,
             models=len({r.threat.assessment_id for r in threats}),
@@ -2835,8 +2842,6 @@ class ThreatRegisterView:
                 if v.repository_id in urls
             ),
         )
-        contracts.validate_view(self.name, model.model_dump(mode="json"))
-        return model
 
     def _ranked(self, threat: Threat) -> RankedThreat:
         crosswalked = threat.severity is None and None not in (threat.impact, threat.likelihood)
@@ -4744,8 +4749,11 @@ class ScoreboardView:
         at = filter.model_copy(update={"as_of": filter.as_of or self._clock.now()})
         with self._findings.shared():  # one fleet facts load behind every sub-view
             summary = self._executive.build(at)
-            trend = self._trend.build(at)
-            register = self._threats.build(at)
+            # the trend's compose, not its build: the scoreboard reads only its last
+            # point, so drift in a field it never reads must not fail it
+            trend = self._trend.compose(at)
+            # likewise the register's: the scoreboard reads only its model and threat counts
+            register = self._threats.compose(at)
             filed = sum(
                 c.filed_at is not None
                 for clocks in self._findings.clocks_in(
