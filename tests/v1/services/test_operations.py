@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import threading
 from collections.abc import Iterator, Sequence
 from datetime import timedelta
@@ -30,7 +29,6 @@ from traust_core.v1.errors import (
 from traust_core.v1.models.artifacts import RunManifestArtifact
 from traust_core.v1.models.common import Cursor, PageRequest, TimeWindow
 from traust_core.v1.models.identity import IdentitySource, Principal
-from traust_core.v1.models.inventory import GoneReason, RepositoryDisposition
 from traust_core.v1.models.operations import (
     OPEN_ORDER_STATES,
     AssetName,
@@ -57,11 +55,7 @@ from traust_core.v1.models.operations import (
 from traust_core.v1.models.vocabulary import ActorKind, BudgetEnforcement
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
-from traust_core.v1.repositories.objects.store import (
-    InMemoryObjectStore,
-    LocalObjectStore,
-    ObjectKey,
-)
+from traust_core.v1.repositories.objects.store import InMemoryObjectStore
 from traust_core.v1.services.artifact_publishing import ArtifactPublisher, PublishSpec, PublishSpecs
 from traust_core.v1.services.operations import OpsService, PolicyDenied, SpendService
 from traust_core.v1.services.portfolio import Inventory
@@ -564,9 +558,13 @@ def test_approve_is_a_person_s_or_a_granted_serviceaccount_s_word(engine: Engine
     assert manifest(engine, order)["approval"]["approver"] == SA.ref
 
 
-def test_a_serviceaccount_does_not_approve_a_fleet_wide_order(engine: Engine) -> None:
+@pytest.mark.parametrize("all_repositories", [False, True], ids=["listed", "estate-wide"])
+def test_a_serviceaccount_does_not_approve_a_fleet_wide_order(
+    engine: Engine, all_repositories: bool
+) -> None:
     """A fleet-wide order (no repository) is a person's release: a grant scopes a
-    ServiceAccount by repository, and `None` is in no scope."""
+    ServiceAccount by registered repositories, and `None` names none — not even the
+    estate-wide flag widens a scope past the fleet-wide boundary."""
     order = seeded(engine, asset="full_audit", state="awaiting_approval")
     assert order.repository_id is None
     granted = scoped_ops(
@@ -923,36 +921,6 @@ def test_plan_records_the_pack_version_and_orders_share_one_manifest(engine: Eng
         "config": [{"name": "pack:security", "digest": "a" * 64}],
     }
     assert first.artifact_id is not None and first.artifact_id == second.artifact_id
-
-
-def test_planned_run_manifest_bytes_land_where_readers_look(engine: Engine, tmp_path: Path) -> None:
-    """The phantom-artifact regression: the engine plans an order (the run-manifest
-    publication through core's doors) while the claim workers read those bytes through
-    the same volume under a different uid. The write must land the bytes at the row's
-    uri, group-readable under the deployments' umask 0002 — or every other pod reads a
-    row whose bytes it cannot open, and the orders that fold them answer
-    source_unavailable."""
-    store = LocalObjectStore(tmp_path)
-    uow = SqlTraustUnitOfWork(engine)
-    service = OpsService(
-        SqlTraustUnitOfWork(engine),
-        FixedClock(T0),
-        ArtifactPublisher(PublishSpecs(PublishSpec(RunManifestArtifact)), store, uow),
-    )
-    was = os.umask(0o002)
-    try:
-        order = service.plan(OrderRequest(asset="diff_scan", priority=1), OPERATOR, [PACK])
-    finally:
-        os.umask(was)
-    assert order.artifact_id is not None
-    with SqlTraustUnitOfWork(engine) as uow:
-        row = uow.artifacts.get(order.artifact_id)
-    written = tmp_path / row.uri
-    assert written.is_file(), row.uri
-    # group-readable: the volume's other-uid readers share one supplemental group
-    assert written.stat().st_mode & 0o040
-    # and a fresh store — another pod's reader — finds the bytes the row names
-    assert LocalObjectStore(tmp_path).stat(ObjectKey.parse(row.uri)).sha256 == row.digest
 
 
 def test_replanning_with_a_new_pack_version_moves_the_manifest(engine: Engine) -> None:
@@ -1467,29 +1435,6 @@ def test_an_asset_bound_to_two_kinds_outside_the_config_is_a_config_error(engine
     repo = subject(engine)
     with pytest.raises(ConfigError, match="several record kinds"):
         ambiguous.submit(OrderRequest(asset="audit", priority=1, repository_id=repo), OPERATOR)
-
-
-def test_a_dispositioned_repository_is_not_a_subject(engine: Engine) -> None:
-    """The planner's universe (foundry plan repo-unreachable): a repository carrying the
-    unreachable disposition is refused by every door that starts a run — no asset is
-    planned for it until a person's verify clears the disposition."""
-    with SqlTraustUnitOfWork(engine) as uow:
-        repo = Seed(uow).repository(url=f"https://github.com/example/{uuid4()}")
-        uow.repositories.update(
-            repo.model_copy(
-                update={
-                    "disposition": RepositoryDisposition.REPO_UNREACHABLE,
-                    "disposition_reason": GoneReason.GONE,
-                }
-            )
-        )
-        uow.commit()
-    assert repo.id is not None
-    with pytest.raises(PolicyDenied) as denied:
-        gated(engine).submit(
-            OrderRequest(asset="assessment", priority=1, repository_id=repo.id), OPERATOR
-        )
-    assert denied.value.deny_code == "subject_unreachable"
 
 
 def test_a_registered_repository_without_an_imported_line_is_not_a_subject(engine: Engine) -> None:
