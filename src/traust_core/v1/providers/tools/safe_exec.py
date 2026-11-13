@@ -499,7 +499,7 @@ def _check_curl_argv(argv: list[str]) -> str:
             return (
                 f"curl flag {flag!r} is denied under safe_exec "
                 "(local-file read/upload/config — exfiltration "
-                "primitives)"
+                "primitives; assessment 2026-07-31 F5)"
             )
         if tok.startswith(("-d@", "--data@")):
             return "curl -d@<file> is denied under safe_exec"
@@ -531,7 +531,7 @@ def _check_kube_argv(argv: list[str]) -> str:
             return (
                 f"kubectl/oc flag {flag!r} is denied under safe_exec "
                 "— target-derived commands run only against the "
-                "engagement-pinned context"
+                "engagement-pinned context (assessment 2026-07-31 F2)"
             )
     return ""
 

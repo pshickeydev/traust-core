@@ -86,7 +86,7 @@ jobs:
           if make -n api-check >/dev/null 2>&1; then
             make api-check
           else
-            echo "::notice::'make api-check' not defined yet — skipping"
+            echo "::notice::'make api-check' not defined yet (XWING-2208) — skipping"
           fi
 
   ratchet:
