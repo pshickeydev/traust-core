@@ -1148,7 +1148,7 @@ class Context:
                     trend,
                     ProgramView(spend, ops, self.assets.names),
                     CoverageView(assessment, portfolio, self.clock),
-                    ExposureView(exposure),
+                    ExposureView(exposure, self.clock),
                     DependencyReachView(exposure, portfolio),
                     PqcView(pqc),
                     PqcWorklistView(pqc),
