@@ -102,7 +102,7 @@ def ops(engine: Engine, at: timedelta = timedelta()) -> OpsService:
 
 
 def scoped_ops(engine: Engine, starts: Sequence[RecordingStartScope]) -> OpsService:
-    """Ops with `recording.start` scopes: the machine principals a deployment granted."""
+    """Ops with `recording.start` scopes: the ServiceAccounts a deployment granted."""
     return OpsService(
         SqlTraustUnitOfWork(engine), FixedClock(T0), publisher(engine), recording_starts=starts
     )
@@ -500,7 +500,7 @@ def test_approval_emits_one_actor_classified_transition(
     ],
     ids=["unverified-human", "machine"],
 )
-def test_approve_needs_a_verified_person_or_a_granted_machine(
+def test_approve_needs_a_verified_person_or_a_granted_serviceaccount(
     engine: Engine, principal: Principal
 ) -> None:
     order = seeded(engine, state="awaiting_approval")
@@ -517,7 +517,7 @@ SA = Principal(
 )
 
 
-def test_approve_is_a_person_s_or_a_granted_serviceaccount_s_word(engine: Engine) -> None:
+def test_approve_is_a_person_s_or_a_granted_machine_s_word(engine: Engine) -> None:
     """The authorization matrix: a verified person approves anything; a ServiceAccount only
     inside a `recording.start` grant covering the order's asset and repository — the same
     scope its recording authority names. The approval record carries the ServiceAccount's
@@ -564,13 +564,9 @@ def test_approve_is_a_person_s_or_a_granted_serviceaccount_s_word(engine: Engine
     assert manifest(engine, order)["approval"]["approver"] == SA.ref
 
 
-@pytest.mark.parametrize("all_repositories", [False, True], ids=["listed", "estate-wide"])
-def test_a_serviceaccount_does_not_approve_a_fleet_wide_order(
-    engine: Engine, all_repositories: bool
-) -> None:
+def test_a_machine_does_not_approve_a_fleet_wide_order(engine: Engine) -> None:
     """A fleet-wide order (no repository) is a person's release: a grant scopes a
-    ServiceAccount by registered repositories, and `None` names none — not even the
-    estate-wide flag widens a scope past the fleet-wide boundary."""
+    ServiceAccount by repository, and `None` is in no scope."""
     order = seeded(engine, asset="full_audit", state="awaiting_approval")
     assert order.repository_id is None
     granted = scoped_ops(
@@ -618,8 +614,8 @@ def test_an_ungranted_caller_s_approve_probe_is_refused_before_the_order_is_read
     engine: Engine,
 ) -> None:
     """No 404-vs-403 oracle on order existence: the caller's shape is checked before the
-    order is read, so an ungranted or unverified machine hears forbidden whether or not the
-    order exists."""
+    order is read, so an ungranted or unverified ServiceAccount hears forbidden whether or
+    not the order exists."""
     unscoped = scoped_ops(engine, ())
     for refused in (
         SA,
