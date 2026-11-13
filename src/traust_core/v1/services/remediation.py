@@ -1274,22 +1274,33 @@ class RemediationService:
         reads once per repository."""
         return self._items(repository_id)
 
-    def items_of_all(self, repository_ids: Collection[UUID]) -> dict[UUID, list[WorkItem]]:
-        """Each repository's work items, oldest first, keyed by repository id: the batched
-        `items_of` for a scope."""
-        assessments_of = self._assessment.list_for_repositories(repository_ids, REMEDIATION)
-        ids = {a.id for found in assessments_of.values() for a in found if a.id is not None}  # type: ignore[union-attr]
-        if not ids:
+    def items_in(self, repository_ids: Collection[UUID]) -> dict[UUID, list[WorkItem]]:
+        """Every work item of these repositories, oldest first, keyed by repository id: the
+        batched `items_of` — one query per table over the whole set, never one listing per
+        repository."""
+        if not repository_ids:
             return {}
-        finding_of = self._findings.records.repositories_of(repository_ids)
+        refs = {r.id: r.repository_id for r in self._inventory.list_refs_of(repository_ids) if r.id}
+        # The whole history, cursor page by cursor page (the collection
+        # listing's own discipline; the fold assembles across pages).
+        assessments = list(
+            every_item(
+                lambda page: self._assessment.list_for_repositories(
+                    repository_ids, REMEDIATION, page
+                )
+            )
+        )
+        if not assessments:
+            return {}
         said: defaultdict[UUID, list[Decision]] = defaultdict(list)
-        for d in self._findings.decisions.for_findings(list(finding_of)):
-            if d.assessment_id in ids:
-                said[d.assessment_id].append(d)
-        return {
-            repository_id: self._assemble(found, said)
-            for repository_id, found in assessments_of.items()
-        }
+        for d in self._findings.decisions.for_assessments(
+            {a.id for a in assessments}  # type: ignore[arg-type]
+        ):
+            said[d.assessment_id].append(d)  # type: ignore[index]
+        grouped: defaultdict[UUID, list[WorkItem]] = defaultdict(list)
+        for item in self._assemble(assessments, said):
+            grouped[refs[item.repository_ref_id]].append(item)
+        return grouped
 
     def covering(self, repository_id: UUID, finding_ids: Collection[UUID]) -> list[WorkItem]:
         """The repository's work items that cover any of these findings: scheduling's

@@ -1030,21 +1030,29 @@ class AssessmentService:
         return sorted(rows, key=lambda a: (a.occurred_at, a.id))
 
     def list_for_repositories(
-        self, repository_ids: Collection[UUID], kind: AssessmentKind | None = None
-    ) -> dict[UUID, list[Assessment]]:
-        """Each repository's assessments (of `kind` when given) across every ref, oldest first,
-        keyed by repository id: the batched `list_for_repository` for a scope."""
-        refs = {r.id: r for r in self._inventory.list_refs_of(repository_ids) if r.id}
-        spellings = [None] if kind is None else self._kind_spellings(kind)
-        rows = [
-            self._read(row)
-            for spelling in spellings
-            for row in self._log.list_of(spelling, list(refs))
-        ]
-        grouped: defaultdict[UUID, list[Assessment]] = defaultdict(list)
-        for a in sorted(rows, key=lambda a: (a.occurred_at, a.id)):
-            grouped[refs[a.repository_ref_id].repository_id].append(a)
-        return grouped
+        self,
+        repository_ids: Collection[UUID],
+        kind: AssessmentKind | None,
+        page: PageRequest,
+    ) -> Page[Assessment]:
+        """The assessments across every ref of these repositories, newest first and
+        cursor-paged under the collection listing's own discipline: the batched
+        `list` — one query per table over the set, never one per repository. A
+        consumer that wants the whole history follows the cursor (the SDK's
+        paged iterators do)."""
+        after = page.position()
+        refs = [r.id for r in self._inventory.list_refs_of(repository_ids) if r.id]
+        kinds = self._kind_spellings(kind) if kind is not None else [None]
+        with self._uow as uow:
+            rows = [
+                self._read(row)
+                for spelling in kinds
+                for row in uow.assessments.search(
+                    repository_ref_ids=refs, kind=spelling, limit=page.limit + 1, after=after
+                )
+            ]
+        rows.sort(key=lambda a: (a.occurred_at, a.id), reverse=True)
+        return Page.of(rows, page.limit, lambda a: (a.occurred_at, a.id))
 
     def population(
         self, as_of: datetime, filter: AssessmentFilter, repository_ids: Collection[UUID]
