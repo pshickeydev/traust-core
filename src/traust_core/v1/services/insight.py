@@ -4110,9 +4110,14 @@ class ExecutiveSummaryView:
         self._census = census
 
     def build(self, filter: ViewFilter) -> ExecutiveSummary:
-        products, shipped, repositories, views = _scoped_findings(
-            self._findings, self._portfolio, filter
-        )
+        model = self.compose(filter)
+        contracts.validate_view(self.name, model.model_dump(mode="json"))
+        return model
+
+    def compose(self, filter: ViewFilter) -> ExecutiveSummary:
+        """The summary before its contract check, for a composite that reads only part of it
+        (the scoreboard's counts): drift in a field it never reads must not fail it."""
+        products, shipped, repositories = _scope(self._portfolio, filter)
         urls = {r.id: r.url for r in repositories}
         opened = [v for found in views.values() for v in found if _is(v, _OPEN)]
         hardening = [v for found in views.values() for v in found if _is(v, _HARDENING)]
@@ -4748,7 +4753,9 @@ class ScoreboardView:
     def build(self, filter: ViewFilter) -> Scoreboard:
         at = filter.model_copy(update={"as_of": filter.as_of or self._clock.now()})
         with self._findings.shared():  # one fleet facts load behind every sub-view
-            summary = self._executive.build(at)
+            # the summary's compose, not its build: the scoreboard reads only its rollup,
+            # leak count and top themes, so drift in a field it never reads must not fail it
+            summary = self._executive.compose(at)
             # the trend's compose, not its build: the scoreboard reads only its last
             # point, so drift in a field it never reads must not fail it
             trend = self._trend.compose(at)
