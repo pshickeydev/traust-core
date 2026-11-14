@@ -15,7 +15,7 @@ import sqlalchemy as sa
 from sqlalchemy.engine import Engine
 
 from tests.v1.conftest import SQL_BACKENDS, contract_db
-from tests.v1.repositories.tables.conftest import T0, Seed
+from tests.v1.repositories.tables.conftest import T0, Seed, repository_for
 from traust_core.v1 import contracts
 from traust_core.v1.context import Config, Context
 from traust_core.v1.errors import ConfigError, DocumentError, NotFoundError
