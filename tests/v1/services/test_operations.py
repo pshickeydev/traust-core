@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 from collections.abc import Iterator
 from datetime import timedelta
@@ -54,7 +55,11 @@ from traust_core.v1.models.operations import (
 from traust_core.v1.models.vocabulary import ActorKind, BudgetEnforcement
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
-from traust_core.v1.repositories.objects.store import InMemoryObjectStore
+from traust_core.v1.repositories.objects.store import (
+    InMemoryObjectStore,
+    LocalObjectStore,
+    ObjectKey,
+)
 from traust_core.v1.services.artifact_publishing import ArtifactPublisher, PublishSpec, PublishSpecs
 from traust_core.v1.services.operations import OpsService, PolicyDenied, SpendService
 from traust_core.v1.services.portfolio import Inventory
@@ -692,6 +697,36 @@ def test_plan_records_the_pack_version_and_orders_share_one_manifest(engine: Eng
         "config": [{"name": "pack:security", "digest": "a" * 64}],
     }
     assert first.artifact_id is not None and first.artifact_id == second.artifact_id
+
+
+def test_planned_run_manifest_bytes_land_where_readers_look(engine: Engine, tmp_path: Path) -> None:
+    """The phantom-artifact regression: the engine plans an order (the run-manifest
+    publication through core's doors) while the claim workers read those bytes through
+    the same volume under a different uid. The write must land the bytes at the row's
+    uri, group-readable under the deployments' umask 0002 — or every other pod reads a
+    row whose bytes it cannot open, and the orders that fold them answer
+    source_unavailable."""
+    store = LocalObjectStore(tmp_path)
+    uow = SqlTraustUnitOfWork(engine)
+    service = OpsService(
+        SqlTraustUnitOfWork(engine),
+        FixedClock(T0),
+        ArtifactPublisher(PublishSpecs(PublishSpec(RunManifestArtifact)), store, uow),
+    )
+    was = os.umask(0o002)
+    try:
+        order = service.plan(OrderRequest(asset="diff_scan", priority=1), OPERATOR, [PACK])
+    finally:
+        os.umask(was)
+    assert order.artifact_id is not None
+    with SqlTraustUnitOfWork(engine) as uow:
+        row = uow.artifacts.get(order.artifact_id)
+    written = tmp_path / row.uri
+    assert written.is_file(), row.uri
+    # group-readable: the volume's other-uid readers share one supplemental group
+    assert written.stat().st_mode & 0o040
+    # and a fresh store — another pod's reader — finds the bytes the row names
+    assert LocalObjectStore(tmp_path).stat(ObjectKey.parse(row.uri)).sha256 == row.digest
 
 
 def test_replanning_with_a_new_pack_version_moves_the_manifest(engine: Engine) -> None:
