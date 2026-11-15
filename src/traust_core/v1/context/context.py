@@ -495,22 +495,18 @@ class Context:
     def register_feeds(self, registry: Path = SHIPPED_FEEDS) -> None:
         """Register a provider for each cached feed, each per-identifier or probed source, and
         the advisory lookup, from the feeds registry traust-core ships (tests pass fixtures)."""
-        # load and check everything (the deployment's API keys, every source) before touching
-        # the registries, so a config error leaves this context as it was and a retry after
-        # fixing it starts clean
-        # the names first, so no error about a variable can echo an unregistered name
-        check_api_key_sources(registry, self.config.feeds.api_keys)
-        api_keys = self.config.feeds.api_key_values()
-        feeds = load_feeds(registry, http=self.http, clock=self.clock)
-        sources = load_feed_sources(
+        for feed in load_feeds(registry, http=self.http, clock=self.clock):
+            self.feeds.register(feed.name, lambda feed=feed: feed)
+        probe_http = HttpFetcher("traust-core", PROBE_POLICY, clock=self.clock)
+        for source in load_feed_sources(
             registry,
             http=self.http,
-            probe_http=HttpFetcher("traust-core", PROBE_POLICY, clock=self.clock),
+            probe_http=probe_http,
             clock=self.clock,
-            api_keys=api_keys,
-            api_key_variables=self.config.feeds.api_keys,
-        )
-        package_sources = load_package_sources(
+            api_keys=self.config.feeds.api_key_values(),
+        ):
+            self.feed_sources.register(source.name, lambda source=source: source)
+        self.package_sources = load_package_sources(
             registry, http=HttpFetcher(PACKAGE_SOURCE_AGENT, self._http_policy, clock=self.clock)
         )
         advisories = load_advisory_lookup(

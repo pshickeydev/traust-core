@@ -445,13 +445,11 @@ sources:
     ident: cve
     probe:
       ident: CVE-2021-44228
-      expect_status: 200
-    # Keyless is rate-limited (about 5 requests per 30 s; 50 with a key). The
-    # key is read from $NVD_API_KEY per request and sent in NVD's `apiKey`
-    # header: provision it from the deployment's secret store (Vault), never
-    # in this file. Unset, the source's readiness check fails and requests go
-    # keyless.
-    api_key_env: NVD_API_KEY
+    # An API key is optional: keyless works at NVD's lower rate limit (about
+    # 5 requests per 30 s; 50 with a key). A deployment that has one names
+    # the variable holding it in traust.yaml (`feeds.api_keys: {nvd:
+    # NVD_API_KEY}`), never in this file; it is sent in NVD's `apiKey` header
+    # to NVD only.
     api_key_header: apiKey
     consumers:
       - traust impact document (traust-core ExposureService.source_document)

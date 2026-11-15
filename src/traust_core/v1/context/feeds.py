@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from datetime import date, timedelta
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit
@@ -67,15 +68,6 @@ class _Incremental(_Strict):
 class _Probe(_Strict):
     ident: str
     ecosystem: str | None = None
-    # what the probe must answer; a successful (2xx) response is the only answer modeled
-    expect_status: int = 200
-
-    @pydantic.field_validator("expect_status")
-    @classmethod
-    def _only_success(cls, value: int) -> int:
-        if value != 200:
-            raise ValueError(f"expect_status {value}: only 200 is checked by the probe")
-        return value
 
 
 class _License(_Strict):
@@ -88,8 +80,8 @@ class _License(_Strict):
     verified: date | str | None = None
 
 
-# The environment variable an API key is read from: never the key itself.
-_ENV_NAME = re.compile(r"[A-Z_][A-Z0-9_]*")
+# An HTTP header name (RFC 9110 token).
+_HEADER = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
 
 
 class _Source(_Strict):
@@ -112,8 +104,8 @@ class _Source(_Strict):
     access: str = "api"
     extra_hosts: tuple[str, ...] = ()
     redirect_hosts: tuple[str, ...] = ()
-    # an API key: the variable it is read from and the header it travels in
-    api_key_env: str | None = None
+    # the header an API key travels in; the key's variable is the deployment's (traust.yaml
+    # `feeds.api_keys`), never this registry
     api_key_header: str | None = None
     # documentation the registry carries for adopters; nothing acts on it
     summary: str | None = None
@@ -121,13 +113,12 @@ class _Source(_Strict):
     license: _License | None = None
     cadence: str | None = None
 
-    @pydantic.model_validator(mode="after")
-    def _key_travels_in_a_header(self) -> _Source:
-        if self.api_key_env is not None and not _ENV_NAME.fullmatch(self.api_key_env):
-            raise ValueError(f"api_key_env {self.api_key_env!r} must name an environment variable")
-        if (self.api_key_env is None) != (self.api_key_header is None):
-            raise ValueError("api_key_env and api_key_header are set together")
-        return self
+    @pydantic.field_validator("api_key_header")
+    @classmethod
+    def _header_name(cls, value: str | None) -> str | None:
+        if value is not None and not _HEADER.fullmatch(value):
+            raise ValueError(f"api_key_header {value!r} is not an HTTP header name")
+        return value
 
 
 class _Registry(_Strict):
@@ -231,6 +222,8 @@ def load_feeds(path: Path, *, http: HttpFetcher, clock: Clock) -> tuple[FeedProv
     for name, source in _load(path).sources.items():
         if source.tier != "cached" or source.access == "disabled":
             continue
+        if source.api_key_header is not None and source.doc_url_template is None:
+            raise ConfigError(f"feeds registry {path}: {name} fetches whole files; no API key")
         max_age = timedelta(hours=source.max_age_hours)
         if source.mode == "file" and source.url and source.file:
             feeds.append(
@@ -273,7 +266,6 @@ def load_feed_sources(
     probe_http: HttpFetcher,
     clock: Clock,
     api_keys: Mapping[str, str] | None = None,
-    api_key_variables: Mapping[str, str] | None = None,
 ) -> tuple[FeedSource, ...]:
     """A provider per source queried per identifier (a live source, or a cached one's documents)
     or carrying a probe: documents on demand, liveness from its probe. `access: disabled` opts a
@@ -281,17 +273,13 @@ def load_feed_sources(
     found = []
     registry = _load(path).sources
     keys = dict(api_keys or {})
-    check_api_key_sources(path, keys)
     for name in keys:
-        source = registry[name]
-        if source.role in _HOST_ROLES or source.access == "disabled":
-            raise ConfigError(f"feeds.api_keys names {name}, which sends no API key")
-        if source.api_key_header is None:
-            raise ConfigError(
-                f"feeds.api_keys names {name}, which declares no api_key_header ({path})"
-            )
+        if name not in registry:
+            raise ConfigError(f"feeds.api_keys names {name}, which is not a registered feed source")
     for name, source in registry.items():
         if source.role in _HOST_ROLES or source.access == "disabled":
+            if name in keys:
+                raise ConfigError(f"feeds.api_keys names {name}, which sends no API key")
             continue
         post = source.method.upper() == "POST"
         template = source.doc_url_template or (
@@ -324,11 +312,7 @@ def load_feed_sources(
                 ident=source.ident,
                 post=post,
                 probe=probe,
-                api_key=(
-                    None
-                    if source.api_key_env is None or source.api_key_header is None
-                    else ApiKey(source.api_key_env, source.api_key_header)
-                ),
+                api_key=_api_key(path, name, source, keys.get(name), post=post),
                 http=http,
                 probe_http=probe_http,
                 clock=clock,
@@ -337,40 +321,20 @@ def load_feed_sources(
     return tuple(found)
 
 
-def check_api_key_sources(path: Path, names: Iterable[str]) -> None:
-    """Every source traust.yaml's `feeds.api_keys` names is in the feeds registry. No name is
-    echoed, the unknown one or the registry's: either may be a key pasted where a source's
-    name goes. The registry file to compare against is named instead."""
-    registry = _load(path).sources
-    if unknown := [name for name in names if name not in registry]:
-        raise ConfigError(
-            f"feeds.api_keys names {len(unknown)} source(s) the feeds registry ({path}) doesn't "
-            "have; names aren't shown, since one may be a pasted key"
-        )
-
-
-def _valid_port(url: str) -> bool:
-    """Whether a URL's port, if any, is one a request can go to: a non-numeric or out-of-range
-    one isn't, and neither is 0."""
-    try:
-        port = urlsplit(url).port  # raises on a malformed or out-of-range port
-    except ValueError:
-        return False
-    return port != 0
-
-
-def _api_key(name: str, source: _Source, value: str | None, variable: str | None) -> ApiKey | None:
-    """The key a deployment gives a source that declares the header it travels in. ApiKey.parse
-    checks the header and value, so a bad one fails at load, not at its first request; the
-    registry has already refused a header on anything but a per-identifier GET."""
-    if value is None or source.api_key_header is None:
+def _api_key(
+    path: Path, name: str, source: _Source, value: str | None, *, post: bool
+) -> ApiKey | None:
+    """The key a deployment gives a source, checked here so a bad one fails at load, not at its
+    first request: only a source declaring the header it travels in, and only on GET."""
+    if value is None:
         return None
-    try:
-        return ApiKey.parse(source.api_key_header, value)
-    except ConfigError as e:
-        # the source and the variable the deployment named (traust.yaml), never the value
-        held = f"${variable}: " if variable else ""
-        raise ConfigError(f"feeds.api_keys.{name}: {held}{e}") from e
+    if source.api_key_header is None:
+        raise ConfigError(f"feeds.api_keys names {name}, which declares no api_key_header ({path})")
+    if post:
+        raise ConfigError(f"feeds.api_keys names {name}: keys are sent on GET sources only")
+    if not value or any(ord(c) < 0x21 or ord(c) == 0x7F for c in value):
+        raise ConfigError(f"feeds.api_keys.{name}: the key holds no usable header value")
+    return ApiKey(source.api_key_header, value)
 
 
 def load_advisory_lookup(
