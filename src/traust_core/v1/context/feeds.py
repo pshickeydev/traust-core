@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import string
-from collections.abc import Iterable, Mapping
+import re
 from datetime import date, timedelta
-from functools import cache
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit
 
@@ -69,6 +67,15 @@ class _Incremental(_Strict):
 class _Probe(_Strict):
     ident: str
     ecosystem: str | None = None
+    # what the probe must answer; a successful (2xx) response is the only answer modeled
+    expect_status: int = 200
+
+    @pydantic.field_validator("expect_status")
+    @classmethod
+    def _only_success(cls, value: int) -> int:
+        if value != 200:
+            raise ValueError(f"expect_status {value}: only 200 is checked by the probe")
+        return value
 
 
 class _License(_Strict):
@@ -79,6 +86,10 @@ class _License(_Strict):
     attribution: str | None = None
     url: str | None = None
     verified: date | str | None = None
+
+
+# The environment variable an API key is read from: never the key itself.
+_ENV_NAME = re.compile(r"[A-Z_][A-Z0-9_]*")
 
 
 class _Source(_Strict):
@@ -101,8 +112,8 @@ class _Source(_Strict):
     access: str = "api"
     extra_hosts: tuple[str, ...] = ()
     redirect_hosts: tuple[str, ...] = ()
-    # the header an API key travels in; the key's variable is the deployment's (traust.yaml
-    # `feeds.api_keys`), never this registry
+    # an API key: the variable it is read from and the header it travels in
+    api_key_env: str | None = None
     api_key_header: str | None = None
     # documentation the registry carries for adopters; nothing acts on it
     summary: str | None = None
@@ -110,44 +121,13 @@ class _Source(_Strict):
     license: _License | None = None
     cadence: str | None = None
 
-    @pydantic.field_validator("api_key_header")
-    @classmethod
-    def _header_name(cls, value: str | None) -> str | None:
-        if value is not None and not is_header_name(value):
-            # never the value: a key pasted here instead of a header name stays out of the error
-            raise ValueError("api_key_header is not an HTTP header name")
-        return value
-
     @pydantic.model_validator(mode="after")
-    def _key_on_a_per_identifier_get(self) -> _Source:
-        """A key travels only on what sends it: a per-identifier GET (a live `url_template`, or
-        a cached source's `doc_url_template`), never a whole-file feed or a POST."""
-        if self.api_key_header is None:
-            return self
-        template = self.doc_url_template or (self.url_template if self.tier == "live" else None)
-        if self.method.upper() != "GET" or template is None or not _per_identifier(template):
-            raise ValueError("api_key_header is for a per-identifier GET source only")
+    def _key_travels_in_a_header(self) -> _Source:
+        if self.api_key_env is not None and not _ENV_NAME.fullmatch(self.api_key_env):
+            raise ValueError(f"api_key_env {self.api_key_env!r} must name an environment variable")
+        if (self.api_key_env is None) != (self.api_key_header is None):
+            raise ValueError("api_key_env and api_key_header are set together")
         return self
-
-
-# The placeholders that put an identifier in a URL (`fill_template`); `{year}` alone doesn't.
-_IDENT_PLACEHOLDERS = frozenset({"ident", "ident_lower", "ident_upper", "ident_lower_us"})
-
-
-def _per_identifier(template: str) -> bool:
-    """Whether a URL template sends an identifier, so each document is its own request: the
-    placeholder must be in the path or query. A template without one, or with one only in the
-    fragment (which a client never sends) or the host (which `_resolve` refuses), is a single
-    endpoint, and a key on it would go to every request."""
-    sent = template.split("#", 1)[0]
-    rest = sent.split("://", 1)[-1]
-    cut = [i for i in (rest.find("/"), rest.find("?")) if i >= 0]
-    path_and_query = rest[min(cut) :] if cut else ""
-    try:
-        fields = {f for _, f, _, _ in string.Formatter().parse(path_and_query) if f is not None}
-    except ValueError:  # a malformed template: refused when it's filled, never keyed
-        return False
-    return bool(fields & _IDENT_PLACEHOLDERS)
 
 
 class _Registry(_Strict):
@@ -344,7 +324,11 @@ def load_feed_sources(
                 ident=source.ident,
                 post=post,
                 probe=probe,
-                api_key=_api_key(name, source, keys.get(name), (api_key_variables or {}).get(name)),
+                api_key=(
+                    None
+                    if source.api_key_env is None or source.api_key_header is None
+                    else ApiKey(source.api_key_env, source.api_key_header)
+                ),
                 http=http,
                 probe_http=probe_http,
                 clock=clock,

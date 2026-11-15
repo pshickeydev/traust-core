@@ -5,6 +5,7 @@ import gzip
 import io
 import json
 import logging
+import os
 import re
 import zlib
 from collections.abc import Callable, Iterator, Sequence
@@ -287,30 +288,15 @@ def fill_template(template: str, identifier: str) -> str:
 
 @dataclass(frozen=True, slots=True)
 class ApiKey:
-    """A source's API key and the header it travels in, from the deployment's config (traust.yaml
-    `feeds.api_keys`). Sent only to the source's own URL, never onto a redirect; never in a URL,
-    a log line, an error or a repr."""
+    """Where a source's API key comes from (`env`, an environment variable read per request) and
+    the header it travels in. The key is never in a URL, a log line or an error."""
 
+    env: str
     header: str
-    value: str = field(repr=False)
 
-    @classmethod
-    def parse(cls, header: str, value: str) -> ApiKey:
-        """A key from the deployment's config: the header must be an HTTP header name and the
-        value non-empty visible ASCII, or a ConfigError that never carries the value."""
-        return cls(header, value)
-
-    def __post_init__(self) -> None:
-        # the checks run on every construction, parse or direct, so no caller can build a key
-        # that can't be sent; the messages never carry the value
-        if not is_header_name(self.header):
-            raise ConfigError("the API key's header is not an HTTP header name")
-        if not is_header_value(self.value):
-            # nor the header: a token-shaped key pasted as the header name would pass its check
-            raise ConfigError("the API key holds no usable header value (visible ASCII only)")
-
-    def headers(self) -> dict[str, str]:
-        return {self.header: self.value}
+    def headers(self) -> dict[str, str] | None:
+        key = os.environ.get(self.env, "").strip()
+        return {self.header: key} if key else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -363,43 +349,36 @@ class FeedSource:
         self._http = http
         self._probe_http = probe_http
         self._clock = clock
-        if api_key is not None and post:
-            raise ConfigError(f"{name}: an API key travels on a GET source only")
         self._api_key = api_key
 
-    def _get(self, http: HttpFetcher, url: str, *, keyed: bool) -> bytes:
-        """A GET, carrying the source's API key only when `keyed` (a URL `_resolve` built from
-        the per-identifier template, so on the template's own host) and the deployment gives
-        one: a secret header, sent to this URL only. Any other request is exactly as before."""
-        if self._api_key is None or not keyed:
-            return http.get(url)
-        try:
-            return http.get(url, secret_headers=self._api_key.headers())
-        except ServiceError as e:
-            if e.status is not None and 400 <= e.status < 500 and e.status != 429:
-                # a revoked, mistyped or wrongly synced key is refused like a bad URL: say so
-                raise ServiceError(
-                    f"{e} (the request carried {self.name}'s API key, which a redirect drops: "
-                    f"a wrong or revoked key is refused this way, so check "
-                    f"feeds.api_keys.{self.name}, then the source's URL)",
-                    status=e.status,
-                    operation=e.operation,
-                    target_hash=e.target_hash,
-                ) from e
-            raise
+    def _get(self, http: HttpFetcher, url: str) -> bytes:
+        """A GET carrying the API key's header when there is one; a keyless source's request is
+        exactly as before."""
+        headers = self._headers()
+        return http.get(url, headers=headers) if headers else http.get(url)
 
-    def _probe_url(self, probe: Probe) -> tuple[str, bool]:
-        """The probe's URL, and whether it carries the key: only a per-identifier one built from
-        the template does. The source's URL as published (`ident: none`) goes keyless, even on
-        the template's host, since it may be another endpoint (a whole-file feed)."""
-        if probe.identifier is None:
-            return self.url, False
-        return self._resolve(probe.identifier), True
+    def _headers(self) -> dict[str, str] | None:
+        """The API key's header when its variable is set; unset, the request goes keyless and
+        says so (`check` reports the source not ready)."""
+        if self._api_key is None:
+            return None
+        headers = self._api_key.headers()
+        if headers is None:
+            log.warning(
+                "%s: $%s is not set; requests go without its API key", self.name, self._api_key.env
+            )
+        return headers
 
     def check(self) -> Readiness:
         """Send the probe: an HTTP refusal means the registry and the service disagree, an
         unreachable host means liveness is undetermined."""
         probe = self._probe
+        if self._api_key is not None and self._api_key.headers() is None:
+            return Readiness(
+                ready=False,
+                detail=f"${self._api_key.env} is not set: {self.name} requests would go without "
+                "their API key (rate-limited); set it from the deployment's secret store",
+            )
         if probe is None:
             return Readiness(ready=True, detail="no probe declared; liveness unchecked")
         host = _host(self.url)
@@ -410,8 +389,8 @@ class FeedSource:
                 body = {"package": {"name": probe.identifier, "ecosystem": probe.ecosystem}}
                 self._probe_http.post_json(self.url, body)
             else:
-                probed, keyed = self._probe_url(probe)
-                self._get(self._probe_http, probed, keyed=keyed)
+                url = self.url if probe.identifier is None else self._resolve(probe.identifier)
+                self._get(self._probe_http, url)
         except (ConfigError, ValidationError) as e:
             return Readiness(ready=False, detail=f"probe URL could not be built: {e}")
         except ServiceError as e:
@@ -439,7 +418,7 @@ class FeedSource:
         """The source's document for one identifier, as it serves it now."""
         url = self._resolve(identifier)
         acquisition = Acquisition(provider=self.name, acquired_at=self._clock.now(), source=url)
-        return Result(self._get(self._http, url, keyed=True), acquisition)
+        return Result(self._get(self._http, url), acquisition)
 
     def _resolve(self, identifier: str) -> str:
         if self.template is None:
