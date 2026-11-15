@@ -3174,7 +3174,7 @@ class DependencyReachView:
         ecosystems: defaultdict[str, list[set[UUID]]] = defaultdict(list)
         for (ecosystem, _), holders in held.items():
             ecosystems[ecosystem].append(holders)
-        return DependencyReach(
+        model = DependencyReach(
             repositories=len(repositories),
             unmeasured=unmeasured,
             ecosystems=tuple(
@@ -3198,6 +3198,8 @@ class DependencyReachView:
                 )[:_TOP_SHARED]
             ),
         )
+        contracts.validate_view(self.name, model.model_dump(mode="json"))
+        return model
 
     def report(self, model: DependencyReach, generated_at: datetime) -> Report:
         summary = (
