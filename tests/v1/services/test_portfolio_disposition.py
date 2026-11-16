@@ -24,8 +24,9 @@ from traust_core.v1.models.inventory import (
     RepositoryDisposition,
     RepositoryFilter,
 )
-from traust_core.v1.models.observation import ComparisonStatus
+from traust_core.v1.models.observation import ComparisonStatus, ForgeFacts
 from traust_core.v1.models.values import HttpsRepoUrl
+from traust_core.v1.models.vocabulary import LivenessStatus
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.services.portfolio import GONE_STREAK_THRESHOLD
 
@@ -542,3 +543,99 @@ def test_prior_urls_answer_vacated_rows_not_forks():
     )
     prior = service.inventory.prior_urls(harness.repository_id)
     assert prior == (repository.url,)
+
+
+# The Qodo #474 third round: the tombstone's record is inert, the worklist is work.
+
+
+def test_an_observation_of_a_tombstone_never_rewrites_the_move_record():
+    """The vacated-URL row's disposition is the correction's record, not observation
+    state: an operator's record against the old URL changes nothing — the signature
+    the alias matching reads survives."""
+    harness, service, _, _, _sources = observer()
+    old_url = _repository(service, harness.repository_id).url
+    service.correct_repository_url(
+        harness.repository_id, _url("https://github.com/moved/relocated")
+    )
+    # An observation of the vacated URL lands on the tombstone row.
+    tombstone = service.find_repository(old_url)
+    assert tombstone is not None and tombstone.id is not None
+    gone = ForgeFacts(
+        repository_id=tombstone.id,
+        repo=None,
+        repo_url=old_url,
+        audited_sha=None,
+        audit_date=None,
+        has_audit=False,
+        status=ComparisonStatus.ERROR,
+        observed_at=service._clock.now(),
+        availability_queried=True,
+        liveness_status=LivenessStatus.MISSING,
+        error="the forge reports no such repository",
+        gone_reason=GoneReason.GONE,
+    )
+    service._count_toward_disposition(tombstone.id, gone, observed_url=old_url)
+    reread = service.find_repository(old_url)
+    assert reread is not None
+    assert reread.disposition_evidence == "url corrected to https://github.com/moved/relocated"
+    # The alias set still answers the old URL after anything observed the tombstone.
+    assert service.inventory.prior_urls(harness.repository_id) == (old_url,)
+
+
+def test_the_worklist_leaves_out_the_corrections_records():
+    """The remediation worklist (dispositioned=True) is work waiting for a person's
+    verify — a correction's vacated-URL records are the move's trail, not work."""
+    harness, service, _, _, _sources = observer()
+    _set_source(service, _sources, _gone())
+    _observe(service, harness.repository_id, minutes=1)
+    _observe(service, harness.repository_id, minutes=2)
+    old_url = _repository(service, harness.repository_id).url
+    service.correct_repository_url(
+        harness.repository_id, _url("https://github.com/moved/relocated")
+    )
+    worklist = service.list_repositories(
+        RepositoryFilter(dispositioned=True), PageRequest(limit=100)
+    )
+    assert old_url not in {r.url for r in worklist.items}
+    assert harness.repository_id in {r.id for r in worklist.items}
+
+
+def test_onboarding_plans_nothing_for_a_dispositioned_repository(engine=None):
+    """The collector re-registering a vacated URL must not re-enter the repository
+    through onboarding's baseline: the universe rule covers the onboarding door."""
+    import pathlib
+    import tempfile
+
+    from tests.v1.repositories.tables.conftest import Seed
+    from tests.v1.services.test_operations import OPERATOR
+    from traust_core.v1.context import Config, Context
+    from traust_core.v1.models.onboarding import OnboardingRequest, RepositorySpec
+    from traust_core.v1.models.values import ProductSlug
+    from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
+    from traust_core.v1.services.identity import IdentityConfig
+
+    home = pathlib.Path(tempfile.mkdtemp())
+    context = Context(Config(home=home, identity=IdentityConfig(trust_local=True)))
+    with SqlTraustUnitOfWork(context.database) as uow:
+        repo = Seed(uow).repository()
+        uow.repositories.update(
+            repo.model_copy(
+                update={
+                    "disposition": RepositoryDisposition.REPO_UNREACHABLE,
+                    "disposition_reason": GoneReason.GONE,
+                }
+            )
+        )
+        uow.commit()
+    assert repo.id is not None
+    onboarding = context.services().onboarding
+    result = onboarding.onboard(
+        OnboardingRequest(
+            product=ProductSlug("example"),
+            label="Example",
+            repositories=(RepositorySpec(url=repo.url),),
+        ),
+        OPERATOR,
+    )
+    assert result.order_ids == ()
+    assert list(result.repository_ids) == [repo.id]

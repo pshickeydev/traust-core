@@ -279,10 +279,15 @@ class Inventory:
         decision 4: the fingerprints survive the move through the edge)."""
         require_uuid(repository_id, "repository.id")
         with self._uow as uow:
+            # Any dispositioned row behind the edge qualifies: the correction's own
+            # tombstones certainly, and a dispositioned fork or mirror's URL simply
+            # matches nothing. Recognizing more than the correction's signature keeps
+            # the alias set working even if a tombstone's evidence was rewritten
+            # before this rule (Qodo #474 round 3).
             return tuple(
                 row.url
                 for row in uow.repositories.list_by_upstream(repository_id)
-                if row.id is not None and _is_vacated(row)
+                if row.id is not None and row.disposition is not None
             )
 
     def private_mirror(self, repository_id: UUID) -> Repository | None:
@@ -544,6 +549,8 @@ class PortfolioService:
         mid-flight) counts for neither: its answer belongs to the vacated URL."""
         with self._uow.write() as uow:
             repository = uow.repositories.get_for_update(repository_id)
+            if _is_vacated(repository):
+                return  # a correction's record, not observation state: nothing here rewrites it
             if observed_url is not None and repository.url != observed_url:
                 return  # the row moved on: this observation answered for the vacated URL
             update: dict[str, object] = {}

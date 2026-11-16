@@ -135,9 +135,16 @@ class SqlRepositoryRepository(SqlMutableRepository[Repository]):
     ) -> list[Repository]:
         """A keyset page of repositories; `dispositioned` narrows the universe the way the
         filter names it (None: every repository, False: only active, True: only the ones
-        carrying the unreachable disposition)."""
+        carrying the unreachable disposition). The worklist form (True) leaves out a URL
+        correction's vacated-URL records — the move's own trail, not repositories
+        waiting for a person's verify (Qodo #474)."""
         where = ()
         if dispositioned is not None:
             gone = self.table.c.disposition.is_not(None)
-            where = (gone,) if dispositioned else (~gone,)
+            if dispositioned:
+                # The correction's signature: the vacated-URL rows a correction left.
+                corrected = self.table.c.disposition_evidence.like("url corrected to%")
+                where = (gone, ~corrected)
+            else:
+                where = (~gone,)
         return self._page("search", *where, limit=limit, after=after)
