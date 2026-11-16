@@ -475,3 +475,19 @@ def test_a_repeated_key_points_at_the_value_that_was_checked(tmp_path: Path) -> 
     path.write_text("feeds:\n  osv_access: api\nfeeds:\n  osv_access: nope\n")
     with pytest.raises(ConfigError, match=r"line 4: feeds/osv_access: is not one of"):
         Config.from_file(path)
+
+
+def test_an_asset_repeated_in_one_list_is_allowed(tmp_path: Path) -> None:
+    path = tmp_path / "traust.yaml"
+    path.write_text("recording:\n  triage: [audit, audit]\n")
+    assert Config.from_file(path).recording.triage == ("audit", "audit")
+
+
+def test_a_config_that_is_not_utf8_is_a_config_error(tmp_path: Path) -> None:
+    path = tmp_path / "traust.yaml"
+    path.write_bytes(b"feeds:\n  osv_access: \xff\xfe\n")
+    with pytest.raises(ConfigError, match=r"not UTF-8 text \(byte \d+\)") as raised:
+        Config.from_file(path)
+    cause = raised.value.__cause__
+    assert cause is not None and "UnicodeDecodeError at byte" in str(cause)
+    assert "0xff" not in str(cause)  # the position, never the byte
