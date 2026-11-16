@@ -547,6 +547,7 @@ class PortfolioService:
         rate limits) never count and never reset: they say nothing about the repository.
         An observation started at a URL the row no longer carries (a correction landed
         mid-flight) counts for neither: its answer belongs to the vacated URL."""
+        changed: Repository | None = None
         with self._uow.write() as uow:
             repository = uow.repositories.get_for_update(repository_id)
             if _is_vacated(repository):
@@ -587,15 +588,20 @@ class PortfolioService:
             if any(getattr(repository, field) != value for field, value in update.items()):
                 repository = uow.repositories.update(repository.model_copy(update=update))
                 uow.commit()
-                self._uow.after_commit(
-                    lambda: log.info(
-                        "portfolio repository %s disposition=%s reason=%s gone_streak=%s",
-                        repository_id,
-                        repository.disposition,
-                        repository.disposition_reason,
-                        repository.gone_streak,
-                    )
+                changed = repository
+        if changed is not None:
+            # Outside the write block: after_commit registered inside it is queued
+            # and dropped when the block's exit rolls the unit of work back — the
+            # flip and the clear would never log (Qodo #474 round 4).
+            self._uow.after_commit(
+                lambda: log.info(
+                    "portfolio repository %s disposition=%s reason=%s gone_streak=%s",
+                    repository_id,
+                    changed.disposition,
+                    changed.disposition_reason,
+                    changed.gone_streak,
                 )
+            )
 
     def correct_repository_url(self, repository_id: UUID, url: HttpsRepoUrl) -> Repository:
         """The URL correction (foundry plan repo-unreachable): the repository moved, and a
@@ -613,6 +619,16 @@ class PortfolioService:
         new = str(url)
         with self._uow.write() as uow:
             repository = uow.repositories.get_for_update(repository_id)
+            if _is_vacated(repository):
+                # A correction's vacated-URL record, not a repository: moving it would
+                # point its replacement upstream at the record instead of the
+                # repository that moved away, orphaning the alias chain (Qodo #474
+                # round 4). Correct the repository itself - the SCI join follows the
+                # record to it.
+                raise ValidationError(
+                    f"{repository_id} is a URL correction's vacated-URL record, not the "
+                    "repository: correct the repository it records the move of"
+                )
             if repository.url == new:
                 return repository
             uow.repositories.lock_url(new)

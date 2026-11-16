@@ -16,7 +16,7 @@ from datetime import timedelta
 import pytest
 
 from tests.v1.observation_support import NOW, observer
-from traust_core.v1.errors import ConflictError
+from traust_core.v1.errors import ConflictError, ValidationError
 from traust_core.v1.models.common import PageRequest
 from traust_core.v1.models.inventory import (
     GoneReason,
@@ -639,3 +639,38 @@ def test_onboarding_plans_nothing_for_a_dispositioned_repository(engine=None):
     )
     assert result.order_ids == ()
     assert list(result.repository_ids) == [repo.id]
+
+
+# The Qodo #474 fourth round: the flip logs, the record is not a repository.
+
+
+def test_the_flip_and_clear_log_outside_the_write_block(caplog):
+    """The disposition change's log line survives the write block: registered after its
+    exit, not queued inside it to be dropped by the rollback."""
+    import logging as _logging
+
+    harness, service, _, _, sources = observer()
+    _set_source(service, sources, _gone())
+    with caplog.at_level(_logging.INFO, logger="traust_core.v1.services.portfolio"):
+        _observe(service, harness.repository_id, minutes=1)
+        _observe(service, harness.repository_id, minutes=2)
+    assert any("disposition=repo_unreachable" in record.message for record in caplog.records), [
+        r.message for r in caplog.records
+    ]
+
+
+def test_a_vacated_record_is_not_a_repository_to_correct():
+    """A correction's vacated-URL record refuses the correction door: moving it would
+    point its replacement's upstream at the record, orphaning the repository's alias
+    chain. The SCI join follows the record to the repository to correct."""
+    harness, service, _, _, _sources = observer()
+    old_url = _repository(service, harness.repository_id).url
+    service.correct_repository_url(
+        harness.repository_id, _url("https://github.com/moved/relocated")
+    )
+    tombstone = service.find_repository(old_url)
+    assert tombstone is not None and tombstone.id is not None
+    with pytest.raises(ValidationError, match="vacated-URL record"):
+        service.correct_repository_url(tombstone.id, _url("https://github.com/else/where"))
+    # The alias chain is intact: the repository still answers its old URL.
+    assert service.inventory.prior_urls(harness.repository_id) == (old_url,)
