@@ -205,6 +205,32 @@ def validate_config(name: str, document: Any) -> None:
     _check(name, _config_validator(name), document)
 
 
+def config_schema_errors(name: str, document: object) -> list[SchemaViolation]:
+    """A config document's contract violations, raw: for a caller that reports them without
+    echoing the document (traust.yaml, which names the deployment's secrets)."""
+    return _violations(_config_validator(name), document)
+
+
+@cache
+def config_property_names(name: str) -> frozenset[str]:
+    """Every property name a config schema declares, at any depth."""
+    found: set[str] = set()
+
+    def walk(node: object) -> None:
+        if isinstance(node, dict):
+            properties = node.get("properties")
+            if isinstance(properties, dict):
+                found.update(properties)
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    walk(_config_validator(name).schema)
+    return frozenset(found)
+
+
 def view_schema(name: str) -> dict[str, JsonValue]:
     """A `views_schema/v1` contract for an on-demand, non-persisted view."""
     return cast(

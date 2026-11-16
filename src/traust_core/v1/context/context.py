@@ -29,6 +29,7 @@ from traust_core.v1.context.feeds import (
     DEPS_DEV,
     DEPS_DEV_CACHE,
     ObjectCache,
+    check_api_key_sources,
     load_advisory_lookup,
     load_feed_sources,
     load_feeds,
@@ -37,6 +38,7 @@ from traust_core.v1.context.feeds import (
 from traust_core.v1.context.logging import configure_logging as install_logging
 from traust_core.v1.context.observation import command_source, comment_sources
 from traust_core.v1.context.preflight import preflight as preflight_requirements
+from traust_core.v1.context.redaction import load_yaml_config
 from traust_core.v1.context.tools import (
     checkov_tool,
     compliance_sources,
@@ -493,30 +495,37 @@ class Context:
     def register_feeds(self, registry: Path = SHIPPED_FEEDS) -> None:
         """Register a provider for each cached feed, each per-identifier or probed source, and
         the advisory lookup, from the feeds registry traust-core ships (tests pass fixtures)."""
-        # the deployment's API keys first: an unset variable fails before anything registers,
-        # so a retry after setting it starts clean
+        # load and check everything (the deployment's API keys, every source) before touching
+        # the registries, so a config error leaves this context as it was and a retry after
+        # fixing it starts clean
+        # the names first, so no error about a variable can echo an unregistered name
+        check_api_key_sources(registry, self.config.feeds.api_keys)
         api_keys = self.config.feeds.api_key_values()
-        for feed in load_feeds(registry, http=self.http, clock=self.clock):
-            self.feeds.register(feed.name, lambda feed=feed: feed)
-        probe_http = HttpFetcher("traust-core", PROBE_POLICY, clock=self.clock)
-        for source in load_feed_sources(
+        feeds = load_feeds(registry, http=self.http, clock=self.clock)
+        sources = load_feed_sources(
             registry,
             http=self.http,
-            probe_http=probe_http,
+            probe_http=HttpFetcher("traust-core", PROBE_POLICY, clock=self.clock),
             clock=self.clock,
             api_keys=api_keys,
-        ):
-            self.feed_sources.register(source.name, lambda source=source: source)
-        self.package_sources = load_package_sources(
+            api_key_variables=self.config.feeds.api_keys,
+        )
+        package_sources = load_package_sources(
             registry, http=HttpFetcher(PACKAGE_SOURCE_AGENT, self._http_policy, clock=self.clock)
         )
-        self.advisories = load_advisory_lookup(
+        advisories = load_advisory_lookup(
             registry,
             http=self.http,
             clock=self.clock,
-            packages=self.package_sources,
+            packages=package_sources,
             air_gapped=self.config.feeds.osv_access == "air-gapped",
         )
+        for feed in feeds:
+            self.feeds.register(feed.name, lambda feed=feed: feed)
+        for source in sources:
+            self.feed_sources.register(source.name, lambda source=source: source)
+        self.package_sources = package_sources
+        self.advisories = advisories
 
     def use_exported_advisories(self, paths: Sequence[Path]) -> None:
         """Air-gapped runs: advisory reads answer from these exported OSV records only."""
@@ -551,13 +560,8 @@ class Context:
     def register_model_catalog(self, path: Path) -> None:
         """Price spend and build the spend view on the model registry at `path` (contracts
         `model-registry`; traust's config/model-registry.yaml)."""
-        try:
-            raw = path.read_bytes()
-            text = raw.decode()
-            document = yaml.safe_load(text)
-            contracts.validate_config("model-registry", document)
-        except (OSError, UnicodeDecodeError, yaml.YAMLError, DocumentError) as e:
-            raise ConfigError(f"model registry {path}: {e}") from e
+        text, document = load_yaml_config(path, "model-registry", label=f"model registry {path}")
+        raw = text.encode()  # the file's exact bytes: the loader decodes them without translation
         self.model_catalog = RegistryModelCatalog.of(
             document, text, hashlib.sha256(raw).hexdigest()[:12]
         )
