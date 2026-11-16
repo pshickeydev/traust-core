@@ -12,8 +12,8 @@ import sqlalchemy as sa
 import yaml
 
 from traust_core.v1 import contracts
-from traust_core.v1.context.redaction import locate, schema_issue, yaml_cause, yaml_where
-from traust_core.v1.errors import ConfigError, DocumentError, Issue
+from traust_core.v1.context.redaction import load_yaml_config, locate
+from traust_core.v1.errors import ConfigError
 from traust_core.v1.models.compliance import DocsTarget
 from traust_core.v1.models.inventory import DEFAULT_FORGE_HOSTS
 from traust_core.v1.models.operations import (
@@ -319,10 +319,8 @@ class RecordingConfig(_Model):
         deliberate alias (remediation rides the triage allowlist until contracts grows a
         recording.remediation section) and is legal on triage only — anywhere else it is
         a misbinding whose remediation prerequisite nothing wires."""
-        # errors name list positions, never the asset: a value pasted into a list stays out.
-        # A repeat within one kind's list is harmless (each allowlist is a set downstream);
-        # only the same asset on two kinds is ambiguous.
-        names: dict[str, tuple[RecordKind, str]] = {}
+        # errors name list positions, never the asset: a value pasted into a list stays out
+        names: dict[str, str] = {}
         for kind in (
             RecordKind.TRIAGE,
             RecordKind.ASSESSMENT,
@@ -338,11 +336,10 @@ class RecordingConfig(_Model):
                             "to the triage allowlist"
                         )
                     continue
-                first_kind, first_at = names.setdefault(asset, (kind, at))
-                if first_kind is not kind:
+                if (first := names.setdefault(asset, at)) != at:
                     raise ValueError(
-                        f"{first_at} and {at} list the same asset: a recording asset belongs "
-                        "to one report kind"
+                        f"{first} and {at} list the same asset: a recording asset belongs to "
+                        "one report kind"
                     )
         return self
 
@@ -453,26 +450,6 @@ class Config(_Model):
         # traust.yaml names the deployment's secrets: its errors are located by line and worded
         # by the schema, never echoing what the file holds
         text, data = load_yaml_config(path, "traust", empty={})
-        provided = frozenset(data)
-        try:
-            text = path.read_text()
-        except OSError as e:
-            raise ConfigError(f"cannot read {path}") from e
-        try:
-            data = yaml.safe_load(text) or {}
-        except yaml.YAMLError as e:
-            # never the parser's own text (a pasted key as a tag, an alias or a line)
-            raise ConfigError(f"cannot read {path}: invalid YAML{yaml_where(e)}") from (
-                yaml_cause(e)
-            )
-        # traust.yaml names the deployment's secrets: its errors are located by line and worded
-        # by the schema, never echoing what the file holds
-        if errors := contracts.config_schema_errors("traust", data):
-            names = contracts.config_property_names("traust")
-            root = yaml.compose(text)
-            issues = [schema_issue(root, e, names) for e in errors]
-            cause = DocumentError("traust", [Issue("$", issue) for issue in issues])
-            raise ConfigError(f"{path}: {'; '.join(issues)}") from cause
         provided = frozenset(data)
         try:
             locations = Locations.model_validate(
