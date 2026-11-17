@@ -1007,6 +1007,7 @@ class Context:
             clock=self.clock,
             objects=self.object_store,
             review=review,
+            rating=rating,
             restatement=RestatementPolicy(identity.restatement_approvers if identity else 0),
             validation_records=validation_records,
             source=sources,
