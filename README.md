@@ -267,6 +267,9 @@ The remaining correctness changes are:
 - `ViewName.REMEDIATION_INDEX` is validated by
   `contracts.validate_view("remediation-index", document)` before `build` returns; an unforked
   or unreported work item's fork and fix branch render as `—`.
+- `ViewName.CENSUS` is validated by `contracts.validate_view("census", document)` before
+  `build` returns. An unrated finding counts in the cuts' and layers' `unrated` severity
+  (it was dropped before: the fold keys it by `str(None)`, which the severity mapping skipped).
 - `ViewName.ATTACK_COVERAGE` is validated by
   `contracts.validate_view("attack-coverage", document)` before `build` returns, Navigator layer
   included; the executive summary embeds the validated view.
@@ -614,6 +617,36 @@ traust and traust-engine import core and call services in-process. The CLI exist
 | `ArtifactPublisher.publish` | validate → objects → SQLite `artifact` row | validate → objects → Postgres `artifact` row |
 
 With no `database.url`, `Context` keeps the record store in SQLite at `<home>/traust.db` (`home` defaults to `~/.traust`) and creates the schema from the traust-contracts DDL on first use. A configured `database.url` is never touched: whoever provisions it creates the schema (`apply_schema(engine, contracts.database_ddl(dialect))`). `ctx.services()` builds every service over one shared unit of work. Contracts owns and tests the schema; core tests repository behaviour.
+
+## Store upgrades
+
+A store's shape is the db contract's (traust-contracts owns and tests it). Fresh stores are
+bootstrapped whole — baseline DDL plus the upgrade channel — on first open. An existing
+store is never migrated behind an open's back: a local store applies pending upgrades at
+open (opening the new version is the consent), a configured database refuses until its
+deployment applies them.
+
+On upgrade day, an operator plans, looks, then applies:
+
+```python
+ctx = Context.from_file(Path("traust.yaml"))
+plan = ctx.store_status()  # empty | version_0 | behind | current
+for upgrade in ctx.pending_db_upgrades():
+    print(upgrade.name, upgrade.sha256[:12], upgrade.destructive or "")
+applied = ctx.apply_db_upgrades()  # the deliberate call
+```
+
+A script that declares a destructive reason (`-- destructive: …` in its header) applies
+only when acknowledged: `ctx.apply_db_upgrades(allow_destructive=True)`, after the
+refusal has named what would run and why. The `traust db upgrades` CLI wraps plan and
+apply for operators who do not embed Python.
+
+A database created before the upgrade channel (no `db_upgrade` stamp table) is version
+0: its shape is unknown, so both the open gate and the surface refuse it. Until adoption
+ships (verify the live schema against the baseline, then stamp), the path is to recreate
+the store: export what must survive (decisions and findings are the durable history —
+re-derive the rest from artifacts), create the new store at the current contract, and
+re-import. A version-0 store whose history must not be touched should wait for adoption.
 
 ## Run the REST API locally
 
