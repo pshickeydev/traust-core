@@ -23,6 +23,10 @@ class FindingRecords:
         with self._uow as uow:
             return uow.findings.list_by_ids(finding_ids)
 
+    def linked_advisory_ids(self) -> list[UUID]:
+        with self._uow as uow:
+            return uow.findings.linked_advisory_ids()
+
     def decisions(self, finding_ids: Collection[UUID]) -> list[Decision]:
         with self._uow as uow:
             return uow.decisions.list_for_findings(list(finding_ids))
@@ -30,16 +34,6 @@ class FindingRecords:
     def ids_for_repository(self, repository_id: UUID) -> list[UUID]:
         with self._uow as uow:
             return [f.id for f in uow.findings.list_for_repository(repository_id) if f.id]
-
-    def repositories_of(self, repository_ids: Collection[UUID]) -> dict[UUID, UUID]:
-        """Each finding's repository, keyed by finding id: the raw mapping a scope's fold
-        groups by, without the views `all_in` builds."""
-        with self._uow as uow:
-            return {
-                f.id: f.repository_id
-                for f in uow.findings.list_for_repositories(repository_ids)
-                if f.id is not None
-            }
 
     def external_refs(
         self, finding_ids: Collection[UUID], system: str | None = None
