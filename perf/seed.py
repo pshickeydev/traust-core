@@ -309,7 +309,8 @@ SEED = (
     JOIN (SELECT id, row_number() OVER (ORDER BY digest) n FROM traust.sbom) s
         ON s.n = 1 + mod(g * 7, {SBOMS})""",
     f"""INSERT INTO traust.advisory (identifier, published_at)
-    SELECT 'CVE-2026-' || lpad(g::text, 5, '0'), now() - make_interval(days => mod(g, 1000))
+    SELECT 'CVE-2026-' || lpad(g::text, greatest(5, length(g::text)), '0'),
+        now() - make_interval(days => mod(g, 1000))
     FROM generate_series(1, {ADVISORIES}) g""",
     # aliases spelled as GitHub does (GHSA-xxxx-xxxx-xxxx in its id alphabet), so AdvisoryNames
     # recognises them and the daily refresh routes them to the ghsa source
