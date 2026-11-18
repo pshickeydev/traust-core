@@ -375,7 +375,7 @@ class Context:
         # The SLA view is built only with one: this run's policy, or the default a recorded one
         # replaces.
         self.sla_policy: SlaPolicy | None = None
-        self.default_sla_policy: SlaPolicy | None = None
+        self._default_sla_policy_path: Path | None = None
         # The ATT&CK coverage view raises without its catalog; threat-model lint requires both
         self.attack_catalog: AttackCatalog | None = None
         self.atlas_catalog: AtlasCatalog | None = None
@@ -576,9 +576,15 @@ class Context:
         self.sla_policy = _sla_policy(path)
 
     def register_default_sla_policy(self, path: Path) -> None:
-        """Build the SLA view on the policy at `path` (traust: the security pack's) until the
-        deployment records its own (`InsightService.record_sla_policy`)."""
-        self.default_sla_policy = _sla_policy(path)
+        """Register the pack's default; read and validate it only when the SLA view needs it."""
+        self._default_sla_policy_path = path
+        self.__dict__.pop("default_sla_policy", None)
+
+    @cached_property
+    def default_sla_policy(self) -> SlaPolicy | None:
+        if self._default_sla_policy_path is None:
+            return None
+        return _sla_policy(self._default_sla_policy_path)
 
     def register_model_catalog(self, path: Path) -> None:
         """Price spend and build the spend view on the model registry at `path` (contracts
@@ -1309,7 +1315,7 @@ class Context:
                     SlaView(
                         findings,
                         portfolio,
-                        self.sla_policy or self.default_sla_policy,
+                        lambda: self.sla_policy or self.default_sla_policy,
                         self.clock,
                         recorded=None if self.sla_policy else sla_policies,
                     ),

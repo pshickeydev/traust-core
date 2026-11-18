@@ -212,6 +212,10 @@ The remaining correctness changes are:
   `executive_panel` (repeatable: `attack`, `pqc`, `isolation`, `iac`) for the executive
   summary's optional panels; any other view refuses it (422), so a panel never silently
   bypasses the stored census.
+- Registering a default SLA policy defers file loading and validation until an SLA view
+  actually needs the default. Recorded policies take precedence without reading the default;
+  unrelated census builds do not depend on its file. Explicit per-run policies are still
+  validated at registration, and an unusable default remains an error when SLA output needs it.
 - The census insight views (`findings-rollup`, `coverage`, `remediation-index`,
   `findings-trend`) are now also **stored builds** (performance-lane wave (d),
   foundry#56): `InsightService.record_builds()` folds the four once at the GLOBAL scope

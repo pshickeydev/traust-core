@@ -88,6 +88,25 @@ def test_record_builds_publishes_one_artifact_the_route_serves(context: Context)
     assert served.model.total.false_positive == 1
 
 
+@pytest.mark.parametrize("contents", [None, "policy_name: [", "policy_name: incomplete\n"])
+def test_census_build_does_not_require_a_usable_sla_default(
+    context: Context, tmp_path: Path, contents: str | None
+) -> None:
+    path = tmp_path / "sla-policy.yaml"
+    if contents is not None:
+        path.write_text(contents)
+    context.register_default_sla_policy(path)
+    seeded(context)
+    insight = context.services().insight
+    result = insight.record_builds()
+    stored = context.services().artifacts.get(result.artifact_id)
+    assert isinstance(stored, InsightBuildsArtifact)
+    served = insight.serve(ViewName.FINDINGS_ROLLUP, ViewFilter())
+    assert served.built_at is not None
+    assert served.model.total.open.critical == 1
+    assert served.model.total.false_positive == 1
+
+
 def test_every_census_view_is_stored_and_served(context: Context) -> None:
     seeded(context)
     insight_service = context.services().insight

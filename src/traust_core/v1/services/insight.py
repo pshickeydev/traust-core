@@ -5683,7 +5683,7 @@ class SlaView:
         self,
         findings: FindingService,
         portfolio: PortfolioService,
-        policy: SlaPolicy | None,
+        policy: Callable[[], SlaPolicy | None],
         clock: Clock,
         *,
         recorded: ArtifactPublisher | None = None,
@@ -5700,11 +5700,12 @@ class SlaView:
         doc = None if self._recorded is None else self._recorded.latest(SlaPolicyArtifact)
         if doc is not None:
             return SlaPolicy.model_validate(json.loads(doc.payload))
-        if self._policy is None:
+        policy = self._policy()
+        if policy is None:
             raise NotFoundError(
                 "no SLA policy: record one (InsightService.record_sla_policy) or register a default"
             )
-        return self._policy
+        return policy
 
     def build(self, filter: ViewFilter) -> SlaDashboard:
         policy = self.policy()
