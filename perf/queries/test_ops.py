@@ -315,12 +315,18 @@ def test_a_run_orders_snapshot_of_a_feed_is_found_by_the_feed_index(
 ) -> None:
     """The document refresh's late-retry check (`ExposureService._snapshot_documents`)."""
     order = _snapshot_order(engine, "nvd-documents")
+    assert order is not None  # the seed keeps documents snapshots for run orders
     (found,) = explained(lambda uow: uow.feed_snapshots.for_run_order("nvd-documents", order))
     fast(found, "idx_ops_feed_snapshot_feed_retrieved", 5)
+    with SqlTraustUnitOfWork(engine) as uow:
+        snapshot = uow.feed_snapshots.for_run_order("nvd-documents", order)
+    assert snapshot is not None and snapshot.run_order_id == order
 
 
 def test_a_documents_feeds_latest_snapshot_is_found_by_the_feed_index(
-    explained: Profile,
+    engine: sa.Engine, explained: Profile
 ) -> None:
     (latest,) = explained(lambda uow: uow.feed_snapshots.latest("nvd-documents"))
     fast(latest, "idx_ops_feed_snapshot_feed_retrieved", 5)
+    with SqlTraustUnitOfWork(engine) as uow:
+        assert uow.feed_snapshots.latest("nvd-documents") is not None

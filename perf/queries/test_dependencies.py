@@ -345,13 +345,15 @@ def test_the_aliases_of_many_advisories_are_read_from_the_alias_index(
 
 
 def _linked_findings(engine: sa.Engine, limit: int) -> list[UUID]:
+    """Findings naming an advisory: half through an alias row, half a canonical one."""
     with SqlTraustUnitOfWork(engine) as uow:
-        table = uow.findings.table
-        return list(
-            uow.connection.scalars(
-                sa.select(table.c.id).where(table.c.advisory_id.is_not(None)).limit(limit)
-            )
+        findings, advisories = uow.findings.table, uow.advisories.table
+        linked = sa.select(findings.c.id).join(
+            advisories, advisories.c.id == findings.c.advisory_id
         )
+        aliased = linked.where(advisories.c.alias_of_id.is_not(None)).limit(limit // 2)
+        canonical = linked.where(advisories.c.alias_of_id.is_(None)).limit(limit - limit // 2)
+        return [*uow.connection.scalars(aliased), *uow.connection.scalars(canonical)]
 
 
 def test_a_pages_advisory_names_take_at_most_four_batched_reads(
@@ -361,6 +363,11 @@ def test_a_pages_advisory_names_take_at_most_four_batched_reads(
     page = _linked_findings(engine, 50)
     statements = explained(lambda uow: _exposure(uow).advisory_names(page))
     assert 3 <= len(statements) <= 4, [s.sql[:120] for s in statements]
+    with SqlTraustUnitOfWork(engine) as uow:
+        names = _exposure(uow).advisory_names(page)
+    assert len(names) == 50
+    # each finding naming a GHSA alias row resolves to its canonical CVE, both names kept
+    assert all(names[f].cves and names[f].ghsas for f in page[:25])
     for statement in statements:
         assert not statement.seq_scans(), statement.plan
         assert statement.execution_ms < 10, statement.plan

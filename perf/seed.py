@@ -60,6 +60,8 @@ ADVISORIES = 50_000
 ADVISORY_BACKED_EVERY = 5
 # A year of daily snapshots per feed: the whole-file feeds and the per-source document manifests
 # (`<source>-documents`), each for a run order. Per-feed shape: it doesn't scale with the estate.
+# Like every seeded artifact, their artifacts are rows with no bytes behind them: perf measures
+# query plans, never payload reads (no case reads a feed's bytes).
 FEEDS = ("epss", "kev", "rh-cve", "vex", "cve-list-documents", "nvd-documents",
          "ghsa-documents", "rh-cve-documents")  # fmt: skip
 SNAPSHOT_DAYS = 365
@@ -307,10 +309,15 @@ SEED = (
     JOIN (SELECT id, row_number() OVER (ORDER BY digest) n FROM traust.sbom) s
         ON s.n = 1 + mod(g * 7, {SBOMS})""",
     f"""INSERT INTO traust.advisory (identifier, published_at)
-    SELECT 'CVE-2026-' || g, now() - make_interval(days => mod(g, 1000))
+    SELECT 'CVE-2026-' || lpad(g::text, 5, '0'), now() - make_interval(days => mod(g, 1000))
     FROM generate_series(1, {ADVISORIES}) g""",
+    # aliases spelled as GitHub does (GHSA-xxxx-xxxx-xxxx in its id alphabet), so AdvisoryNames
+    # recognises them and the daily refresh routes them to the ghsa source
     """INSERT INTO traust.advisory (alias_of_id, identifier)
-    SELECT id, 'GHSA-' || substr(identifier, 10) FROM traust.advisory
+    SELECT id, 'GHSA-' || substr(g, 1, 4) || '-' || substr(g, 5, 4) || '-' || substr(g, 9, 4)
+    FROM (SELECT id, identifier,
+            translate(md5(identifier), '0123456789abcdef', '23456789cfghjmpq') g
+        FROM traust.advisory) a
     WHERE mod(abs(hashtext(identifier)), 2) = 0""",
     f"""INSERT INTO traust.advisory_package (advisory_id, package_id)
     SELECT a.id, p.id
@@ -330,7 +337,7 @@ SEED = (
     f"""UPDATE traust.finding f SET advisory_id = a.id, advisory_match = 'confirmed'
     FROM (SELECT id, row_number() OVER (ORDER BY id) n FROM traust.finding
         WHERE fingerprint_algo = 'v3') pick
-    JOIN (SELECT id, row_number() OVER (ORDER BY identifier) n FROM traust.advisory) a
+    JOIN (SELECT id, row_number() OVER (ORDER BY md5(id::text)) n FROM traust.advisory) a
         ON a.n = 1 + mod(pick.n * 3, {ADVISORIES})
     WHERE f.id = pick.id AND mod(pick.n, {ADVISORY_BACKED_EVERY}) = 0""",
     """INSERT INTO traust.assessment (repository_ref_id, kind, status, assessor, assessor_version,
