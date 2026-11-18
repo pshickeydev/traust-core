@@ -1646,19 +1646,13 @@ class PortfolioService:
         return self.inventory.find_repository(url)
 
     def resolve_repositories(self, urls: Sequence[str]) -> list[RepositoryResolution]:
-        """The batch identity resolution over the repository universe (the read-side
-        plan's S1): every asked-for spelling's answer in one call, so a consumer joins by
-        id instead of rebuilding a canonicalizer and join tiers beside core. Each answer
-        is the repository core knows under the spelling — its own id, never a
-        neighbor's — with the upstream edge as the hint when the matched row carries one
-        (a fork, a mirror: the caller's judgement, not the door's). A URL correction's
-        vacated spelling follows its edge to the repository that moved; several rows
-        under one case-folded spelling (GitHub's owner/repo) are the candidates a person
-        settles; an unregistered or unparseable spelling is the honest absence. The
-        first tier is the production join's own fold — whitespace, trailing slash and
-        .git stripped, git@ ssh folded to https, host lowercased, scheme and www
-        preserved — and deliberately nothing broader: distinct records a wider fold
-        would collapse meet only as candidates."""
+        """Every asked-for spelling's answer in one call: the repository core knows
+        under it, with the upstream edge as the hint when the matched row carries one,
+        and a URL correction's vacated spelling followed to the repository that moved.
+        The first tier folds whitespace, trailing slash and .git, git@ ssh spellings
+        and host case (scheme and www preserved); a case-folded spelling several rows
+        share answers as candidates; an unregistered or unparseable spelling answers
+        the honest absence."""
         asked = list(dict.fromkeys(urls))
         canonical = {url: _canonical_repo_url(url) for url in asked}
         wanted = {folded for folded in canonical.values() if folded is not None}
@@ -1683,16 +1677,14 @@ class PortfolioService:
                         key=lambda r: (r.created_at, r.id),
                     )
                     if len(candidates) > 1:
-                        # one folded spelling, several repositories: the review list,
-                        # never the door's pick (the oldest would be a guess)
+                        # one folded spelling, several repositories: never this method's
+                        # pick (the oldest would be a guess)
                         answers.append(RepositoryResolution(url=url, candidates=tuple(candidates)))
                         continue
                     row = candidates[0] if candidates else None
                 if row is not None and _is_vacated(row) and row.upstream_id is not None:
-                    # the correction's own record: the repository moved, and the
-                    # identity survived the move through the edge (foundry plan
-                    # repo-unreachable, resolved decision 4) — the old spelling
-                    # answers the repository, not the record of its leaving
+                    # the correction's own record: the old spelling answers the
+                    # repository that moved, not the record of its leaving
                     row = uow.repositories.get(row.upstream_id)
                 answers.append(
                     RepositoryResolution(
@@ -1915,11 +1907,9 @@ def _registered_repository(
 
 
 def _canonical_repo_url(raw: str) -> str | None:
-    """The spelling core joins by — the production join's own fold, exported once here
-    (the read-side plan's S1): whitespace stripped, trailing slash and .git suffix
+    """The spelling core joins by: whitespace stripped, trailing slash and .git suffix
     removed, git@ ssh spellings folded to https, the host lowercased; scheme and www
-    preserved. None when the spelling is no https repository URL: the honest absence,
-    never a guess at what it might have meant."""
+    preserved. None when the spelling is no https repository URL."""
     folded = raw.strip()
     if folded.startswith("git@"):
         host, _, path = folded.removeprefix("git@").partition(":")

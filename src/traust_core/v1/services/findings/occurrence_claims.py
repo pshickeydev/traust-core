@@ -1,21 +1,11 @@
 """The occurrence-claim door: CVSS claims recorded as governed statements.
 
-The interaction boundary plan (foundry#97) retired the SCI backfill that wrote
-`traust.occurrence.cvss_score`/`cvss_vector` over psql, disabling the append-only
-guard trigger inside each transaction — the sharpest boundary violation in the
-estate. This module is the door that replaces it: the caller declares the claims a
-report stated (the finding by its fingerprint — the identity both sides share — the
-assessment that reported it, and the CVSS itself), and core validates each claim
-through its own CVSS discipline and records it through the claim-audit pattern the
-finding-claim corrections established.
-
-The write respects the append-only semantics absolutely: occurrence rows are one per
-finding and assessment by contracts constraint, mutation is refused by the guard
-trigger, and the door never touches the trigger — the claim lands as a decision (a
-person's data-error statement under a ticket), never a column mutation. What the
-occurrence already carries (the fixed intake's own write, `FindingCandidate.cvss_*`
-flowing onto the occurrence) needs no recording; a conflicting claim is the review
-list, never an overwrite — the same never-overwrite rule the retired script applied.
+The caller declares the claims a report stated (the finding by its fingerprint, the
+assessment that reported it, the CVSS itself); each claim validates through core's
+own CVSS discipline and records as a person's data-error decision — never a column
+mutation, since occurrence rows are append-only by contracts constraint. What the
+occurrence already carries needs no recording; a conflicting claim is refused, never
+an overwrite.
 """
 
 from __future__ import annotations
@@ -55,18 +45,17 @@ class OccurrenceClaims:
         rationale: str,
         principal: Principal,
     ) -> OccurrenceClaimReport:
-        """One batch of declared claims, one transaction: every claim's honest answer in
-        the report (the coverage counts and the review lists the retired script produced,
-        answered from the door's own responses), nothing guessed and nothing overwritten."""
+        """One batch of declared claims, one transaction: every claim's answer in the
+        report, nothing guessed and nothing overwritten."""
         if not principal.is_verified_human():
             raise ForbiddenError("an occurrence claim needs a verified human")
         if not ticket.strip():
             raise ValidationError("an occurrence claim names its authority: a ticket")
         if len(rationale.strip()) < RATIONALE_MIN_LENGTH:
             raise ValidationError(f"a rationale of at least {RATIONALE_MIN_LENGTH} characters")
-        # A deterministic processing order (the claim's own key, not the caller's): the
-        # append locks each finding's row, and two concurrent batches locking the same
-        # findings in different orders would deadlock where sorted they queue.
+        # A deterministic processing order: the append locks each finding's row, and
+        # two concurrent batches locking the same findings in different orders would
+        # deadlock where sorted they queue.
         ordered = sorted(
             dict.fromkeys(claims),
             key=lambda c: (c.repository_id, c.fingerprint_algo, c.fingerprint, c.assessment_id),
@@ -91,10 +80,9 @@ class OccurrenceClaims:
         rationale: str,
         principal: Principal,
     ) -> OccurrenceClaimResult:
-        # The CVSS discipline first (models.cvss.score_of, never a guess at a malformed
-        # one): a vector without a version prefix, a malformed metric, an uncomputable
-        # base score — refused and listed, exactly the review-list honesty the retired
-        # script produced for its unparseable claims.
+        # The CVSS discipline first (models.cvss.score_of): a malformed vector — no
+        # version prefix, a malformed metric, an uncomputable base score — is refused,
+        # never guessed at.
         if score_of(CvssSource.SCANNER, claim.cvss_vector, document="occurrence-claim") is None:
             return OccurrenceClaimResult(claim=claim, outcome=OccurrenceClaimOutcome.INVALID)
         finding = uow.findings.find_by_fingerprint(
@@ -111,8 +99,8 @@ class OccurrenceClaims:
             )
         assert occurrence.id is not None
         if occurrence.cvss_score is not None or occurrence.cvss_vector is not None:
-            # The occurrence said something: the fixed intake's own write needs no
-            # recording, and anything else is the caller's review, never an overwrite.
+            # the occurrence said something: an equal claim is the idempotent answer,
+            # anything else is refused, never overwritten
             carried = (occurrence.cvss_vector, occurrence.cvss_score) == (
                 claim.cvss_vector,
                 claim.cvss_score,

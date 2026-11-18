@@ -155,10 +155,9 @@ class RecordDecision(Model):
 
 
 class OccurrenceClaim(Model):
-    """A CVSS claim one occurrence's report stated, declared for recording: the finding by
-    its fingerprint (the identity both sides share), the assessment whose report stated
-    the claim, and the claim itself — the vector and the score, both present, the way a
-    contracts report states them (a present score block carries its vector)."""
+    """A CVSS claim one occurrence's report stated, declared for recording: the finding
+    by its fingerprint, the assessment whose report stated the claim, and the claim
+    itself — the vector and the score, both present."""
 
     repository_id: UUID
     fingerprint_algo: str = Field(min_length=1, max_length=64)
@@ -169,17 +168,15 @@ class OccurrenceClaim(Model):
 
 
 class OccurrenceClaimOutcome(StrEnum):
-    """What the claim door did with one declared claim: the honest answer per claim,
-    never a script-side guess — the retired backfill's report (the coverage counts and
-    the review lists) answered from the door's own responses."""
+    """What the claim door did with one declared claim."""
 
-    RECORDED = "recorded"  # the claim landed: the governed statement is appended
+    RECORDED = "recorded"  # the governed statement is appended
     ALREADY_RECORDED = "already_recorded"  # the same claim statement exists (idempotent)
     ALREADY_CARRIED = "already_carried"  # the occurrence's own columns state it
-    CONFLICTING = "conflicting"  # the occurrence carries a different claim: the review list
+    CONFLICTING = "conflicting"  # the occurrence carries a different claim
     UNKNOWN_FINDING = "unknown_finding"  # no finding under the declared fingerprint
     UNREPORTED = "unreported"  # the assessment did not report the finding
-    INVALID = "invalid"  # the claim fails core's CVSS discipline: never a guess
+    INVALID = "invalid"  # the claim fails core's CVSS discipline
 
 
 class OccurrenceClaimResult(Model):
@@ -195,7 +192,7 @@ class OccurrenceClaimResult(Model):
 
 class OccurrenceClaimReport(Model):
     """The batch's answers, one row per declared claim in declaration order, with the
-    coverage count per outcome — the report shape the retired backfill produced."""
+    count per outcome."""
 
     results: tuple[OccurrenceClaimResult, ...]
     counts: Mapping[OccurrenceClaimOutcome, int]

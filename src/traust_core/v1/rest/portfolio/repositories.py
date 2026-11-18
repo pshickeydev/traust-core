@@ -98,24 +98,19 @@ def get_repository(repository_id: UUID, portfolio: Portfolio, _: Caller) -> Repo
     return portfolio.get_repository(repository_id)
 
 
-# The batch identity resolution (the read-side plan's S1): the repository universe
-# answered per URL spelling in one call — the id core already knows under each, the
-# alias knowledge core owns, and the honest absences — so a consumer joins by id
-# instead of rebuilding a canonicalizer and join tiers beside core. A page's worth of
-# spellings per request, and none is a refusal, never a firehose of the universe.
+# The batch identity resolution: the repository universe answered per URL spelling
+# in one call, a page's worth of spellings per request (no set is a refusal).
 @router.post("/v1/repositories:resolve", responses=PROBLEMS(401, 422))
 def resolve_repositories(
     body: RepositoryResolutionRequest, portfolio: Portfolio, _: Caller
 ) -> list[RepositoryResolution]:
-    """Resolve repository URL spellings to the repositories core knows (S1): each
-    answer carries the repository's own id — never a neighbor's — with the upstream
-    edge as the hint when the matched row carries one (a fork, a mirror: the caller's
-    judgement), and a URL correction's vacated spelling follows its edge to the
-    repository that moved. Drifted spellings (a trailing slash, a .git suffix, a git@
-    ssh spelling, host case) fold through core's own canonicalizer; several rows under
-    one case-folded spelling answer as candidates — the review list, never the door's
-    pick; an unregistered or unparseable spelling answers the honest absence. Every
-    verified caller resolves (a machine principal as freely as a person)."""
+    """Resolve repository URL spellings to the repositories core knows: each answer
+    carries the repository's own id with the upstream edge as the hint when the matched
+    row carries one, and a URL correction's vacated spelling follows its edge to the
+    repository that moved. Drifted spellings (trailing slash, .git, git@ ssh, host
+    case) fold through core's own canonicalizer; several rows under one case-folded
+    spelling answer as candidates; an unregistered or unparseable spelling answers
+    the honest absence."""
     if not body.urls:
         raise ValidationError("resolve named repository urls; the set is required")
     if len(body.urls) > MAX_REPOSITORY_IDS:
@@ -151,14 +146,10 @@ def register_ref(
 def mark_default_branch(
     repository_id: UUID, body: DefaultRefNaming, portfolio: Portfolio, _: Caller
 ) -> RepositoryRef:
-    """Name the repository's default branch (the observation lane's own door): the
-    forge's default-branch answer — the branch and its head commit — recorded exactly
-    the way the repo_state observation records it, the get_or_add that adds the line
-    when absent and moves the default flag when a new answer names another (a named
-    line is immutable once recorded). What a survey of the forge answered, a caller
-    records here; what the observation lane itself observes, it records the same way
-    in-process. Every verified caller names one — the engine's machine principals and
-    a person's deliberate verify alike, the lane's own discipline."""
+    """Name the repository's default branch: the forge's answer (the branch and its
+    head commit) recorded the way the repo_state observation records it — the line
+    added when absent, the default flag named anew when the answer moves (a named
+    line is immutable once recorded). Every verified caller names one."""
     return portfolio.mark_default_branch(repository_id, GitSha.parse(body.sha), body.branch)
 
 

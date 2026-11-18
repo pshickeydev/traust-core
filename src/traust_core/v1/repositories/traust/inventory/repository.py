@@ -78,8 +78,7 @@ class SqlRepositoryRepository(SqlMutableRepository[Repository]):
         return self._one(f"find {url}", self.table.c.url == url)
 
     def find_by_urls(self, urls: Collection[str]) -> list[Repository]:
-        """The rows registered at these URLs, exact spellings, in bounded batches: the
-        resolution door's first tier, one statement per batch instead of one per URL."""
+        """The rows registered at these URLs, exact spellings, in bounded batches."""
         return self._many_in(f"find {len(urls)} by url", self.table.c.url, urls)
 
     def get_for_update(self, repository_id: UUID) -> Repository:
@@ -100,9 +99,8 @@ class SqlRepositoryRepository(SqlMutableRepository[Repository]):
 
     def find_by_urls_casefold(self, urls: Collection[str]) -> list[Repository]:
         """Every repository whose URL matches one of these spellings ignoring case, in
-        bounded batches: the resolution door's GitHub tier, one folded scan per batch for
-        the whole set (the caller folds only github-kind hosts' spellings). Several rows
-        may share one folded key — the door lists them as candidates, never picks."""
+        bounded batches (the callers fold only github-kind hosts' spellings). Several
+        rows may share one folded key; the caller lists them, never picks."""
         folded = {url.lower() for url in urls}
         if not folded:
             return []

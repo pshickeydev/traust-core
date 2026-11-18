@@ -1,7 +1,4 @@
-"""The batch identity resolution door (the read-side plan's S1, foundry#97): every
-asked-for spelling's answer in one call — the id core already knows under it, the alias
-knowledge core owns, and the honest absences — so a consumer joins by id instead of
-rebuilding a canonicalizer and join tiers beside core."""
+"""The batch identity resolution: every asked-for spelling's answer in one call."""
 
 from __future__ import annotations
 
@@ -47,10 +44,8 @@ def test_a_registered_url_resolves_to_its_repository(context: Context, client: T
 def test_drifted_spellings_fold_through_cores_own_canonicalizer(
     context: Context, client: TestClient
 ) -> None:
-    """The drift the production join folds — a trailing slash, a .git suffix, a git@ ssh
-    spelling, host case — resolves to the id core already knows (S1's acceptance: a
-    drifted/mirror/git@ spelling returns the id, and the consumer's canonicalizer
-    retires with it)."""
+    """The drift the join folds — a trailing slash, a .git suffix, a git@ ssh spelling,
+    host case — resolves to the id core already knows."""
     repo = seed(context, url="https://github.com/Org/Repo")
     drifted = [
         "https://github.com/Org/Repo/",
@@ -79,9 +74,8 @@ def test_a_github_case_drift_resolves_to_the_one_registered_row(
 def test_a_folded_spelling_several_rows_share_answers_the_candidates(
     context: Context, client: TestClient
 ) -> None:
-    """When several rows share one folded spelling, the door answers the review list
-    (the candidates, oldest first), never its own pick: the retired backfill's review
-    output, made the door's honest answer."""
+    """When several rows share one folded spelling, the door answers the candidates,
+    oldest first, never its own pick."""
     with SqlTraustUnitOfWork(context.database) as uow:
         made = Seed(uow)
         first = made.repository(url="https://github.com/org/casey")
@@ -114,9 +108,7 @@ def test_a_fork_answers_its_own_id_with_the_upstream_hint(
     context: Context, client: TestClient
 ) -> None:
     """A fork (or mirror) is its own repository: the spelling answers the row's own id —
-    never the parent's — with the upstream edge as the hint the caller judges (the
-    linked-spelling case the retired backfill sent to review, now the door's own
-    answer: S1's 'the URL's own id with an aliasOf hint')."""
+    never the parent's — with the upstream edge as the hint the caller judges."""
     with SqlTraustUnitOfWork(context.database) as uow:
         made = Seed(uow)
         parent = made.repository(url="https://github.com/org/parent")

@@ -1,7 +1,5 @@
-"""The default-ref observation door (foundry#97, retiring the default-ref backfill's
-SQL writes): the forge's default-branch answer recorded exactly the way the repo_state
-observation records it — mark_default_branch's get_or_add, exposed as the door the
-survey feeds."""
+"""Naming the default branch through the door: the forge's answer recorded the way
+the repo_state observation records it (mark_default_branch's get_or_add)."""
 
 from __future__ import annotations
 

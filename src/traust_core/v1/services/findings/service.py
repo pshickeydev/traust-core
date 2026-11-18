@@ -296,9 +296,8 @@ class FindingService:
         rationale: str,
         principal: Principal,
     ) -> OccurrenceClaimReport:
-        """The occurrence-claim door (foundry#97): a batch of declared CVSS claims,
-        validated and recorded as governed statements — the person-gated write path
-        that retired the trigger-disabling backfill."""
+        """A batch of declared CVSS claims, validated and recorded as governed
+        statements."""
         return self._occurrence_claims.record(
             claims, ticket=ticket, rationale=rationale, principal=principal
         )

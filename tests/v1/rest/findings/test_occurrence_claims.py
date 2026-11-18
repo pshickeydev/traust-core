@@ -1,8 +1,5 @@
-"""The occurrence-claim door (foundry#97): the write path for the CVSS claims
-occurrences' reports stated, retiring the SCI backfill that wrote the occurrence
-columns over psql with the append-only guard trigger disabled. The claims land as
-governed statements — a person's data-error decision under a ticket — never a column
-mutation: the trigger stays armed, and the occurrence rows keep what they said."""
+"""Recording occurrence CVSS claims: the claims land as governed statements — a
+person's data-error decision under a ticket — never a column mutation."""
 
 from __future__ import annotations
 
@@ -103,9 +100,8 @@ def test_a_retried_claim_is_idempotent(context: Context, client: TestClient) -> 
 def test_what_the_occurrence_already_carries_needs_no_recording(
     context: Context, client: TestClient
 ) -> None:
-    """The fixed intake's own write (FindingCandidate.cvss_* onto the occurrence) is the
-    claim already carried: no statement, and an equal declaration is the idempotent
-    answer — never an overwrite, exactly the retired script's never-overwrite rule."""
+    """What the occurrence's own columns already carry needs no statement: an equal
+    declaration is the idempotent answer, and nothing is overwritten."""
     world = seed(context, cvss_vector=VECTOR, cvss_score=Decimal("5.3"))
     answer = record(client, bearer(context, ANALYST), [world.claim()])
     assert answer.status_code == 200, answer.text
@@ -135,9 +131,8 @@ def test_a_conflicting_claim_is_the_review_list_never_an_overwrite(
 def test_refusals_are_answered_per_claim_never_guessed(
     context: Context, client: TestClient
 ) -> None:
-    """The honest answers the retired script's review list produced: an unknown
-    fingerprint, an assessment that did not report the finding, and a claim that fails
-    core's CVSS discipline (never a guess at a malformed one)."""
+    """Refused claims are answered per claim: an unknown fingerprint, an assessment that
+    did not report the finding, and a claim that fails the CVSS discipline."""
     world = seed(context)
     other = seed(context)
     claims = [

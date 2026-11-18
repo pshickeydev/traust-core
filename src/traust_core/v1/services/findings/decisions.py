@@ -383,13 +383,10 @@ class FindingDecisions:
         ticket: str,
         rationale: str,
     ) -> tuple[Decision, bool]:
-        """Append a recorded occurrence claim's audit record (the occurrence-claim door,
-        foundry#97): the claim corrects data an earlier recording left unrecorded, so the
-        statement is a data_error carrying the person's authority — the same audit-record
-        shape the claim corrections append, a person's statement that judges no validity,
-        resolution or severity (the disposition fold reads none of it). Returns the
-        decision and whether this call appended it (False: the same statement already
-        stood — idempotent, the statement key's own promise)."""
+        """Append a recorded occurrence claim's audit record: a data_error statement
+        under the person's authority, judging no validity, resolution or severity (the
+        disposition fold reads none of it). Returns the decision and whether this call
+        appended it (False: the same statement already stood — idempotent)."""
         if not principal.is_verified_human():
             raise ForbiddenError("an occurrence claim needs a verified human")
         if not ticket.strip() or len(rationale.strip()) < RATIONALE_MIN_LENGTH:
