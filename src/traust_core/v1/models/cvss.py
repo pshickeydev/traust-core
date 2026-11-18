@@ -10,11 +10,12 @@ from enum import StrEnum
 from typing import Literal, TypeVar
 
 import pydantic
+from cvss import CVSS3, CVSS4
+from cvss.exceptions import CVSSError
 from pydantic import Field, StrictBool, StrictFloat, StrictInt, StrictStr
 
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.base import Dto, Model
-from traust_core.v1.models.dependencies import cvss_base_score
 
 
 class CvssSource(StrEnum):
@@ -137,6 +138,31 @@ class EffectiveCvss(Model):
         return self.chosen.source if self.chosen is not None else None
 
 
+def cvss_base_score(vector: str) -> float | None:
+    """A `CVSS:3.0/` or `CVSS:3.1/` vector's base score; None for any other, or one FIRST's
+    formula refuses (a 4.0 score is never ranked, so it isn't one of these)."""
+    score = _v3_base_score(vector)
+    return None if score is None else float(score)
+
+
+def _v3_base_score(vector: str) -> Decimal | None:
+    """FIRST's 3.0/3.1 formula, each version's own rounding (Red Hat's `cvss`)."""
+    if not vector.startswith(("CVSS:3.0/", "CVSS:3.1/")):
+        return None
+    try:
+        return CVSS3(vector).base_score
+    except CVSSError:
+        return None
+
+
+def _v4_base_score(vector: str) -> Decimal | None:
+    """FIRST's 4.0 formula over the whole vector, as sources state it (Red Hat's `cvss`)."""
+    try:
+        return Decimal(str(CVSS4(vector).base_score))
+    except CVSSError:
+        return None
+
+
 def score_of(
     source: CvssSource,
     vector: object,
@@ -147,8 +173,8 @@ def score_of(
     scored_by: str | None = None,
     acquired_at: datetime | None = None,
 ) -> CvssScore | None:
-    """A stated score, or None when it can't be trusted: never a guess at a malformed one.
-    A 3.x score is the one its vector computes, which a stated score must agree with."""
+    """A score, or None when it can't be trusted: never a guess at a malformed one. The score
+    is the one its vector computes (FIRST's formula), which a stated score must agree with."""
     if not isinstance(vector, str) or (detected := _version(vector)) is None:
         return None
     if version is not None and str(version) != detected:
@@ -156,14 +182,10 @@ def score_of(
     claimed = _bounded(stated)
     if not _well_formed(vector, detected) or (stated is not None and claimed is None):
         return None
-    if detected == "4.0":
-        score = claimed
-    else:
-        if (computed := cvss_base_score(vector)) is None:
-            return None
-        score = Decimal(str(computed))
-        if claimed is not None and claimed != score:
-            return None
+    computed = _v4_base_score(vector) if detected == "4.0" else _v3_base_score(vector)
+    if computed is None or (claimed is not None and claimed != computed):
+        return None
+    score = computed
     return CvssScore(
         source=source,
         version=detected,

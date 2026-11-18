@@ -373,8 +373,39 @@ def test_two_authorities_with_one_vector_are_both_kept_in_either_order() -> None
         assert made is not None
         return made
 
-    first, second = adp("adp-a", "9.2"), adp("adp-b", "8.7")
+    first, second = adp("adp-a", "9.2"), adp("adp-b", "9.2")
     assert set(distinct([first, second])) == set(distinct([second, first])) == {first, second}
+
+
+def test_a_40_score_is_the_one_its_vector_computes() -> None:
+    computed = score_of(CvssSource.GHSA, V40, document="osv:GHSA-x")  # stated without a score
+    assert computed is not None and computed.score == Decimal("9.2")
+    # the whole vector, threat and supplemental metrics included, as CNAs score it: these are
+    # two published CNA statements (NVD Secondary), each stated with this score
+    for vector, stated in (
+        (
+            "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:H/SI:H/SA:H/E:P/CR:X/IR:X/AR:X"
+            "/MAV:X/MAC:X/MAT:X/MPR:X/MUI:X/MVC:X/MVI:X/MVA:X/MSC:X/MSI:X/MSA:X/S:X/AU:X/R:X"
+            "/V:X/RE:X/U:X",
+            "9.3",
+        ),
+        (
+            "CVSS:4.0/AV:N/AC:L/AT:P/PR:N/UI:P/VC:N/VI:N/VA:H/SC:N/SI:N/SA:N/E:U/CR:X/IR:X/AR:X"
+            "/MAV:X/MAC:X/MAT:X/MPR:X/MUI:X/MVC:X/MVI:X/MVA:X/MSC:X/MSI:X/MSA:X/S:X/AU:X/R:U"
+            "/V:X/RE:L/U:Green",
+            "2.3",
+        ),
+    ):
+        agreed = score_of(CvssSource.CNA, vector, document="test", stated=stated)
+        assert agreed is not None and agreed.score == Decimal(stated)
+    assert score_of(CvssSource.ADP, V40, document="test", stated="8.7") is None  # disagrees
+
+
+def test_a_40_vector_its_formula_refuses_states_nothing() -> None:
+    no_impact = V40.replace("/VC:H/VI:H/VA:H", "/VC:N/VI:N/VA:N")
+    zero = score_of(CvssSource.CNA, no_impact, document="test")
+    assert zero is not None and zero.score == Decimal("0.0")
+    assert score_of(CvssSource.CNA, V40.replace("AV:N", "AV:Q"), document="test") is None
 
 
 def test_a_40_vector_out_of_the_specs_metric_order_is_refused() -> None:

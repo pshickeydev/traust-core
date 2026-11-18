@@ -10,7 +10,7 @@ All modules live under `traust_core.v1` (see [Versioning](#versioning)).
 | **Errors** | `errors` | the exception hierarchy every layer raises (`ValidationError`, `NotFoundError`, …) | ad hoc exceptions |
 | **Models** | `models` | one model per contract table, grouped by section — `inventory`, `dependencies`, `assessment`, `findings`, `operations`, `ledger` (fields = columns) — next to that section's service types; `base` (`Model` strict, `Dto` tolerant, `Entity` with a database-generated UUIDv4 id, `AppendOnly` for tables that are never updated), `values` (`HttpsRepoUrl`, `GitSha`, `CveId`, `to_rfc3339` / `TimestampError`: the contracts' one RFC 3339 rule), `integrity` | dicts passed between scripts |
 | **Validation rules** | `models.validation` | `ValidationScope.permits(action, target, as_of=…)`, `ValidationPlan.requires_approval()`, `ValidationAttempt.soundness()` — pure scope, approval and refutation rules | duplicated harness scope and soundness rules |
-| **CVSS sources** | `models.cvss`, `services.findings.cvss`, `models.feed_documents`, `services.exposure` | the per-source documents kept daily (`exposure.refresh_documents`: one manifest snapshot per source, a failed fetch keeping the last document; `exposure.stored_document` reads one back, digest-checked); `exposure.advisory_names` is the batched door every advisory join goes through (canonical name plus aliases, CVEs split out), and `exposure.refresh_advisory_documents` keeps every linked advisory's documents; each advisory source's CVSS from its stored document (`cve_list_scores`, `nvd_scores`, `osv_scores`, `rh_cve_scores`, `csaf_scores`, `scanner_score`; `score_of` refuses a malformed vector, a version that disagrees with it, a score outside 0–10 or one its vector doesn't compute), and the one a finding shows: `effective(scores)` ranks NIST > GitHub-reviewed GHSA > CNA > ADP > Red Hat > scanner, takes a source's 3.1 before its 3.0, and keeps 4.0 alongside, never ranked | `AdvisoryRecord.cvss_score`, which reads only one feed's 3.x vectors |
+| **CVSS sources** | `models.cvss`, `services.findings.cvss`, `models.feed_documents`, `services.exposure` | the per-source documents kept daily (`exposure.refresh_documents`: one manifest snapshot per source, a failed fetch keeping the last document; `exposure.stored_document` reads one back, digest-checked); `exposure.advisory_names` is the batched door every advisory join goes through (canonical name plus aliases, CVEs split out), and `exposure.refresh_advisory_documents` keeps every linked advisory's documents; each advisory source's CVSS from its stored document (`cve_list_scores`, `nvd_scores`, `osv_scores`, `rh_cve_scores`, `csaf_scores`, `scanner_score`; `score_of` refuses a malformed vector, a version that disagrees with it, a score outside 0–10 or one its vector doesn't compute; FIRST's 3.x and 4.0 formulas through the `cvss` library), and the one a finding shows: `effective(scores)` ranks NIST > GitHub-reviewed GHSA > CNA > ADP > Red Hat > scanner, takes a source's 3.1 before its 3.0, and keeps 4.0 alongside, never ranked | `AdvisoryRecord.cvss_score`, which reads only one feed's 3.x vectors |
 | **Validation recording** | `services.validation`, `models.validation` | `record_order(doc, provenance, bindings, run_order_id, principal)` binds machine reports to a live order lease; trusted-local `record(doc, provenance, bindings)` and `evidence(artifact_id)` retain their existing semantics | re-running probes, interpreting source labels as database IDs |
 | **Artifacts** | `models.artifacts` | the `ArtifactDocument` base + `SchemaView` (fields from the installed schema, `doc.findings[0].verdict`, unknown names raise) and the named documents (`TriageArtifact`, `SecurityAuditArtifact`, …, `Verdict`, `Severity`) | `json.load` + `.get("key")` |
 | **Artifact publishing** | `services.artifact_publishing` | `ctx.artifact_publisher(specs).publish(name, raw)` or `.publish_artifact(artifact)`: exact gate → content-addressed objects → an artifact UUID on SQLite and Postgres; `get(artifact_id)` verifies the persisted digest; `list_for_assessment(id, kind=…)` reads metadata | writing `analysis-results` files by hand or optional indexing |
@@ -380,15 +380,19 @@ order with a usable CVSS 3.x score wins:
 
 - **Version.** Within the winning source, its CVSS 3.1 score, else its 3.0 score. A 4.0 score is
   kept and shown alongside (`EffectiveCvss.v4`, the highest-ranked one) but never sets the
-  score, so no 4.0 calculator ranks findings. CVSS 2 is not read.
+  score. CVSS 2 is not read.
 - **Ties.** Two 3.x scores from the same source and version: the higher one.
 - **Trust.** `score_of` refuses rather than guesses. It refuses:
   - a key or value outside FIRST's CVSS 3.0/3.1 or 4.0 metric tables, or a missing base metric;
   - a 4.0 vector whose metrics are out of the spec's order;
   - a version that disagrees with the vector, or a repeated metric;
   - a stated score outside 0–10, or anything but a plain decimal;
-  - a stated 3.x score that isn't exactly what its vector computes.
-  A 3.x score is always the one its vector computes (FIRST's formula, with 3.0's own rounding).
+  - a stated score that isn't exactly what its vector computes, 3.x or 4.0.
+  A score is always the one its vector computes: FIRST's formulas for 3.0 (with its own
+  rounding), 3.1 and 4.0, from Red Hat Product Security's `cvss` library (LGPLv3+, pinned
+  exactly; only `models.cvss` imports it). A source that states a vector without a score,
+  as OSV's GHSA records often do for 4.0, gets the computed one. The 4.0 score is over the whole
+  vector, threat and supplemental metrics included, as CNAs and NVD state it.
 - **Shape.** Each parser takes the stored document's bytes and validates them into a typed shape;
   a document that doesn't fit it, including a present score block without its vector, is a
   `ValidationError`, never a silently missing score.
