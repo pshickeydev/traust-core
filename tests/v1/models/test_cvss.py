@@ -16,6 +16,7 @@ from traust_core.v1.models.cvss import (
     CvssSource,
     csaf_scores,
     cve_list_scores,
+    cvss_base_score,
     distinct,
     nvd_scores,
     osv_scores,
@@ -217,6 +218,11 @@ def _score(source: CvssSource, vector: str, stated: str | None = None) -> CvssSc
         (V31 + "/XYZ:Q", None, None),  # a metric CVSS doesn't define
         ("CVSS:4.0/AV:Z/AC:L/AT:P/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N", None, "9.2"),
         (V40 + "/U:Purple", None, "9.2"),  # an urgency no metric has
+        (V40 + "/U:clear", None, None),  # 4.0 not in the canonical case
+        (V40 + "/S:C", None, None),  # a 3.x value under 4.0's Safety metric
+        (V40 + "/ZZ:Q", None, None),  # a metric 4.0 doesn't define
+        (V40 + "/SA:N", None, None),  # a repeated 4.0 metric, still in order
+        ("CVSS:3.0/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H", None, None),  # 3.0 missing a base metric
         (V31, None, "8.14"),  # stated more precisely than its vector computes
         (V31, None, "8.1000001"),
         (V31, None, "1e1"),
@@ -438,7 +444,5 @@ def test_a_secondary_metric_from_nist_is_neither_nists_nor_an_adps() -> None:
 
 
 def test_a_30_vector_rounds_as_30_does() -> None:
-    from traust_core.v1.models.dependencies import cvss_base_score
-
     assert cvss_base_score(V30) == 9.1
     assert cvss_base_score("CVSS:3.0/AV:N/AC:L/PR:N/UI:N/S:Q/C:H/I:H/A:H") is None

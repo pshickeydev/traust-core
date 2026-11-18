@@ -36,72 +36,12 @@ _VECTOR: dict[CvssVersion, re.Pattern[str]] = {
     "3.1": re.compile(r"CVSS:3\.1(/[A-Z]{1,3}:[A-Z])+"),
     "4.0": re.compile(r"CVSS:4\.0(/[A-Z]{1,3}:[A-Za-z]{1,5})+"),
 }
-_CIA, _MOD = ("H", "L", "N"), ("X", "H", "M", "L")
-# FIRST's metric values: 3.0 and 3.1 share one table, 4.0 has its own. Base metrics are required.
-_V3_BASE = {
-    "AV": ("N", "A", "L", "P"),
-    "AC": ("L", "H"),
-    "PR": ("N", "L", "H"),
-    "UI": ("N", "R"),
-    "S": ("U", "C"),
-    "C": _CIA,
-    "I": _CIA,
-    "A": _CIA,
-}
-_V3_METRICS = {
-    **_V3_BASE,
-    "E": ("X", "H", "F", "P", "U"),
-    "RL": ("X", "U", "W", "T", "O"),
-    "RC": ("X", "C", "R", "U"),
-    "CR": _MOD,
-    "IR": _MOD,
-    "AR": _MOD,
-    "MAV": ("X", "N", "A", "L", "P"),
-    "MAC": ("X", "L", "H"),
-    "MPR": ("X", "N", "L", "H"),
-    "MUI": ("X", "N", "R"),
-    "MS": ("X", "U", "C"),
-    "MC": ("X", *_CIA),
-    "MI": ("X", *_CIA),
-    "MA": ("X", *_CIA),
-}
-_V4_BASE = {
-    "AV": ("N", "A", "L", "P"),
-    "AC": ("L", "H"),
-    "AT": ("N", "P"),
-    "PR": ("N", "L", "H"),
-    "UI": ("N", "P", "A"),
-    "VC": _CIA,
-    "VI": _CIA,
-    "VA": _CIA,
-    "SC": _CIA,
-    "SI": _CIA,
-    "SA": _CIA,
-}
-_V4_METRICS = {
-    **_V4_BASE,
-    "E": ("X", "A", "P", "U"),
-    "CR": _MOD,
-    "IR": _MOD,
-    "AR": _MOD,
-    "MAV": ("X", "N", "A", "L", "P"),
-    "MAC": ("X", "L", "H"),
-    "MAT": ("X", "N", "P"),
-    "MPR": ("X", "N", "L", "H"),
-    "MUI": ("X", "N", "P", "A"),
-    "MVC": ("X", *_CIA),
-    "MVI": ("X", *_CIA),
-    "MVA": ("X", *_CIA),
-    "MSC": ("X", *_CIA),
-    "MSI": ("X", "S", *_CIA),
-    "MSA": ("X", "S", *_CIA),
-    "S": ("X", "N", "P"),
-    "AU": ("X", "N", "Y"),
-    "R": ("X", "A", "U", "I"),
-    "V": ("X", "D", "C"),
-    "RE": ("X", "L", "M", "H"),
-    "U": ("X", "Clear", "Green", "Amber", "Red"),
-}
+# The spec's 4.0 metric order, which the library doesn't check; it refuses every other malformation.
+_V4_ORDER = (
+    *("AV", "AC", "AT", "PR", "UI", "VC", "VI", "VA", "SC", "SI", "SA", "E", "CR", "IR", "AR"),
+    *("MAV", "MAC", "MAT", "MPR", "MUI", "MVC", "MVI", "MVA", "MSC", "MSI", "MSA"),
+    *("S", "AU", "R", "V", "RE", "U"),
+)
 _DECIMAL = re.compile(r"\d{1,2}(\.\d{1,3})?")
 _NIST = "nvd@nist.gov"
 _NVD_BLOCKS: tuple[tuple[str, CvssVersion], ...] = (("v31", "3.1"), ("v30", "3.0"), ("v40", "4.0"))
@@ -180,7 +120,7 @@ def score_of(
     if version is not None and str(version) != detected:
         return None
     claimed = _bounded(stated)
-    if not _well_formed(vector, detected) or (stated is not None and claimed is None):
+    if not _in_spec_order(vector, detected) or (stated is not None and claimed is None):
         return None
     computed = _v4_base_score(vector) if detected == "4.0" else _v3_base_score(vector)
     if computed is None or (claimed is not None and claimed != computed):
@@ -471,20 +411,15 @@ def _version(vector: str) -> CvssVersion | None:
     return next((v for v, pattern in _VECTOR.items() if pattern.fullmatch(vector)), None)
 
 
-def _well_formed(vector: str, version: CvssVersion) -> bool:
-    metrics, base = (_V4_METRICS, _V4_BASE) if version == "4.0" else (_V3_METRICS, _V3_BASE)
-    pairs = [pair.split(":", 1) for pair in vector.split("/")[1:]]
-    keys = [key for key, _ in pairs]
-    if version == "4.0":  # 4.0 requires the spec's order; 3.x allows any
-        order = list(metrics)
-        positions = [order.index(key) if key in metrics else -1 for key in keys]
-        if positions != sorted(positions):
-            return False
-    return (
-        len(keys) == len(set(keys))
-        and set(base) <= set(keys)
-        and all(value in metrics.get(key, ()) for key, value in pairs)
-    )
+def _in_spec_order(vector: str, version: CvssVersion) -> bool:
+    """4.0 requires the spec's metric order; 3.x allows any."""
+    if version != "4.0":
+        return True
+    keys = [pair.split(":", 1)[0] for pair in vector.split("/")[1:]]
+    if not set(keys) <= set(_V4_ORDER):
+        return False
+    positions = [_V4_ORDER.index(key) for key in keys]
+    return positions == sorted(positions)
 
 
 def _bounded(value: object) -> Decimal | None:
