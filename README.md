@@ -634,7 +634,8 @@ traust-server --config traust.yaml db upgrade            # plan: names, hashes, 
 traust-server --config traust.yaml db upgrade --apply    # the deliberate call
 ```
 
-Exit 0: current, applied, or no store yet (an open creates it). Exit 1: pending without
+Exit 0: current, applied, or no local store yet (a local open creates it; a configured
+database is its deployment's to provision). Exit 1: pending without
 `--apply`, version 0, or a channel refusal. The Python behind it, for embedders:
 
 ```python

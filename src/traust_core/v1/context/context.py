@@ -876,6 +876,11 @@ class Context:
             ) from error
         return stamped or ran
 
+    def shipped_db_upgrades(self) -> list[contracts.Upgrade]:
+        """Every script the channel ships: what bringing a pre-channel store on
+        presumes done. Read-only - the manifest, never the database."""
+        return contracts.shipped_db_upgrades(Dialect.of(self._store_engine))
+
     def store_status(self) -> StoreStatus:
         """The store's standing against the db contract, read without opening
         through the gate: for doctor and operators, before a refusal surprises

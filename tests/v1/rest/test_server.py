@@ -150,7 +150,10 @@ def test_db_upgrade_brings_a_pre_channel_store_on(
     with pytest.raises(SystemExit) as exit_code:
         server.main(["--config", str(config), "db", "upgrade"])
     assert exit_code.value.code == 1  # plan only: the store is not on the channel yet
-    assert "not on the channel yet" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "not on the channel yet" in out
+    assert "0001_repository_disposition" in out  # the manifest: what stamping presumes done
+    assert "nothing runs" in out
 
     with pytest.raises(SystemExit) as exit_code:
         server.main(["--config", str(config), "db", "upgrade", "--apply"])

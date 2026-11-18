@@ -353,3 +353,9 @@ def stamp_db_channel(dbapi: _DbapiConnection, dialect: Dialect) -> list[Upgrade]
     script stamped as applied in one transaction, nothing run. The connection
     must be in autocommit: the stamping manages its own transaction."""
     return migrations.stamp_channel(dbapi, dialect)
+
+
+def shipped_db_upgrades(dialect: Dialect) -> list[Upgrade]:
+    """Every script the channel ships - the manifest bringing a pre-channel
+    store on presumes done. Read-only: the shipped channel, no database."""
+    return migrations.pending_upgrades(dialect, {})

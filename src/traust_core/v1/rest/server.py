@@ -124,10 +124,12 @@ def _db_upgrade(context: Context, args: argparse.Namespace) -> int:
             return 1
         if status.state is StoreState.PRE_CHANNEL:
             if not args.apply:
-                print(
-                    "not on the channel yet: the store predates it and is presumed current - "
-                    "rerun with --apply to bring it on at the channel's head (nothing runs)"
-                )
+                print("not on the channel yet: the store predates it and is presumed current.")
+                print("bringing it on stamps every shipped script as done - nothing runs:")
+                for upgrade in context.shipped_db_upgrades():
+                    mark = f"  [destructive: {upgrade.destructive}]" if upgrade.destructive else ""
+                    print(f"  {upgrade.name}  sha256:{upgrade.sha256[:12]}{mark}")
+                print("rerun with --apply to bring it on at the channel's head")
                 return 1
             stamped = context.apply_db_upgrades()
             names = ", ".join(upgrade.name for upgrade in stamped) or "nothing"
