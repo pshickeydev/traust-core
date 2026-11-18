@@ -229,6 +229,23 @@ class SyncReport(Model):
         )
 
 
+class RepositoryResolution(Model):
+    """One asked-for URL spelling's answer over the repository universe (the read-side
+    plan's S1): the repository core knows under it — its own id, never a neighbor's —
+    plus the upstream edge as the hint when the matched row carries one (a fork, a
+    mirror: the same edge the fork resolution reads, the caller's to judge). A URL
+    correction's vacated spelling follows its edge to the repository that moved, so an
+    old spelling answers the identity that survived the move. Several rows under one
+    case-folded spelling is the honest ambiguity a person settles — the candidates,
+    oldest first, instead of a script-side guess; no row at all (an unregistered or
+    unparseable spelling) is the honest absence."""
+
+    url: str
+    repository: Repository | None = None
+    alias_of: UUID | None = None
+    candidates: tuple[Repository, ...] = ()
+
+
 class RepositoryFilter(Model):
     """Every repository, or the one registered at `url`.
 
