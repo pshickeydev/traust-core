@@ -86,3 +86,100 @@ def test_token_refuses_a_server_that_does_not_trust_its_local_issuer(tmp_path: P
 def test_token_needs_an_identity(tmp_path: Path) -> None:
     with pytest.raises(SystemExit):
         server.main(["--config", str(local(tmp_path)), "token"])
+
+
+def test_db_upgrade_plans_reports_and_exits_by_state(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from traust_contracts.v1.migrations import Upgrade
+
+    from traust_core.v1 import contracts
+
+    config = local(tmp_path)
+
+    def run(args: list[str]) -> tuple[SystemExit | None, str]:
+        code: SystemExit | None = None
+        try:
+            server.main(args)
+        except SystemExit as exit_code:
+            code = exit_code
+        captured = capsys.readouterr()
+        return getattr(code, "code", None), captured.out + captured.err
+
+    code, out = run(["--config", str(config), "db", "upgrade"])
+    assert (code, "no store yet" in out) == (0, True)
+
+    _ = Context(Config(home=tmp_path)).database  # a stamped, up-to-date store
+    code, out = run(["--config", str(config), "db", "upgrade"])
+    assert (code, "up to date" in out) == (0, True)
+
+    pending = [
+        Upgrade("0004_safe", "c" * 64, ("SELECT 1;",)),
+        Upgrade("0005_drops", "d" * 64, ("DROP TABLE t;",), "t is gone"),
+    ]
+    monkeypatch.setattr(contracts, "pending_db_upgrades", lambda dbapi, dialect: pending)
+    code, out = run(["--config", str(config), "db", "upgrade"])
+    assert code == 1
+    assert "0005_drops" in out and "[destructive: t is gone]" in out
+    assert "rerun with --apply" in out
+
+    applied: list[object] = []
+    monkeypatch.setattr(
+        contracts,
+        "run_db_upgrades",
+        lambda dbapi, dialect: applied.append(dbapi) or pending,
+    )
+    code, out = run(["--config", str(config), "db", "upgrade", "--apply"])
+    assert code == 1  # unacknowledged destructive work refuses
+    assert "allow_destructive" in out
+    assert applied == []
+
+    code, out = run(["--config", str(config), "db", "upgrade", "--apply", "--allow-destructive"])
+    assert (code, "applied 2 upgrade(s)" in out) == (0, True)
+    assert len(applied) == 1
+
+
+def test_db_upgrade_reports_a_version_0_store(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config = local(tmp_path)
+    engine = Context(Config(home=tmp_path)).database  # a store the channel stamped
+    with engine.begin() as connection:
+        connection.exec_driver_sql("DROP TABLE db_upgrade")  # the shape before the channel
+    engine.dispose()
+    with pytest.raises(SystemExit) as exit_code:
+        server.main(["--config", str(config), "db", "upgrade"])
+    assert exit_code.value.code == 1
+    assert "version 0" in capsys.readouterr().out
+
+
+def test_db_upgrade_refuses_an_empty_configured_database(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+
+    config = tmp_path / "traust.yaml"
+    config.write_text(
+        f"home: {tmp_path}\ndatabase: {{ url: sqlite:///{tmp_path}/deployment.db }}\n"
+    )
+    with pytest.raises(SystemExit) as exit_code:
+        server.main(["--config", str(config), "db", "upgrade", "--apply"])
+    assert exit_code.value.code == 1  # its deployment provisions it, never this command
+    assert "configured database is empty" in capsys.readouterr().out
+
+
+def test_db_upgrade_reports_a_channel_refusal_without_a_traceback(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from traust_core.v1 import contracts
+
+    config = local(tmp_path)
+    _ = Context(Config(home=tmp_path)).database  # a stamped store
+
+    def refuse(dbapi: object, dialect: str) -> object:
+        raise contracts.MigrationError("upgrade 0001_x changed after databases applied it")
+
+    monkeypatch.setattr(contracts, "pending_db_upgrades", refuse)
+    with pytest.raises(SystemExit) as exit_code:  # the plan itself refuses
+        server.main(["--config", str(config), "db", "upgrade"])
+    assert exit_code.value.code == 1
+    assert "refused this store" in capsys.readouterr().err

@@ -1426,7 +1426,7 @@ def _run_channel(engine: Engine, *, local: bool) -> None:
             f"the database is behind the db contract ({len(pending)} upgrade(s) pending: "
             f"{_upgrade_plan(pending)}): a configured database's upgrades are its "
             "deployment's - plan them with Context.pending_db_upgrades(), apply with "
-            "Context.apply_db_upgrades() (the `traust db upgrades` CLI wraps both) "
+            "Context.apply_db_upgrades() (the `traust-server db upgrade` command wraps both) "
             "with its owners"
         )
 

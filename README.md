@@ -626,7 +626,16 @@ store is never migrated behind an open's back: a local store applies pending upg
 open (opening the new version is the consent), a configured database refuses until its
 deployment applies them.
 
-On upgrade day, an operator plans, looks, then applies:
+On upgrade day, an operator plans, looks, then applies — the command the deployment's
+own entrypoint carries:
+
+```bash
+traust-server --config traust.yaml db upgrade            # plan: names, hashes, destructive reasons
+traust-server --config traust.yaml db upgrade --apply    # the deliberate call
+```
+
+Exit 0: current, applied, or no store yet (an open creates it). Exit 1: pending without
+`--apply`, version 0, or a channel refusal. The Python behind it, for embedders:
 
 ```python
 ctx = Context.from_file(Path("traust.yaml"))
@@ -637,9 +646,9 @@ applied = ctx.apply_db_upgrades()  # the deliberate call
 ```
 
 A script that declares a destructive reason (`-- destructive: …` in its header) applies
-only when acknowledged: `ctx.apply_db_upgrades(allow_destructive=True)`, after the
-refusal has named what would run and why. The `traust db upgrades` CLI wraps plan and
-apply for operators who do not embed Python.
+only when acknowledged: `--allow-destructive` on the command,
+`ctx.apply_db_upgrades(allow_destructive=True)` in Python, after the refusal has named
+what would run and why.
 
 A database created before the upgrade channel (no `db_upgrade` stamp table) is version
 0: its shape is unknown, so both the open gate and the surface refuse it. Until adoption
