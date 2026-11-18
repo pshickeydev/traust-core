@@ -650,12 +650,13 @@ only when acknowledged: `--allow-destructive` on the command,
 `ctx.apply_db_upgrades(allow_destructive=True)` in Python, after the refusal has named
 what would run and why.
 
-A database created before the upgrade channel (no `db_upgrade` stamp table) is version
-0: its shape is unknown, so both the open gate and the surface refuse it. Until adoption
-ships (verify the live schema against the baseline, then stamp), the path is to recreate
-the store: export what must survive (decisions and findings are the durable history —
-re-derive the rest from artifacts), create the new store at the current contract, and
-re-import. A version-0 store whose history must not be touched should wait for adoption.
+A database created before the upgrade channel is presumed current and starts on it at
+the head: the first `db upgrade --apply` stamps every shipped script as applied — nothing
+runs, nothing re-runs — and from then on the store is on the routine. A local store is
+brought on by its first open; a configured database refuses until its deployment brings it
+on. Nothing is verified about a database someone hand-changed — a later script refuses what
+does not fit, transactionally, and that refusal is the operator's to resolve with the
+contract's owners.
 
 ## Run the REST API locally
 

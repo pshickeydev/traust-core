@@ -346,3 +346,10 @@ def run_db_upgrades(dbapi: _DbapiConnection, dialect: Dialect) -> list[Upgrade]:
 def pending_db_upgrades(dbapi: _DbapiConnection, dialect: Dialect) -> list[Upgrade]:
     """Plan pending db-contract upgrades without touching the database."""
     return migrations.run_upgrades(dbapi, dialect, dry_run=True)
+
+
+def stamp_db_channel(dbapi: _DbapiConnection, dialect: Dialect) -> list[Upgrade]:
+    """Bring a store from before the channel onto it at the head: every shipped
+    script stamped as applied in one transaction, nothing run. The connection
+    must be in autocommit: the stamping manages its own transaction."""
+    return migrations.stamp_channel(dbapi, dialect)

@@ -139,7 +139,7 @@ def test_db_upgrade_plans_reports_and_exits_by_state(
     assert len(applied) == 1
 
 
-def test_db_upgrade_reports_a_version_0_store(
+def test_db_upgrade_brings_a_pre_channel_store_on(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     config = local(tmp_path)
@@ -149,8 +149,15 @@ def test_db_upgrade_reports_a_version_0_store(
     engine.dispose()
     with pytest.raises(SystemExit) as exit_code:
         server.main(["--config", str(config), "db", "upgrade"])
-    assert exit_code.value.code == 1
-    assert "version 0" in capsys.readouterr().out
+    assert exit_code.value.code == 1  # plan only: the store is not on the channel yet
+    assert "not on the channel yet" in capsys.readouterr().out
+
+    with pytest.raises(SystemExit) as exit_code:
+        server.main(["--config", str(config), "db", "upgrade", "--apply"])
+    assert exit_code.value.code == 0
+    out = capsys.readouterr().out
+    assert "on the channel" in out
+    assert "0001_repository_disposition" in out  # presumed done, nothing ran
 
 
 def test_db_upgrade_refuses_an_empty_configured_database(

@@ -106,9 +106,10 @@ def _db_upgrade(context: Context, args: argparse.Namespace) -> int:
 
     The command an operator (or deploy job) runs against a pinned store: names, hashes and
     declared destructive reasons first, application only when asked, destructive work only
-    when acknowledged. Exit 0: current, applied, or no local store yet. Exit 1: pending
-    without ``--apply``, an empty configured database (its deployment provisions it),
-    version 0, or a channel refusal.
+    when acknowledged. A store from before the channel starts at its beginning: the plan
+    lists every script, 0001 first. Exit 0: current, applied, or no local store yet. Exit 1:
+    pending without ``--apply``, an empty configured database (its deployment provisions
+    it), or a channel refusal.
     """
     try:
         status = context.store_status()
@@ -121,12 +122,17 @@ def _db_upgrade(context: Context, args: argparse.Namespace) -> int:
                 "command (core README, Two setups, one API)"
             )
             return 1
-        if status.state is StoreState.VERSION_0:
-            print(
-                "version 0: the store predates the upgrade channel - adopt (planned) or "
-                "recreate it (README, Store upgrades)"
-            )
-            return 1
+        if status.state is StoreState.PRE_CHANNEL:
+            if not args.apply:
+                print(
+                    "not on the channel yet: the store predates it and is presumed current - "
+                    "rerun with --apply to bring it on at the channel's head (nothing runs)"
+                )
+                return 1
+            stamped = context.apply_db_upgrades()
+            names = ", ".join(upgrade.name for upgrade in stamped) or "nothing"
+            print(f"on the channel: {len(stamped)} script(s) presumed done ({names})")
+            return 0
         if not status.pending:
             print("up to date")
             return 0
