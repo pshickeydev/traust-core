@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 import pytest
+import sqlalchemy as sa
 
 from perf.harness import Explained, Profile
 from perf.seed import RUN_ORDERS, TYPICAL_REPOSITORY
@@ -299,3 +300,27 @@ def test_deep_null_started_segment_seeks_its_partial_index(
     (page,) = explained(read)
     fast(page, "idx_ops_run_order_unstarted", 50)
     assert not any("Sort" in line for line in page.plan), page.plan
+
+
+def _snapshot_order(engine: sa.Engine, feed: str) -> UUID:
+    with SqlTraustUnitOfWork(engine) as uow:
+        snapshots = uow.feed_snapshots.table
+        return uow.connection.scalar(  # type: ignore[no-any-return]
+            sa.select(snapshots.c.run_order_id).where(snapshots.c.feed == feed).limit(1)
+        )
+
+
+def test_a_run_orders_snapshot_of_a_feed_is_found_by_the_feed_index(
+    engine: sa.Engine, explained: Profile
+) -> None:
+    """The document refresh's late-retry check (`ExposureService._snapshot_documents`)."""
+    order = _snapshot_order(engine, "nvd-documents")
+    (found,) = explained(lambda uow: uow.feed_snapshots.for_run_order("nvd-documents", order))
+    fast(found, "idx_ops_feed_snapshot_feed_retrieved", 5)
+
+
+def test_a_documents_feeds_latest_snapshot_is_found_by_the_feed_index(
+    explained: Profile,
+) -> None:
+    (latest,) = explained(lambda uow: uow.feed_snapshots.latest("nvd-documents"))
+    fast(latest, "idx_ops_feed_snapshot_feed_retrieved", 5)

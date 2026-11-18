@@ -658,3 +658,11 @@ def test_the_cross_repository_page_uses_the_repository_index_at_volume(
 def test_newest_person_statement_reads_the_nonmachine_partial_index(explained: Profile) -> None:
     (statement,) = explained(lambda unit: unit.decisions.newest_person_statement())
     fast(statement, "idx_decision_nonmachine_recorded", 50)
+
+
+def test_the_advisories_findings_name_are_read_from_the_advisory_index(
+    explained: Profile,
+) -> None:
+    """The daily document refresh's estate-wide read (`refresh_advisory_documents`)."""
+    (linked,) = explained(lambda uow: uow.findings.linked_advisory_ids())
+    fast(linked, "idx_finding_advisory", 100)
