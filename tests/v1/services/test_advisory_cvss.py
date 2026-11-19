@@ -3,6 +3,7 @@ ranked build of every authority's scores, and its read, parsed once per publicat
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from datetime import timedelta
 from decimal import Decimal
@@ -27,6 +28,7 @@ from tests.v1.services.test_advisory_names import (
 )
 from traust_core.v1.errors import ConfigError, RepositoryError, ServiceError, ValidationError
 from traust_core.v1.models.cvss import AdvisoryCvss, CvssSource
+from traust_core.v1.models.feed_documents import AdvisoryCvssNotBuilt
 from traust_core.v1.providers.base import ProviderRegistry
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.feeds import FeedProvider, FeedSource
@@ -168,16 +170,43 @@ def test_with_no_source_registered_nothing_is_built(engine: Engine) -> None:  # 
     assert world.builds() == []
 
 
-def test_a_document_for_another_record_scores_nothing(world: World) -> None:
-    asked = advisory(world.engine, "CVE-2026-0003")
-    finding(world.engine, asked.id)
-    # the source answers CVE-2026-0003 with Log4Shell's record: a valid document, not this one's
-    other = (FIXTURES / "nvd-CVE-2021-44228.json").read_bytes()
-    world.http.answers["https://nvd.test/cves?cveId=CVE-2026-0003"] = other
+@pytest.mark.parametrize(
+    ("source", "url", "answer"),
+    [
+        ("nvd", "https://nvd.test/cves?cveId=CVE-2026-0003", "nvd-CVE-2021-44228.json"),
+        # another CVE's record that states no score at all: still not this one's
+        ("cve-list", "https://cve.test/api/cve/CVE-2026-0003", "rejected"),
+    ],
+)
+def test_a_document_for_another_record_is_unreadable_even_with_no_scores(
+    engine: Engine,  # noqa: F811
+    source: str,
+    url: str,
+    answer: str,
+) -> None:
+    world = World(engine, sources=(source,))
+    finding(engine, advisory(engine, "CVE-2026-0003").id)
+    rejected = {"cveMetadata": {"cveId": LOG4SHELL, "state": "REJECTED"}}
+    world.http.answers[url] = (
+        json.dumps(rejected).encode() if answer == "rejected" else (FIXTURES / answer).read_bytes()
+    )
     world.service().refresh_advisory_documents()
     build = world.service().refresh_advisory_cvss()
     assert dict(build.scores) == {}
-    assert build.unreadable == ("nvd:CVE-2026-0003",)
+    assert build.unreadable == (f"{source}:CVE-2026-0003",)
+
+
+def test_a_build_whose_artifact_row_is_gone_reads_as_unreadable(world: World) -> None:
+    canonical = advisory(world.engine, LOG4SHELL)
+    finding(world.engine, canonical.id)
+    world.serve_log4shell()
+    world.service().refresh_advisory_documents()
+    with SqlTraustUnitOfWork(world.engine) as uow:
+        latest = uow.feed_snapshots.latest(ADVISORY_CVSS_FEED)
+    assert latest is not None and canonical.id is not None
+    svc = world.service()
+    lost = latest.model_copy(update={"artifact_id": uuid4()})
+    assert svc._parsed_build(lost) is None  # never raises: the read and freshness fold
 
 
 def test_a_source_with_names_that_kept_nothing_is_named_and_the_build_is_not_fresh(
@@ -227,7 +256,7 @@ def test_an_unreadable_build_reads_as_unreadable_and_is_not_fresh(
     assert status.fetched_at is None and status.last_error == "the latest build is unreadable"
 
 
-def test_a_store_failure_in_the_build_is_its_own_outcome_and_the_documents_still_report(
+def test_a_store_failure_in_the_build_raises_with_the_documents_outcomes(
     world: World, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     finding(world.engine, advisory(world.engine, LOG4SHELL_GHSA, LOG4SHELL).id)
@@ -238,12 +267,15 @@ def test_a_store_failure_in_the_build_is_its_own_outcome_and_the_documents_still
         raise RepositoryError("the store is unreachable", operation="put")
 
     monkeypatch.setattr(svc, "_record_advisory_cvss", failing)
-    outcomes = {o.source: o for o in svc.refresh_advisory_documents()}
-    assert outcomes["nvd"].ok and outcomes["ghsa"].ok  # the documents were kept
-    failed = outcomes[ADVISORY_CVSS_FEED]
-    assert not failed.ok and failed.requested == 1
-    assert failed.error == "RepositoryError: the store is unreachable; the documents were kept"
-    assert world.builds() == []
+    with pytest.raises(AdvisoryCvssNotBuilt) as raised:
+        svc.refresh_advisory_documents()
+    assert str(raised.value) == (
+        "advisory-cvss not built (RepositoryError: the store is unreachable); "
+        "the documents were kept"
+    )
+    outcomes = {o.source: o for o in raised.value.outcomes}
+    assert set(outcomes) == {"nvd", "ghsa"} and all(o.ok for o in outcomes.values())
+    assert isinstance(raised.value, ServiceError) and world.builds() == []
 
 
 def test_a_build_is_parsed_once_per_publication_across_services(

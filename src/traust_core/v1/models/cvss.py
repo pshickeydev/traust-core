@@ -498,3 +498,18 @@ def distinct(scores: Iterable[CvssScore | None]) -> tuple[CvssScore, ...]:
             key = (score.source, score.version, score.vector, score.document, score.scored_by)
             seen.setdefault((*key, score.score), score)
     return tuple(seen.values())
+
+
+def record_ids(kind: str, raw: bytes) -> tuple[str, ...]:
+    """The record ids a document names, `kind` being its scores' `document` prefix: each CVE an
+    NVD response holds, else the one record's; checked against the id asked for."""
+    if kind == "nvd":
+        record = _parsed(_NvdRecord, raw, "an NVD API 2.0 CVE record")
+        return tuple(v.cve.cve_id for v in record.vulnerabilities)
+    if kind == "cve-list":
+        return (_parsed(_CveListHeader, raw, "a CVE List record").metadata.cve_id,)
+    if kind == "osv":
+        return (_parsed(_OsvRecord, raw, "an OSV record").record_id,)
+    if kind == "rh-cve":
+        return (_parsed(_RhCveRecord, raw, "a Red Hat Security Data CVE record").cve_id,)
+    raise ValidationError(f"{kind}: not a document kind with record ids")

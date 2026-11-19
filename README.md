@@ -483,12 +483,12 @@ unchanged day is the same bytes, so one artifact. Views read this build, never t
   `refresh_advisory_cvss` raises `ConfigError`.
 - **An unreadable document scores nothing.** A kept document that doesn't parse, that the store
   lost, or that is another record's (a source can answer one id with another's record; every
-  score must name the record asked for) is named in `AdvisoryCvss.unreadable` and logged; the
-  rest still score. So is a source with names to score that has kept no documents yet
+  document must name the record asked for, scored or not) is named in `AdvisoryCvss.unreadable`
+  and logged; the rest still score. So is a source with names to score that has kept no documents yet
   (`<source>-documents`).
 - **A store failure keeps the documents' outcome.** When the build itself fails on the store,
-  the document refresh still returns each source's outcome, plus a failed `advisory-cvss` one;
-  the last build stays served.
+  the document refresh raises `AdvisoryCvssNotBuilt` (a `ServiceError`) carrying each source's
+  outcome (`outcomes`); the documents are kept and the last build stays served.
 - **Reads.** `exposure.advisory_cvss(advisory_ids)` returns `AdvisoryCvssRead`: each asked
   advisory's ranked scores, keyed as asked (an alias reads its canonical's), and `built_at`.
   An advisory no authority scored is absent; before the first build, `built_at` is None. It is

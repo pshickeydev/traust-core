@@ -44,6 +44,7 @@ from traust_core.v1.models.cvss import (
     cve_list_scores,
     nvd_scores,
     osv_scores,
+    record_ids,
     rh_cve_scores,
 )
 from traust_core.v1.models.dependencies import (
@@ -107,6 +108,7 @@ from traust_core.v1.models.dependencies import (
     version_key,
 )
 from traust_core.v1.models.feed_documents import (
+    AdvisoryCvssNotBuilt,
     AdvisoryDocumentsRefresh,
     DocumentFailure,
     DocumentRefresh,
@@ -1414,16 +1416,18 @@ class ExposureService:
             # nothing refreshed anywhere: an outage, never a result a caller could take as done
             reasons = "; ".join(f"{o.source}: {o.error}" for o in attempted)
             raise ServiceError(f"no advisory documents refreshed ({reasons})")
-        # some source is registered: rank what the documents now say
-        if outcomes and (failed := self._built_or_why(names, run_order_id)) is not None:
-            outcomes.append(failed)
+        if outcomes:  # some source is registered: rank what the documents now say
+            self._build_after(outcomes, names, run_order_id)
         return outcomes
 
-    def _built_or_why(
-        self, names: Collection[AdvisoryNames], run_order_id: UUID | None
-    ) -> AdvisoryDocumentsRefresh | None:
-        """Build the CVSS ranking; a store failure is its own failed outcome, so the finished
-        document refresh still reports (its documents kept, the last build still served)."""
+    def _build_after(
+        self,
+        outcomes: Sequence[AdvisoryDocumentsRefresh],
+        names: Collection[AdvisoryNames],
+        run_order_id: UUID | None,
+    ) -> None:
+        """Build the CVSS ranking; a store failure raises `AdvisoryCvssNotBuilt` carrying the
+        finished document refresh's outcomes (its documents kept, the last build served)."""
         try:
             self._record_advisory_cvss(names, run_order_id)
         except (RepositoryError, NotFoundError, IntegrityError) as e:
@@ -1432,12 +1436,11 @@ class ExposureService:
                 "%s not built; documents kept error_type=%s cause=%s operation=%s",
                 ADVISORY_CVSS_FEED, type(e).__name__, cause, getattr(e, "operation", None),
             )  # fmt: skip
-            error = f"{type(e).__name__}: {_redacted(str(e))}; the documents were kept"
-            advisories = len({n.advisory_id for n in names})
-            return AdvisoryDocumentsRefresh(
-                source=ADVISORY_CVSS_FEED, requested=advisories, error=error
-            )
-        return None
+            raise AdvisoryCvssNotBuilt(
+                f"{ADVISORY_CVSS_FEED} not built ({type(e).__name__}: {_redacted(str(e))}); "
+                "the documents were kept",
+                outcomes,
+            ) from e
 
     def refresh_advisory_cvss(self, run_order_id: UUID | None = None) -> AdvisoryCvss:
         """Rank every authority's scores for each linked advisory from the kept documents and
@@ -1466,9 +1469,10 @@ class ExposureService:
         return AdvisoryCvssRead(scores=scores, built_at=latest.retrieved_at)
 
     def _parsed_build(self, snapshot: FeedSnapshot) -> AdvisoryCvss | None:
-        artifact = self._log.get_artifact(snapshot.artifact_id)
-        assert artifact.id is not None
-        return self._advisory_cvss.parse(artifact.id, lambda: stored_bytes(self._objects, artifact))
+        def read() -> bytes:  # a lost artifact row reads as an unreadable build, like lost bytes
+            return stored_bytes(self._objects, self._log.get_artifact(snapshot.artifact_id))
+
+        return self._advisory_cvss.parse(snapshot.artifact_id, read)
 
     def _document_sources(self) -> list[str]:
         return [s for s in _ADVISORY_DOCUMENT_SOURCES if s in self._feed_sources.names()]
@@ -1530,11 +1534,10 @@ class ExposureService:
         """The scores a kept document states: its bytes checked against the manifest's digest,
         every score from the record asked for (a source can answer with another one)."""
         raw = self._objects.read(_document_object(source, entry.digest), entry.digest)
-        scores = _SCORES_OF[source](raw, acquired_at=entry.acquired_at)
-        expected = f"{_DOCUMENT_PREFIX[source]}:{identifier}".casefold()
-        if any(s.document.casefold() != expected for s in scores):
-            raise ValidationError(f"{source}: {identifier}: the document is another record's")
-        return scores
+        named = record_ids(_DOCUMENT_PREFIX[source], raw)
+        if any(i.casefold() != identifier.casefold() for i in named):
+            raise ValidationError(f"{source}: {identifier}: the document is {', '.join(named)}'s")
+        return _SCORES_OF[source](raw, acquired_at=entry.acquired_at)
 
     def advisories_for(self, finding_id: UUID) -> list[Advisory]:
         """The advisory a finding is about, canonical first, then every alias (CVE, GHSA, OSV
