@@ -406,3 +406,17 @@ def test_a_failure_never_repeats_a_urls_credentials(
     with pytest.raises(ServiceError) as raised:
         world.svc.refresh_documents("cve-list", [A, B])
     assert "s3cret" not in str(raised.value)
+
+
+def test_a_sources_kept_documents_are_in_feed_freshness_once_kept(world: World) -> None:
+    assert [s.name for s in world.svc.feed_statuses()] == []  # never refreshed: not watched yet
+    world.http.serve(A, doc(A))
+    world.svc.refresh_documents("cve-list", [A])
+    [status] = world.svc.feed_statuses()
+    assert (status.name, status.fetched_at, status.max_age) == (
+        "cve-list-documents",
+        AT,
+        timedelta(hours=24),
+    )
+    assert not status.stale(AT + timedelta(hours=24))
+    assert status.stale(AT + timedelta(hours=25))  # a refresh that stopped working goes stale

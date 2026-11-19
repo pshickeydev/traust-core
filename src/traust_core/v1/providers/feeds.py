@@ -361,11 +361,13 @@ class FeedSource:
         clock: Clock,
         api_key: ApiKey | None = None,
         max_bytes: int = DOCUMENT_BYTES,
+        max_age: timedelta = timedelta(hours=24),
     ) -> None:
         if max_bytes < 1:
             raise ConfigError(f"{name}: a document size cap is at least one byte")
         self.name = name
         self._max_bytes = max_bytes
+        self.max_age = max_age  # how old its kept documents may be (`max_age_hours`)
         self.url = url
         self.template = template
         self._ident = _IDENTS.get(ident or "")

@@ -349,6 +349,7 @@ def load_feed_sources(
                 probe=probe,
                 api_key=_api_key(name, source, keys.get(name), (api_key_variables or {}).get(name)),
                 max_bytes=source.max_document_bytes or DOCUMENT_BYTES,
+                max_age=timedelta(hours=source.max_age_hours),
                 http=http,
                 probe_http=probe_http,
                 clock=clock,
