@@ -1,14 +1,16 @@
-"""`traust-server`: serve the REST API, or mint a local token for it. Imports nothing from FastAPI
-until it serves."""
+"""`traust-server`: serve the REST API, mint a local token for it, or run the
+store's db-contract upgrades. Imports nothing from FastAPI until it serves."""
 
 from __future__ import annotations
 
 import argparse
 import logging
+import sys
 from pathlib import Path
 
-from traust_core.v1.context import Config, Context
+from traust_core.v1.context import Config, Context, StoreState
 from traust_core.v1.context.serve import hand_config, handed_config
+from traust_core.v1.errors import ConfigError
 
 _REST_EXTRA = {"fastapi", "starlette", "uvicorn"}
 _UNTRUSTED = "this config does not trust its local issuer: set identity.trust_local: true"
@@ -25,6 +27,8 @@ def main(argv: list[str] | None = None) -> None:
     if args.command == "token":
         print(_token(config, args.identity, machine=args.machine))
         return
+    if args.command == "db":
+        raise SystemExit(_db_upgrade(Context(config), args))
     try:
         import uvicorn
     except ModuleNotFoundError as e:
@@ -97,6 +101,65 @@ def _token(config: Config, identity: str, *, machine: bool) -> str:
     return Context(config).local_issuer.mint(identity, machine=machine).token.get_secret_value()
 
 
+def _db_upgrade(context: Context, args: argparse.Namespace) -> int:
+    """Plan the store's db-contract upgrades; ``--apply`` runs them, the operator's call.
+
+    The command an operator (or deploy job) runs against a pinned store: names, hashes and
+    declared destructive reasons first, application only when asked, destructive work only
+    when acknowledged. A store from before the channel starts at its beginning: the plan
+    lists every script, 0001 first. Exit 0: current, applied, or no local store yet. Exit 1:
+    pending without ``--apply``, an empty configured database (its deployment provisions
+    it), or a channel refusal.
+    """
+    try:
+        if args.allow_destructive and not args.apply:
+            print(
+                "--allow-destructive acknowledges an apply: add --apply, or drop the flag",
+                file=sys.stderr,
+            )
+            return 2
+        status = context.store_status()
+        if status.state is StoreState.EMPTY:
+            if context.config.database.url is None:
+                print("no store yet: it is created on first open (local) or by its deployment")
+                return 0
+            print(
+                "the configured database is empty: its deployment provisions it, never this "
+                "command (core README, Two setups, one API)"
+            )
+            return 1
+        if status.state is StoreState.PRE_CHANNEL:
+            if not args.apply:
+                print("not on the channel yet: the store predates it and is presumed current.")
+                print("bringing it on stamps every shipped script as done - nothing runs:")
+                for upgrade in context.shipped_db_upgrades():
+                    mark = f"  [destructive: {upgrade.destructive}]" if upgrade.destructive else ""
+                    print(f"  {upgrade.name}  sha256:{upgrade.sha256[:12]}{mark}")
+                print("rerun with --apply to bring it on at the channel's head")
+                return 1
+            stamped = context.apply_db_upgrades()
+            names = ", ".join(upgrade.name for upgrade in stamped) or "nothing"
+            print(f"on the channel: {len(stamped)} script(s) presumed done ({names})")
+            return 0
+        if not status.pending:
+            print("up to date")
+            return 0
+        print(f"{len(status.pending)} upgrade(s) pending:")
+        for upgrade in status.pending:
+            mark = f"  [destructive: {upgrade.destructive}]" if upgrade.destructive else ""
+            print(f"  {upgrade.name}  sha256:{upgrade.sha256[:12]}{mark}")
+        if not args.apply:
+            print("pending upgrades - rerun with --apply to run them")
+            return 1
+        applied = context.apply_db_upgrades(allow_destructive=args.allow_destructive)
+    except ConfigError as error:
+        print(str(error), file=sys.stderr)
+        return 1
+    names = ", ".join(upgrade.name for upgrade in applied) or "nothing"
+    print(f"applied {len(applied)} upgrade(s): {names}")
+    return 0
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="traust-server", description=__doc__)
     parser.add_argument("--config", type=Path, help="traust-core config YAML (default: ~/.traust)")
@@ -113,4 +176,17 @@ def _parser() -> argparse.ArgumentParser:
     token = commands.add_parser("token", help="print a token from this server's local issuer")
     token.add_argument("identity", help="a person's email, or a runner's name with --machine")
     token.add_argument("--machine", action="store_true", help="a machine (runner) identity")
+    db = commands.add_parser("db", help="the store's db-contract channel")
+    db_commands = db.add_subparsers(dest="db_command", required=True)
+    upgrade = db_commands.add_parser(
+        "upgrade", help="plan pending db-contract upgrades; --apply runs them"
+    )
+    upgrade.add_argument(
+        "--apply", action="store_true", help="apply what the plan shows (default: plan only)"
+    )
+    upgrade.add_argument(
+        "--allow-destructive",
+        action="store_true",
+        help="with --apply: acknowledge scripts that declare a destructive reason",
+    )
     return parser

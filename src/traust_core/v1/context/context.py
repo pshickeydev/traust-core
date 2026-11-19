@@ -282,7 +282,8 @@ class StoreState(StrEnum):
     """A store's standing against the db contract, read without the open gate."""
 
     EMPTY = "empty"  # no store yet: an open (local) or a deployment bootstraps it
-    VERSION_0 = "version_0"  # predates the channel: shape unknown, adopt or recreate
+    PRE_CHANNEL = "pre_channel"  # from before the channel: presumed current, the first
+    # apply stamps it on at the head - nothing runs, nothing re-runs
     BEHIND = "behind"  # stamped, with pending upgrades
     CURRENT = "current"  # stamped, up to date
 
@@ -806,18 +807,25 @@ class Context:
                 extra={"operation": "store.bootstrap", "outcome": "fresh"},
             )
         elif populated:
+            # A store from before the channel is presumed current and starts on it
+            # at the head: the stamping is the channel's first act, and the first
+            # script to run after it is the next one shipped. A local store is
+            # brought on by the open (opening the new version is the consent); a
+            # configured database's is its deployment's, never an open's.
             if _channel_stamped(engine):
                 _run_channel(engine, local=local)
+            elif local:
+                _bring_store_on_channel(engine)
             else:
-                log.error(
-                    "store refused: the database predates the db_upgrade stamp table "
-                    "(version 0) - its shape is unknown, recreate the store",
-                    extra={"operation": "store.bootstrap", "outcome": "refused_version_0"},
+                log.warning(
+                    "configured database refused: not on the upgrade channel - its "
+                    "deployment brings it on, not this open",
+                    extra={"operation": "store.bootstrap", "outcome": "refused_off_channel"},
                 )
                 raise ConfigError(
-                    "the database predates the upgrade channel: its schema has no db_upgrade "
-                    "stamp table, so its shape is unknown — recreate the store from the current "
-                    "contract (traust-contracts db/v1/traust/README.md, Upgrades)"
+                    "the database predates the upgrade channel: bring it on with "
+                    "`traust-server db upgrade --apply` (it is presumed current and starts "
+                    "at the channel's head), or Context.apply_db_upgrades()"
                 )
         # else: a configured empty database is its deployment's, never bootstrapped
         return engine
@@ -825,8 +833,12 @@ class Context:
     def pending_db_upgrades(self) -> list[contracts.Upgrade]:
         """The db-contract upgrades this store has not run, planned not applied:
         names, hashes and declared destructive reasons. Touches no schema -
-        not even the stamp table - so an operator looks before committing."""
+        not even the stamp table - so an operator looks before committing.
+        A store from before the channel has nothing pending yet: bringing it
+        on (the first ``apply``) stamps it at the channel's head."""
         engine = self._planable_store_engine()
+        if not _channel_stamped(engine):
+            return []  # off the channel: the first apply brings it on at the head
         try:
             return on_driver_connection(
                 engine, lambda dbapi: contracts.pending_db_upgrades(dbapi, Dialect.of(engine))
@@ -838,14 +850,18 @@ class Context:
 
     def apply_db_upgrades(self, *, allow_destructive: bool = False) -> list[contracts.Upgrade]:
         """Apply the db-contract upgrade channel deliberately - the operator's
-        call, never an open's. A script that declares a destructive reason runs
-        only when the caller acknowledges it: the plan is read first, and a
-        destructive pending script without ``allow_destructive`` is a refusal
-        naming what would run and why. Each script runs whole with its stamp in
-        one transaction; the channel is idempotent and refuses drift either
-        way."""
+        call, never an open's. A store from before the channel is brought on
+        first: every shipped script stamped as applied, nothing run, presumed
+        current. A script that declares a destructive reason runs only when the
+        caller acknowledges it: the plan is read first, and a destructive
+        pending script without ``allow_destructive`` is a refusal naming what
+        would run and why. Each script runs whole with its stamp in one
+        transaction; the channel is idempotent and refuses drift either way."""
         engine = self._planable_store_engine()
         try:
+            stamped: list[contracts.Upgrade] = []
+            if not _channel_stamped(engine):
+                stamped = _bring_store_on_channel(engine)  # the channel's first act
             pending = on_driver_connection(
                 engine, lambda dbapi: contracts.pending_db_upgrades(dbapi, Dialect.of(engine))
             )
@@ -857,13 +873,19 @@ class Context:
                     "with apply_db_upgrades(allow_destructive=True) (the CLI's "
                     "--allow-destructive flag)"
                 )
-            return on_driver_connection(
+            ran = on_driver_connection(
                 engine, lambda dbapi: contracts.run_db_upgrades(dbapi, Dialect.of(engine))
             )
         except MigrationError as error:
             raise ConfigError(
                 f"the db contract's upgrade channel refused this store: {error}"
             ) from error
+        return stamped or ran
+
+    def shipped_db_upgrades(self) -> list[contracts.Upgrade]:
+        """Every script the channel ships: what bringing a pre-channel store on
+        presumes done. Read-only - the manifest, never the database."""
+        return contracts.shipped_db_upgrades(Dialect.of(self._store_engine))
 
     def store_status(self) -> StoreStatus:
         """The store's standing against the db contract, read without opening
@@ -874,7 +896,7 @@ class Context:
         if not _store_populated(engine):
             return StoreStatus(StoreState.EMPTY)
         if not _channel_stamped(engine):
-            return StoreStatus(StoreState.VERSION_0)
+            return StoreStatus(StoreState.PRE_CHANNEL)  # the first apply brings it on
         try:
             pending = on_driver_connection(
                 engine, lambda dbapi: contracts.pending_db_upgrades(dbapi, Dialect.of(engine))
@@ -888,20 +910,14 @@ class Context:
         return StoreStatus(StoreState.CURRENT)
 
     def _planable_store_engine(self) -> Engine:
-        """The store engine for the operator's channel calls: a known shape, or
-        a refusal that says which. Version 0 and empty stores are bootstrapped
-        or recreated, never upgraded through the surface."""
+        """The store engine for the operator's channel calls. An empty store
+        refuses (bootstrap is an open's, or its deployment's); anything else
+        plans - a store from before the channel starts on it at the head."""
         engine = self._store_engine
         if not _store_populated(engine):
             raise ConfigError(
                 "the store is empty: it is bootstrapped by an open (a local store) or by its "
                 "deployment - there is nothing to plan or apply"
-            )
-        if not _channel_stamped(engine):
-            raise ConfigError(
-                "the database predates the upgrade channel: its schema has no db_upgrade "
-                "stamp table, so its shape is unknown — recreate the store from the current "
-                "contract (traust-contracts db/v1/traust/README.md, Upgrades)"
             )
         return engine
 
@@ -1393,9 +1409,25 @@ def _store_populated(engine: Engine) -> bool:
 
 
 def _channel_stamped(engine: Engine) -> bool:
-    """The db_upgrade stamp table is the channel's mark on a database it manages."""
+    """The db_upgrade stamp table: the channel's bookkeeping, created by its runner."""
     schema = "traust" if Dialect.of(engine) == Dialect.POSTGRES else None
     return sa.inspect(engine).has_table("db_upgrade", schema=schema)
+
+
+def _bring_store_on_channel(engine: Engine) -> list[contracts.Upgrade]:
+    """A store from before the channel, presumed current, starts on it at the
+    head: every shipped script stamped as applied, nothing run."""
+    dialect = Dialect.of(engine)
+    stamped = on_driver_connection(engine, lambda dbapi: contracts.stamp_db_channel(dbapi, dialect))
+    if stamped:
+        log.info(
+            "store on the channel dialect=%s scripts=%d names=%s - presumed current, at the head",
+            dialect,
+            len(stamped),
+            [upgrade.name for upgrade in stamped],
+            extra={"operation": "store.channel", "outcome": "on", "count": len(stamped)},
+        )
+    return stamped
 
 
 def _run_channel(engine: Engine, *, local: bool) -> None:
@@ -1432,7 +1464,7 @@ def _run_channel(engine: Engine, *, local: bool) -> None:
             f"the database is behind the db contract ({len(pending)} upgrade(s) pending: "
             f"{_upgrade_plan(pending)}): a configured database's upgrades are its "
             "deployment's - plan them with Context.pending_db_upgrades(), apply with "
-            "Context.apply_db_upgrades() (the `traust db upgrades` CLI wraps both) "
+            "Context.apply_db_upgrades() (the `traust-server db upgrade` command wraps both) "
             "with its owners"
         )
 

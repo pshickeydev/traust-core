@@ -61,6 +61,15 @@ Python 3.11+ library. The platform API lives in `traust_core.v1`. Overview: [REA
 
 ## Contracts
 
+- **Store upgrades are core's, on the operator's call.** A store behind the db contract refuses
+  to open (a local dev store applies at open — opening the new version is the consent). The
+  operator path is `traust-server --config traust.yaml db upgrade` (plan; `--apply` to run,
+  `--allow-destructive` to acknowledge declared destructive work); embedders use
+  `Context.pending_db_upgrades()` / `apply_db_upgrades()` / `store_status()`. A database from
+  before the channel is presumed current: it starts on the channel at the head — the first
+  apply (or a local open) stamps every shipped script as applied, nothing re-runs. Never
+  hand-apply DDL or edit an applied script; a shape change lands as a channel script in
+  traust-contracts.
 - traust-contracts is a pinned dependency; read its data through `traust_core.v1.contracts` only, never import `traust_contracts`
 - Nothing from traust-contracts is copied or generated into this repo
 - Artifacts are named types in `models/artifacts.py` (`TriageArtifact`, ...); their fields come from the installed schema, never a hand-written copy
