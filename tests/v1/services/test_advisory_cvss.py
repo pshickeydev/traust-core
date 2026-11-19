@@ -25,7 +25,7 @@ from tests.v1.services.test_advisory_names import (
     engine,  # noqa: F401 - the SQLite and Postgres fixture
     finding,
 )
-from traust_core.v1.errors import ValidationError
+from traust_core.v1.errors import ConfigError, RepositoryError, ServiceError, ValidationError
 from traust_core.v1.models.cvss import AdvisoryCvss, CvssSource
 from traust_core.v1.providers.base import ProviderRegistry
 from traust_core.v1.providers.clock import FixedClock
@@ -48,6 +48,7 @@ class World:
         self.objects = InMemoryObjectStore()
         self.cache = AdvisoryCvssCache()
         self.sources = sources
+        self.at = AT
 
     def service(self) -> ExposureService:
         registry: ProviderRegistry[FeedSource] = ProviderRegistry("feed-source")
@@ -56,7 +57,7 @@ class World:
             source = FeedSource(
                 name, template, template=template, ident=ident, post=False, probe=None,
                 http=self.http, probe_http=self.http,  # type: ignore[arg-type]
-                clock=FixedClock(AT),
+                clock=FixedClock(self.at),
             )  # fmt: skip
             registry.register(name, lambda source=source: source)
         uow = SqlTraustUnitOfWork(self.engine)
@@ -66,7 +67,7 @@ class World:
             feeds=ProviderRegistry[FeedProvider]("feed"),
             feed_sources=registry,
             objects=self.objects,
-            clock=FixedClock(AT),
+            clock=FixedClock(self.at),
             advisory_cvss=self.cache,
         )
 
@@ -158,10 +159,90 @@ def test_an_unchanged_day_is_one_artifact_and_a_retry_in_its_order_adds_no_build
     assert len(builds) == 2 and len(set(builds)) == 1
 
 
-def test_with_no_source_registered_the_refresh_builds_nothing(engine: Engine) -> None:  # noqa: F811
+def test_with_no_source_registered_nothing_is_built(engine: Engine) -> None:  # noqa: F811
     world = World(engine, sources=())
     finding(engine, advisory(engine, LOG4SHELL).id)
     assert world.service().refresh_advisory_documents() == []
+    with pytest.raises(ConfigError, match="no advisory document source is registered"):
+        world.service().refresh_advisory_cvss()
+    assert world.builds() == []
+
+
+def test_a_document_for_another_record_scores_nothing(world: World) -> None:
+    asked = advisory(world.engine, "CVE-2026-0003")
+    finding(world.engine, asked.id)
+    # the source answers CVE-2026-0003 with Log4Shell's record: a valid document, not this one's
+    other = (FIXTURES / "nvd-CVE-2021-44228.json").read_bytes()
+    world.http.answers["https://nvd.test/cves?cveId=CVE-2026-0003"] = other
+    world.service().refresh_advisory_documents()
+    build = world.service().refresh_advisory_cvss()
+    assert dict(build.scores) == {}
+    assert build.unreadable == ("nvd:CVE-2026-0003",)
+
+
+def test_a_source_with_names_that_kept_nothing_is_named_and_the_build_is_not_fresh(
+    world: World,
+) -> None:
+    finding(world.engine, advisory(world.engine, LOG4SHELL_GHSA, LOG4SHELL).id)
+    world.serve_log4shell()
+    world.http.answers[OSV] = ServiceError("HTTP 503", status=503)  # its first refresh fails
+    outcomes = {o.source: o for o in world.service().refresh_advisory_documents()}
+    assert outcomes["nvd"].ok and not outcomes["ghsa"].ok
+    build = world.service().refresh_advisory_cvss()
+    assert build.unreadable == ("ghsa-documents",)
+    [status] = [s for s in world.service().feed_statuses() if s.name == ADVISORY_CVSS_FEED]
+    assert status.fetched_at is None and status.stale(AT)
+    assert status.last_error == "no readable documents from ghsa-documents"
+
+
+def test_the_build_is_as_old_as_its_oldest_sources_documents(world: World) -> None:
+    finding(world.engine, advisory(world.engine, LOG4SHELL_GHSA, LOG4SHELL).id)
+    world.serve_log4shell()
+    world.service().refresh_advisory_documents()
+    world.at = AT + timedelta(days=2)
+    world.http.answers[NVD] = ServiceError("HTTP 503", status=503)  # NVD keeps its day-0 manifest
+    world.service().refresh_advisory_documents()
+    statuses = {s.name: s for s in world.service().feed_statuses()}
+    status = statuses[ADVISORY_CVSS_FEED]
+    assert status.fetched_at == AT and status.stale(world.at)  # not the day-2 build time
+    assert statuses["ghsa-documents"].fetched_at == world.at
+
+
+def test_an_unreadable_build_reads_as_unreadable_and_is_not_fresh(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    canonical = advisory(world.engine, LOG4SHELL)
+    finding(world.engine, canonical.id)
+    world.serve_log4shell()
+    world.service().refresh_advisory_documents()
+
+    def corrupt(raw: bytes) -> AdvisoryCvss:
+        raise ValidationError("not an advisory CVSS build (1 problem(s))")
+
+    monkeypatch.setattr(AdvisoryCvss, "from_bytes", staticmethod(corrupt))
+    assert canonical.id is not None
+    read = world.service().advisory_cvss([canonical.id])
+    assert (dict(read.scores), read.built_at, read.unreadable) == ({}, AT, True)
+    [status] = [s for s in world.service().feed_statuses() if s.name == ADVISORY_CVSS_FEED]
+    assert status.fetched_at is None and status.last_error == "the latest build is unreadable"
+
+
+def test_a_store_failure_in_the_build_is_its_own_outcome_and_the_documents_still_report(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    finding(world.engine, advisory(world.engine, LOG4SHELL_GHSA, LOG4SHELL).id)
+    world.serve_log4shell()
+    svc = world.service()
+
+    def failing(*args: object) -> AdvisoryCvss:
+        raise RepositoryError("the store is unreachable", operation="put")
+
+    monkeypatch.setattr(svc, "_record_advisory_cvss", failing)
+    outcomes = {o.source: o for o in svc.refresh_advisory_documents()}
+    assert outcomes["nvd"].ok and outcomes["ghsa"].ok  # the documents were kept
+    failed = outcomes[ADVISORY_CVSS_FEED]
+    assert not failed.ok and failed.requested == 1
+    assert failed.error == "RepositoryError: the store is unreachable; the documents were kept"
     assert world.builds() == []
 
 

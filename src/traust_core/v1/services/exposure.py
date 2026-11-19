@@ -185,6 +185,8 @@ _SCORES_OF: dict[str, Callable[..., tuple[CvssScore, ...]]] = {
     "rh-cve": rh_cve_scores,
     "ghsa": osv_scores,
 }
+# the record name each source's parser gives its scores' `document` (`osv:` for GHSA records)
+_DOCUMENT_PREFIX = {"cve-list": "cve-list", "nvd": "nvd", "rh-cve": "rh-cve", "ghsa": "osv"}
 # the daily ranked build of every authority's scores the views read (`refresh_advisory_cvss`)
 ADVISORY_CVSS_FEED = "advisory-cvss"
 _REFRESH_DOCUMENTS = "refresh the advisory documents (refresh_advisory_documents)"
@@ -1368,7 +1370,7 @@ class ExposureService:
         """Keep the documents for every advisory a finding names, from each registered source:
         CVE ids to the CVE List, NVD and Red Hat, GHSA ids to `ghsa`. A failed source keeps its
         last manifest and says why (`ok` false); when every source asked fails, it raises."""
-        names = self._names_of(self._findings.linked_advisory_ids()).values()
+        names = list(self._names_of(self._findings.linked_advisory_ids()).values())
         cves = sorted({c for n in names for c in n.cves})
         ghsas = sorted({g for n in names for g in n.ghsas})
         outcomes = []
@@ -1412,13 +1414,36 @@ class ExposureService:
             # nothing refreshed anywhere: an outage, never a result a caller could take as done
             reasons = "; ".join(f"{o.source}: {o.error}" for o in attempted)
             raise ServiceError(f"no advisory documents refreshed ({reasons})")
-        if outcomes:  # some source is registered: rank what the documents now say
-            self._record_advisory_cvss(names, run_order_id)
+        # some source is registered: rank what the documents now say
+        if outcomes and (failed := self._built_or_why(names, run_order_id)) is not None:
+            outcomes.append(failed)
         return outcomes
+
+    def _built_or_why(
+        self, names: Collection[AdvisoryNames], run_order_id: UUID | None
+    ) -> AdvisoryDocumentsRefresh | None:
+        """Build the CVSS ranking; a store failure is its own failed outcome, so the finished
+        document refresh still reports (its documents kept, the last build still served)."""
+        try:
+            self._record_advisory_cvss(names, run_order_id)
+        except (RepositoryError, NotFoundError, IntegrityError) as e:
+            cause = type(e.__cause__).__name__ if e.__cause__ is not None else None
+            log.error(
+                "%s not built; documents kept error_type=%s cause=%s operation=%s",
+                ADVISORY_CVSS_FEED, type(e).__name__, cause, getattr(e, "operation", None),
+            )  # fmt: skip
+            error = f"{type(e).__name__}: {_redacted(str(e))}; the documents were kept"
+            advisories = len({n.advisory_id for n in names})
+            return AdvisoryDocumentsRefresh(
+                source=ADVISORY_CVSS_FEED, requested=advisories, error=error
+            )
+        return None
 
     def refresh_advisory_cvss(self, run_order_id: UUID | None = None) -> AdvisoryCvss:
         """Rank every authority's scores for each linked advisory from the kept documents and
         store the build (`advisory-cvss`): the views read it, never the documents."""
+        if not self._document_sources():
+            raise ConfigError(f"{ADVISORY_CVSS_FEED}: no advisory document source is registered")
         names = self._names_of(self._findings.linked_advisory_ids()).values()
         return self._record_advisory_cvss(names, run_order_id)
 
@@ -1427,15 +1452,12 @@ class ExposureService:
         latest build, keyed as asked; an advisory no authority scored is absent."""
         with self._uow as uow:
             latest = uow.feed_snapshots.latest(ADVISORY_CVSS_FEED)
-            artifact = None if latest is None else self._log.get_artifact(latest.artifact_id)
-            asked = uow.advisories.list_by_ids(advisory_ids) if artifact is not None else []
-        if latest is None or artifact is None or artifact.id is None:
+            asked = uow.advisories.list_by_ids(advisory_ids) if latest is not None else []
+        if latest is None:
             return AdvisoryCvssRead(scores={}, built_at=None)
-        build = self._advisory_cvss.parse(
-            artifact.id, lambda: stored_bytes(self._objects, artifact)
-        )
+        build = self._parsed_build(latest)
         if build is None:
-            return AdvisoryCvssRead(scores={}, built_at=None)
+            return AdvisoryCvssRead(scores={}, built_at=latest.retrieved_at, unreadable=True)
         scores = {
             a.id: found
             for a in asked
@@ -1443,13 +1465,23 @@ class ExposureService:
         }
         return AdvisoryCvssRead(scores=scores, built_at=latest.retrieved_at)
 
+    def _parsed_build(self, snapshot: FeedSnapshot) -> AdvisoryCvss | None:
+        artifact = self._log.get_artifact(snapshot.artifact_id)
+        assert artifact.id is not None
+        return self._advisory_cvss.parse(artifact.id, lambda: stored_bytes(self._objects, artifact))
+
+    def _document_sources(self) -> list[str]:
+        return [s for s in _ADVISORY_DOCUMENT_SOURCES if s in self._feed_sources.names()]
+
     def _record_advisory_cvss(
         self, names: Iterable[AdvisoryNames], run_order_id: UUID | None
     ) -> AdvisoryCvss:
-        sources = [s for s in _ADVISORY_DOCUMENT_SOURCES if s in self._feed_sources.names()]
+        """A store failure (`RepositoryError`) stops the build, so the last one stays served
+        rather than a partial one; an unreadable document or manifest only scores nothing."""
+        advisories = list({n.advisory_id: n for n in names}.values())
         manifests: dict[str, FeedDocumentManifest] = {}
         unreadable: list[str] = []
-        for source in sources:
+        for source in self._document_sources():
             try:
                 manifest = self.document_manifest(source)
             except (ValidationError, NotFoundError, IntegrityError) as e:
@@ -1458,6 +1490,10 @@ class ExposureService:
                 continue
             if manifest is not None:
                 manifests[source] = manifest
+            elif any(_names_for(source, a) for a in advisories):
+                # it has names to score but has kept nothing yet: a gap, never a silent absence
+                log.warning("%s: none kept yet; it scores nothing", _documents_feed(source))
+                unreadable.append(_documents_feed(source))
         parsed: dict[tuple[str, str], tuple[CvssScore, ...]] = {}
 
         def stated(source: str, identifier: str) -> tuple[CvssScore, ...]:
@@ -1465,7 +1501,7 @@ class ExposureService:
             entry = manifests[source].documents.get(identifier)
             if key not in parsed and entry is not None:
                 try:
-                    parsed[key] = self._document_scores(source, entry)
+                    parsed[key] = self._document_scores(source, identifier, entry)
                 except (ValidationError, NotFoundError, IntegrityError) as e:
                     log.warning("%s:%s unreadable; it scores nothing: %s", source, identifier, e)
                     unreadable.append(f"{source}:{identifier}")
@@ -1473,13 +1509,11 @@ class ExposureService:
             return parsed.get(key, ())
 
         by_advisory: dict[UUID, tuple[CvssScore, ...]] = {}
-        for advisory in {n.advisory_id: n for n in names}.values():
+        for advisory in advisories:
             found = [
                 score
                 for source in manifests
-                for identifier in (
-                    advisory.cves if _ADVISORY_DOCUMENT_SOURCES[source] == "cve" else advisory.ghsas
-                )
+                for identifier in _names_for(source, advisory)
                 for score in stated(source, identifier)
             ]
             if found:
@@ -1490,11 +1524,17 @@ class ExposureService:
         self._snapshot(ADVISORY_CVSS_FEED, key, raw, run_order_id)
         return build
 
-    def _document_scores(self, source: str, entry: FeedDocument) -> tuple[CvssScore, ...]:
-        """The scores a kept document states, its bytes checked against the manifest's digest."""
-        ref = self._objects.stat(_document_object(source, entry.digest))
-        raw = self._objects.get(replace(ref, sha256=entry.digest))
-        return _SCORES_OF[source](raw, acquired_at=entry.acquired_at)
+    def _document_scores(
+        self, source: str, identifier: str, entry: FeedDocument
+    ) -> tuple[CvssScore, ...]:
+        """The scores a kept document states: its bytes checked against the manifest's digest,
+        every score from the record asked for (a source can answer with another one)."""
+        raw = self._objects.read(_document_object(source, entry.digest), entry.digest)
+        scores = _SCORES_OF[source](raw, acquired_at=entry.acquired_at)
+        expected = f"{_DOCUMENT_PREFIX[source]}:{identifier}".casefold()
+        if any(s.document.casefold() != expected for s in scores):
+            raise ValidationError(f"{source}: {identifier}: the document is another record's")
+        return scores
 
     def advisories_for(self, finding_id: UUID) -> list[Advisory]:
         """The advisory a finding is about, canonical first, then every alias (CVE, GHSA, OSV
@@ -1914,16 +1954,35 @@ class ExposureService:
             for source, snapshot in latest.items()
             if snapshot is not None
         ]
-        if built is not None:  # the ranked build is as fresh as the documents must be
-            statuses.append(
-                FeedStatus(
-                    name=ADVISORY_CVSS_FEED,
-                    fetched_at=built.retrieved_at,
-                    max_age=min(ages.values()),
-                    refresh=_REFRESH_DOCUMENTS,
-                )
-            )
+        if built is not None:
+            statuses.append(self._build_status(built, latest, min(ages.values())))
         return statuses
+
+    def _build_status(
+        self,
+        built: FeedSnapshot,
+        documents: Mapping[str, FeedSnapshot | None],
+        max_age: timedelta,
+    ) -> FeedStatus:
+        """The build is as old as its oldest source's documents; an unreadable build, or one a
+        source with names to score gave nothing, has no fresh time at all."""
+        build = self._parsed_build(built)
+        missing = [] if build is None else [u for u in build.unreadable if u.endswith("-documents")]
+        error = (
+            "the latest build is unreadable"
+            if build is None
+            else f"no readable documents from {', '.join(missing)}"
+            if missing
+            else None
+        )
+        times = [built.retrieved_at, *(s.retrieved_at for s in documents.values() if s is not None)]
+        return FeedStatus(
+            name=ADVISORY_CVSS_FEED,
+            fetched_at=None if error else min(times),
+            max_age=max_age,
+            last_error=error,
+            refresh=_REFRESH_DOCUMENTS,
+        )
 
     def feed_payload(self, feed: FeedName) -> bytes | None:
         """The latest snapshot's bytes; None when the feed was never fetched."""
@@ -2426,11 +2485,12 @@ def _with_judged(found: SymbolResolution | None, judged: Sequence[str]) -> Symbo
 
 
 class AdvisoryCvssRead(Model):
-    """Authority scores by asked advisory id, and when the build they come from was made;
-    `built_at` None: no readable build yet, so no authority scored anything."""
+    """Authority scores by asked advisory id and when their build was made (None: none yet);
+    `unreadable`: the latest build can't be read, so nothing is scored until the next one."""
 
     scores: Mapping[UUID, tuple[CvssScore, ...]]
     built_at: datetime | None
+    unreadable: bool = False
 
 
 class AdvisoryCvssCache:
@@ -2456,6 +2516,11 @@ class AdvisoryCvssCache:
                 parsed = None
             self._by_artifact = (artifact_id, parsed)
             return parsed
+
+
+def _names_for(source: str, advisory: AdvisoryNames) -> tuple[str, ...]:
+    """The advisory's names a document source is asked for: its CVEs, or its GHSAs."""
+    return advisory.cves if _ADVISORY_DOCUMENT_SOURCES[source] == "cve" else advisory.ghsas
 
 
 def _documents_feed(source: str) -> str:

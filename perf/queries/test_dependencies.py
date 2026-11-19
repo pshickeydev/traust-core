@@ -355,7 +355,7 @@ def test_a_pages_advisory_cvss_read_is_three_keyed_reads(
     ]
     statements = explained(lambda uow: _exposure(uow).advisory_cvss(ids))
     assert len(statements) == 3, [s.sql[:120] for s in statements]
-    latest, _artifact, advisories = statements
+    latest, advisories, _artifact = statements
     assert latest.uses_index("idx_ops_feed_snapshot_feed_retrieved"), latest.plan
     assert advisories.uses_index("advisory_pkey"), advisories.plan
     for statement in statements:

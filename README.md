@@ -479,17 +479,27 @@ document and fetch time. One build (`models.cvss.AdvisoryCvss`, keyed by canonic
 `feed` artifact plus a `feed_snapshot` named `advisory-cvss`, with the documents' retry rules; an
 unchanged day is the same bytes, so one artifact. Views read this build, never the documents.
 
-- **Only when a source is registered.** With none, the refresh builds nothing.
-- **An unreadable document scores nothing.** A kept document that doesn't parse, or that the
-  store lost, is named in `AdvisoryCvss.unreadable` and logged; the rest still score.
+- **Only when a source is registered.** With none, the refresh builds nothing and
+  `refresh_advisory_cvss` raises `ConfigError`.
+- **An unreadable document scores nothing.** A kept document that doesn't parse, that the store
+  lost, or that is another record's (a source can answer one id with another's record; every
+  score must name the record asked for) is named in `AdvisoryCvss.unreadable` and logged; the
+  rest still score. So is a source with names to score that has kept no documents yet
+  (`<source>-documents`).
+- **A store failure keeps the documents' outcome.** When the build itself fails on the store,
+  the document refresh still returns each source's outcome, plus a failed `advisory-cvss` one;
+  the last build stays served.
 - **Reads.** `exposure.advisory_cvss(advisory_ids)` returns `AdvisoryCvssRead`: each asked
   advisory's ranked scores, keyed as asked (an alias reads its canonical's), and `built_at`.
-  An advisory no authority scored is absent; with no readable build, `built_at` is None. It is
+  An advisory no authority scored is absent; before the first build, `built_at` is None. It is
   three keyed reads; the build is parsed once per publication by the Context's
   `advisory_cvss_cache`, which outlives the per-request services. An unreadable build is
-  logged and remembered until the next one.
+  logged, read as `unreadable`, and remembered until the next one.
 - **Freshness.** Once built, `feed_statuses()` lists `advisory-cvss` with the shortest document
-  source's `max_age_hours`, its refresh being the document refresh.
+  source's `max_age_hours`, its refresh being the document refresh. It is as old as its oldest
+  source's documents, so a source that stopped refreshing makes it stale; an unreadable build, or
+  one missing a source's documents, has no fresh time and says why (`last_error`); drift-watch
+  shows it stale with that reason.
 
 **Set an NVD API key.** This refresh asks NVD for every linked CVE every day. Without a key NVD
 allows about 5 requests per 30 seconds, so a few thousand CVEs take hours. A key is free
