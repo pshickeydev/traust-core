@@ -7,8 +7,10 @@ from uuid import UUID
 
 from traust_core.v1.errors import IntegrityError, NotFoundError
 from traust_core.v1.models.common import RecordBudget
+from traust_core.v1.models.cvss import severity_of
 from traust_core.v1.models.findings import (
     Finding,
+    FindingCvss,
     FindingExternalRef,
     FindingLabel,
     FindingView,
@@ -196,7 +198,8 @@ class FindingViewQuery:
             )
         latest = reported[-1] if reported else None
         disposition = facts.disposition(finding.id, as_of)
-        severity = self._rating.effective_severity(latest, disposition)
+        label = self._rating.severity_label(latest, disposition)
+        severity = label.severity
         # the reporting assessments' own times — the occurrence→assessment
         # join the census reads for its SLA `first` — computed once here for
         # the view's date fields (facts.at already holds them for the fold)
@@ -212,6 +215,16 @@ class FindingViewQuery:
             occurrence=latest,
             disposition=disposition,
             effective_severity=severity,
+            cvss=(
+                FindingCvss(
+                    score=latest.cvss_score,
+                    vector=latest.cvss_vector,
+                    severity=severity_of(latest.cvss_vector),
+                    basis=label.basis,
+                )
+                if latest is not None
+                else None
+            ),
             sla_due=due,
             first_reported_at=first_reported,
             last_reported_at=last_reported,
