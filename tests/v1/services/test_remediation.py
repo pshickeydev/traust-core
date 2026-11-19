@@ -29,6 +29,7 @@ from traust_core.v1.errors import (
     ForbiddenError,
     IntegrityError,
     NotFoundError,
+    ServiceError,
     ValidationError,
 )
 from traust_core.v1.models.artifacts import RemediationArtifact, ReportArtifact, ValidationArtifact
@@ -597,6 +598,41 @@ def test_record_refuses_a_published_artifact_that_is_not_the_report(
         service.record(report([found.id]), claimed)  # type: ignore[list-item]
     with pytest.raises(ValidationError, match="several repositories"):
         service.record(report([found.id, elsewhere.id]), provenance())  # type: ignore[list-item]
+
+
+def test_direct_order_record_requires_a_ledger_before_staging_the_report_or_patch(
+    service: RemediationService, context: Context, engine: Engine
+) -> None:
+    ref, found = seeded(engine)
+    assert ref.id is not None
+    item = service.open(ids(found), ref.id)
+    with SqlTraustUnitOfWork(engine) as uow:
+        order = Seed(uow).run_order(
+            asset="remediate_finding",
+            repository_id=ref.repository_id,
+            work_item_id=item.work_item_id,
+        )
+        uow.commit()
+    assert order.id is not None
+    diff = b"+bounded\n"
+    doc = report(ids(found), patch__diff_sha256=hashlib.sha256(diff).hexdigest())
+    origin = provenance().model_copy(update={"run_id": order.id})
+    before = decisions(engine, found[0])
+    with pytest.raises(ServiceError, match="requires a ledger"):
+        service.record(doc, origin, run_order_id=order.id, diff=diff)
+    assert not tuple(context.object_store.list())
+    assert service.get(item.work_item_id) == item
+    assert decisions(engine, found[0]) == before
+
+    context.config = context.config.model_copy(update={"ledger": LedgerConfig()})
+    writer = context.services().remediation
+    done = writer.record(doc, origin, run_order_id=order.id, diff=diff)
+    assert done.reported_by == order.id and done.patch is not None
+    said = decisions(engine, found[0])[-1]
+    with SqlTraustUnitOfWork(engine) as uow:
+        assert uow.events.find_by_decision(said.id) is not None
+    with pytest.raises(ServiceError, match="requires a ledger"):
+        service.record(doc, origin)
 
 
 def test_steps_go_on_the_ledger_when_it_is_on(engine: Engine, tmp_path: Path) -> None:

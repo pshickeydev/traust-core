@@ -61,6 +61,7 @@ def context(harness: ValidationHarness, tmp_path: Path) -> Iterator[Context]:
         clock=FixedClock(NOW),
     )
     context.__dict__["local_issuer"] = LocalIssuer(context.config.home, SystemClock())
+    context.local_issuer.mint("validation-runner", machine=True)
     try:
         yield context
     finally:

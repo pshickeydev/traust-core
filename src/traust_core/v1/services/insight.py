@@ -51,6 +51,7 @@ from traust_core.v1.models.dependencies import (
     ExposureFilter,
     ExposureRollup,
     NoManifestSbomError,
+    UnresolvedManifest,
     malicious_id,
     package_name,
 )
@@ -116,6 +117,7 @@ from traust_core.v1.models.insight import (
     LeastPrivilege,
     LocComparison,
     LocDashboard,
+    ManifestCoverageCounts,
     OscalAssessmentResults,
     PackageReach,
     PatternExample,
@@ -174,6 +176,7 @@ from traust_core.v1.models.inventory import (
     Product,
     Repository,
     RepositoryFilter,
+    RepositoryRef,
     default_line,
 )
 from traust_core.v1.models.operations import (
@@ -442,14 +445,12 @@ class InsightService:
 
     def report(self, view: ViewName, filter: ViewFilter) -> Report:
         """The view as a report for a person (markdown, html)."""
-        found = self._view(view, filter)
-        return found.report(found.build(filter), filter.as_of or self._clock.now())
+        return self._build_report(self._view(view, filter), filter)[1]
 
     def publish(self, view: ViewName, filter: ViewFilter) -> RenderedView:
         """The view's model and its markdown and html renders; core writes no files."""
         found = self._view(view, filter)
-        model = found.build(filter)
-        report = found.report(model, filter.as_of or self._clock.now())
+        model, report = self._build_report(found, filter)
         export = getattr(found, "export", None)
         return RenderedView(
             view=view,
@@ -477,8 +478,7 @@ class InsightService:
         self.check(view, filter, format)
         found = self._view(view, filter)
         export = getattr(found, "export", None)
-        model = found.build(filter)
-        report = found.report(model, filter.as_of or self._clock.now())
+        model, report = self._build_report(found, filter)
         if format is ReportFormat.CSV:
             body = csv_table(export(model))  # type: ignore[misc]
         elif format is ReportFormat.HTML:
@@ -486,6 +486,13 @@ class InsightService:
         else:
             body = MarkdownRenderer().render(report).decode()
         return RenderedReport(view=view, format=format, stem=_stem(report.title), body=body)
+
+    def _build_report(self, view: View, filter: ViewFilter) -> tuple[ViewModel, Report]:
+        generated_at = filter.as_of
+        if isinstance(view, (DependencyReachView, PqcPortfolioView)):
+            return view.build_report(filter, generated_at or self._clock.now())
+        model = view.build(filter)
+        return model, view.report(model, generated_at or self._clock.now())
 
     def record_sla_policy(self, doc: SlaPolicyArtifact, provenance: Provenance) -> PublishResult:
         """Record the deployment's SLA policy: the SLA view's from now on, over the shipped
@@ -3253,10 +3260,21 @@ class DependencyReachView:
         self._portfolio = portfolio
 
     def build(self, filter: ViewFilter) -> DependencyReach:
+        return self._snapshot(filter)[0]
+
+    def with_coverage(self, filter: ViewFilter) -> tuple[DependencyReach, ManifestCoverageCounts]:
+        """Pair strict v1 reach with scan coverage for the same captured default heads."""
+        model, heads = self._snapshot(filter)
+        scans = self._exposure.manifest_coverage(heads)
+        return model, _manifest_gap_counts(scans.values(), model.repositories)
+
+    def _snapshot(self, filter: ViewFilter) -> tuple[DependencyReach, Collection[RepositoryRef]]:
         if filter.as_of is not None:
             raise ValidationError("the dependency-reach view reads the latest manifests; no as_of")
         _, _, repositories = _scope(self._portfolio, filter)
-        held, unmeasured = _manifest_holders(self._exposure, self._portfolio, repositories)
+        ids = [r.id for r in repositories if r.id is not None]
+        heads = self._portfolio.default_refs(ids).values()
+        held, unmeasured = _manifest_holders(self._exposure, heads, len(repositories))
         ecosystems: defaultdict[str, list[set[UUID]]] = defaultdict(list)
         for (ecosystem, _), holders in held.items():
             ecosystems[ecosystem].append(holders)
@@ -3285,15 +3303,34 @@ class DependencyReachView:
             ),
         )
         contracts.validate_view(self.name, model.model_dump(mode="json"))
-        return model
+        return model, heads
 
-    def report(self, model: DependencyReach, generated_at: datetime) -> Report:
+    def build_report(
+        self, filter: ViewFilter, generated_at: datetime
+    ) -> tuple[DependencyReach, Report]:
+        model, coverage = self.with_coverage(filter)
+        return model, self.report(model, generated_at, coverage)
+
+    def report(
+        self,
+        model: DependencyReach,
+        generated_at: datetime,
+        coverage: ManifestCoverageCounts | None = None,
+    ) -> Report:
         summary = (
             f"{model.repositories - model.unmeasured} of {model.repositories} repositories have a "
             "manifest SBOM at their default-branch commit; the rest are not measured, not "
-            "dependency-free. docker and helm are dependency surfaces only: their vulnerabilities "
-            "come from image SBOMs, so they never appear in the exposure view's advisory tables."
+            "dependency-free. Tables show observed packages and repositories only. "
+            "An unlisted dependency is unknown where coverage is missing or unresolved. docker "
+            "and helm are dependency surfaces only: their vulnerabilities come from image SBOMs, "
+            "so they never appear in the exposure view's advisory tables."
         )
+        empty = (
+            "_No manifests recorded._"
+            if model.unmeasured == model.repositories
+            else "_No manifest packages observed._"
+        )
+        gaps = _manifest_gap_sections(coverage, "repository", "repositories") if coverage else ()
         return Report(
             title="Dependency reach",
             generated_at=generated_at,
@@ -3303,34 +3340,64 @@ class DependencyReachView:
                     "Per ecosystem",
                     ("ecosystem", "repositories", "packages"),
                     [(e.ecosystem, str(e.repositories), str(e.packages)) for e in model.ecosystems],
-                    "_No manifests recorded._",
+                    empty,
                 ),
                 _table_section(
                     f"Top {_TOP_SHARED} shared packages by blast radius",
                     ("ecosystem", "package", "repositories"),
                     [(p.ecosystem, p.name, str(p.repositories)) for p in model.shared],
-                    "_No manifests recorded._",
+                    empty,
                 ),
+                *gaps,
             ),
         )
+
+
+def _manifest_gap_counts(
+    coverage: Collection[tuple[UnresolvedManifest, ...] | None], total: int
+) -> ManifestCoverageCounts:
+    unresolved: Counter[Ecosystem] = Counter()
+    without_scan = total
+    for gaps in coverage:
+        if gaps is not None:
+            without_scan -= 1
+            unresolved.update({gap.ecosystem for gap in gaps})
+    return ManifestCoverageCounts(
+        without_scan=without_scan, unresolved=dict(sorted(unresolved.items()))
+    )
+
+
+def _manifest_gap_sections(
+    coverage: ManifestCoverageCounts, unit: str, units: str
+) -> tuple[Section, ...]:
+    notes = []
+    if coverage.without_scan:
+        notes.append(
+            f"{units.capitalize()} without scan-backed manifest coverage: {coverage.without_scan} "
+            "(unknown across ecosystems)."
+        )
+    notes.extend(
+        f"{ecosystem}: unresolved manifests in {count} {unit if count == 1 else units}."
+        for ecosystem, count in coverage.unresolved.items()
+    )
+    return (Section(heading="Unknown manifest coverage", body="\n\n".join(notes)),) if notes else ()
 
 
 _TOP_SHARED = 25
 
 
 def _manifest_holders(
-    exposure: ExposureService, portfolio: PortfolioService, repositories: Sequence[Repository]
+    exposure: ExposureService, heads: Collection[RepositoryRef], repositories: int
 ) -> tuple[dict[tuple[str, str], set[UUID]], int]:
     """Per (ecosystem, package): the repositories whose latest default-branch manifest holds it;
     and how many repositories have no manifest SBOM there (not measured, not dependency-free)."""
-    heads = portfolio.default_refs([r.id for r in repositories if r.id is not None])
-    measured = [ref for ref in heads.values() if ref.manifest_sbom_id is not None]
+    measured = [ref for ref in heads if ref.manifest_sbom_id is not None]
     held: defaultdict[tuple[str, str], set[UUID]] = defaultdict(set)
     packages = exposure.manifest_packages(measured)
     for ref in measured:
         for package in packages[ref.id]:  # type: ignore[index]
             held[package.ecosystem, package.name].add(ref.repository_id)
-    return held, len(repositories) - len(measured)
+    return held, repositories - len(measured)
 
 
 _CONFIRMED = ValidationVerdict("confirmed")
@@ -3658,6 +3725,13 @@ class PqcPortfolioView:
         self._portfolio = portfolio
 
     def build(self, filter: ViewFilter) -> PqcPortfolio:
+        return self._build(filter)
+
+    def _build(
+        self,
+        filter: ViewFilter,
+        package_refs: dict[UUID | None, list[RepositoryRef]] | None = None,
+    ) -> PqcPortfolio:
         if filter.team_ids:
             raise ValidationError("the pqc-portfolio view scopes by product, not team")
         if filter.as_of is not None:
@@ -3670,13 +3744,21 @@ class PqcPortfolioView:
             return urls[ref_id]
 
         products: Sequence[UUID | None] = list(dict.fromkeys(filter.product_ids)) or [None]
-        scopes = tuple(self._scope(p, url) for p in products)
+        scopes = tuple(
+            self._scope(p, url, None if package_refs is None else package_refs.setdefault(p, []))
+            for p in products
+        )
         index = () if filter.product_ids else self._products(scopes[0].repositories)
         model = PqcPortfolio(scopes=scopes, products=index)
         contracts.validate_view(self.name, model.model_dump(mode="json"))
         return model
 
-    def _scope(self, product_id: UUID | None, url: Callable[[UUID], str]) -> PqcPortfolioScope:
+    def _scope(
+        self,
+        product_id: UUID | None,
+        url: Callable[[UUID], str],
+        package_refs: list[RepositoryRef] | None,
+    ) -> PqcPortfolioScope:
         scope = PqcFilter(product_id=product_id)
         rows = sorted(
             (
@@ -3696,10 +3778,12 @@ class PqcPortfolioView:
         without_sbom = 0
         for row in rows:
             try:
-                packages = self._code_facts.packages(row.readiness.repository_ref_id)
+                ref, packages = self._code_facts.package_observations(row.readiness.repository_ref_id)
             except NoManifestSbomError:
                 without_sbom += 1
                 continue
+            if package_refs is not None:
+                package_refs.append(ref)
             for f in packages:
                 using[(f.package or f.provider or "", f.provider)].add(row.repository_url)
         return PqcPortfolioScope(
@@ -3746,8 +3830,32 @@ class PqcPortfolioView:
         )
         return tuple(index)
 
-    def report(self, model: PqcPortfolio, generated_at: datetime) -> Report:
-        sections = [s for scope in model.scopes for s in _pqc_scope_sections(scope)]
+    def build_report(self, filter: ViewFilter, generated_at: datetime) -> tuple[PqcPortfolio, Report]:
+        package_refs: dict[UUID | None, list[RepositoryRef]] = {}
+        model = self._build(filter, package_refs)
+        coverage = {
+            product: self._code_facts.package_coverage(refs).values()
+            for product, refs in package_refs.items()
+        }
+        return model, self.report(model, generated_at, coverage)
+
+    def report(
+        self,
+        model: PqcPortfolio,
+        generated_at: datetime,
+        coverage: Mapping[UUID | None, Collection[tuple[UnresolvedManifest, ...] | None]] | None = None,
+    ) -> Report:
+        sections = []
+        for scope in model.scopes:
+            sections.extend(_pqc_scope_sections(scope))
+            if coverage is not None:
+                sections.extend(
+                    _manifest_gap_sections(
+                        _manifest_gap_counts(coverage[scope.product_id], len(scope.repositories)),
+                        "commit",
+                        "commits",
+                    )
+                )
         if model.products:
             sections.append(
                 _table_section(
@@ -3791,7 +3899,8 @@ class PqcVendorsView:
             raise ValidationError("the pqc-vendors view reads the latest claims and manifests")
         claims = self._pqc.vendor_claims()
         _, _, repositories = _scope(self._portfolio, filter)
-        held, unmeasured = _manifest_holders(self._exposure, self._portfolio, repositories)
+        heads = self._portfolio.default_refs([r.id for r in repositories if r.id is not None])
+        held, unmeasured = _manifest_holders(self._exposure, heads.values(), len(repositories))
         rows = sorted(
             (PqcVendorRow(claim=c, repositories=_vendor_holders(c, held)) for c in claims.vendors),
             key=lambda r: (
@@ -3836,9 +3945,10 @@ class PqcVendorsView:
         summary = (
             f"Claims v{model.version} (updated {model.updated}): curated status claims dated per "
             "row; re-verify before external use. The delegated / blocked-external class: crypto "
-            "the fleet cannot fix locally, sorted worst first. Fleet counts are the repositories "
+            "the fleet cannot fix locally, sorted worst first. Observed counts are the repositories "
             f"whose default-branch manifest SBOM holds a vendor's packages ({measured} of "
             f"{model.repositories} measured; the rest are not measured, not zero)."
+            " A zero count does not prove absence where manifest coverage is unknown."
         )
         rows = [r.claim for r in model.vendors]
         return Report(
@@ -4039,10 +4149,11 @@ def _pqc_scope_sections(scope: PqcPortfolioScope) -> list[Section]:
             body=", ".join(blocked) or "_None._",
         ),
         _table_section(
-            "Crypto packages (manifest SBOMs)",
+            "Observed crypto packages (manifest SBOMs)",
             ("package", "provider", "repos"),
             [(p.package, p.provider or "-", str(p.repositories)) for p in scope.packages],
-            "_No crypto packages in the scope's manifest SBOMs._",
+            "_No crypto packages observed. Absence is unknown where manifest coverage is "
+            "missing or unresolved._",
         ),
         *(
             [Section(heading="Without a manifest SBOM", body=f"{scope.without_sbom} repositories.")]

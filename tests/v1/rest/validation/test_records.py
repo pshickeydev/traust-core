@@ -425,6 +425,19 @@ def test_a_valid_report_requires_the_actual_verified_machine_lease_holder(
     assert accepted.status_code == 200, accepted.text
 
 
+def test_an_authorized_validation_writer_needs_its_own_ledger(
+    context: Context, client: TestClient, harness: ValidationHarness, run: ValidationRun
+) -> None:
+    context.config = context.config.model_copy(update={"ledger": None})
+    before = snapshot(context.database)
+    objects = tuple(harness.objects.list())
+    request = run.body(report(harness, finding={"evidence_grade": "E0"}), harness.bindings())
+    response = client.post(URL, json=request, headers=run.headers)
+    assert response.status_code == 500, response.text
+    assert snapshot(context.database) == before
+    assert tuple(harness.objects.list()) == objects
+
+
 def test_native_service_rejects_an_unrelated_runner_before_writing(
     context: Context, harness: ValidationHarness, run: ValidationRun
 ) -> None:

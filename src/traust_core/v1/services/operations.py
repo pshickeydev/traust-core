@@ -784,6 +784,10 @@ class OpsService:
             raise ValidationError("recording provenance.run_id must equal run_order_id")
         if provenance.source != _RECORDING_SOURCES.get(kind):
             raise ValidationError("recording provenance source does not match the report kind")
+        if kind in (RecordKind.ASSESSMENT, RecordKind.TRIAGE) and (
+            order.started_at is None or provenance.occurred_at != order.started_at
+        ):
+            raise ConflictError(f"order {order.id}: not the current recording lease attempt")
 
     def _require_lease(self, order: RunOrder, repository_id: UUID) -> None:
         """A leased order's lease is live and its scope is this one repository (a fleet-wide

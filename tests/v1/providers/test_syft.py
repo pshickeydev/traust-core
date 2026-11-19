@@ -173,6 +173,47 @@ def test_manifests_with_nothing_to_pin_them_are_unresolved(
     )
 
 
+@pytest.mark.parametrize(
+    ("contents", "has_external_base"),
+    [
+        ("FROM base:1.2.3\n", True),
+        ("\ufeffFROM base:1.2.3\n", True),
+        ("# escape=\\\nFROM base:1.2.3\n", True),
+        ("from --platform=$PLATFORM \\\n  base@sha256:" + "a" * 64 + "\n", True),
+        ("FROM ${BASE}\n", True),
+        ("FROM scratch AS empty\nFROM empty\n", False),
+        ("# FROM base:1.2.3\nFROM scratch\n", False),
+        ("FROM scratch\nCOPY --from=registry.example/base:1 /tool /\n", True),
+        ("FROM scratch\nCOPY --link --chown=7 --from=\"${BASE}\" [\"/bin\", \"/\"]\n", True),
+        ("FROM scratch\nCOPY --fr\\\n# middle of flag\nom=base:1 /tool /\n", True),
+        ("FROM scratch AS BuIlD\nFROM scratch\nCOPY --from=build /tool /\n", False),
+        ("FROM scratch\nFROM scratch\nCOPY --link --from=0 /tool /\n", False),
+        ("FROM scratch\nCOPY --from=42 /tool /\n", True),
+        ("FROM scratch\nCOPY ./assets --from=not-a-flag /dst/\n", False),
+        ("FROM scratch\nRUN echo \\\n# not an instruction\n\n  FROM literal\n", False),
+        ("# escape=`\nFROM scratch\nRUN echo `\nCOPY --from=literal / /\n", False),
+        ("# escape=`\nFROM scratch\nCO`\nPY --from=external / /\n", True),
+        ("# escape=`\nFROM scratch\nCOPY --fr`om=external / /\n", True),
+        ("FROM scratch\nCOPY -- --from=literal /\n", False),
+        ("FROM scratch\nRUN <<'EOF'\nFROM literal\nCOPY --from=literal / /\nEOF\n", False),
+        ('FROM scratch\nCOPY <<A <<-"B" /\nFROM literal\nA\nCOPY --from=x / /\n\tB\n', False),
+        ("FROM scratch\nRUN <<EOF\nignored\nEOF\nCOPY --from=base:1 /tool /\n", True),
+        ("FROM scratch\nRUN <<EOF\nignored\n", True),  # ambiguous boundary, never clean
+        ("FROM scratch\nRUN echo '<<EOF'\nCOPY --from=base:1 /tool /\n", True),
+        ("FROM scratch\nONBUILD COPY --from=base:1 /tool /\n", True),
+        ("FROM scratch\nRUN [ -f /tmp/x ] && cat <<EOF\nFROM literal\nEOF\n", False),
+    ],
+)
+def test_containerfile_external_images_have_unresolved_coverage(
+    tmp_path: Path, contents: str, has_external_base: bool
+) -> None:
+    found = unresolved_manifests(_tree(tmp_path, {"nested/Dockerfile.build": contents}))
+    expected = [("docker", "nested/Dockerfile.build", "unsupported-manifest")]
+    assert [(m.ecosystem, m.path, m.reason) for m in found] == (
+        expected if has_external_base else []
+    )
+
+
 def test_an_oversized_manifest_is_unresolved_without_reading_it(tmp_path: Path) -> None:
     (tmp_path / "package.json").write_text(" " * (MAX_FILE_BYTES + 1))
     assert [m.path for m in unresolved_manifests(tmp_path)] == ["package.json"]

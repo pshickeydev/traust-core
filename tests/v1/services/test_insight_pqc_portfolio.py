@@ -213,6 +213,27 @@ def test_an_empty_portfolio_says_so(engine: Engine) -> None:  # noqa: F811
     assert "_No readiness recorded._" in text and "Without a manifest SBOM" not in text
 
 
+def test_crypto_package_report_distinguishes_unbacked_sboms_from_observed_packages(
+    engine: Engine,  # noqa: F811
+) -> None:
+    world = World(engine, None)
+    positive = world.ref()
+    empty = world.ref(
+        url=f"{URL}-unbacked", sbom=b'{"bomFormat":"CycloneDX","components":[]}'
+    )
+    world.pqc.record(positive, report(), PROVENANCE)
+    world.pqc.record(empty, report(metadata=meta(f"{URL}-unbacked")), PROVENANCE)
+    view = PqcPortfolioView(world.pqc, world.code_facts, world.portfolio)
+    model, report_output = view.build_report(ViewFilter(), T0)
+    [scope] = model.scopes
+
+    assert scope.without_sbom == 0
+    assert scope.packages and all(p.repositories == 1 for p in scope.packages)
+    text = MarkdownRenderer().render(report_output).decode()
+    assert "Observed crypto packages (manifest SBOMs)" in text
+    assert "Commits without scan-backed manifest coverage: 2" in text
+
+
 @pytest.mark.parametrize(
     ("filter", "error"),
     [(ViewFilter(team_ids=(uuid4(),)), "not team"), (ViewFilter(as_of=T0), "no as_of")],

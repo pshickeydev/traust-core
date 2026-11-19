@@ -4,6 +4,7 @@ read so a package missing from that SBOM is unknown rather than absent (plan 28,
 from __future__ import annotations
 
 import json
+import shutil
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -12,10 +13,13 @@ from uuid import UUID
 import pytest
 from sqlalchemy.engine import Engine
 
-from tests.v1.repositories.tables.conftest import Seed
+from tests.v1.providers.test_forge_archive import checkout as archive_checkout
+from tests.v1.providers.test_forge_archive import tarball
+from tests.v1.repositories.tables.conftest import T0, Seed
 from tests.v1.services.test_exposure_impact import LODASH, Lookup, engine
 from tests.v1.services.test_exposure_sweep import FakeCheckout, FakeSbomTool
 from traust_core.v1.errors import IntegrityError, NotFoundError, ValidationError
+from traust_core.v1.models.artifacts import ManifestCoverageArtifact
 from traust_core.v1.models.assessment import AssessmentKind
 from traust_core.v1.models.dependencies import (
     AdvisoryIdentifier,
@@ -26,17 +30,22 @@ from traust_core.v1.models.dependencies import (
     UnresolvedManifest,
     Version,
 )
+from traust_core.v1.models.insight import ViewFilter, ViewName
 from traust_core.v1.models.remediation import PropagationEvidence, propagated
 from traust_core.v1.models.vocabulary import Ecosystem, ManifestCoverageReason
 from traust_core.v1.providers.base import ProviderRegistry, Result
-from traust_core.v1.providers.clock import Clock
+from traust_core.v1.providers.clock import Clock, FixedClock
 from traust_core.v1.providers.feeds import FeedProvider
+from traust_core.v1.providers.process import ProcessRunner
+from traust_core.v1.providers.syft import SyftSbom
 from traust_core.v1.providers.tools import ToolRequest
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.repositories.objects import InMemoryObjectStore
 from traust_core.v1.services.artifact_publishing import stored_bytes
+from traust_core.v1.services.assessment import AssessmentService
 from traust_core.v1.services.exposure import ExposureService
 from traust_core.v1.services.findings import FindingIntake, IdentityPolicy, TaxonomyPolicy
+from traust_core.v1.services.insight import DependencyReachView, InsightService
 from traust_core.v1.services.portfolio import PortfolioPolicy, PortfolioService
 
 __all__ = ["engine"]
@@ -49,7 +58,7 @@ NO_LODASH = json.dumps(
 
 def exposure(
     engine: Engine,
-    tool: FakeSbomTool | None = None,
+    tool: FakeSbomTool | SyftSbom | None = None,
     *records: AdvisoryRecord,
     clock: Clock | None = None,
     checkout: object | None = None,
@@ -89,6 +98,40 @@ def coverage_runs(engine: Engine, ref: UUID) -> int:
         runs = uow.assessments.list_for_ref(ref)
     assert not [a for a in runs if a.kind == AssessmentKind.TOOL_SCAN]  # code-facts' kind
     return sum(a.kind == AssessmentKind.MANIFEST_SBOM for a in runs)
+
+
+@pytest.mark.skipif(shutil.which("syft") is None, reason="syft not on PATH")
+@pytest.mark.parametrize(
+    ("instructions", "expected", "state"),
+    [
+        (
+            "FROM base:1.2.3",
+            [("docker", "build/images/Dockerfile", "unsupported-manifest")],
+            FixUptakeState.NOT_OBSERVED,
+        ),
+        (
+            "FROM scratch\nCOPY --from=base:1.2.3 /tool /",
+            [("docker", "build/images/Dockerfile", "unsupported-manifest")],
+            FixUptakeState.NOT_OBSERVED,
+        ),
+        ("FROM scratch\nCOPY <<EOF /file\nFROM literal\nEOF", [], FixUptakeState.MODULE_ABSENT),
+    ],
+)
+def test_a_dockerfile_only_archive_records_the_gap_on_its_scan(
+    engine: Engine, instructions: str, expected: list[tuple[str, str, str]], state: FixUptakeState
+) -> None:
+    _, archive = archive_checkout(
+        tarball({"build/images/Dockerfile": (instructions + "\n").encode()})
+    )
+    ref = ref_id(engine)
+    service = exposure(engine, SyftSbom(ProcessRunner(["syft"]), FixedClock(T0)), checkout=archive)
+    service.record_manifest_sbom(ref)
+    assert service.dependencies(ref) == []
+    assert coverage_runs(engine, ref) == 1
+    gaps = service.unresolved_manifests(ref)
+    assert gaps is not None
+    assert [(m.ecosystem, m.path, m.reason) for m in gaps] == expected
+    assert service.consumes_fix(ref, Ecosystem.DOCKER, "base", Version("1.2.4")).state == state
 
 
 def test_each_scan_records_its_coverage_bound_to_its_sbom_and_itself(
@@ -244,6 +287,88 @@ def test_the_fleet_sweep_keeps_an_sbom_given_as_a_document(engine: Engine) -> No
     kept = service.ingest_sbom(NO_LODASH, ref)
     assert service.record_manifest_sbom(ref) == kept  # no checkout wired: nothing fetched
     assert service.unresolved_manifests(ref) is None
+
+
+@pytest.mark.parametrize(
+    ("base", "state", "paths"),
+    [
+        ("base:1.2.3", FixUptakeState.NOT_OBSERVED, ["build/images/Dockerfile"]),
+        ("scratch", FixUptakeState.MODULE_ABSENT, []),
+    ],
+)
+def test_requeue_upgrades_a_legacy_scan_once_at_the_same_sha_and_sbom(
+    engine: Engine, tmp_path: Path, base: str, state: FixUptakeState, paths: list[str]
+) -> None:
+    reference, tool = ref_id(engine), FakeSbomTool(raw=NO_LODASH)
+    root = tmp_path / "build" / "images"
+    root.mkdir(parents=True)
+    (root / "Dockerfile").write_text(f"FROM {base}\n")
+    archive = FakeCheckout(tmp_path)
+    span = (AffectedSpan(introduced=Version("0"), fixed=Version("1.2.4")),)
+    advisory = AdvisoryRecord(
+        identifier=AdvisoryIdentifier("GHSA-base-unit-test"),
+        source="osv",
+        affected=tuple(
+            AffectedPackage(ecosystem=e, name=n, spans=span)
+            for e, n in ((Ecosystem.NPM, "left-pad"), (Ecosystem.DOCKER, "base"))
+        ),
+    )
+    service = exposure(engine, tool, advisory, checkout=archive)
+    sbom = service.ingest_sbom(NO_LODASH, reference)
+    with SqlTraustUnitOfWork(engine) as uow:
+        ref = uow.repository_refs.get(reference)
+        old = Seed(uow).assessment(
+            ref, kind=AssessmentKind.MANIFEST_SBOM, assessor="syft", assessor_version="1.51.1"
+        )
+        document = ManifestCoverageArtifact.from_document(
+            {
+                "artifact": "manifest-coverage",
+                "tool": {"name": "syft", "version": "1.51.1"},
+                "assessment_id": str(old.id),
+                "sbom_id": str(sbom.id),
+                "unresolved": {},
+            }
+        )
+        service._attach_document(uow, old, document)
+        legacy = uow.repository_refs.update(
+            ref.model_copy(update={"manifest_sbom_assessment_id": old.id})
+        )
+        uow.commit()
+
+    def uptake(ecosystem: Ecosystem) -> FixUptakeState:
+        return service.consumes_fix(reference, ecosystem, "base", Version("1.2.4")).state
+
+    assert service.unresolved_manifests(reference) is None
+    assert uptake(Ecosystem.DOCKER) == FixUptakeState.NOT_OBSERVED
+    assert uptake(Ecosystem.PYPI) == FixUptakeState.MODULE_ABSENT
+    found = service.find_advisory(advisory.identifier)
+    assert found and found.advisory_id
+    prepared = {p.package.name: p for p in service.prepare(found.advisory_id, reference)}
+    assert set(prepared) == {"base", "left-pad"}
+    assert prepared["base"].evidence.l1_depends_on is None
+    assert prepared["base"].document("1").repos[0].classification == "inconclusive"
+
+    tool.raw = b"not json"
+    with pytest.raises(ValidationError):
+        service.record_manifest_sbom(reference)
+    assert coverage_runs(engine, reference) == 1
+    assert uptake(Ecosystem.DOCKER) == FixUptakeState.NOT_OBSERVED
+    tool.raw = NO_LODASH
+    assert service.record_manifest_sbom(reference) == sbom
+    with SqlTraustUnitOfWork(engine) as uow:
+        current = uow.repository_refs.get(reference)
+        assert current.sha == ref.sha and current.manifest_sbom_id == sbom.id
+        assert current.manifest_sbom_assessment_id != old.id
+    coverage = service.unresolved_manifests(reference)
+    assert coverage is not None and [m.path for m in coverage] == paths
+    # Even after the refresh, a caller holding the old snapshot must not
+    # receive the new scan's coverage merely because its SBOM id is equal.
+    assert service.manifest_coverage([legacy])[reference] is None
+    assert service.manifest_coverage([current])[reference] == coverage
+    assert uptake(Ecosystem.DOCKER) == state
+    assert service.record_manifest_sbom(reference) == sbom
+    assert coverage_runs(engine, reference) == 2
+    assert len(archive.asked) == len(archive.released) == len(tool.workspaces) == 2
 
 
 def test_an_image_shipping_the_fix_does_not_speak_for_an_unknown_manifest(
@@ -409,3 +534,53 @@ def test_a_package_the_commit_lacks_is_still_assessed_where_its_ecosystem_went_u
     assert set(prepared) == {"left-pad", "lodash"}
     assert prepared["lodash"].evidence.l1_depends_on is None
     assert prepared["lodash"].document("1").repos[0].classification == "inconclusive"
+
+
+def test_scan_coverage_beside_v1_reach_counts_a_shared_sbom_by_repository(
+    engine: Engine, tmp_path: Path
+) -> None:
+    uow = SqlTraustUnitOfWork(engine)
+    with uow:
+        seed = Seed(uow)
+        partial = seed.repository_ref(
+            seed.repository(url="https://github.com/org/partial"), is_default=True
+        )
+        complete = seed.repository_ref(
+            seed.repository(url="https://github.com/org/complete"), is_default=True
+        )
+        for ref in (partial, complete):
+            seed.assessment(ref, kind=AssessmentKind.REPO_STATE)
+        seed.repository(url="https://github.com/org/never-observed")
+        uow.commit()
+    assert partial.id is not None and complete.id is not None
+    service = exposure(engine)
+    locked = service.ingest_dependencies(complete.id, checkout(tmp_path / "complete", locked=True))
+    partial_tree = checkout(tmp_path / "partial", locked=False)
+    (partial_tree / "package.json").write_text('{"dependencies":{"also-unresolved":"^1"}}')
+    unlocked = service.ingest_dependencies(partial.id, partial_tree)
+    assert locked.sbom.id == unlocked.sbom.id
+    portfolio = PortfolioService(uow, PortfolioPolicy(), assessment=AssessmentService(uow))
+    reader = DependencyReachView(service, portfolio)
+    insight = InsightService([reader], FixedClock(T0))
+    view, scope = ViewName.DEPENDENCY_REACH, ViewFilter()
+
+    reach, coverage = reader.with_coverage(scope)
+
+    wire = insight.serve(view, scope).model.model_dump(mode="json")
+    assert "coverage" not in wire
+    assert reach.model_dump(mode="json") == wire
+    assert coverage.model_dump(mode="json") == {"without_scan": 1, "unresolved": {"npm": 1}}
+    assert wire["shared"] == [{"ecosystem": "npm", "name": "left-pad", "repositories": 2}]
+    report = insight.publish(view, scope)
+    assert report.model == reach
+    assert "Unknown manifest coverage" in report.html
+    assert "| npm | left-pad | 2 |" in report.markdown
+
+    service.ingest_sbom(NO_LODASH, partial.id)
+    assert insight.serve(view, scope).model.model_dump(mode="json") == wire
+    current, gaps = reader.with_coverage(scope)
+    assert current == reach
+    assert gaps.model_dump(mode="json") == {"without_scan": 2, "unresolved": {}}
+    captured = reader.report(reach, T0, coverage)
+    assert any("npm: unresolved manifests in 1 repository." in s.body for s in captured.sections)
+    assert "npm: unresolved manifests" not in insight.publish(view, scope).markdown

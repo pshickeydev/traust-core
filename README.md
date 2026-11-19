@@ -853,6 +853,17 @@ manifest SBOM first (`syft scan dir:<checkout> -o cyclonedx-json`, then
 Other enumerator-specific fact kinds remain with their
 skill-port slices.
 
+`exposure.record_manifest_sbom(ref_id)` is the requeue door for an unchanged head.
+The `manifest_sbom` assessment identifies Core's coverage probe (`traust-manifest-coverage`,
+version `2`); the bound `manifest-coverage` document's `tool` still identifies the SBOM
+cataloger and its real version. Older assessments identified only the cataloger. Their
+empty coverage maps cannot rule out Docker dependencies. Requeue selected refs after
+upgrading the producer and readers: each old scan needs a new assessment, not a new SHA
+or SBOM ID. Subsequent requeues reuse that assessment. A failed refresh leaves the old
+scan attached and its Docker negative unknown; document-only imports still have no coverage.
+Do not use pre-upgrade readers to certify historical Docker negatives. Publishing the
+`unsupported-manifest` reason requires a contracts pin that admits it.
+
 Java route ownership credits resolver receivers only when they resolve to declared
 injected fields with admitted injection initialization and no later field writes
 or setter mutation in the checkout hierarchy, and only while the field's value stays
@@ -968,17 +979,27 @@ then shares assessment/artifact recording and existing
 or resolution becomes a decision. `AssessmentRecordResult` returns native
 `assessment_id`, `artifact_id`, and `intake` (`IntakeResult`, whose `findings` maps
 original labels to native UUIDs and `created` names newly admitted findings).
-The raw bytes are retained unchanged, the assessment binds its order at creation,
-and replay cannot adopt an unbound or differently bound assessment. Plain
-`AssessmentService.record` remains document-only for secure-code reports;
-`record_scan` remains third-party scanner intake only.
+For order-bound authored and triage writes, `provenance.occurred_at` is the
+`started_at` returned by **this claim**. Capture it before execution; never read
+the current lease to stamp an earlier attempt's output. Under the lease lock,
+the same order, subject (ref for authored; source assessment for triage), and
+exact bytes replay the recorded IDs. Changing the subject or bytes conflicts.
+The order cannot adopt an unbound or differently bound assessment.
+
+An authored report may omit `metadata.commit`; if supplied it must exactly match
+the selected inventory ref's SHA. Unstamped rows go through native intake. A
+supplied fingerprint must match the native calculation, as must its algorithm
+when named. A mismatch or an algorithm without a fingerprint refuses the report;
+Core neither rewrites the artifact nor guesses another identity epoch. These
+checks do not redefine historical imports or third-party scanner intake.
 
 `GET /v1/assessments/{assessment_id}/intake` returns
 `AssessmentIntakeBindings` (`{"findings": {"<original label>": "<native UUID>"}}`),
 with no `created` history. For secure-code assessments, the read verifies the retained
 report's digest, derives its candidates through the same report model, and resolves
-them through the finding-intake identity owner. Every match must belong to that
-assessment's occurrence set.
+them through the finding-intake identity owner. Only matches with an occurrence
+on this assessment are returned; a row held for rebaseline has no binding until
+admitted. An occurrence that no report row identifies is an integrity error.
 
 For triage assessments, `AssessmentService` delegates to
 `FindingDecisions.intake_bindings`. That owner verifies the original triage artifact
@@ -1148,9 +1169,10 @@ decision. A verified defense-in-depth gap uses `verdict: true_positive` and
 finding kind. An undetermined or manual-test outcome remains review-only,
 including when its kind is known.
 
-Explicit kind changes commit with new triage and artifact admission, before
-per-finding decision writes. Interrupted recording can resume without losing a
-kind that admission accepted; replay still cannot overwrite a later judgment.
+For unbound triage with optional signing, kind changes commit with triage and
+artifact admission, so an interrupted import can resume by verdict. When signing
+is required, the batch commits only after the repository's new root is signed.
+Replay cannot overwrite a later judgment.
 
 Summary and rendering keep weaknesses separate from actionable vulnerabilities.
 Broken weakness citations retain the re-vote requirement. Historical
@@ -1181,6 +1203,21 @@ Authentication alone does not authorize recording. The service requires the
 caller's own active repository-scoped order lease, an explicitly authorized
 server asset for triage, and provenance bound to that order. New assessments
 retain their native `run_order_id`; replay cannot adopt another or an unbound run.
+
+The recording server checks **its own** `ledger:` configuration before serving
+decision-producing recording capabilities. A triage asset requires
+`ledger.required: true`, `key_path` and `public_key_path` for a working cosign
+pair. The leased writer checks again: each decision, its event, the batch
+signature, review items and assessment metadata commit together. A refused
+record leaves no published database state; unreferenced content-addressed bytes
+may remain after a late failure. A review-only triage creates no layer.
+
+Order-bound validation, remediation (the `remediate_finding` alias on the
+triage allowlist), verification, cloud-audit judgments and fuzz confirmations
+require ledger events but do not themselves mandate signed roots. An enabled
+pack asset can additionally require signing in deployment preflight. Unjudged
+assessment intake, read-only servers and standalone decisions do not inherit
+the triage signing requirement.
 
 ### Registry reader review candidate
 
