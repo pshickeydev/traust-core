@@ -756,3 +756,20 @@ def test_a_sources_document_cap_comes_from_the_registry() -> None:
     sources = _load(shipped).sources
     assert sources["vex"].max_document_bytes == 128 * 1024 * 1024
     assert sources["nvd"].max_document_bytes is None  # the default cap
+
+
+def test_a_sources_document_age_limit_comes_from_its_max_age_hours(tmp_path: Path) -> None:
+    text = REGISTRY + "  nvd:\n    tier: live\n    url_template: https://nvd.test/{ident}\n"
+    text += "    ident: cve\n    max_age_hours: 36\n"
+    ctx = Context(Config())
+    ctx.register_feeds(_registry(tmp_path, text))
+    assert ctx.feed_sources.get("nvd").max_age == timedelta(hours=36)
+    assert ctx.feed_sources.get("osv").max_age == timedelta(hours=24)  # the registry's default
+
+
+@pytest.mark.parametrize("hours", ["0", "-6"])
+def test_an_age_limit_that_isnt_positive_is_a_config_error(tmp_path: Path, hours: str) -> None:
+    text = REGISTRY.replace("    max_age_hours: 12\n", f"    max_age_hours: {hours}\n")
+    assert text != REGISTRY
+    with pytest.raises(ConfigError, match="max_age_hours"):
+        Context(Config()).register_feeds(_registry(tmp_path, text))

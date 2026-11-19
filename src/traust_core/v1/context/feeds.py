@@ -94,7 +94,7 @@ class _Source(_Strict):
     file: str | None = None
     index_url: str | None = None
     index_file: str | None = None
-    max_age_hours: float = 24.0
+    max_age_hours: pydantic.PositiveFloat = 24.0
     # a per-identifier document's size cap, when the default (DOCUMENT_BYTES) is too small
     max_document_bytes: pydantic.PositiveInt | None = None
     paginate: _Paginate | None = None
@@ -349,6 +349,7 @@ def load_feed_sources(
                 probe=probe,
                 api_key=_api_key(name, source, keys.get(name), (api_key_variables or {}).get(name)),
                 max_bytes=source.max_document_bytes or DOCUMENT_BYTES,
+                max_age=timedelta(hours=source.max_age_hours),
                 http=http,
                 probe_http=probe_http,
                 clock=clock,

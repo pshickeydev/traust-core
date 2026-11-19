@@ -40,6 +40,7 @@ class FeedStatus(Dto):
     fetched_at: datetime | None = None
     max_age: timedelta
     last_error: str | None = None
+    refresh: str | None = None  # what refreshes it when stale; None: fetching the feed itself
 
     def stale(self, now: datetime) -> bool:
         return self.fetched_at is None or now - self.fetched_at > self.max_age
@@ -361,11 +362,13 @@ class FeedSource:
         clock: Clock,
         api_key: ApiKey | None = None,
         max_bytes: int = DOCUMENT_BYTES,
+        max_age: timedelta = timedelta(hours=24),
     ) -> None:
         if max_bytes < 1:
             raise ConfigError(f"{name}: a document size cap is at least one byte")
         self.name = name
         self._max_bytes = max_bytes
+        self.max_age = max_age  # how old its kept documents may be (`max_age_hours`)
         self.url = url
         self.template = template
         self._ident = _IDENTS.get(ident or "")

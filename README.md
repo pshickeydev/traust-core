@@ -438,6 +438,13 @@ in the object store at `feeds/<source>/documents/<sha256>.json`, one copy per di
   artifact insert, which serializes writers, so concurrent refreshes see each other. A new
   snapshot always sorts after the last one, even when the clock stepped back.
 
+- **Freshness.** Once a source has a kept manifest, `exposure.feed_statuses()` lists it as
+  `<source>-documents` with the source's `max_age_hours` (default 24), so the freshness view
+  (`feeds:<source>-documents`) flags a document refresh that stopped working. A source never
+  refreshed isn't listed: before the first refresh, a failed run shows only as a degraded order.
+  Freshness is per source, not per document: one advisory whose fetch keeps failing while the
+  others succeed leaves the row fresh, and shows as each run's degraded `error` count and log.
+
 `exposure.stored_document(source, identifier)` reads the latest manifest's document back,
 checked against its digest (`IntegrityError` on a mismatch); `None` when the manifest doesn't
 name it. Reads never fetch.
