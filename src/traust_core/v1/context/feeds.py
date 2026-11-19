@@ -94,7 +94,7 @@ class _Source(_Strict):
     file: str | None = None
     index_url: str | None = None
     index_file: str | None = None
-    max_age_hours: float = 24.0
+    max_age_hours: pydantic.PositiveFloat = 24.0
     # a per-identifier document's size cap, when the default (DOCUMENT_BYTES) is too small
     max_document_bytes: pydantic.PositiveInt | None = None
     paginate: _Paginate | None = None

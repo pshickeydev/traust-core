@@ -420,3 +420,23 @@ def test_a_sources_kept_documents_are_in_feed_freshness_once_kept(world: World) 
     )
     assert not status.stale(AT + timedelta(hours=24))
     assert status.stale(AT + timedelta(hours=25))  # a refresh that stopped working goes stale
+
+
+def test_a_stale_document_source_names_the_document_refresh_not_a_feed_fetch(world: World) -> None:
+    from traust_core.v1.services.operations import FreshnessQuery
+
+    world.http.serve(A, doc(A))
+    world.svc.refresh_documents("cve-list", [A])
+    world.clock.at += timedelta(hours=30)
+
+    class _NoProviders:
+        def readiness(self, kind: object) -> list[object]:
+            return []
+
+        def databases(self) -> list[object]:
+            return []
+
+    freshness = FreshnessQuery(_NoProviders(), world.svc, world.clock)  # type: ignore[arg-type]
+    [row] = [i for i in freshness.stale() if i.item == "feeds:cve-list-documents"]
+    assert row.status.value == "stale"
+    assert row.refresh == "refresh the advisory documents (refresh_advisory_documents)"

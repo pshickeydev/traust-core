@@ -1566,7 +1566,7 @@ class FreshnessQuery:
 
 
 def _feed_item(status: FeedStatus, now: datetime) -> StaleItem:
-    item, refresh = f"feeds:{status.name}", f"fetch feed {status.name}"
+    item, refresh = f"feeds:{status.name}", status.refresh or f"fetch feed {status.name}"
     if status.fetched_at is None:
         return StaleItem(
             item=item, status=Freshness.PENDING, detail="never fetched", refresh=refresh

@@ -40,6 +40,7 @@ class FeedStatus(Dto):
     fetched_at: datetime | None = None
     max_age: timedelta
     last_error: str | None = None
+    refresh: str | None = None  # what refreshes it when stale; None: fetching the feed itself
 
     def stale(self, now: datetime) -> bool:
         return self.fetched_at is None or now - self.fetched_at > self.max_age

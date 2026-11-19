@@ -1804,6 +1804,7 @@ class ExposureService:
                 name=_documents_feed(source),
                 fetched_at=snapshot.retrieved_at,
                 max_age=self._feed_sources.get(source).max_age,
+                refresh="refresh the advisory documents (refresh_advisory_documents)",
             )
             for source, snapshot in latest.items()
             if snapshot is not None
