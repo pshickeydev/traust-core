@@ -64,7 +64,8 @@ class CvssScore(Model):
 
 
 class EffectiveCvss(Model):
-    """A finding's chosen 3.x score, the highest-ranked 4.0 beside it, and every source's."""
+    """A finding's chosen score (3.x; 4.0 only when no source has 3.x), the highest-ranked 4.0
+    beside it, and every source's."""
 
     chosen: CvssScore | None
     v4: CvssScore | None
