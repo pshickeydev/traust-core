@@ -16,6 +16,7 @@ from pydantic import Field, StrictBool, StrictFloat, StrictInt, StrictStr
 
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.base import Dto, Model
+from traust_core.v1.models.vocabulary import Severity
 
 
 class CvssSource(StrEnum):
@@ -83,6 +84,33 @@ def cvss_base_score(vector: str) -> float | None:
     formula refuses (a 4.0 score is never ranked, so it isn't one of these)."""
     score = _v3_base_score(vector)
     return None if score is None else float(score)
+
+
+def severity_of(vector: str | None) -> Severity | None:
+    """A vector's qualitative rating — FIRST's bands, Red Hat's `cvss` — or None when the
+    vector doesn't parse: never a guess at a malformed one. CVSS "None" reads informational."""
+    if not isinstance(vector, str) or (version := _version(vector)) is None:
+        return None
+    # the spec's 4.0 metric order, the same refusal `score_of` applies — a vector the
+    # scoring path rejects as malformed never supplies a computed label either
+    if version == "4.0" and not _in_spec_order(vector, version):
+        return None
+    try:
+        parsed = CVSS4(vector) if version == "4.0" else CVSS3(vector)
+        label = parsed.severities()[0]
+    except CVSSError:
+        return None
+    return Severity.INFORMATIONAL if label == "None" else Severity(label.lower())
+
+
+def cvss_computed_score(vector: str) -> Decimal | None:
+    """The base score FIRST's formula computes for a 3.x or 4.0 vector, or None when the
+    vector doesn't parse — the number a stated score must agree with."""
+    if (version := _version(vector)) is None:
+        return None
+    if version == "4.0":
+        return _v4_base_score(vector) if _in_spec_order(vector, version) else None
+    return _v3_base_score(vector)
 
 
 def _v3_base_score(vector: str) -> Decimal | None:
