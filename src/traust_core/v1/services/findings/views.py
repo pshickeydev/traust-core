@@ -7,10 +7,8 @@ from uuid import UUID
 
 from traust_core.v1.errors import IntegrityError, NotFoundError
 from traust_core.v1.models.common import RecordBudget
-from traust_core.v1.models.cvss import severity_of
 from traust_core.v1.models.findings import (
     Finding,
-    FindingCvss,
     FindingExternalRef,
     FindingLabel,
     FindingView,
@@ -25,7 +23,7 @@ from traust_core.v1.repositories.objects import ObjectStore
 from traust_core.v1.services.artifact_publishing import AssessmentLog
 from traust_core.v1.services.findings.claims import claim_fold
 from traust_core.v1.services.findings.facts import FindingFacts
-from traust_core.v1.services.findings.rating import RatingPolicy
+from traust_core.v1.services.findings.rating import RatingPolicy, finding_cvss
 
 
 class FindingViewQuery:
@@ -215,16 +213,7 @@ class FindingViewQuery:
             occurrence=latest,
             disposition=disposition,
             effective_severity=severity,
-            cvss=(
-                FindingCvss(
-                    score=latest.cvss_score,
-                    vector=latest.cvss_vector,
-                    severity=severity_of(latest.cvss_vector),
-                    basis=label.basis,
-                )
-                if latest is not None
-                else None
-            ),
+            cvss=finding_cvss(latest, label),
             sla_due=due,
             first_reported_at=first_reported,
             last_reported_at=last_reported,

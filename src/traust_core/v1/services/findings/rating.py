@@ -12,6 +12,7 @@ from traust_core.v1.models.cvss import severity_of
 from traust_core.v1.models.findings import (
     LIKELIHOOD_FACTORS,
     Disposition,
+    FindingCvss,
     Occurrence,
     RatingInputs,
     RiskLevel,
@@ -130,6 +131,20 @@ class SeverityLabel(Model):
 
     severity: Severity | None
     basis: SeverityBasis
+
+
+def finding_cvss(occurrence: Occurrence | None, label: SeverityLabel) -> FindingCvss | None:
+    """The cvss block for a finding shown with `occurrence`: that occurrence's score and
+    vector, the severity its vector computes, and the label's basis — one constructor, so
+    the chain always describes the occurrence the view displays."""
+    if occurrence is None:
+        return None
+    return FindingCvss(
+        score=occurrence.cvss_score,
+        vector=occurrence.cvss_vector,
+        severity=severity_of(occurrence.cvss_vector),
+        basis=label.basis,
+    )
 
 
 class RatingPolicy:
