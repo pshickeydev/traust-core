@@ -525,6 +525,16 @@ class Context:
         # the names first, so no error about a variable can echo an unregistered name
         check_api_key_sources(registry, self.config.feeds.api_keys)
         api_keys = self.config.feeds.api_key_values()
+        unset = self.config.feeds.unset_api_keys()
+        for source, variable in unset.items():
+            log.error(
+                "feeds.api_keys.%s names %s, which is unset or empty: %s runs keyless at its "
+                "lower rate limit",
+                source,
+                variable,
+                source,
+                extra={"operation": "feeds.api_key", "outcome": "keyless", "source": source},
+            )
         feeds = load_feeds(registry, http=self.http, clock=self.clock)
         sources = load_feed_sources(
             registry,
@@ -533,6 +543,7 @@ class Context:
             clock=self.clock,
             api_keys=api_keys,
             api_key_variables=self.config.feeds.api_keys,
+            unset_api_keys=unset,
         )
         package_sources = load_package_sources(
             registry, http=HttpFetcher(PACKAGE_SOURCE_AGENT, self._http_policy, clock=self.clock)

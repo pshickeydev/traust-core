@@ -262,22 +262,22 @@ class Locations(_Model):
 class FeedsConfig(_Model):
     osv_access: Literal["api", "air-gapped"] = "api"  # air-gapped: exported OSV records only
     # source -> the environment variable holding its API key (`nvd: NVD_API_KEY`). Optional:
-    # a source not named here goes keyless; a named variable that is unset is a config error.
+    # a source not named here, or named with an unset or empty variable, goes keyless.
     api_keys: dict[
         Annotated[str, pydantic.StringConstraints(pattern=r"^[a-z0-9][a-z0-9_-]*$")],
         Annotated[str, pydantic.StringConstraints(pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")],
     ] = pydantic.Field(default_factory=dict)
 
     def api_key_values(self) -> dict[str, str]:
-        """Each named source's API key, read from its variable, which must be set and non-empty.
-        Whether the value can travel in a header is ApiKey's check, made when the feeds load and
-        before any registers."""
-        keys = {}
-        for source, name in self.api_keys.items():
-            value = _read_env(name, f"feeds.api_keys.{source}")
-            assert value is not None  # _read_env returns None only for no variable name
-            keys[source] = value
-        return keys
+        """Each named source's API key that its variable holds. Whether the value can travel in
+        a header is ApiKey's check, made when the feeds load and before any registers."""
+        named = self.api_keys.items()
+        return {source: value for source, name in named if (value := os.environ.get(name))}
+
+    def unset_api_keys(self) -> dict[str, str]:
+        """The named sources whose variable is unset or empty (source -> variable): they run
+        keyless at the source's lower rate limit rather than failing the feeds."""
+        return {source: name for source, name in self.api_keys.items() if not os.environ.get(name)}
 
 
 class ComplianceConfig(_Model):
