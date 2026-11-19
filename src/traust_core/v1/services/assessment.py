@@ -561,7 +561,10 @@ class AssessmentService:
         self._recording.check_recording(
             run_order_id, principal, RecordKind.ASSESSMENT, ref.repository_id, provenance
         )
-        contracts.validate_json("report#/$defs/canonical_write", doc.payload)
+        document = contracts.validate_json("report#/$defs/canonical_write", doc.payload)
+        doc = type(doc)(doc.payload, document)
+        if doc.metadata.commit is not None and doc.metadata.commit != ref.sha:
+            raise ValidationError("report metadata.commit does not match the prepared ref")
         self._gate(doc)
         assessment = Assessment(
             repository_ref_id=repository_ref_id,
@@ -573,7 +576,7 @@ class AssessmentService:
             occurred_at=provenance.occurred_at,
         )
         prepared, artifact = self._prepare_record(
-            doc, assessment, provenance.artifact, canonicalize_priorities=False
+            doc, assessment, provenance.artifact, authored_order_id=run_order_id
         )
         with self._recording.recording(
             order_id=run_order_id,
@@ -582,11 +585,33 @@ class AssessmentService:
             repository_id=ref.repository_id,
             provenance=provenance,
         ):
+            replay = self._log.recorded_order(run_order_id, assessment.kind, repository_ref_id, doc)
+            if replay is not None:
+                recorded, report = replay
+                assert recorded.id is not None and report.id is not None
+                return AssessmentRecordResult(
+                    assessment_id=recorded.id,
+                    artifact_id=report.id,
+                    intake=IntakeResult(findings=self.intake_bindings(recorded.id).findings),
+                )
+            assert self._intake is not None
+            candidates = FindingCandidate.of_report(doc.findings, ref.repository_id)
+            for entry, candidate in zip(doc.findings, candidates, strict=True):
+                if entry.fingerprint is None and entry.fingerprint_algo is None:
+                    continue
+                native = self._intake.fingerprint(candidate)
+                if entry.fingerprint != native.value or entry.fingerprint_algo not in (
+                    None,
+                    native.algo,
+                ):
+                    raise ValidationError(
+                        f"report label {candidate.label}: fingerprint stamp mismatch"
+                    )
             recorded, report, intake = self._record_findings(
                 prepared,
                 assessment,
                 artifact,
-                FindingCandidate.of_report(doc.findings, ref.repository_id),
+                candidates,
                 hold_moves=True,
             )
             assert recorded.id is not None and report.id is not None
@@ -703,7 +728,7 @@ class AssessmentService:
         assessment: Assessment,
         artifact: ArtifactRef | None,
         *,
-        canonicalize_priorities: bool = True,
+        authored_order_id: UUID | None = None,
     ) -> tuple[AssessmentArtifact, ArtifactRef | StagedArtifact[AssessmentArtifact]]:
         contracts.validate_enum("assessment_kind", assessment.kind)
         if (schema := RECORDED_SCHEMAS.get(AssessmentKind(assessment.kind))) is None:
@@ -727,7 +752,7 @@ class AssessmentService:
         digest = sha256_hex(doc.payload)
         written = (
             doc.with_canonical_priorities()
-            if canonicalize_priorities and artifact is None and isinstance(doc, ReportArtifact)
+            if authored_order_id is None and artifact is None and isinstance(doc, ReportArtifact)
             else doc
         )
         if artifact is not None:
@@ -736,9 +761,15 @@ class AssessmentService:
                 raise IntegrityError(
                     f"artifact {artifact.id}: doc digest {digest} != published {published.digest}"
                 )
-        existing = self._recorded(
-            assessment, schema, tuple(dict.fromkeys((digest, sha256_hex(written.payload))))
-        )
+        if authored_order_id is not None:
+            # Avoid staging a known replay. Recording repeats this lookup under the lease lock.
+            existing = self._log.recorded_order(
+                authored_order_id, assessment.kind, assessment.repository_ref_id, doc
+            )
+        else:
+            existing = self._recorded(
+                assessment, schema, tuple(dict.fromkeys((digest, sha256_hex(written.payload))))
+            )
         if existing is not None:
             row = existing[1]
             assert row.id is not None
@@ -886,8 +917,9 @@ class AssessmentService:
         ref = self._inventory.get_ref(repository_ref_id)
         doc = CloudConfigAuditArtifact.parse(doc.payload)
         self._gate(doc)
-        self._decisions.require_signable()
         candidates, judgments = audit_candidates(doc, ref.repository_id), audit_judgments(doc)
+        if judgments:
+            self._decisions.require_signable()
         requested = Assessment(
             repository_ref_id=repository_ref_id,
             run_order_id=run_order_id,
@@ -1245,14 +1277,16 @@ class AssessmentService:
                 for occurrence in self._findings.occurrences(assessment_id=assessment_id)
             }
             bindings: dict[Label, UUID] = {}
+            identified: set[UUID] = set()
             for candidate in FindingCandidate.of_report(doc.findings, repository_id):
                 finding_id = self._intake.match(repository_id, candidate)
-                if finding_id is None or finding_id not in admitted:
-                    raise IntegrityError(
-                        f"assessment {assessment_id}: report label {candidate.label} "
-                        "does not identify an admitted finding"
-                    )
-                bindings[candidate.label] = finding_id
+                if finding_id is not None and finding_id in admitted:
+                    identified.add(finding_id)
+                    bindings[candidate.label] = finding_id
+            if identified != admitted:
+                raise IntegrityError(
+                    f"assessment {assessment_id}: report labels do not cover its admitted findings"
+                )
             return AssessmentIntakeBindings(findings=bindings)
 
     def observation_target(

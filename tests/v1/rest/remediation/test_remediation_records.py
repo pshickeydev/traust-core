@@ -196,6 +196,8 @@ def test_admission_matches_the_owner_preserves_bytes_and_replays_without_writes(
         "open",
         got.report.id,
     )
+    with SqlTraustUnitOfWork(engine) as uow:
+        assert uow.events.find_by_decision(said.id) is not None
     before = snapshot(context)
     same_as_in_process(
         response.json(),
@@ -355,6 +357,8 @@ def test_only_the_live_lease_owner_can_close_and_replay(
     origin = provenance().model_copy(update={"run_id": order.id})
     request = body(doc, order, origin)
     before = snapshot(context)
+    configured = context.config
+    context.config = configured.model_copy(update={"ledger": None})
     refused = client.post(URL, json=request, headers=runner(context, "unrelated-runner"))
     assert_problem(refused, 403, "")
     assert snapshot(context) == before
@@ -364,6 +368,10 @@ def test_only_the_live_lease_owner_can_close_and_replay(
             doc, origin, order.id, machine(context, "unrelated-runner")
         )
     assert snapshot(context) == before
+    refused = client.post(URL, json=request, headers=runner(context))
+    assert_problem(refused, 500, "Internal Server Error")
+    assert snapshot(context) == before
+    context.config = configured
     accepted = client.post(URL, json=request, headers=runner(context))
     assert accepted.status_code == 200, accepted.text
     assert context.services().remediation.get(item.work_item_id).is_done()
@@ -462,6 +470,7 @@ def test_order_authorization_refusals_leave_rows_and_objects_unchanged(
         raw = json.loads(report(world).payload)
         raw["source_findings"][0]["finding_ref"] = str(other.id)
         request = body(RemediationArtifact.parse(json.dumps(raw).encode()), order)
+    context.config = context.config.model_copy(update={"ledger": None})
     before = snapshot(context)
     response = client.post(URL, json=request, headers=headers)
     assert_problem(response, status, "")
@@ -591,6 +600,7 @@ def test_named_order_cannot_record_another_work_item(
         raw = json.loads(report(world).payload)
         raw["source_findings"][0]["finding_ref"] = str(found.id)
         doc = RemediationArtifact.parse(json.dumps(raw).encode())
+    context.config = context.config.model_copy(update={"ledger": None})
     before = snapshot(context)
     response = client.post(URL, json=body(doc, order), headers=runner(context))
     assert_problem(response, 422, "")

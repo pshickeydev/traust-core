@@ -55,6 +55,7 @@ from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.repositories.objects import ObjectKey
 from traust_core.v1.repositories.objects.store import ObjectRef
 from traust_core.v1.services.artifact_publishing import AssessmentLog, PublishSpec, PublishSpecs
+from traust_core.v1.services.ledger import LedgerConfig
 
 FIXTURES = Path(__file__).parents[2] / "fixtures"
 WHEN = datetime(2026, 10, 23, 9, tzinfo=UTC)
@@ -122,6 +123,12 @@ def context(engine: Engine, tmp_path: Path) -> Context:
     ctx = Context(Config(home=tmp_path))
     ctx.__dict__["database"] = engine
     return ctx
+
+
+def ledger_writer(context: Context) -> Context:
+    writer = Context(context.config.model_copy(update={"ledger": LedgerConfig()}))
+    writer.__dict__["database"] = context.database
+    return writer
 
 
 @pytest.fixture
@@ -886,6 +893,7 @@ def test_slow_object_upload_does_not_hold_the_orders_write_lock(
     kind: AssessmentKind,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    context = ledger_writer(context)
     subject = (
         FuzzReportArtifact.parse(fixture("assessments/widget-fuzz-report.json"))
         if kind == AssessmentKind.FUZZ
@@ -940,3 +948,7 @@ def test_slow_object_upload_does_not_hold_the_orders_write_lock(
         recorded = pending.result(timeout=20)
     assert recorded.run_order_id == order.id
     assert context.services().assessment.get(recorded.id).id == recorded.id
+    with SqlTraustUnitOfWork(engine) as uow:
+        decisions = uow.decisions.list_for_assessments([recorded.id])
+        assert decisions
+        assert all(uow.events.find_by_decision(d.id) is not None for d in decisions)

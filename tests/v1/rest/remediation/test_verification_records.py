@@ -169,6 +169,7 @@ def test_admission_matches_the_owner_preserves_bytes_and_replays_without_writes(
     assert snapshot(context) == before
     with SqlTraustUnitOfWork(engine) as uow:
         assessment = uow.assessments.get(got.verification_id)
+        assert uow.events.find_by_decision(said.id) is not None
     assert (assessment.kind, assessment.assessor, assessment.assessor_version) == (
         "verification",
         "skill:verify-remediation",
@@ -385,6 +386,8 @@ def test_only_the_live_lease_owner_can_close_and_replay(
     origin = provenance().model_copy(update={"run_id": order.id})
     request = body(doc, order, origin)
     before = snapshot(context)
+    configured = context.config
+    context.config = configured.model_copy(update={"ledger": None})
     refused = client.post(URL, json=request, headers=runner(context, "unrelated-runner"))
     assert_problem(refused, 403, "")
     assert snapshot(context) == before
@@ -394,6 +397,10 @@ def test_only_the_live_lease_owner_can_close_and_replay(
             doc, origin, order.id, machine(context, "unrelated-runner")
         )
     assert snapshot(context) == before
+    refused = client.post(URL, json=request, headers=runner(context))
+    assert_problem(refused, 500, "Internal Server Error")
+    assert snapshot(context) == before
+    context.config = configured
     accepted = client.post(URL, json=request, headers=runner(context))
     assert accepted.status_code == 200, accepted.text
     assert not context.services().findings.get(world.ids[0]).is_open()
@@ -488,6 +495,7 @@ def test_order_authorization_refusals_leave_rows_and_objects_unchanged(
         context.config = context.config.model_copy(
             update={"recording": context.config.recording.model_copy(update={"verification": ()})}
         )
+    context.config = context.config.model_copy(update={"ledger": None})
     before = snapshot(context)
     response = client.post(URL, json=request, headers=headers)
     assert_problem(response, status, "")

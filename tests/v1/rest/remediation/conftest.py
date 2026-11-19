@@ -13,6 +13,7 @@ from traust_core.v1.context.config import RecordingConfig
 from traust_core.v1.providers.clock import SystemClock
 from traust_core.v1.providers.identity import LocalIssuer
 from traust_core.v1.services.identity import IdentityConfig
+from traust_core.v1.services.ledger import LedgerConfig
 
 
 @pytest.fixture(params=SQL_BACKENDS)
@@ -27,9 +28,11 @@ def context(engine: Engine, tmp_path: Path) -> Context:
         engine,
         tmp_path,
         identity=IdentityConfig(trust_local=True),
+        ledger=LedgerConfig(),
         # The remediation door authorizes under the triage allowlist (NEED: contracts has
         # no recording.remediation section yet); its orders run the native scheduler asset.
         recording=RecordingConfig(verification=("verify",), triage=("remediate_finding",)),
     )
     context.__dict__["local_issuer"] = LocalIssuer(context.config.home, SystemClock())
+    context.local_issuer.mint("remediation-runner", machine=True)
     return context

@@ -1753,7 +1753,7 @@ requires-dist = [
     { name = "jsonschema", extras = ["format-nongpl"], specifier = ">=4.0" },
     { name = "psycopg", extras = ["binary"], marker = "extra == 'postgres'", specifier = ">=3.1" },
     { name = "pydantic", specifier = ">=2.11" },
-    { name = "pyjwt", extras = ["crypto"], specifier = ">=2.8" },
+    { name = "pyjwt", extras = ["crypto"], specifier = ">=2.9" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "referencing", specifier = ">=0.30" },
     { name = "sqlalchemy", specifier = ">=2.0" },

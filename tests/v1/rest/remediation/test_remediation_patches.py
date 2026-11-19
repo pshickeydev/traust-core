@@ -28,7 +28,7 @@ from traust_core.v1.models.artifacts import RemediationArtifact
 from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.repositories.objects.store import ObjectKey, ObjectRef
-from traust_core.v1.services.findings.decisions import FindingDecisions
+from traust_core.v1.services.ledger import LedgerService
 
 DIFF = b"--- a/pkg/api/handler.go\n+++ b/pkg/api/handler.go\n+// bounded request\n"
 
@@ -78,7 +78,7 @@ def test_runner_uploads_hold_neither_the_lease_lock_nor_findings_write_intent(
     assert set(uploaded) == ({DIFF} if replay else {DIFF, doc.payload})
 
 
-def test_a_runner_resolution_failure_rolls_back_report_patch_and_ticket_links(
+def test_a_runner_ledger_failure_rolls_back_report_patch_ticket_links_and_decisions(
     context: Context, client: TestClient, engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     world = World(engine)
@@ -92,10 +92,10 @@ def test_a_runner_resolution_failure_rolls_back_report_patch_and_ticket_links(
     before = snapshot(context)
 
     def interrupted(*args: object, **kwargs: object) -> None:
-        raise RepositoryError("resolution interrupted")
+        raise RepositoryError("seal interrupted")
 
     with monkeypatch.context() as patch:
-        patch.setattr(FindingDecisions, "record_resolution", interrupted)
+        patch.setattr(LedgerService, "seal", interrupted)
         response = client.post(URL, json=request, headers=headers)
     assert response.status_code == 500, response.text
     after = snapshot(context)

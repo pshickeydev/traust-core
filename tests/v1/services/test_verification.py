@@ -20,7 +20,7 @@ from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import Seed
 from tests.v1.services.test_exposure_advisories import GRPC, FakeLookup
 from traust_core.v1.context import Config, Context
-from traust_core.v1.errors import IntegrityError, NotFoundError, ValidationError
+from traust_core.v1.errors import IntegrityError, NotFoundError, ServiceError, ValidationError
 from traust_core.v1.models.artifacts import VerificationArtifact
 from traust_core.v1.models.common import ArtifactRef, PageRequest, Provenance
 from traust_core.v1.models.findings import Finding
@@ -255,11 +255,19 @@ def test_recording_again_changes_nothing(service: VerificationService, engine: E
     )  # type: ignore[arg-type]
 
 
-def test_recording_again_finishes_a_run_that_stopped_part_way(
-    service: VerificationService, engine: Engine, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("prepublished", [False, True])
+def test_failed_order_verdict_rolls_back_report_metadata_regressions_and_proofs(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, prepublished: bool
 ) -> None:
     world = World(engine, findings=2)
+    service = make_context(engine, tmp_path, ledger=LedgerConfig()).services().verification
     doc = report(world, {world.ids[0]: "resolved", world.ids[1]: "unresolved"})
+    prior = service._publisher.publish_ref(doc) if prepublished else None
+    with SqlTraustUnitOfWork(engine) as uow:
+        order = Seed(uow).run_order(asset="verify", repository_id=world.repo.id)
+        uow.commit()
+    assert order.id is not None
+    origin = provenance(prior).model_copy(update={"run_id": order.id})
     decide = service._findings.decisions.record_resolution
     calls = iter([decide, RuntimeError])
 
@@ -270,16 +278,22 @@ def test_recording_again_finishes_a_run_that_stopped_part_way(
         return step(*args, **kwargs)
 
     monkeypatch.setattr(service._findings.decisions, "record_resolution", flaky)
-    with pytest.raises(RuntimeError):
-        service.record(doc, provenance())
+    with pytest.raises(RuntimeError, match="connection lost"):
+        service.record(doc, origin, run_order_id=order.id)
     monkeypatch.undo()
-    # the verdicts are one transaction (as they already were through the record door):
-    # the stopped run left nothing behind to finish
+    with SqlTraustUnitOfWork(engine) as uow:
+        stored = uow.artifacts.find(None, sha256_hex(doc.payload))
+        assert (stored.id if stored else None) == (prior.id if prior else None)
+        assert len(uow.findings.list_for_repository(world.repo.id)) == len(world.ids)
+        assert uow.connection.scalar(sa.select(sa.func.count()).select_from(uow.events.table)) == 0
     assert not service.list(  # type: ignore[arg-type]
         VerificationFilter(repository_id=world.repo.id), PageRequest()
     ).items
-    got = service.record(doc, provenance())
+    got = service.record(doc, origin, run_order_id=order.id)
     assert {v.verdict for v in got.verdicts} == {"resolved", "unresolved"}
+    with SqlTraustUnitOfWork(engine) as uow:
+        assert uow.assessments.get(got.verification_id).run_order_id == order.id
+        assert uow.connection.scalar(sa.select(sa.func.count()).select_from(uow.events.table)) == 2
 
 
 @pytest.mark.parametrize(
@@ -441,6 +455,31 @@ def test_record_refuses_a_report_it_cannot_place(
     with pytest.raises(error, match=said):
         service.record(doc, provenance())
     assert decisions(engine, world.ids[0])[-1].assessment_id is None  # nothing stated
+
+
+def test_direct_order_verification_requires_a_ledger_before_upload_and_on_replay(
+    service: VerificationService, context: Context, engine: Engine
+) -> None:
+    world = World(engine)
+    with SqlTraustUnitOfWork(engine) as uow:
+        order = Seed(uow).run_order(asset="verify", repository_id=world.repo.id)
+        uow.commit()
+    assert order.id is not None
+    origin = provenance().model_copy(update={"run_id": order.id})
+    doc = report(world)
+    before = decisions(engine, world.ids[0])
+    with pytest.raises(ServiceError, match="requires a ledger"):
+        service.record(doc, origin, run_order_id=order.id)
+    assert not tuple(context.object_store.list())
+    assert decisions(engine, world.ids[0]) == before
+    with SqlTraustUnitOfWork(engine) as uow:
+        assert uow.artifacts.find(None, sha256_hex(doc.payload)) is None
+        assert not uow.assessments.list_for_ref(world.patched.id)
+
+    context.config = context.config.model_copy(update={"ledger": LedgerConfig()})
+    context.services().verification.record(doc, origin, run_order_id=order.id)
+    with pytest.raises(ServiceError, match="requires a ledger"):
+        service.record(doc, origin)
 
 
 def test_verdicts_go_on_the_ledger_when_it_is_on(engine: Engine, tmp_path: Path) -> None:

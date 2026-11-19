@@ -866,7 +866,9 @@ class RemediationService:
                     f"order {run_order_id}: remediation report covers findings of another"
                     " repository"
                 )
-        staged = self._stage_remediation(doc, provenance, order.work_item_id, diff)
+        staged = self._stage_remediation(
+            doc, provenance, order.work_item_id, diff, order_bound=True
+        )
         with self._recording.recording(
             order_id=run_order_id,
             principal=principal,
@@ -911,9 +913,10 @@ class RemediationService:
             if diff is not None:
                 raise ValidationError("fleet-fix specs do not take remediation patch bytes")
             return self._record_fleet_fix(doc, provenance)
-        return self._record_remediation(
-            self._stage_remediation(doc, provenance, work_item_id, diff), run_order_id
+        staged = self._stage_remediation(
+            doc, provenance, work_item_id, diff, order_bound=run_order_id is not None
         )
+        return self._record_remediation(staged, run_order_id)
 
     def _stage_remediation(
         self,
@@ -921,6 +924,8 @@ class RemediationService:
         provenance: Provenance,
         work_item_id: UUID | None,
         diff: bytes | None,
+        *,
+        order_bound: bool,
     ) -> _RemediationRecording:
         doc = RemediationArtifact.parse(doc.payload)
         if doc.fork.visibility == ForkVisibility.PUBLIC:
@@ -960,6 +965,8 @@ class RemediationService:
                 raise IntegrityError(
                     f"artifact {published.id}: doc digest {digest} != published {published.digest}"
                 )
+        if order_bound or item.reported_by is not None:
+            self._findings.decisions.require_order_ledger()
         patch, refusal = None, None
         if diff is not None:
             try:
@@ -1736,10 +1743,12 @@ class VerificationService:
                 digest,
             )
 
-        # the bytes go first, outside the transaction: content-addressed, a copy is harmless
-        published = None
+        staged = None
         if not recorded():
-            published = (provenance.artifact or self._publisher.publish_ref(doc)).id
+            if run_order_id is not None:
+                self._findings.decisions.require_order_ledger()
+            if provenance.artifact is None:
+                staged = self._publisher.stage(doc)
         said: defaultdict[tuple[Any, ...], list[UUID]] = defaultdict(list)
         for finding_id, f in verdicts.items():
             propagation = f.cross_repo.propagation if f.cross_repo else None
@@ -1756,8 +1765,16 @@ class VerificationService:
                         f"verification assessment {assessment.id} belongs to order "
                         f"{assessment.run_order_id}, not {run_order_id}"
                     )
+                if assessment.run_order_id is not None:
+                    self._findings.decisions.require_order_ledger()
+                    assert assessment.id is not None
+                    return self._recorded_verification(repository_id, assessment.id)
             else:
-                assert published is not None  # a recorded assessment is never removed
+                if staged is not None:
+                    published = self._publisher.publish_staged(staged).artifact_id
+                else:
+                    assert provenance.artifact is not None  # recorded assessments are never removed
+                    published = provenance.artifact.id
                 assessment, report = self._log.add(
                     Assessment(
                         repository_ref_id=ref.id,  # type: ignore[arg-type]
@@ -1798,10 +1815,13 @@ class VerificationService:
                     "verification %s: %d verdicts on ref %s", assessment.id, len(verdicts), ref.id
                 )
             )
-        (verification,) = (
-            v for v in self._verifications(repository_id) if v.verification_id == assessment.id
-        )
-        return verification
+        return self._recorded_verification(repository_id, assessment.id)
+
+    def _recorded_verification(self, repository_id: UUID, assessment_id: UUID) -> Verification:
+        for verification in self._verifications(repository_id):
+            if verification.verification_id == assessment_id:
+                return verification
+        raise IntegrityError(f"verification assessment {assessment_id} lacks its recorded result")
 
     def _audit_of(
         self, finding_ids: Sequence[UUID], original_commit: str, patched: RepositoryRef
