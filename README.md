@@ -10,7 +10,7 @@ All modules live under `traust_core.v1` (see [Versioning](#versioning)).
 | **Errors** | `errors` | the exception hierarchy every layer raises (`ValidationError`, `NotFoundError`, …) | ad hoc exceptions |
 | **Models** | `models` | one model per contract table, grouped by section — `inventory`, `dependencies`, `assessment`, `findings`, `operations`, `ledger` (fields = columns) — next to that section's service types; `base` (`Model` strict, `Dto` tolerant, `Entity` with a database-generated UUIDv4 id, `AppendOnly` for tables that are never updated), `values` (`HttpsRepoUrl`, `GitSha`, `CveId`, `to_rfc3339` / `TimestampError`: the contracts' one RFC 3339 rule), `integrity` | dicts passed between scripts |
 | **Validation rules** | `models.validation` | `ValidationScope.permits(action, target, as_of=…)`, `ValidationPlan.requires_approval()`, `ValidationAttempt.soundness()` — pure scope, approval and refutation rules | duplicated harness scope and soundness rules |
-| **CVSS sources** | `models.cvss`, `services.findings.cvss`, `models.feed_documents`, `services.exposure` | the per-source documents kept daily (`exposure.refresh_documents`: one manifest snapshot per source, a failed fetch keeping the last document; `exposure.stored_document` reads one back, digest-checked); `exposure.advisory_names` is the batched door every advisory join goes through (canonical name plus aliases, CVEs split out), and `exposure.refresh_advisory_documents` keeps every linked advisory's documents; each advisory source's CVSS from its stored document (`cve_list_scores`, `nvd_scores`, `osv_scores`, `rh_cve_scores`, `csaf_scores`, `scanner_score`; `score_of` refuses a malformed vector, a version that disagrees with it, a score outside 0–10 or one its vector doesn't compute; FIRST's 3.x and 4.0 formulas through the `cvss` library), and the one a finding shows: `effective(scores)` ranks NIST > GitHub-reviewed GHSA > CNA > ADP > Red Hat > scanner, takes a source's 3.1 before its 3.0, and a 4.0 score only when no source has a 3.x one (the highest-ranked 4.0 shown alongside) | `AdvisoryRecord.cvss_score`, which reads only one feed's 3.x vectors |
+| **CVSS sources** | `models.cvss`, `services.findings.cvss`, `models.feed_documents`, `services.exposure` | the per-source documents kept daily (`exposure.refresh_documents`: one manifest snapshot per source, a failed fetch keeping the last document; `exposure.stored_document` reads one back, digest-checked); `exposure.advisory_names` is the batched door every advisory join goes through (canonical name plus aliases, CVEs split out), and `exposure.refresh_advisory_documents` keeps every linked advisory's documents, then ranks their scores into the daily `advisory-cvss` build that `exposure.advisory_cvss` reads; each advisory source's CVSS from its stored document (`cve_list_scores`, `nvd_scores`, `osv_scores`, `rh_cve_scores`, `csaf_scores`, `scanner_score`; `score_of` refuses a malformed vector, a version that disagrees with it, a score outside 0–10 or one its vector doesn't compute; FIRST's 3.x and 4.0 formulas through the `cvss` library), and the one a finding shows: `effective(scores)` ranks NIST > GitHub-reviewed GHSA > CNA > ADP > Red Hat > scanner, takes a source's 3.1 before its 3.0, and a 4.0 score only when no source has a 3.x one (the highest-ranked 4.0 shown alongside) | `AdvisoryRecord.cvss_score`, which reads only one feed's 3.x vectors |
 | **Validation recording** | `services.validation`, `models.validation` | `record_order(doc, provenance, bindings, run_order_id, principal)` binds machine reports to a live order lease; trusted-local `record(doc, provenance, bindings)` and `evidence(artifact_id)` retain their existing semantics | re-running probes, interpreting source labels as database IDs |
 | **Artifacts** | `models.artifacts` | the `ArtifactDocument` base + `SchemaView` (fields from the installed schema, `doc.findings[0].verdict`, unknown names raise) and the named documents (`TriageArtifact`, `SecurityAuditArtifact`, …, `Verdict`, `Severity`) | `json.load` + `.get("key")` |
 | **Artifact publishing** | `services.artifact_publishing` | `ctx.artifact_publisher(specs).publish(name, raw)` or `.publish_artifact(artifact)`: exact gate → content-addressed objects → an artifact UUID on SQLite and Postgres; `get(artifact_id)` verifies the persisted digest; `list_for_assessment(id, kind=…)` reads metadata | writing `analysis-results` files by hand or optional indexing |
@@ -469,6 +469,27 @@ that fails keeps its last manifest and says why (`AdvisoryDocumentsRefresh.ok` f
 `error`); the others still refresh. When every source asked fails, the refresh raises
 `ServiceError` naming each one's reason, so an outage never reads as a finished refresh. A
 failure's text never carries a URL's credentials or query string.
+
+### The daily CVSS build
+
+After the documents, the refresh ranks what they state (`exposure.refresh_advisory_cvss`, also
+callable on its own): for each linked advisory, every authority's scores from its CVEs' `cve-list`,
+`nvd` and `rh-cve` documents and its GHSAs' `ghsa` document, in `effective`'s order, each with its
+document and fetch time. One build (`models.cvss.AdvisoryCvss`, keyed by canonical advisory) is a
+`feed` artifact plus a `feed_snapshot` named `advisory-cvss`, with the documents' retry rules; an
+unchanged day is the same bytes, so one artifact. Views read this build, never the documents.
+
+- **Only when a source is registered.** With none, the refresh builds nothing.
+- **An unreadable document scores nothing.** A kept document that doesn't parse, or that the
+  store lost, is named in `AdvisoryCvss.unreadable` and logged; the rest still score.
+- **Reads.** `exposure.advisory_cvss(advisory_ids)` returns `AdvisoryCvssRead`: each asked
+  advisory's ranked scores, keyed as asked (an alias reads its canonical's), and `built_at`.
+  An advisory no authority scored is absent; with no readable build, `built_at` is None. It is
+  three keyed reads; the build is parsed once per publication by the Context's
+  `advisory_cvss_cache`, which outlives the per-request services. An unreadable build is
+  logged and remembered until the next one.
+- **Freshness.** Once built, `feed_statuses()` lists `advisory-cvss` with the shortest document
+  source's `max_age_hours`, its refresh being the document refresh.
 
 **Set an NVD API key.** This refresh asks NVD for every linked CVE every day. Without a key NVD
 allows about 5 requests per 30 seconds, so a few thousand CVEs take hours. A key is free

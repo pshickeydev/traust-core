@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from typing import Literal, TypeVar
+from uuid import UUID
 
 import pydantic
 from cvss import CVSS3, CVSS4
@@ -61,6 +63,28 @@ class CvssScore(Model):
     document: str
     scored_by: str | None = None
     acquired_at: datetime | None = None
+
+
+class AdvisoryCvss(Model):
+    """Every authority's scores for each linked advisory (canonical id), ranked, from one day's
+    kept documents; `unreadable` names a kept document that didn't parse, so it stated nothing."""
+
+    scores: Mapping[UUID, tuple[CvssScore, ...]]
+    unreadable: tuple[str, ...] = ()
+
+    def to_bytes(self) -> bytes:
+        # canonical: the same scores are the same bytes, so an unchanged day is one artifact
+        body = self.model_dump(mode="json")
+        return json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+
+    @classmethod
+    def from_bytes(cls, raw: bytes) -> AdvisoryCvss:
+        try:
+            return cls.model_validate_json(raw)
+        except pydantic.ValidationError as e:
+            raise ValidationError(
+                f"not an advisory CVSS build ({e.error_count()} problem(s))"
+            ) from e
 
 
 class EffectiveCvss(Model):
