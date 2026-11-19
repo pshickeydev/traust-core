@@ -84,7 +84,33 @@ identity:                                 # absent: no caller can be verified (R
 | `campaign.tracking_reference`, `campaign.display_name` | the tracking key and title reports cite |
 | `remediation.fork_org`, `remediation.patch_prefix`, `remediation.private_forge_hosts` | where fixes are pushed: the mirror org, the patch-repository name prefix the convention computes (`patch-` by default; a deployment running SCI's provisioner sets `sci-patch-`), and the deployment's own forge hosts |
 | `forge_tokens` | forge host -> the environment variable holding its API token, beside `forge_hosts` |
-| `overrides.rule_pack_allowlist` | enables supplemental rule packs; absent: none. The only override: tool pins, safe-exec profiles and the feeds registry are the project's and ship in `context/shipped/` (`Context.register_toolchain()` / `register_feeds()` read them) |
+| `overrides.rule_pack_allowlist` | enables explicitly selected supplemental rule packs; absent: none. Sources may be local directories relative to the allowlist or HTTPS Git repositories pinned to a 40-hex commit. Enabled packs must pass the same native quality gates as the shipped rules |
+
+## Adopter Opengrep rules
+
+Set `overrides.rule_pack_allowlist` to an adopter-owned allowlist. For example:
+
+```yaml
+packs:
+  acme:
+    enabled: true
+    source: rules/acme
+    rules: [acme-authentication-check]
+```
+
+The source above resolves beside the allowlist file, not the process's working directory.
+Keep native Opengrep fixtures beside their rule YAML, sharing its basename; every authored
+rule requires both `ruleid:` and `ok:` cases. A pinned HTTPS Git source uses the existing
+checkout and rules-subtree convention and must carry those fixtures too. Relative local
+sources cannot select a single file: an enabled local pack is a directory.
+
+`opengrep_quality_report` checks without a database. Actual scans run native validation
+and strict native tests over private snapshots and then consume those same snapshots.
+Missing fixtures, skipped/unreported tests, unknown test IDs, duplicate rule IDs, failed
+assertions, abnormal native exits, or invalid enabled sources refuse the run; there is no
+validation bypass or silent fallback to only the public pack. Per-rule selection still
+limits reported supplemental hits, but the supplied pack must pass quality checks.
+These checks establish fixture behavior, not real application exploitability.
 
 ## Feed API keys
 

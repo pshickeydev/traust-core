@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 from tests.v1.conftest import CheckoutForge, NoCheckouts
+from tests.v1.providers.tools.opengrep_fixtures import write_rule
 from traust_core.v1.context import Config, Context
 from traust_core.v1.context.documents import yaml_documents
 from traust_core.v1.errors import ConfigError, NotFoundError, ValidationError
@@ -398,6 +399,11 @@ SWEEP_RULE = """rules:
 
 def sweep_rule(tmp_path: Path) -> RuleFile:
     path = write(tmp_path / "rule.yaml", SWEEP_RULE)
+    path.with_suffix(".go").write_text(
+        'package fixture\nimport "os/exec"\nfunc sample(c string) {\n'
+        '// ruleid: traust-go-sweep-cwe-78\nexec.Command("sh", "-c", c)\n'
+        '// ok: traust-go-sweep-cwe-78\nexec.Command("echo", c)\n}\n'
+    )
     return RuleFile(path=path, ids=("traust-go-sweep-cwe-78",), unauthored=False)
 
 
@@ -422,7 +428,7 @@ def test_a_repository_the_sweep_cant_reach_is_recorded_not_raised(
     # the stand-in bare is removed, so the mirror's fetch of the https URL fails
     forge = CheckoutForge(tmp_path, "https://github.com/o/r")
     shutil.rmtree(forge.bare)
-    sweeper = OpengrepRuleSweep(PACK, (), forge.service())
+    sweeper = OpengrepRuleSweep(PACK, (), forge.service(), load=yaml_documents)
     repo = SweepRepo(slug="r", url=url.format(tmp=tmp_path), sha="a" * 40)
     got = sweeper.scan(repo, sweep_rule(tmp_path), "opengrep", 30)
     assert (got.slug, got.error, got.facts) == ("r", error.format(tmp=tmp_path), ())
@@ -432,7 +438,7 @@ def test_a_remote_repository_without_its_pinned_commit_is_recorded_not_raised(
     tmp_path: Path,
 ) -> None:
     forge = CheckoutForge(tmp_path, "https://github.com/o/r")
-    sweeper = OpengrepRuleSweep(PACK, (), forge.service())
+    sweeper = OpengrepRuleSweep(PACK, (), forge.service(), load=yaml_documents)
     got = sweeper.scan(SweepRepo(slug="r", url=forge.url), sweep_rule(tmp_path), "opengrep", 30)
     assert (got.error, got.detail) == (
         "clone_failed",
@@ -441,7 +447,7 @@ def test_a_remote_repository_without_its_pinned_commit_is_recorded_not_raised(
 
 
 def test_the_sweep_is_ready_only_with_its_binary() -> None:
-    sweeper = OpengrepRuleSweep(PACK, (), NEVER)
+    sweeper = OpengrepRuleSweep(PACK, (), NEVER, load=yaml_documents)
     assert not sweeper.check("no-such-opengrep-binary").ready
 
 
@@ -452,7 +458,7 @@ def test_one_rule_is_swept_over_a_local_checkout(tmp_path: Path) -> None:
         'package main\nimport "os/exec"\nfunc f(c string) { exec.Command("sh", "-c", c) }\n',
     ).parent
     clean = write(tmp_path / "repos" / "clean" / "main.go", "package main\nfunc f() {}\n").parent
-    sweeper = OpengrepRuleSweep(PACK, ("PATH", "HOME"), NEVER)
+    sweeper = OpengrepRuleSweep(PACK, ("PATH", "HOME"), NEVER, load=yaml_documents)
     rule = sweep_rule(tmp_path)
     found = sweeper.scan(SweepRepo(slug="hit", url=f"dir:{hit}"), rule, "opengrep", 120)
     (fact,) = found.facts
@@ -477,7 +483,7 @@ def test_a_remote_repository_is_swept_at_its_pinned_commit_not_the_heads(tmp_pat
         }
     )
     forge.commit({"main.go": "package main\nfunc f(c string) {}\n"})  # the head moves on
-    sweeper = OpengrepRuleSweep(PACK, ("PATH", "HOME"), forge.service())
+    sweeper = OpengrepRuleSweep(PACK, ("PATH", "HOME"), forge.service(), load=yaml_documents)
     found = sweeper.scan(
         SweepRepo(slug="hit", url=forge.url, sha=str(audited)),
         sweep_rule(tmp_path),
@@ -526,6 +532,24 @@ def test_a_rule_reads_its_kind_and_an_unknown_kind_is_refused(tmp_path: Path) ->
 
 
 def test_trial_files_must_be_bare_names(tmp_path: Path) -> None:
-    sweeper = OpengrepRuleSweep(PACK, ("PATH", "HOME"), NEVER)
+    sweeper = OpengrepRuleSweep(PACK, ("PATH", "HOME"), NEVER, load=yaml_documents)
     with pytest.raises(ValidationError, match="bare file name"):
-        sweeper.trial("rules: []\n", {"../escape.py": "x"}, "opengrep", 30)
+        sweeper.trial(
+            "rules: []\n",
+            {"../escape.py": "x"},
+            "opengrep",
+            30,
+            examples={"../escape.py": "x"},
+        )
+
+
+def test_local_adopter_pack_metadata_tracks_its_content(tmp_path: Path) -> None:
+    config = write_rule(tmp_path / "custom", "acme-local-rule")
+    source = SupplementalPack("acme", str(config.parent), ("acme-local-rule",))
+    packs = OpengrepRulePacks(PACK, "builtin", lambda: [source], NEVER, yaml_documents)
+    original = next(pack for pack in packs.packs() if pack.name == "acme")
+    assert [str(rule.id) for rule in original.rules] == ["acme-local-rule"]
+    fixture = config.with_suffix(".py")
+    fixture.write_text(fixture.read_text() + "\n# updated business-case documentation\n")
+    changed = next(pack for pack in packs.packs() if pack.name == "acme")
+    assert changed.version != original.version

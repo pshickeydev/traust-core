@@ -43,5 +43,11 @@ class RuleSweeper(Protocol):
     def scan(self, repo: SweepRepo, rule: RuleFile, binary: str, timeout: int) -> RepoSweep: ...
 
     def trial(
-        self, rule: str, target: Path | Mapping[str, str], binary: str, timeout: int
+        self,
+        rule: str,
+        target: Path | Mapping[str, str],
+        binary: str,
+        timeout: int,
+        *,
+        examples: Mapping[str, str],
     ) -> RepoSweep: ...

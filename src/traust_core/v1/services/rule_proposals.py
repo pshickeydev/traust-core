@@ -8,7 +8,7 @@ import re
 from collections.abc import Iterator
 from typing import Any
 
-from traust_core.v1.models.rule_mining import ProposalCheck, ProposalCheckName
+from traust_core.v1.models.rule_mining import ProposalCheck, ProposalCheckName, example_lines
 from traust_core.v1.models.vocabulary import FindingKind
 
 MAX_HITS = 25
@@ -120,18 +120,6 @@ def regexes(rule: dict[str, Any]) -> ProposalCheck:
     return _check(ProposalCheckName.REGEX, problems)
 
 
-def example_lines(rule_id: str, example: str) -> tuple[set[int], set[int]]:
-    """(lines a `ruleid:` comment says must match, lines an `ok:` comment says must not): each
-    marker names the line after it, as `opengrep --test` reads them."""
-    fire: set[int] = set()
-    quiet: set[int] = set()
-    for number, line in enumerate(example.splitlines(), start=1):
-        m = re.search(r"\b(ruleid|ok):\s*([\w.,-]+)", line)
-        if m and rule_id in m.group(2).split(","):
-            (fire if m.group(1) == "ruleid" else quiet).add(number + 1)
-    return fire, quiet
-
-
 def examples(rule_id: str, example: str, hit_lines: set[int]) -> ProposalCheck:
     fire, quiet = example_lines(rule_id, example)
     problems = []
@@ -141,6 +129,8 @@ def examples(rule_id: str, example: str, hit_lines: set[int]) -> ProposalCheck:
         problems.append(f"no match on ruleid line(s) {missed}")
     if wrong := sorted(quiet & hit_lines):
         problems.append(f"matches ok line(s) {wrong}")
+    if extra := sorted(hit_lines - fire - quiet):
+        problems.append(f"unexpected match on unannotated line(s) {extra}")
     return _check(ProposalCheckName.EXAMPLES, problems)
 
 

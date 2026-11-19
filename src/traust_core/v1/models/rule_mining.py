@@ -338,6 +338,38 @@ class RuleHit(Dto):
     nosem_marked: bool = False
 
 
+class ProposalCheckName(StrEnum):
+    STRUCTURE = "structure"
+    CATCH_ALL = "catch-all"
+    PATHS = "paths"
+    REGEX = "regex"
+    VALIDATE = "validate"
+    TEST = "test"
+    EXAMPLES = "examples"
+    EXPLOSION = "explosion"
+
+
+class ProposalCheck(Model):
+    name: ProposalCheckName
+    passed: bool
+    detail: str = ""
+
+
+class RuleQualityReport(Model):
+    rules: tuple[str, ...]
+    checks: tuple[ProposalCheck, ...]
+
+    @property
+    def passed(self) -> bool:
+        return (
+            bool(self.rules)
+            and len(self.checks) == 2
+            and {check.name for check in self.checks}
+            == {ProposalCheckName.VALIDATE, ProposalCheckName.TEST}
+            and all(check.passed for check in self.checks)
+        )
+
+
 class RepoSweep(Model):
     """One repository's sweep with one rule: hits, or the error that stopped it."""
 
@@ -350,6 +382,7 @@ class RepoSweep(Model):
     files_scanned: int | None = None
     engine_errors: int | None = None
     facts: tuple[RuleHit, ...] = ()
+    quality_checks: tuple[ProposalCheck, ...] = ()
 
 
 class RuleSweepRequest(Dto):
@@ -612,21 +645,6 @@ class RuleProposal(Dto):
     timeout: int = 300
 
 
-class ProposalCheckName(StrEnum):
-    STRUCTURE = "structure"
-    CATCH_ALL = "catch-all"
-    PATHS = "paths"
-    REGEX = "regex"
-    EXAMPLES = "examples"
-    EXPLOSION = "explosion"
-
-
-class ProposalCheck(Model):
-    name: ProposalCheckName
-    passed: bool
-    detail: str = ""
-
-
 class ProposalVerdict(Model):
     """The gate's answer: every check, and the draft an admitted proposal was staged as."""
 
@@ -636,3 +654,14 @@ class ProposalVerdict(Model):
     draft: str | None = None
     hits: int | None = None  # on the checkout
     files_scanned: int | None = None
+
+
+def example_lines(rule_id: str, example: str) -> tuple[set[int], set[int]]:
+    """Lines marked as required matches or required non-matches for one rule."""
+    fire: set[int] = set()
+    quiet: set[int] = set()
+    for number, line in enumerate(example.splitlines(), start=1):
+        marker = re.search(r"\b(ruleid|ok):\s*([\w.,-]+)", line)
+        if marker and rule_id in marker.group(2).split(","):
+            (fire if marker.group(1) == "ruleid" else quiet).add(number + 1)
+    return fire, quiet

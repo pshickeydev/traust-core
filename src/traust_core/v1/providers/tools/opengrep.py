@@ -3,9 +3,9 @@ for the audit skills to judge. A candidate generator, never a verdict.
 
 Rule packs are a swappable input passed by path, never vendored: the deployment's pack
 (`Context.register_rule_pack`), its supplemental packs enabled per rule by the allowlist, or the
-sources a caller names (a local path, a git URL pinned `@<sha>`, a registry `p/<pack>`). The
-registry's `auto` is refused: it fetches rules with no per-pack license accounting. A pinned git
-source is a workspace from the checkout service, never a clone of our own."""
+sources a caller names (a tested local path or an HTTPS git URL pinned `@<sha>`). Registry
+shorthands are refused because they provide no local behavioral fixtures. A pinned git source
+is a workspace from the checkout service, never a clone of our own."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ import logging
 import re
 import shutil
 from collections.abc import Mapping, Sequence
+from contextlib import ExitStack
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as package_version
@@ -21,13 +22,16 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from traust_core.v1.errors import NotFoundError, ServiceError, ValidationError
+from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.artifacts import AdapterResultArtifact
+from traust_core.v1.models.rule_mining import ProposalCheck
 from traust_core.v1.models.values import GitSha, HttpsRepoUrl
 from traust_core.v1.providers.clock import Clock
+from traust_core.v1.providers.config_matrix import YamlLoader
 from traust_core.v1.providers.process import ProcessRunner, ProcessTimeout
 from traust_core.v1.providers.sources import CheckoutRequest, Checkouts, Workspace
 from traust_core.v1.providers.tools.adapter import adapter_result
+from traust_core.v1.providers.tools.opengrep_quality import RuleQualityError, checked_rules
 
 log = logging.getLogger(__name__)
 
@@ -53,11 +57,6 @@ ARGUS_RULES_LICENSE = (
     "internal use, redistribution and commercial use "
     "permitted with attribution — see "
     "docs/external-dependencies.md"
-)
-REGISTRY_LICENSE = (
-    "Semgrep registry pack: license varies per pack; "
-    "Semgrep-maintained packs are restrictively licensed — "
-    "see docs/external-dependencies.md"
 )
 
 TEST_PATH_RE = re.compile(r"(^|/)(tests?|e2e|examples?|testdata|hack)(/|$)")
@@ -212,11 +211,12 @@ def resolve_rules(
                     "docs/external-dependencies.md)"
                 )
             if re.match(r"^[pr]/[\w./-]+$", src):
-                resolved.append(
-                    {"source": src, "config": [src], "sha": None, "license_note": REGISTRY_LICENSE}
+                raise ValidationError(
+                    "registry-only rules have no local test fixtures; use a tested local "
+                    "pack or a pinned HTTPS checkout"
                 )
             elif src.startswith(("http://", "https://", "git@")):
-                rules, workspace = _git_rules(src, target, checkouts)
+                rules, workspace = _git_rules(src, checkouts)
                 resolved.append(rules)
                 held.append(workspace)
             else:
@@ -238,20 +238,15 @@ def resolve_rules(
     return resolved, held
 
 
-def _git_rules(src: str, target: Path, checkouts: Checkouts) -> tuple[dict[str, Any], Workspace]:
+def _git_rules(src: str, checkouts: Checkouts) -> tuple[dict[str, Any], Workspace]:
     url, ref = pinned_rules_source(src)
     workspace = checkouts.checkout(
         CheckoutRequest(
             repo=HttpsRepoUrl.parse(url, [urlsplit(url).hostname or ""]), ref=GitSha.parse(ref)
         )
     ).data
-    # argus nests its rules beside a tests/ tree of deliberately vulnerable fixtures: scope the
-    # config to the rules subtree, then filter to the target's languages.
     root = rules_root(url, workspace.path)
     configs = [str(root)]
-    if url.rstrip("/").endswith(("opengrep-rules", "argus-observe-rules")):
-        langs = detect_language_dirs(target)
-        configs = [str(root / d) for d in sorted(langs) if (root / d).is_dir()] or configs
     return {
         "source": src,
         "config": configs,
@@ -301,16 +296,33 @@ def bare_rule_id(check_id: str) -> str:
     return check_id.rsplit(".", 1)[-1] if check_id else check_id
 
 
-def supplemental_packs(packs: Mapping[str, Any]) -> list[SupplementalPack]:
-    """The allowlist's enabled packs that name a source and at least one rule: an enabled pack
-    with no rules would mean every rule, the wholesale enablement this forbids."""
+def supplemental_packs(
+    packs: Mapping[str, Any], *, base: Path | None = None
+) -> list[SupplementalPack]:
+    """Enabled, explicitly selected packs; local paths resolve beside the allowlist."""
     out = []
     for name, cfg in packs.items():
         if not isinstance(cfg, dict) or not cfg.get("enabled"):
             continue
-        rules = tuple(str(r) for r in (cfg.get("rules") or []) if r)
-        if rules and (src := cfg.get("source")):
-            out.append(SupplementalPack(name, str(src), rules))
+        rules = cfg.get("rules")
+        source = cfg.get("source")
+        if (
+            not isinstance(rules, list)
+            or not rules
+            or any(not isinstance(rule, str) or not rule.strip() for rule in rules)
+            or len(set(rules)) != len(rules)
+            or not isinstance(source, str)
+            or not source.strip()
+        ):
+            raise ValidationError(f"enabled rule pack {name} needs a source and unique rule ids")
+        if not source.startswith(("https://", "http://", "git@")):
+            path = Path(source).expanduser()
+            if not path.is_absolute():
+                if base is None:
+                    raise ValidationError(f"relative rule pack {name} needs an allowlist directory")
+                path = base / path
+            source = str(path.resolve())
+        out.append(SupplementalPack(name, source, tuple(rules)))
     return out
 
 
@@ -349,7 +361,7 @@ def _strings(value: Any) -> list[str]:
 
 
 def normalize(
-    raw: dict[str, Any], target: Path
+    raw: dict[str, Any], target: Path, rule_ids: frozenset[str] = frozenset()
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """opengrep's JSON as (facts, engine errors)."""
     facts = []
@@ -363,9 +375,12 @@ def normalize(
             rel = path
         start = (r.get("start") or {}).get("line", 0)
         end = (r.get("end") or {}).get("line", 0)
+        stated = r.get("check_id", "?")
+        matching = [rule for rule in rule_ids if stated == rule or stated.endswith("." + rule)]
+        rule_id = max(matching, key=len) if matching else bare_rule_id(stated)
         facts.append(
             {
-                "rule_id": bare_rule_id(r.get("check_id", "?")),
+                "rule_id": rule_id,
                 "severity_hint": SEVERITY_HINT.get(extra.get("severity", ""), "low"),
                 "file": rel,
                 "start_line": start,
@@ -410,35 +425,62 @@ def execute_scan(
     pack: Path,
     runner: ProcessRunner,
     checkouts: Checkouts,
+    load: YamlLoader,
     supplements: Sequence[SupplementalPack] = (),
     rule_allow: RuleAllowlist | None = None,
     timeout: int = SCAN_TIMEOUT,
     opengrep_bin: str = "opengrep",
 ) -> dict[str, Any]:
-    """Run opengrep over `target` and return its full facts report. Supplements apply only to a
-    default (pack) run; a supplement that won't resolve or fetch is refused: the pack is skipped
-    with its reason in the report, never a scan abort."""
+    """Scan only rule snapshots that passed native validation and strict fixture tests."""
     rules, held = resolve_rules(rule_sources, target, pack, checkouts)
     applied: list[str] = []
     skipped: list[dict[str, str]] = []
     supp_allow: set[str] = set()
+    quality_inputs = ExitStack()
+    quality_checks: list[ProposalCheck] = []
+    active_configs: list[Path] = []
+    active_ids: set[str] = set()
+    enabled: dict[int, tuple[str, ...]] = {}
     try:
         if not rule_sources:
             for supp in supplements:
-                try:
-                    supp_rules, supp_held = resolve_rules([supp.source], target, pack, checkouts)
-                except (ValidationError, ServiceError, NotFoundError) as e:
-                    log.warning("supplemental pack %s refused: %s", supp.name, e)
-                    skipped.append({"pack": supp.name, "reason": str(e)})
-                    continue
-                rules += supp_rules
+                if (
+                    not supp.source.startswith(("https://", "http://", "git@"))
+                    and not Path(supp.source).is_dir()
+                ):
+                    raise ValidationError(
+                        f"local rule pack {supp.name} must be an existing directory: {supp.source}"
+                    )
+                supp_rules, supp_held = resolve_rules([supp.source], target, pack, checkouts)
                 held += supp_held
+                for source in supp_rules:
+                    enabled[len(rules)] = supp.rules
+                    rules.append(source)
                 applied.append(supp.name)
                 supp_allow.update(supp.rules)
+        for index, source in enumerate(rules):
+            checked = quality_inputs.enter_context(
+                checked_rules(
+                    [Path(path) for path in source["config"]],
+                    runner,
+                    load=load,
+                    binary=opengrep_bin,
+                    timeout=timeout,
+                )
+            )
+            quality_checks.extend(checked.report.checks)
+            if not checked.report.passed:
+                raise RuleQualityError(checked.report)
+            ids = set(checked.report.rules)
+            if duplicate := active_ids & ids:
+                raise ValidationError(f"duplicate rule ids across packs: {sorted(duplicate)}")
+            if missing := set(enabled.get(index, ())) - ids:
+                raise ValidationError(f"enabled rules not found in pack: {sorted(missing)}")
+            active_ids.update(ids)
+            active_configs.extend(checked.configs)
         cmd = [opengrep_bin, "scan", "--json", "--quiet", "--disable-nosem"]
-        for r in rules:
-            for c in r["config"]:
-                cmd += ["--config", c]
+        for config in active_configs:
+            cmd += ["--config", str(config)]
         for e in EXCLUDES:
             cmd += ["--exclude", e]
         # repository content must never reach the scanner's option parsing
@@ -447,12 +489,14 @@ def execute_scan(
             proc = runner.run(cmd, check=False, timeout_seconds=timeout)
         except ProcessTimeout as e:
             raise TimeoutError(f"opengrep timed out after {timeout}s") from e
+        if proc.returncode not in (0, 1):
+            raise RuntimeError(f"opengrep scan exited {proc.returncode}")
         try:
             raw = json.loads(proc.stdout)
         except json.JSONDecodeError as e:
             raise RuntimeError("opengrep produced no JSON") from e
 
-        facts, errors = normalize(raw, target)
+        facts, errors = normalize(raw, target, frozenset(active_ids))
         allow = rule_allow
         if allow is None and supp_allow:
             traust_ids = harness_pack_rule_ids(pack)
@@ -502,11 +546,15 @@ def execute_scan(
             },
             "coverage": coverage_block(target, pack),
             "facts": facts,
+            "quality_checks": [check.model_dump(mode="json") for check in quality_checks],
             "errors": errors,
         }
     finally:
-        for workspace in held:
-            checkouts.release(workspace)
+        try:
+            quality_inputs.close()
+        finally:
+            for workspace in held:
+                checkouts.release(workspace)
 
 
 def format_lines(start: int | None, end: int | None) -> str:
@@ -564,6 +612,7 @@ def scan(
     runner: ProcessRunner,
     clock: Clock,
     checkouts: Checkouts,
+    load: YamlLoader,
     supplements: Sequence[SupplementalPack] = (),
     rules: Sequence[str] = (),
     rule_allow: RuleAllowlist | None = None,
@@ -583,6 +632,7 @@ def scan(
         pack=pack,
         runner=runner,
         checkouts=checkouts,
+        load=load,
         supplements=supplements,
         rule_allow=rule_allow,
         timeout=timeout,

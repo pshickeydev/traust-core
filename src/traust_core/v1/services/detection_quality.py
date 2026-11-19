@@ -1141,19 +1141,39 @@ class DetectionQualityService:
         # a rule that fails a static check never runs: its regex alone could hang the engine
         if rule_id is not None and all(c.passed for c in checks):
             trial = {proposal.example_name: proposal.example}
-            found = sweeper.trial(proposal.rule, trial, proposal.binary, proposal.timeout)
-            lines = {f.start_line for f in found.facts if f.file.endswith(proposal.example_name)}
-            checks.append(
-                rule_proposals.examples(rule_id, proposal.example, lines)
-                if found.error is None
-                else _failed_check(ProposalCheckName.EXAMPLES, found)
+            found = sweeper.trial(
+                proposal.rule, trial, proposal.binary, proposal.timeout, examples=trial
             )
+            checks.extend(_native_checks(found))
+            if all(c.passed for c in checks):
+                lines = {
+                    f.start_line
+                    for f in found.facts
+                    if f.file == proposal.example_name and f.rule_id == rule_id
+                }
+                checks.append(
+                    rule_proposals.examples(rule_id, proposal.example, lines)
+                    if found.error is None and found.engine_errors == 0
+                    else _failed_check(ProposalCheckName.EXAMPLES, found)
+                )
         if rule_id is not None and all(c.passed for c in checks):
             found = sweeper.trial(
-                proposal.rule, proposal.checkout, proposal.binary, proposal.timeout
+                proposal.rule,
+                proposal.checkout,
+                proposal.binary,
+                proposal.timeout,
+                examples=trial,
             )
-            if found.error is None:
-                hits, files_scanned = len(found.facts), found.files_scanned or 0
+            native = _native_checks(found)
+            if not all(check.passed for check in native):
+                checks.extend(native)
+            elif (
+                found.error is None
+                and found.engine_errors == 0
+                and found.files_scanned is not None
+                and found.files_scanned > 0
+            ):
+                hits, files_scanned = len(found.facts), found.files_scanned
                 hit_files = len({f.file for f in found.facts})
                 checks.append(rule_proposals.explosion(hits, hit_files, files_scanned))
             else:
@@ -1676,8 +1696,23 @@ class DetectionQualityService:
 M = TypeVar("M", bound=BaseModel)
 
 
+def _native_checks(found: RepoSweep) -> tuple[ProposalCheck, ...]:
+    required = {ProposalCheckName.VALIDATE, ProposalCheckName.TEST}
+    if len(found.quality_checks) == 2 and {c.name for c in found.quality_checks} == required:
+        return found.quality_checks
+    return tuple(
+        ProposalCheck(name=name, passed=False, detail="missing mandatory native quality result")
+        for name in (ProposalCheckName.VALIDATE, ProposalCheckName.TEST)
+    )
+
+
 def _failed_check(name: ProposalCheckName, found: RepoSweep) -> ProposalCheck:
-    return ProposalCheck(name=name, passed=False, detail=f"scan failed: {found.error}")
+    detail = (
+        found.detail
+        or found.error
+        or (f"engine_errors={found.engine_errors}, files_scanned={found.files_scanned}")
+    )
+    return ProposalCheck(name=name, passed=False, detail=f"scan failed: {detail}")
 
 
 def _failed(stage: str, e: TraustError) -> LaneStage:

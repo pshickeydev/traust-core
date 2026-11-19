@@ -4,6 +4,7 @@ the checkout service, pinned to a commit — never a clone of a default branch."
 
 from __future__ import annotations
 
+import hashlib
 import re
 import shutil
 import tempfile
@@ -26,7 +27,7 @@ from traust_core.v1.models.detection_quality import (
     RuleRef,
     SeededFinding,
 )
-from traust_core.v1.models.rule_mining import RepoSweep, RuleFile, RuleHit, SweepRepo
+from traust_core.v1.models.rule_mining import ProposalCheck, RepoSweep, RuleFile, RuleHit, SweepRepo
 from traust_core.v1.models.values import GitSha, HttpsRepoUrl
 from traust_core.v1.models.vocabulary import FindingKind
 from traust_core.v1.providers.base import Readiness, on_path
@@ -39,6 +40,7 @@ from traust_core.v1.providers.tools.opengrep import (
     pinned_rules_source,
     rules_root,
 )
+from traust_core.v1.providers.tools.opengrep_quality import RuleQualityError
 
 GIT_TIMEOUT = 120.0
 TRAUST_PACK = "traust"
@@ -89,12 +91,27 @@ class OpengrepRulePacks:
         return RulePack(name=name, version=ref, rules=tuple(found.values()))
 
     def _supplement(self, supplement: SupplementalPack) -> RulePack:
-        try:
-            url, ref = pinned_rules_source(supplement.source)
-        except ValueError as e:
-            raise ConfigError(f"rule pack {supplement.name}: {e}") from e
-        with self._at(url, ref) as workspace:
-            found = rule_refs(rules_root(url, workspace.path), self._load)
+        if supplement.source.startswith(("https://", "http://", "git@")):
+            try:
+                url, ref = pinned_rules_source(supplement.source)
+            except ValidationError as error:
+                raise ConfigError(f"rule pack {supplement.name}: {error}") from error
+            with self._at(url, ref) as workspace:
+                found = rule_refs(rules_root(url, workspace.path), self._load)
+        else:
+            root = Path(supplement.source)
+            if not root.is_dir():
+                raise ConfigError(f"local rule pack {supplement.name} is not a directory: {root}")
+            found = rule_refs(root, self._load)
+            digest = hashlib.sha256()
+            for path in sorted(root.rglob("*")):
+                relative = path.relative_to(root)
+                if not path.is_file() or any(p.startswith(".") for p in relative.parts):
+                    continue
+                if not path.resolve().is_relative_to(root.resolve()):
+                    raise ValidationError(f"rule input leaves its pack directory: {path}")
+                digest.update(relative.as_posix().encode() + b"\0" + path.read_bytes() + b"\0")
+            ref = "local:" + digest.hexdigest()
         if missing := sorted(set(supplement.rules) - set(found)):
             raise ValidationError(
                 f"rule pack {supplement.name}@{ref[:12]}: allowlisted rules not in the pack: "
@@ -126,10 +143,13 @@ class OpengrepRuleSweep:
 
     name = "opengrep-sweep"
 
-    def __init__(self, pack: Path, keep_env: Sequence[str], checkouts: Checkouts) -> None:
+    def __init__(
+        self, pack: Path, keep_env: Sequence[str], checkouts: Checkouts, *, load: YamlLoader
+    ) -> None:
         self._pack = pack
         self._keep_env = tuple(keep_env)
         self._checkouts = checkouts
+        self._load = load
 
     def check(self, binary: str) -> Readiness:
         return on_path(binary)
@@ -178,13 +198,24 @@ class OpengrepRuleSweep:
                 pack=self._pack,
                 runner=runner,
                 checkouts=self._checkouts,
+                load=self._load,
                 timeout=timeout,
                 opengrep_bin=binary,
             )
+        except RuleQualityError as error:
+            return found.model_copy(
+                update={
+                    "error": "rule_quality_failed",
+                    "detail": str(error),
+                    "quality_checks": error.report.checks,
+                }
+            )
+        except ValidationError as error:
+            return found.model_copy(update={"error": "invalid_rules", "detail": str(error)})
         except TimeoutError:
             return found.model_copy(update={"error": "scan_timeout"})
-        except RuntimeError:
-            return found.model_copy(update={"error": "opengrep_no_json"})
+        except RuntimeError as error:
+            return found.model_copy(update={"error": "opengrep_failed", "detail": str(error)})
         finally:
             if workspace is not None:
                 self._checkouts.release(workspace)
@@ -193,11 +224,20 @@ class OpengrepRuleSweep:
                 "files_scanned": report["stats"]["files_scanned"],
                 "engine_errors": report["stats"]["errors"],
                 "facts": tuple(RuleHit.model_validate(f) for f in report["facts"]),
+                "quality_checks": tuple(
+                    ProposalCheck.model_validate(check) for check in report["quality_checks"]
+                ),
             }
         )
 
     def trial(
-        self, rule: str, target: Path | Mapping[str, str], binary: str, timeout: int
+        self,
+        rule: str,
+        target: Path | Mapping[str, str],
+        binary: str,
+        timeout: int,
+        *,
+        examples: Mapping[str, str],
     ) -> RepoSweep:
         """An unstaged rule's hits over a checkout, or over `target` files written to a
         temporary tree (names are bare file names)."""
@@ -205,6 +245,10 @@ class OpengrepRuleSweep:
             root = Path(tmp)
             path = root / "rule.yaml"
             path.write_text(rule, encoding="utf-8")
+            for name, text in examples.items():
+                if Path(name).name != name or not Path(name).suffix:
+                    raise ValidationError(f"example must be a bare file name: {name}")
+                (root / ("rule." + name)).write_text(text, encoding="utf-8")
             if isinstance(target, Path):
                 scanned = target
             else:

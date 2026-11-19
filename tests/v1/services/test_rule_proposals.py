@@ -137,7 +137,7 @@ os.system(other)
     ("hit_lines", "passed", "problem"),
     [
         ({3}, True, ""),
-        ({3, 7}, True, ""),  # a marker for another rule doesn't bind this one
+        ({3, 7}, False, "unexpected match on unannotated line(s) [7]"),
         (set(), False, "no match on ruleid line(s) [3]"),
         ({3, 5}, False, "matches ok line(s) [5]"),
     ],
