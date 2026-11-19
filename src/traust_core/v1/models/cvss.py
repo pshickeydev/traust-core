@@ -82,7 +82,7 @@ class EffectiveCvss(Model):
 
 def cvss_base_score(vector: str) -> float | None:
     """A `CVSS:3.0/` or `CVSS:3.1/` vector's base score; None for any other, or one FIRST's
-    formula refuses (a 4.0 score is never ranked, so it isn't one of these)."""
+    formula refuses (`AdvisoryRecord.cvss_score` ranks 3.x vectors only)."""
     score = _v3_base_score(vector)
     return None if score is None else float(score)
 

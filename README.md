@@ -406,7 +406,7 @@ order with a usable CVSS 3.x score wins:
   `osv:GHSA-…`, `rh-cve:CVE-…`, `csaf:…`) and who scored it, so a reader sees what every
   source said. A CNA or ADP score that both the CVE List and NVD carry appears once per
   document; ranking is unaffected, since both are the same source.
-- **Unscored.** No usable 3.x score anywhere is `None`, never 0.
+- **Unscored.** No usable 3.x or 4.0 score anywhere is `None`, never 0.
 
 A finding's own audit-authored vector (a code finding) is not ranked against feeds; only
 advisory-backed findings take the feed-ranked score. No view reads the ranking yet: the
