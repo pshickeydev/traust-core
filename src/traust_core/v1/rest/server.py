@@ -112,6 +112,12 @@ def _db_upgrade(context: Context, args: argparse.Namespace) -> int:
     it), or a channel refusal.
     """
     try:
+        if args.allow_destructive and not args.apply:
+            print(
+                "--allow-destructive acknowledges an apply: add --apply, or drop the flag",
+                file=sys.stderr,
+            )
+            return 2
         status = context.store_status()
         if status.state is StoreState.EMPTY:
             if context.config.database.url is None:

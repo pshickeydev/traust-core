@@ -139,6 +139,16 @@ def test_db_upgrade_plans_reports_and_exits_by_state(
     assert len(applied) == 1
 
 
+def test_allow_destructive_without_apply_is_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config = local(tmp_path)
+    with pytest.raises(SystemExit) as exit_code:
+        server.main(["--config", str(config), "db", "upgrade", "--allow-destructive"])
+    assert exit_code.value.code == 2  # the acknowledgement is never silently dropped
+    assert "add --apply" in capsys.readouterr().err
+
+
 def test_db_upgrade_brings_a_pre_channel_store_on(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
