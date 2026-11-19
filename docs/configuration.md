@@ -104,6 +104,9 @@ rule requires both `ruleid:` and `ok:` cases. A pinned HTTPS Git source uses the
 checkout and rules-subtree convention and must carry those fixtures too. Relative local
 sources cannot select a single file: an enabled local pack is a directory.
 
+Only fixture paths present in each rule's native `check.matches` count toward coverage.
+Expected autofix outputs such as `policy.fixed.py` cannot supply missing negative cases.
+
 `opengrep_quality_report` checks without a database. Actual scans run native validation
 and strict native tests over private snapshots and then consume those same snapshots.
 Missing fixtures, skipped/unreported tests, unknown test IDs, duplicate rule IDs, failed

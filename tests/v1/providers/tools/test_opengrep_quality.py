@@ -106,6 +106,27 @@ def test_native_success_without_both_behavior_directions_is_refused(
         assert "both ruleid: and ok:" in checked.report.checks[-1].detail
 
 
+@pytest.mark.skipif(not shutil.which("opengrep"), reason="real Opengrep integration")
+@pytest.mark.parametrize("negative_in_matching_fixture", [False, True])
+def test_only_native_matching_fixtures_provide_negative_coverage(
+    tmp_path: Path, negative_in_matching_fixture: bool
+) -> None:
+    config = write_rule(tmp_path / "pack", name="policy")
+    negative = "# ok: example-rule\nsafe(value)\n"
+    config.with_suffix(".py").write_text(
+        "# ruleid: example-rule\ndangerous(value)\n"
+        + (negative if negative_in_matching_fixture else "")
+    )
+    config.with_name("policy.fixed.py").write_text(negative)
+    with checked_rules(
+        [config.parent], ProcessRunner(("opengrep",)), load=yaml_documents
+    ) as checked:
+        assert checked.report.checks[0].passed
+        assert checked.report.passed is negative_in_matching_fixture
+        if not negative_in_matching_fixture:
+            assert "native matching fixtures" in checked.report.checks[-1].detail
+
+
 def test_duplicate_rule_ids_are_not_an_ambiguous_pack(tmp_path: Path) -> None:
     write_rule(tmp_path, name="first")
     write_rule(tmp_path, name="second")

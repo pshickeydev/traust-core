@@ -93,8 +93,9 @@ def _copy_text(source: Path, target: Path, boundary: Path) -> str:
 
 def _snapshot(
     sources: Sequence[Path], root: Path, examples: Mapping[str, str] | None, load: YamlLoader
-) -> tuple[tuple[Path, ...], tuple[str, ...], tuple[str, ...], list[str]]:
-    configs, rules, fixtures, problems = [], [], [], []
+) -> tuple[tuple[Path, ...], tuple[str, ...], dict[Path, str], list[str]]:
+    configs, rules, problems = [], [], []
+    fixtures: dict[Path, str] = {}
     seen: set[Path] = set()
     for index, source in enumerate(sources):
         source = source.expanduser().resolve()
@@ -143,9 +144,8 @@ def _snapshot(
                     problems.append(f"{rule_id} is an unauthored skeleton")
             for fixture in sorted(path.parent.glob(path.stem + ".*")):
                 if _fixture(fixture, path):
-                    fixtures.append(
-                        _copy_text(fixture, destination.parent / fixture.name, boundary)
-                    )
+                    staged = destination.parent / fixture.name
+                    fixtures[staged.resolve()] = _copy_text(fixture, staged, boundary)
     if examples is not None:
         if len(configs) != 1:
             raise ValidationError("proposal examples require exactly one rule file")
@@ -154,10 +154,10 @@ def _snapshot(
                 raise ValidationError(f"example must be a bare file name with an extension: {name}")
             destination = configs[0].with_name(configs[0].stem + "." + name)
             destination.write_text(text, encoding="utf-8")
-            fixtures.append(text)
+            fixtures[destination.resolve()] = text
     if not rules:
         problems.append("no authored rules found")
-    return tuple(configs), tuple(rules), tuple(fixtures), problems
+    return tuple(configs), tuple(rules), fixtures, problems
 
 
 def _run(runner: ProcessRunner, argv: Sequence[str], timeout: int) -> ProcessResult:
@@ -193,16 +193,12 @@ def _validate(
 def _tests(
     root: Path,
     rules: Sequence[str],
-    fixtures: Sequence[str],
+    fixtures: Mapping[Path, str],
     runner: ProcessRunner,
     binary: str,
     timeout: int,
 ) -> ProposalCheck:
     issues = []
-    for rule_id in rules:
-        annotations = [example_lines(rule_id, fixture) for fixture in fixtures]
-        if not any(fire for fire, _ in annotations) or not any(quiet for _, quiet in annotations):
-            issues.append(f"{rule_id} needs both ruleid: and ok: examples")
     try:
         result = _run(runner, [binary, "test", "--json", "--strict", str(root)], timeout)
         if result.returncode != 0:
@@ -218,6 +214,17 @@ def _tests(
         for config in native.results.values():
             for rule_id, check in config.checks.items():
                 tested.add(rule_id)
+                annotations = [
+                    example_lines(rule_id, fixtures[path])
+                    for name in check.matches
+                    if (path := Path(name).resolve()) in fixtures
+                ]
+                if not any(fire for fire, _ in annotations) or not any(
+                    quiet for _, quiet in annotations
+                ):
+                    issues.append(
+                        f"{rule_id} needs both ruleid: and ok: examples in native matching fixtures"
+                    )
                 if (
                     not check.passed
                     or check.errors
