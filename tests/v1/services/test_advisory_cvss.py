@@ -196,6 +196,39 @@ def test_a_document_for_another_record_is_unreadable_even_with_no_scores(
     assert build.unreadable == (f"{source}:CVE-2026-0003",)
 
 
+def test_an_nvd_reply_naming_no_record_is_unreadable(engine: Engine) -> None:  # noqa: F811
+    world = World(engine, sources=("nvd",))
+    finding(engine, advisory(engine, "CVE-2026-0003").id)
+    empty = {"resultsPerPage": 0, "totalResults": 0, "vulnerabilities": []}
+    world.http.answers["https://nvd.test/cves?cveId=CVE-2026-0003"] = json.dumps(empty).encode()
+    world.service().refresh_advisory_documents()
+    assert world.service().refresh_advisory_cvss().unreadable == ("nvd:CVE-2026-0003",)
+
+
+def test_an_unchanged_rebuild_after_a_failed_read_serves_its_scores(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    canonical = advisory(world.engine, LOG4SHELL)
+    finding(world.engine, canonical.id)
+    world.serve_log4shell()
+    world.service().refresh_advisory_documents()
+    real = AdvisoryCvss.from_bytes
+
+    def flaky(raw: bytes) -> AdvisoryCvss:
+        raise ValidationError("not an advisory CVSS build (1 problem(s))")
+
+    monkeypatch.setattr(AdvisoryCvss, "from_bytes", staticmethod(flaky))
+    assert canonical.id is not None
+    assert world.service().advisory_cvss([canonical.id]).unreadable
+    monkeypatch.setattr(AdvisoryCvss, "from_bytes", staticmethod(real))
+    world.at = AT + timedelta(days=1)
+    world.service().refresh_advisory_cvss()  # the same bytes: the same artifact, a new snapshot
+    builds = world.builds()
+    assert len(builds) == 2 and len(set(builds)) == 1
+    read = world.service().advisory_cvss([canonical.id])
+    assert not read.unreadable and read.scores[canonical.id]
+
+
 def test_a_build_whose_artifact_row_is_gone_reads_as_unreadable(world: World) -> None:
     canonical = advisory(world.engine, LOG4SHELL)
     finding(world.engine, canonical.id)
@@ -305,7 +338,7 @@ def test_an_unreadable_build_is_remembered_until_the_next_one() -> None:
         return b"not json"
 
     assert cache.parse(one, corrupt) is None
-    assert cache.parse(one, corrupt) is None and len(reads) == 1  # never read again
+    assert cache.parse(one, corrupt) is None and len(reads) == 1  # not again in its publication
     good = AdvisoryCvss(scores={}).to_bytes()
     assert cache.parse(two, lambda: good) == AdvisoryCvss(scores={})
 

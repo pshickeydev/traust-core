@@ -482,8 +482,8 @@ unchanged day is the same bytes, so one artifact. Views read this build, never t
 - **Only when a source is registered.** With none, the refresh builds nothing and
   `refresh_advisory_cvss` raises `ConfigError`.
 - **An unreadable document scores nothing.** A kept document that doesn't parse, that the store
-  lost, or that is another record's (a source can answer one id with another's record; every
-  document must name the record asked for, scored or not) is named in `AdvisoryCvss.unreadable`
+  lost, or that is another record's or names none (a source can answer one id with another's
+  record, NVD with an empty reply; every document must name the record asked for, scored or not) is named in `AdvisoryCvss.unreadable`
   and logged; the rest still score. So is a source with names to score that has kept no documents yet
   (`<source>-documents`).
 - **A store failure keeps the documents' outcome.** When the build itself fails on the store,

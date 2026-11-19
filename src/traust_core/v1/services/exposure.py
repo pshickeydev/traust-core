@@ -1472,7 +1472,9 @@ class ExposureService:
         def read() -> bytes:  # a lost artifact row reads as an unreadable build, like lost bytes
             return stored_bytes(self._objects, self._log.get_artifact(snapshot.artifact_id))
 
-        return self._advisory_cvss.parse(snapshot.artifact_id, read)
+        assert snapshot.id is not None
+        # by publication, not artifact: an unchanged rebuild after a failed read reads again
+        return self._advisory_cvss.parse(snapshot.id, read)
 
     def _document_sources(self) -> list[str]:
         return [s for s in _ADVISORY_DOCUMENT_SOURCES if s in self._feed_sources.names()]
@@ -1535,6 +1537,8 @@ class ExposureService:
         every score from the record asked for (a source can answer with another one)."""
         raw = self._objects.read(_document_object(source, entry.digest), entry.digest)
         named = record_ids(_DOCUMENT_PREFIX[source], raw)
+        if not named:  # an NVD reply with no vulnerability: the record asked for isn't in it
+            raise ValidationError(f"{source}: {identifier}: the document names no record")
         if any(i.casefold() != identifier.casefold() for i in named):
             raise ValidationError(f"{source}: {identifier}: the document is {', '.join(named)}'s")
         return _SCORES_OF[source](raw, acquired_at=entry.acquired_at)
@@ -2497,27 +2501,27 @@ class AdvisoryCvssRead(Model):
 
 
 class AdvisoryCvssCache:
-    """The latest advisory CVSS build, parsed once per publication: the Context owns it, so it
-    outlives the per-request services. An unreadable build is remembered until the next one."""
+    """The latest advisory CVSS build, parsed once per publication (its snapshot): the Context
+    owns it, so it outlives per-request services. An unreadable one is kept until the next."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._by_artifact: tuple[UUID, AdvisoryCvss | None] | None = None
+        self._by_publication: tuple[UUID, AdvisoryCvss | None] | None = None
 
-    def parse(self, artifact_id: UUID, read: Callable[[], bytes]) -> AdvisoryCvss | None:
+    def parse(self, publication_id: UUID, read: Callable[[], bytes]) -> AdvisoryCvss | None:
         with self._lock:
-            if self._by_artifact is not None and self._by_artifact[0] == artifact_id:
-                return self._by_artifact[1]
+            if self._by_publication is not None and self._by_publication[0] == publication_id:
+                return self._by_publication[1]
             try:
                 parsed: AdvisoryCvss | None = AdvisoryCvss.from_bytes(read())
             except (ValidationError, NotFoundError, IntegrityError) as e:
                 log.error(
                     "advisory CVSS build %s is unreadable (%s); no authority scores until the next",
-                    artifact_id,
+                    publication_id,
                     type(e).__name__,
                 )
                 parsed = None
-            self._by_artifact = (artifact_id, parsed)
+            self._by_publication = (publication_id, parsed)
             return parsed
 
 
