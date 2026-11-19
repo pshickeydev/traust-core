@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import sys
 import tempfile
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -22,6 +23,12 @@ from traust_core.v1.models.rule_mining import (
 )
 from traust_core.v1.providers.config_matrix import YamlLoader
 from traust_core.v1.providers.process import ProcessResult, ProcessRunner
+
+# The bundled scanner Python uses the process locale, not PYTHONUTF8.
+OPENGREP_ENV = {
+    "LC_ALL": "en_US.UTF-8" if sys.platform == "darwin" else "C.UTF-8",
+    "SEMGREP_SEND_METRICS": "off",
+}
 
 _OUTPUT_LIMIT = 4 << 20
 _SKIPPABLE_ERRORS = re.compile(r"\b[1-9]\d*\s+(?:fatal|skippable)\s+errors?\b", re.I)
@@ -159,7 +166,7 @@ def _run(runner: ProcessRunner, argv: Sequence[str], timeout: int) -> ProcessRes
         check=False,
         timeout_seconds=timeout,
         max_output_bytes=_OUTPUT_LIMIT,
-        env={"SEMGREP_SEND_METRICS": "off"},
+        env=OPENGREP_ENV,
     )
 
 
@@ -211,7 +218,11 @@ def _tests(
         for config in native.results.values():
             for rule_id, check in config.checks.items():
                 tested.add(rule_id)
-                if not check.passed or check.errors or not check.matches:
+                if (
+                    not check.passed
+                    or check.errors
+                    or not any(match.expected_lines for match in check.matches.values())
+                ):
                     issues.append(f"native test did not pass {rule_id}")
                 for match in check.matches.values():
                     if set(match.expected_lines) != set(match.reported_lines):

@@ -37,6 +37,10 @@ class NativeRunner:
             check = next(iter(checks.values()))
             if self.failure == "test-empty":
                 data["results"] = {}
+            elif self.failure == "test-no-assertions":
+                for match in check["matches"].values():
+                    match["expected_lines"] = []
+                    match["reported_lines"] = []
             elif self.failure == "test-unexpected":
                 next(iter(check["matches"].values()))["reported_lines"].append(99)
             elif self.failure == "test-errors":
@@ -63,6 +67,7 @@ class NativeRunner:
         "validate-skipped",
         "test-exit",
         "test-empty",
+        "test-no-assertions",
         "test-unexpected",
         "test-errors",
         "test-missing-fixture",
@@ -139,6 +144,7 @@ def test_an_abnormal_scan_exit_is_not_accepted_because_json_exists(tmp_path: Pat
 def test_real_native_gate_enables_a_namespaced_local_adopter_rule(tmp_path: Path) -> None:
     builtin = write_rule(tmp_path / "builtin", "builtin-rule")
     custom = write_rule(tmp_path / "custom", "acme.security.rule")
+    custom.write_text("# Adopted rule — UTF-8 source\n" + custom.read_text(), encoding="utf-8")
     target = tmp_path / "checkout"
     target.mkdir()
     (target / "app.py").write_text("dangerous(value)\nsafe(value)\n")
@@ -146,7 +152,7 @@ def test_real_native_gate_enables_a_namespaced_local_adopter_rule(tmp_path: Path
         target,
         [],
         pack=builtin.parent,
-        runner=ProcessRunner(("opengrep",)),
+        runner=ProcessRunner(("opengrep",), keep_env=("PATH", "HOME")),
         checkouts=NoCheckouts(),
         load=yaml_documents,
         supplements=(SupplementalPack("acme", str(custom.parent), ("acme.security.rule",)),),

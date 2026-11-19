@@ -31,7 +31,11 @@ from traust_core.v1.providers.config_matrix import YamlLoader
 from traust_core.v1.providers.process import ProcessRunner, ProcessTimeout
 from traust_core.v1.providers.sources import CheckoutRequest, Checkouts, Workspace
 from traust_core.v1.providers.tools.adapter import adapter_result
-from traust_core.v1.providers.tools.opengrep_quality import RuleQualityError, checked_rules
+from traust_core.v1.providers.tools.opengrep_quality import (
+    OPENGREP_ENV,
+    RuleQualityError,
+    checked_rules,
+)
 
 log = logging.getLogger(__name__)
 
@@ -486,7 +490,7 @@ def execute_scan(
         # repository content must never reach the scanner's option parsing
         cmd += ["--", str(target)]
         try:
-            proc = runner.run(cmd, check=False, timeout_seconds=timeout)
+            proc = runner.run(cmd, check=False, timeout_seconds=timeout, env=OPENGREP_ENV)
         except ProcessTimeout as e:
             raise TimeoutError(f"opengrep timed out after {timeout}s") from e
         if proc.returncode not in (0, 1):
@@ -513,7 +517,7 @@ def execute_scan(
             facts = kept
 
         og_version = (
-            runner.run([opengrep_bin, "--version"], check=False)
+            runner.run([opengrep_bin, "--version"], check=False, env=OPENGREP_ENV)
             .stdout.decode(errors="replace")
             .strip()
             .splitlines()[-1]
