@@ -1117,6 +1117,7 @@ class Context:
             findings=findings,
             advisory_cvss=self.advisory_cvss_cache,
             checkout=self.checkouts,
+            ops=ops,
         )
         sync = PortfolioSync(portfolio, sources, clock=self.clock, hosts=hosts)
         catalog = ProviderCatalog(

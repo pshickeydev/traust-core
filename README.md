@@ -11,7 +11,7 @@ All modules live under `traust_core.v1` (see [Versioning](#versioning)).
 | **Models** | `models` | one model per contract table, grouped by section — `inventory`, `dependencies`, `assessment`, `findings`, `operations`, `ledger` (fields = columns) — next to that section's service types; `base` (`Model` strict, `Dto` tolerant, `Entity` with a database-generated UUIDv4 id, `AppendOnly` for tables that are never updated), `values` (`HttpsRepoUrl`, `GitSha`, `CveId`, `to_rfc3339` / `TimestampError`: the contracts' one RFC 3339 rule), `integrity` | dicts passed between scripts |
 | **Validation rules** | `models.validation` | `ValidationScope.permits(action, target, as_of=…)`, `ValidationPlan.requires_approval()`, `ValidationAttempt.soundness()` — pure scope, approval and refutation rules | duplicated harness scope and soundness rules |
 | **CVSS sources** | `models.cvss`, `services.findings.cvss`, `models.feed_documents`, `services.exposure` | the per-source documents kept daily (`exposure.refresh_documents`: one manifest snapshot per source, a failed fetch keeping the last document; `exposure.stored_document` reads one back, digest-checked); `exposure.advisory_names` is the batched door every advisory join goes through (canonical name plus aliases, CVEs split out), and `exposure.refresh_advisory_documents` keeps every linked advisory's documents, then ranks their scores into the daily `advisory-cvss` build that every finding view reads (`exposure.AdvisoryCvssReader`); each advisory source's CVSS from its stored document (`cve_list_scores`, `nvd_scores`, `osv_scores`, `rh_cve_scores`, `csaf_scores`, `scanner_score`; `score_of` refuses a malformed vector, a version that disagrees with it, a score outside 0–10 or one its vector doesn't compute; FIRST's 3.x and 4.0 formulas through the `cvss` library), and the one a finding shows: `effective(scores)` ranks NIST > GitHub-reviewed GHSA > CNA > ADP > Red Hat > scanner, takes a source's 3.1 before its 3.0, and a 4.0 score only when no source has a 3.x one (the highest-ranked 4.0 shown alongside) | `AdvisoryRecord.cvss_score`, which reads only one feed's 3.x vectors |
-| **Validation recording** | `services.validation`, `models.validation` | `record_order(doc, provenance, bindings, run_order_id, principal)` binds machine reports to a live order lease; trusted-local `record(doc, provenance, bindings)` and `evidence(artifact_id)` retain their existing semantics | re-running probes, interpreting source labels as database IDs |
+| **Validation recording** | `services.validation`, `models.validation` | `record_order(doc, provenance, bindings, run_order_id, principal, lease_generation=…)` binds machine reports to a live order lease; trusted-local `record(doc, provenance, bindings)` and `evidence(artifact_id)` retain their existing semantics | re-running probes, interpreting source labels as database IDs |
 | **Artifacts** | `models.artifacts` | the `ArtifactDocument` base + `SchemaView` (fields from the installed schema, `doc.findings[0].verdict`, unknown names raise) and the named documents (`TriageArtifact`, `SecurityAuditArtifact`, …, `Verdict`, `Severity`) | `json.load` + `.get("key")` |
 | **Artifact publishing** | `services.artifact_publishing` | `ctx.artifact_publisher(specs).publish(name, raw)` or `.publish_artifact(artifact)`: exact gate → content-addressed objects → an artifact UUID on SQLite and Postgres; `get(artifact_id)` verifies the persisted digest; `list_for_assessment(id, kind=…)` reads metadata | writing `analysis-results` files by hand or optional indexing |
 | **Code facts** | `services.code_facts`, `models.code_facts`, `providers.crypto`, `providers.crypto_image`, `providers.crypto_cluster`, `providers.route_guards`, `providers.route_ownership`, `providers.django_routes`, `providers.python_guards`, `providers.express_routes`, `providers.java_routes`, `providers.go_routes`, `providers.python_ownership`, `providers.express_ownership`, `providers.ruby_ownership`, `providers.rust_ownership`, `providers.go_ownership`, `providers.syntax`, `providers.grpc_guards`, `providers.llm_app`, `providers.config_matrix`, `providers.sanitizers`, `providers.fork_lag`, `providers.priv_profile`, `providers.tree`, `models.elf_formats`, `models.crypto_formats` | `ctx.services().code_facts.collect/list/symbols/language_stats` over the latest `tool_scan` assessment's `CodeFactsArtifact`; measured LoC, exact symbol filters and snapshot-bound pagination. `code_facts.enumerate(kind, ToolRequest)` runs a deterministic `FactEnumerator` over a checkout (`CryptoProbe`: toolchains, images, policies a checkout configures; the secure-code pre-scans `RouteGuardMatrix` (Go's net/http, gorilla/mux, chi, gin, echo and fiber routers through their groups, mounts and the places they are served, a guard credited only where it surely runs (`providers.go_routes`); Django and DRF through each urlconf's `include()` chain and routers (`providers.django_routes`), Flask with its blueprint and API prefixes, FastAPI, aiohttp; a Django, DRF or Flask guard counts only when it is a known auth library guard that no checkout definition shadows, never checkout decorators, mixins, permission classes or hooks (`providers.python_guards`); Express, Spring, JAX-RS and Go parsed with tree-sitter grammars loaded by `providers.syntax`), `GrpcGuardMatrix` (Go gRPC servers, their interceptors, the services registered on them and their methods), `LlmAppDetector` (whether a checkout is an LLM, agent or MCP application and which files use it, from imports, direct manifest declarations and prompt templates), `ConfigMatrix`, `SanitizerDiscovery` and `ForkDetector`, over `providers.tree`'s symlink-safe file walk); `code_facts.route_guards(ToolRequest, resolve_handlers=)` places handlers through the symbol index; route rows carry `ownership` on authenticated id routes (`providers.route_ownership`: scoped, checked, caller-blind, unchecked, none, unknown or n/a, with the spans behind it; caller-blind and unchecked rows are judged; filled for Spring and JAX-RS from each handler's path variables, caller, lookups by id, checks and one same-repository hop, for FastAPI (`providers.python_ownership`) from the handler and the dependencies handed a path id, for Express (`providers.express_ownership`) from the handler, the checkout middleware in its chain and the functions it calls, and for Rails (`providers.ruby_ownership`) from the action, its `before_action` callbacks, models, Pundit policies and the CanCanCan `Ability`, and for axum and actix-web (`providers.rust_ownership`, which judges the handler's reads by id but never credits a route as protected) from the handler, its auth extractors and one same-crate hop, through sqlx, diesel, sea-orm and in-memory stores, and for Go (`providers.go_ownership`, which judges a read by the path id alone and credits nothing) from the handler the route matrix resolved and one checkout call deep); `code_facts.grpc_guards(ToolRequest)` is the gRPC service x interceptor matrix; `code_facts.coverage(ToolRequest, repository_ref_id=)` compares the repository's latest threat-model entry points (`assessment.threat_model_entry_points`) and what the pre-scans detected against the pre-scan for each entry-point kind, as covered, uncovered or unexplained; `code_facts.llm_app(ToolRequest)` is the LLM-application detection that gates the LLM review; `code_facts.priv_profile(ToolRequest, repo)` is the operator privilege profile (`PrivProfiler`: SCC requests, securityContexts, namespaces and install modes, every RBAC rule, and the shipped RBAC no `+kubebuilder:rbac` marker declares) as the contract `PrivProfileArtifact`; `code_facts.fork_lag(ToolRequest, offline=)` adds each tracked upstream version's advisories (`exposure.package_advisories`), a failed read being the result's `network` error; `code_facts.crypto(ref_id, ToolRequest)` adds the crypto packages of the ref's ingested manifest SBOM (`services.crypto_packages.CryptoPackagePolicy` over `exposure.dependencies`; `NoManifestSbomError` when none was ingested). `code_facts.image_crypto(digest, ImageRequest)` is the image tier (podman/docker inspect, create and `cp` through `ProcessRunner`, never running the image; DT_NEEDED from `models.elf_formats`) plus the crypto packages of the image's SBOM (`exposure.image_dependencies`; `NoImageSbomError`); `code_facts.cluster_crypto(ClusterRequest, ValidationScope)` is the cluster tier (`oc exec`, `openssl s_client` parsed by `models.crypto_formats`), every exec namespace gated by `ValidationScope.decide(k8s, exec)` and logged. Nothing is recorded: the facts are re-derivable from the commit | source scans at read time, a side symbol database, byte-based LoC estimates, `traust_engine.adapters.crypto_probe`, `crypto_audit` image/cluster tiers, `_util/elf.py` (linked libraries), traust secure-code-audit `enumerate_route_guards.py`, `traust_engine.adapters.llm_app`, `expand_config_matrix.py`, `probe_sanitizers.py` discovery, `run_fork_advisory_lag.py`, operator-priv-profile `build_priv_profile.py` |
@@ -615,7 +615,7 @@ sustain a refutation unless a deployment, control or differential gate invalidat
 
 Trusted in-process callers may use
 `ctx.services().validation.record(ValidationArtifact.parse(raw), provenance, bindings)`.
-Remote runners use `record_order(doc, provenance, bindings, run_order_id, principal)`,
+Remote runners use `record_order(doc, provenance, bindings, run_order_id, principal, lease_generation=…)`,
 the same protected service entry point as REST. Supply real `Provenance`
 (`run_id`, `source=SourceType.VALIDATION_REPORT`, `occurred_at`) from the producing order;
 recording does not invent a run, timestamp or execution plan, or execute live probes.
@@ -804,7 +804,7 @@ triage = publisher.get(published.artifact_id)
 ```
 
 `POST /v1/verification-records` requires a verified machine bearer token and a strict
-`{"payload": "<original JSON text>", "provenance": {...}, "run_order_id": "<order UUID>"}`
+`{"payload": "<original JSON text>", "provenance": {...}, "run_order_id": "<order UUID>", "lease_generation": 1}`
 body. The report is parsed as `VerificationArtifact` without reserializing its evidence
 bytes. `VerificationService.record_order` admits only the live lease holder of an order
 for the report's repository and an asset in the server's `recording.verification`
@@ -817,8 +817,9 @@ event envelopes and layer IDs are not request fields. Authentication is not a hu
 countersign: report verdicts remain machine-assessment judgments under the owner's policy.
 
 `POST /v1/validation-records` requires a verified machine bearer and a strict JSON body
-with `run_order_id` (UUID), `payload` (the original UTF-8 JSON text), `provenance`
-(`Provenance`) and `bindings` (`ValidationRecordInput`). The service locks that order
+with `run_order_id` (UUID), `lease_generation` (positive integer from claim/start),
+`payload` (the original UTF-8 JSON text), `provenance` (`Provenance`) and `bindings`
+(`ValidationRecordInput`). The service locks that order
 through recording and requires its live lease to belong to the actual caller. Its asset
 must appear in the server's `recording.validation` allowlist (empty by default), and
 every source assessment must belong to the order's one non-null repository.
@@ -920,16 +921,29 @@ later default-branch changes do not affect the paired contents.
 ## Leased report-recording authority
 
 `OpsService.recording` is the service-owned guard for native report mutations.
-It requires a verified machine principal, its own active leased order, the same
-repository, a server-authorized asset for the report kind, and provenance whose
-`run_id` equals the order UUID and whose source matches that kind. The order row
+It requires a verified machine principal, its own active leased order, the positive
+`lease_generation` returned by claim or start, the same repository, a server-authorized
+asset for the report kind, and matching provenance (`run_id` and source). The order row
 stays locked through the report transaction; expiry is checked again before the
 outer commit. A caller cannot gain recording authority from a bearer token alone.
+Every assessment, triage, validation, remediation (including a patch `diff`), and
+verification recording body carries `lease_generation` as a top-level JSON integer,
+not a provenance field. A missing or non-positive value is a 422; an older generation
+is a 409 even for a byte-for-byte replay by the same worker. No report response changes.
+
+`PortfolioService.record_forge_facts` and `ExposureService.record_manifest_sbom`
+accept `run_order_id`, `worker`, and `lease_generation` together for scheduled runs.
+They check the claim before acquisition and again under the order lock before the
+shared database transaction commits, including cache hits. Omit all three for a
+manual observation or scan. Attribution-only feed snapshots and below-range scans
+do not grant or renew a lease.
 
 An already-dispatched worker can obtain its native order with `POST /v1/orders/start`
 and `{"order": {"asset": "verify", "priority": 1, "repository_id": "<registered repository UUID>"}, "lease_seconds": 300}`.
-The strict `StartRecordingRequest` returns the persisted `RunOrder`, including the
-database's timestamp precision and timezone representation. The lease holder comes
+The strict `StartRecordingRequest` returns the persisted `RunOrder`. Its `lease_generation`
+increments on each grant, not on heartbeat or expiry. Hold on to that generation and pass it
+unchanged on heartbeat, completion and order-bound writes, even if the same machine gets the
+order again. Only the completing worker and generation may replay its outcome. The lease holder comes
 from the verified machine caller, never the body. `OpsService.start_recording` checks the
 asset's report-recording allowlist and a matching `recording.start` capability before
 delegating to the existing `start` owner. Each capability has `principal` (the verified
@@ -979,7 +993,7 @@ Existing native verification inputs are available through
 `VerificationService.prepare` consumes an existing native work item.
 
 `POST /v1/assessment-records` is the explicit secure-code claim-intake workflow.
-Its strict `AssessmentRecordRequest` contains `run_order_id`, `repository_ref_id`,
+Its strict `AssessmentRecordRequest` contains `run_order_id`, `lease_generation`, `repository_ref_id`,
 `payload` (the original UTF-8 report JSON), `provenance`, and `assessor_version`.
 `AssessmentService.record_secure_code` authorizes through `OpsService.recording`
 with the default-deny `recording.assessment` capability and existing
@@ -990,9 +1004,9 @@ then shares assessment/artifact recording and existing
 or resolution becomes a decision. `AssessmentRecordResult` returns native
 `assessment_id`, `artifact_id`, and `intake` (`IntakeResult`, whose `findings` maps
 original labels to native UUIDs and `created` names newly admitted findings).
-For order-bound authored and triage writes, `provenance.occurred_at` is the
-`started_at` returned by **this claim**. Capture it before execution; never read
-the current lease to stamp an earlier attempt's output. Under the lease lock,
+`provenance.occurred_at` is immutable event data, not lease authority. Capture the
+generation before execution; never read the current lease to stamp an earlier
+attempt's output. Under the lease lock,
 the same order, subject (ref for authored; source assessment for triage), and
 exact bytes replay the recorded IDs. Changing the subject or bytes conflicts.
 The order cannot adopt an unbound or differently bound assessment.
@@ -1196,7 +1210,7 @@ Prepublishing a legacy artifact does not authorize a new deprecated write.
 `GET /v1/assessments/{assessment_id}/triage-input` returns the existing
 `TriageInput`, including native finding and occurrence bindings.
 `POST /v1/assessments/{assessment_id}/triage-records` accepts strict
-`{"run_order_id": "<owned order UUID>", "payload": "<original UTF-8 JSON text>", "provenance": {...}}` and calls
+`{"run_order_id": "<owned order UUID>", "lease_generation": 1, "payload": "<original UTF-8 JSON text>", "provenance": {...}}` and calls
 `FindingDecisions.record_triage`. Its `TriageRecordResult` always includes the
 recorded assessment/artifact UUIDs, even when every finding queues review and
 `decisions` is empty. The in-process `record` decision-list projection remains
@@ -1487,7 +1501,7 @@ Existing indexed `GET /v1/orders` filters and its cursor contract remain unchang
 
 `models.operations` exports the contract-backed `SessionTask` and `SessionResult`, plus
 `SessionRecord` for runner-computed file digests. `OpsService.record_session(order_id,
-worker, session)` appends an immutable manifest under the current, unexpired lease;
+worker, session, lease_generation=…)` appends immutable evidence bearing that same generation;
 identical evidence is idempotent and changed evidence for the same executor session conflicts.
 `ops.manifest` returns session entries when present and preserves the empty-manifest response.
 `BelowRangeService.record` accepts an explicit optional `run_order_id` independently of legacy

@@ -14,6 +14,7 @@ from sqlalchemy.engine import Engine
 from tests.v1.repositories.tables.conftest import Seed
 from tests.v1.rest.conftest import bearer, same_as_in_process
 from tests.v1.rest.ops.conftest import runner
+from tests.v1.rest.remediation.conftest import reclaim
 from tests.v1.rest.remediation.test_remediations import schedule
 from tests.v1.services.test_remediation import REPORT, WHEN, decisions
 from traust_core.v1.context import Context
@@ -100,6 +101,7 @@ def body(
             (origin or provenance()).model_copy(update={"run_id": order.id}).model_dump(mode="json")
         ),
         "run_order_id": str(order.id),
+        "lease_generation": order.lease_generation,
     }
 
 
@@ -201,7 +203,9 @@ def test_admission_matches_the_owner_preserves_bytes_and_replays_without_writes(
     before = snapshot(context)
     same_as_in_process(
         response.json(),
-        context.services().remediation.record_order(doc, origin, order.id, machine(context)),
+        context.services().remediation.record_order(
+            doc, origin, order.id, machine(context), lease_generation=order.lease_generation
+        ),
     )
     replay = client.post(
         URL,
@@ -311,7 +315,16 @@ def test_invalid_unicode_is_a_refusal_not_a_server_failure(
 
 
 @pytest.mark.parametrize(
-    "case", ["object payload", "missing provenance", "missing order", "actor", "signer", "event"]
+    "case",
+    [
+        "object payload",
+        "missing provenance",
+        "missing order",
+        "missing generation",
+        "actor",
+        "signer",
+        "event",
+    ],
 )
 def test_strict_transport_rejects_non_native_envelopes_and_identities(
     context: Context, client: TestClient, engine: Engine, case: str
@@ -324,12 +337,31 @@ def test_strict_transport_rejects_non_native_envelopes_and_identities(
         del request["provenance"]
     elif case == "missing order":
         del request["run_order_id"]
+    elif case == "missing generation":
+        del request["lease_generation"]
     else:
         request[case] = "human:admin@example.com" if case != "event" else {"layer_id": str(uuid4())}
     before = snapshot(context)
     response = client.post(URL, json=request, headers=runner(context))
     assert_problem(response, 422, "")
     assert snapshot(context) == before
+
+
+@pytest.mark.parametrize("url", [URL, "/v1/verification-records"])
+def test_record_doors_require_a_strict_positive_generation(
+    context: Context, client: TestClient, url: str
+) -> None:
+    origin = provenance()
+    request = {
+        "payload": "{}",
+        "provenance": origin.model_dump(mode="json"),
+        "run_order_id": str(origin.run_id),
+    }
+    headers = runner(context)
+    for invalid in (None, 0, -1, True, "1", 1.0):
+        response = client.post(url, json={**request, "lease_generation": invalid}, headers=headers)
+        assert response.status_code == 422, response.text
+        assert "body.lease_generation" in response.json()["detail"]
 
 
 @pytest.mark.parametrize("token", [None, "not-a-valid-token"])
@@ -365,7 +397,11 @@ def test_only_the_live_lease_owner_can_close_and_replay(
     assert not context.services().remediation.get(item.work_item_id).is_done()
     with pytest.raises(ForbiddenError):
         context.services().remediation.record_order(
-            doc, origin, order.id, machine(context, "unrelated-runner")
+            doc,
+            origin,
+            order.id,
+            machine(context, "unrelated-runner"),
+            lease_generation=order.lease_generation,
         )
     assert snapshot(context) == before
     refused = client.post(URL, json=request, headers=runner(context))
@@ -384,6 +420,15 @@ def test_only_the_live_lease_owner_can_close_and_replay(
     assert replay.status_code == 200, replay.text
     assert replay.json() == accepted.json()
     assert snapshot(context) == after
+    reclaimed = reclaim(context, order)
+    before = snapshot(context)
+    refused = client.post(URL, json=request, headers=runner(context))
+    assert_problem(refused, 409, "stale lease generation")
+    assert snapshot(context) == before
+    current = {**request, "lease_generation": reclaimed.lease_generation}
+    replay = client.post(URL, json=current, headers=runner(context))
+    assert replay.status_code == 200 and replay.json() == accepted.json()
+    assert snapshot(context) == before
 
 
 @pytest.mark.parametrize(
@@ -441,6 +486,8 @@ def test_order_authorization_refusals_leave_rows_and_objects_unchanged(
         order = leased(context, world)
     assert order.id is not None
     request = body(report(world), order)
+    if case == "queued order":
+        request["lease_generation"] = 1
     headers = runner(context)
     if case == "human read token":
         headers = bearer(context, owner.identity)
@@ -449,7 +496,12 @@ def test_order_authorization_refusals_leave_rows_and_objects_unchanged(
     elif case == "expired lease":
         context.clock = FixedClock(context.clock.now() + timedelta(hours=3))
     elif case == "finished lease":
-        context.services().ops.complete(order.id, WorkerId(owner.ref), JobResult.succeeded())
+        context.services().ops.complete(
+            order.id,
+            WorkerId(owner.ref),
+            JobResult.succeeded(),
+            lease_generation=order.lease_generation,
+        )
     elif case == "forged run id":
         request["provenance"] = provenance().model_dump(mode="json")
     elif case == "unknown order":
@@ -492,6 +544,7 @@ def test_native_order_recording_rejects_an_unverified_machine(
             provenance().model_copy(update={"run_id": order.id}),
             order.id,
             machine(context).model_copy(update={"verified_by": None}),
+            lease_generation=order.lease_generation,
         )
     assert snapshot(context) == before
     assert len(decisions(engine, world.found)) == 2
@@ -620,7 +673,10 @@ def test_named_retry_records_identical_report_bytes_on_its_own_attempt(
     original = WorkItem.model_validate(recorded.json())
     assert first_order.id is not None
     context.services().ops.complete(
-        first_order.id, WorkerId(machine(context).ref), JobResult.succeeded()
+        first_order.id,
+        WorkerId(machine(context).ref),
+        JobResult.succeeded(),
+        lease_generation=first_order.lease_generation,
     )
     retry = opened(context, world)
     assert retry.work_item_id != original.work_item_id

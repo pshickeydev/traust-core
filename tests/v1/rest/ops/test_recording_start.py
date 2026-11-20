@@ -148,7 +148,12 @@ def test_verified_machine_starts_its_scoped_run_and_can_record(
         occurred_at=order.started_at,
     )
     with context.services().ops.recording(
-        order.id, principal(context), RecordKind.VERIFICATION, order.repository_id, provenance
+        order.id,
+        principal(context),
+        RecordKind.VERIFICATION,
+        order.repository_id,
+        provenance,
+        lease_generation=response.json()["lease_generation"],
     ):
         pass
     assert context.services().ops.get(order.id) == order
