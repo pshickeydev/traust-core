@@ -759,7 +759,7 @@ class Context:
             checkouts=self.checkouts,
         )
         self.rule_sweeper = OpengrepRuleSweep(
-            self.rule_pack, self.config.process.keep_env, self.checkouts
+            self.rule_pack, self.config.process.keep_env, self.checkouts, load=yaml_documents
         )
 
     def register_rule_drafts(self, root: Path) -> None:
