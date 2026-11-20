@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from typing import Literal, TypeVar
+from uuid import UUID
 
 import pydantic
 from cvss import CVSS3, CVSS4
@@ -61,6 +63,28 @@ class CvssScore(Model):
     document: str
     scored_by: str | None = None
     acquired_at: datetime | None = None
+
+
+class AdvisoryCvss(Model):
+    """Every authority's scores for each linked advisory (canonical id), ranked, from one day's
+    kept documents; `unreadable` names a kept document that didn't parse, so it stated nothing."""
+
+    scores: Mapping[UUID, tuple[CvssScore, ...]]
+    unreadable: tuple[str, ...] = ()
+
+    def to_bytes(self) -> bytes:
+        # canonical: the same scores are the same bytes, so an unchanged day is one artifact
+        body = self.model_dump(mode="json")
+        return json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+
+    @classmethod
+    def from_bytes(cls, raw: bytes) -> AdvisoryCvss:
+        try:
+            return cls.model_validate_json(raw)
+        except pydantic.ValidationError as e:
+            raise ValidationError(
+                f"not an advisory CVSS build ({e.error_count()} problem(s))"
+            ) from e
 
 
 class EffectiveCvss(Model):
@@ -474,3 +498,18 @@ def distinct(scores: Iterable[CvssScore | None]) -> tuple[CvssScore, ...]:
             key = (score.source, score.version, score.vector, score.document, score.scored_by)
             seen.setdefault((*key, score.score), score)
     return tuple(seen.values())
+
+
+def record_ids(kind: str, raw: bytes) -> tuple[str, ...]:
+    """The record ids a document names, `kind` being its scores' `document` prefix: each CVE an
+    NVD response holds, else the one record's; checked against the id asked for."""
+    if kind == "nvd":
+        record = _parsed(_NvdRecord, raw, "an NVD API 2.0 CVE record")
+        return tuple(v.cve.cve_id for v in record.vulnerabilities)
+    if kind == "cve-list":
+        return (_parsed(_CveListHeader, raw, "a CVE List record").metadata.cve_id,)
+    if kind == "osv":
+        return (_parsed(_OsvRecord, raw, "an OSV record").record_id,)
+    if kind == "rh-cve":
+        return (_parsed(_RhCveRecord, raw, "a Red Hat Security Data CVE record").cve_id,)
+    raise ValidationError(f"{kind}: not a document kind with record ids")

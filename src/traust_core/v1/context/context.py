@@ -178,7 +178,7 @@ from traust_core.v1.services.below_range import BelowRangeService
 from traust_core.v1.services.code_facts import CodeFactsService
 from traust_core.v1.services.compliance import GATE, ComplianceService
 from traust_core.v1.services.detection_quality import DetectionQualityService
-from traust_core.v1.services.exposure import ExposureService
+from traust_core.v1.services.exposure import AdvisoryCvssCache, ExposureService
 from traust_core.v1.services.findings import (
     FindingDecisions,
     FindingIntake,
@@ -607,6 +607,12 @@ class Context:
         """The stored census builds' parse, shared by every wired InsightService: services are
         built per request, the parse is once per publication."""
         return ParsedBuilds()
+
+    @cached_property
+    def advisory_cvss_cache(self) -> AdvisoryCvssCache:
+        """The advisory CVSS build's parse, shared by every wired ExposureService: services are
+        built per request, the parse is once per publication."""
+        return AdvisoryCvssCache()
 
     @cached_property
     def window_memo(self) -> WindowMemo:
@@ -1074,6 +1080,7 @@ class Context:
             hosts=hosts,
             sbom_tool=SyftSbom(self.process, self.clock),
             findings=findings,
+            advisory_cvss=self.advisory_cvss_cache,
             checkout=self.checkouts,
         )
         sync = PortfolioSync(portfolio, sources, clock=self.clock, hosts=hosts)
