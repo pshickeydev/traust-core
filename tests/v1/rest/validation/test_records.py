@@ -22,7 +22,7 @@ from tests.v1.services.test_validation import (
 from traust_core.v1.context import Context
 from traust_core.v1.errors import ForbiddenError
 from traust_core.v1.models.artifacts import ValidationArtifact
-from traust_core.v1.models.common import ArtifactRef
+from traust_core.v1.models.common import ArtifactRef, Provenance
 from traust_core.v1.models.identity import Credential
 from traust_core.v1.models.operations import RunOrder
 from traust_core.v1.models.validation import (
@@ -94,6 +94,11 @@ def test_first_record_and_retries_preserve_native_ids_and_exact_utf8_evidence(
         assert after[table] == before[table]
     retry = client.post(URL, json=run.body(doc, bindings, provenance), headers=run.headers)
     assert retry.status_code == 200 and retry.json() == response.json()
+    stale = provenance.model_copy(
+        update={"occurred_at": provenance.occurred_at + timedelta(hours=1)}
+    )
+    refused = client.post(URL, json=run.body(doc, bindings, stale), headers=run.headers)
+    assert refused.status_code == 409, refused.text
     assert snapshot(context.database) == after
     assert context.services().ops.get(saved_id(run.order)) == run.order
 
@@ -550,6 +555,8 @@ def test_independent_run_keeps_new_identity_without_rebinding_another_orders_art
     assert claimed_order.id == other.id
     request["run_order_id"] = str(other.id)
     request["provenance"]["run_id"] = str(other.id)
+    assert claimed_order.started_at is not None
+    request["provenance"]["occurred_at"] = claimed_order.started_at.isoformat()
     if explicit_artifact:
         with SqlTraustUnitOfWork(context.database) as uow:
             artifact = uow.artifacts.get(result.artifact_ids[0])
@@ -572,7 +579,7 @@ def test_independent_run_keeps_new_identity_without_rebinding_another_orders_art
             assert stored_bytes(harness.objects, retained_report) == doc.payload
     for artifact_id in independent.evidence_artifact_ids:
         evidence = context.services().validation.evidence(artifact_id)
-        assert evidence.provenance.model_dump(mode="json") == request["provenance"]
+        assert evidence.provenance == Provenance.model_validate(request["provenance"])
     independent_after = snapshot(context.database)
     objects_after = tuple(harness.objects.list())
     second_retry = client.post(URL, json=request, headers=run.headers)
