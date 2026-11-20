@@ -212,6 +212,7 @@ class FindingViewQuery:
         picked = selection(
             authority,
             latest.cvss_vector if latest is not None else None,
+            latest.cvss_score if latest is not None else None,
             reported=latest is not None,
             document=f"occurrence:{latest.id}" if latest is not None else "",
         )

@@ -7,7 +7,8 @@ import logging
 import re
 import threading
 from collections import defaultdict
-from collections.abc import Callable, Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
@@ -2496,11 +2497,29 @@ class AdvisoryCvssCache:
         self._by_publication: tuple[UUID, AdvisoryCvss | None] | None = None
 
     def parse(self, publication_id: UUID, read: Callable[[], bytes]) -> AdvisoryCvss | None:
+        """A store failure (`RepositoryError`) reads as no build and is never kept: the next
+        read retries. The read runs outside the lock, so a slow store blocks no other reader."""
         with self._lock:
             if self._by_publication is not None and self._by_publication[0] == publication_id:
                 return self._by_publication[1]
+        try:
+            raw = read()
+        except RepositoryError as e:
+            log.warning(
+                "advisory CVSS build %s not read (%s); no authority scores this read",
+                publication_id,
+                type(e).__name__,
+            )
+            return None
+        except (NotFoundError, IntegrityError) as e:
+            raw, lost = None, e
+        with self._lock:
+            if self._by_publication is not None and self._by_publication[0] == publication_id:
+                return self._by_publication[1]  # another reader parsed it meanwhile
             try:
-                parsed: AdvisoryCvss | None = AdvisoryCvss.from_bytes(read())
+                if raw is None:
+                    raise lost
+                parsed: AdvisoryCvss | None = AdvisoryCvss.from_bytes(raw)
             except (ValidationError, NotFoundError, IntegrityError) as e:
                 log.error(
                     "advisory CVSS build %s is unreadable (%s); no authority scores until the next",
@@ -2514,20 +2533,27 @@ class AdvisoryCvssCache:
 
 class AdvisoryCvssReader:
     """The latest `advisory-cvss` build, read in the caller's transaction: the door every
-    view's authority scores come through. `per_request` reads which build once, then keeps it."""
+    view's authority scores come through; inside `pinned`, which build is read once."""
 
-    def __init__(
-        self, objects: ObjectStore, cache: AdvisoryCvssCache, *, per_request: bool = False
-    ) -> None:
+    def __init__(self, objects: ObjectStore, cache: AdvisoryCvssCache) -> None:
         self._objects = objects
         self._cache = cache
-        self._per_request = per_request
+        self._pinned = 0
         self._latest: tuple[FeedSnapshot | None] | None = None
 
+    @contextmanager
+    def pinned(self) -> Iterator[None]:
+        """A composed build's many facts loads count at one build; nothing outlives the block."""
+        self._pinned += 1
+        try:
+            yield
+        finally:
+            self._pinned -= 1
+            if not self._pinned:
+                self._latest = None
+
     def read(self, uow: TraustUnitOfWork, advisory_ids: Collection[UUID]) -> AdvisoryCvssRead:
-        # a request's many facts loads (a whole-scope read's batches) ask once, so every batch
-        # counts at the same build
-        if self._latest is None or not self._per_request:
+        if self._latest is None or not self._pinned:
             self._latest = (uow.feed_snapshots.latest(ADVISORY_CVSS_FEED),)
         (latest,) = self._latest
         if latest is None:

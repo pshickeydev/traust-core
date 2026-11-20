@@ -15,6 +15,7 @@ from sqlalchemy.engine import Engine
 from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import T0, Seed
 from traust_core.v1.context import Config, Context
+from traust_core.v1.errors import RepositoryError
 from traust_core.v1.models.assessment import Artifact
 from traust_core.v1.models.cvss import AdvisoryCvss, CvssScore, CvssSource, score_of
 from traust_core.v1.models.dependencies import AdvisoryMatch
@@ -26,6 +27,7 @@ from traust_core.v1.models.vocabulary import Severity
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.repositories.objects import ObjectKey
+from traust_core.v1.services import exposure as exposure_module
 from traust_core.v1.services.artifact_publishing import record_artifact
 from traust_core.v1.services.exposure import ADVISORY_CVSS_FEED
 from traust_core.v1.services.insight import _sarif_result
@@ -192,3 +194,48 @@ def test_sarif_carries_the_selected_statement_and_its_source(context: Context) -
         "source": "nist",
     }
     assert result["properties"]["security-severity"] == "9.5"  # critical's
+
+
+def test_a_report_with_a_vector_and_no_score_stays_unscored(context: Context) -> None:
+    with SqlTraustUnitOfWork(context.database) as uow:
+        seed = Seed(uow)
+        repo = seed.repository()
+        finding = seed.finding(repo)
+        seed.occurrence(finding, seed.assessment(seed.repository_ref(repo)), cvss_vector=CRITICAL)
+        uow.commit()
+    assert finding.id is not None
+    shown = view(context, finding.id)
+    assert shown.cvss is not None and shown.cvss.selected is None  # nothing the scanner stated
+    assert (shown.cvss_score, shown.cvss_source) == (None, None)
+    assert (shown.effective_severity, shown.cvss.basis) == (Severity.CRITICAL, "computed")
+
+
+def test_one_sources_differing_statements_are_no_conflict(context: Context) -> None:
+    advisory_id, finding_id = reported(context)
+    publish(
+        context,
+        {
+            advisory_id: (
+                stated(CvssSource.NIST, CRITICAL),
+                stated(CvssSource.NIST, HIGH, "nvd:CVE-2026-0102"),  # the advisory's second CVE
+            )
+        },
+    )
+    shown = view(context, finding_id)
+    assert shown.cvss is not None and not shown.cvss.conflict
+
+
+def test_a_store_outage_reading_the_build_leaves_findings_as_before(
+    context: Context, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    advisory_id, finding_id = reported(context)
+    publish(context, {advisory_id: (stated(CvssSource.NIST, CRITICAL),)})
+
+    def outage(*args: object) -> bytes:
+        raise RepositoryError("the store is unreachable", operation="get")
+
+    monkeypatch.setattr(exposure_module, "stored_bytes", outage)
+    shown = view(context, finding_id)
+    assert (shown.effective_severity, shown.cvss_score) == (Severity.MEDIUM, Decimal("5.3"))
+    monkeypatch.undo()
+    assert view(context, finding_id).effective_severity is Severity.CRITICAL  # never kept

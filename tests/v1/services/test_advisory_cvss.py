@@ -391,19 +391,39 @@ def counting(monkeypatch: pytest.MonkeyPatch) -> Callable[[], int]:
     return lambda: len(calls)
 
 
-def test_a_per_request_reader_reads_which_build_once_and_keeps_it(world: World) -> None:
+def test_a_pinned_reader_reads_which_build_once_and_forgets_it_after(world: World) -> None:
     canonical = advisory(world.engine, LOG4SHELL)
     finding(world.engine, canonical.id)
     world.serve_log4shell()
     world.service().refresh_advisory_documents()
     assert canonical.id is not None
-    request = AdvisoryCvssReader(world.objects, world.cache, per_request=True)
+    reader = AdvisoryCvssReader(world.objects, world.cache)
+    with reader.pinned():
+        with SqlTraustUnitOfWork(world.engine) as uow:
+            first = reader.read(uow, [canonical.id])
+        world.at = AT + timedelta(days=1)
+        world.service().refresh_advisory_cvss()  # a newer publication, mid-build
+        with SqlTraustUnitOfWork(world.engine) as uow:
+            assert reader.read(uow, [canonical.id]).built_at == first.built_at  # the same build
     with SqlTraustUnitOfWork(world.engine) as uow:
-        first = request.read(uow, [canonical.id])
-    world.at = AT + timedelta(days=1)
-    world.service().refresh_advisory_cvss()  # a newer publication, mid-request
-    with SqlTraustUnitOfWork(world.engine) as uow:
-        assert request.read(uow, [canonical.id]).built_at == first.built_at  # the same build
-        fresh = AdvisoryCvssReader(world.objects, world.cache).read(uow, [canonical.id])
-    assert fresh.built_at is not None and first.built_at is not None
-    assert fresh.built_at > first.built_at  # the next request sees it
+        after = reader.read(uow, [canonical.id])  # outside the block: the newer one
+    assert after.built_at is not None and first.built_at is not None
+    assert after.built_at > first.built_at
+
+
+def test_a_store_failure_reading_the_build_is_no_build_and_never_kept(world: World) -> None:
+    canonical = advisory(world.engine, LOG4SHELL)
+    finding(world.engine, canonical.id)
+    world.serve_log4shell()
+    world.service().refresh_advisory_documents()
+    assert canonical.id is not None
+    reads: list[int] = []
+
+    def outage() -> bytes:
+        reads.append(1)
+        raise RepositoryError("the store is unreachable", operation="get")
+
+    one = uuid4()
+    assert world.cache.parse(one, outage) is None
+    assert world.cache.parse(one, outage) is None and len(reads) == 2  # retried, never kept
+    assert world.cache.parse(one, lambda: AdvisoryCvss(scores={}).to_bytes()) is not None

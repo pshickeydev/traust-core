@@ -292,6 +292,7 @@ class FindingCensus:
         chosen = selection(
             authority.get(advisory_id, ()) if advisory_id is not None else (),
             occurrence.cvss_vector if occurrence is not None else None,
+            occurrence.cvss_score if occurrence is not None else None,
             reported=occurrence is not None,
             document="occurrence",
         ).chosen

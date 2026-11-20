@@ -1130,7 +1130,11 @@ class ContainerFindingsView:
             # the same authority statements, selected against this image's report
             authority = [s.stated() for s in view.cvss.authority_scores] if view.cvss else []
             picked = selection(
-                authority, latest.cvss_vector, reported=True, document=f"occurrence:{latest.id}"
+                authority,
+                latest.cvss_vector,
+                latest.cvss_score,
+                reported=True,
+                document=f"occurrence:{latest.id}",
             )
             label = self._rating.severity_label(latest, view.disposition, picked.chosen)
             selected = view.model_copy(

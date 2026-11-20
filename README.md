@@ -497,7 +497,10 @@ unchanged day is the same bytes, so one artifact. Views read this build, never t
   build, `built_at` is None. It reads the latest snapshot (and, once per publication, its
   artifact); the build is parsed once per publication by the Context's `advisory_cvss_cache`,
   which outlives the per-request services. An unreadable build is logged, read as
-  `unreadable`, and remembered until the next one.
+  `unreadable`, and remembered until the next one; a store failure reading it is logged and
+  never kept, so the next read retries (the read runs outside the cache's lock). Inside
+  `FindingService.shared()` (a composed build), the reader pins which build it reads, so every
+  load counts at one.
 - **Freshness.** Once built, `feed_statuses()` lists `advisory-cvss` with the shortest document
   source's `max_age_hours`, its refresh being the document refresh. It is as old as its oldest
   source's documents, so a source that stopped refreshing makes it stale; an unreadable build, or
@@ -513,8 +516,9 @@ scanner's) by `effective`'s order.
 
 - **The cvss block.** `FindingCvss` keeps the report's `score`, `vector` and computed
   `severity`, and adds `authority_scores` (every authority's statement, ranked, each with its
-  FIRST band), `selected` (the one chosen, `reason: precedence`, possibly the scanner's) and
-  `conflict` (two authorities' scored statements of one 3.x version in different bands).
+  FIRST band), `selected` (the one chosen, `reason: precedence`; the scanner's only when its
+  report stated a score its vector computes) and `conflict` (two different authorities' scored
+  statements of one 3.x version in different bands).
 - **The effective severity.** When an authority's statement is selected, the finding counts at
   its band (`basis: authority`), unless a severity decision stands (`judgement`, D20); otherwise
   the order is as before: the computed band of the report's vector, a judgement, the scanner's

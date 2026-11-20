@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from decimal import Decimal
 
 from traust_core.v1.models.cvss import (
     CvssScore,
@@ -10,9 +11,10 @@ from traust_core.v1.models.cvss import (
     CvssVersion,
     EffectiveCvss,
     distinct,
-    scanner_score,
+    score_of,
     severity_of,
 )
+from traust_core.v1.models.values import canonical_decimal
 
 PRECEDENCE: tuple[CvssSource, ...] = (
     CvssSource.NIST,
@@ -36,24 +38,40 @@ def effective(scores: Sequence[CvssScore]) -> EffectiveCvss:
 
 
 def selection(
-    authority: Sequence[CvssScore], vector: str | None, *, reported: bool, document: str
+    authority: Sequence[CvssScore],
+    vector: str | None,
+    score: Decimal | None,
+    *,
+    reported: bool,
+    document: str,
 ) -> EffectiveCvss:
-    """`effective` over every authority's statement and the latest report's own (the scanner's
-    `vector`, from `document`); an unreported finding selects nothing."""
+    """`effective` over every authority's statement and the latest report's own: the scanner's
+    only when it reported a score its vector computes. An unreported finding selects nothing."""
     if not reported:
         return effective(())
-    scanner = scanner_score(vector, document=document)
+    scanner = None
+    if score is not None:
+        # the canonical form: SQLite reads 5.3 back as 5.3000000000
+        stated = canonical_decimal(score)
+        scanner = score_of(CvssSource.SCANNER, vector, document=document, stated=stated)
     return effective([*authority, *([scanner] if scanner is not None else [])])
 
 
 def conflicting(scores: Sequence[CvssScore]) -> bool:
-    """Whether two authorities' scored statements of one 3.x version fall in different bands."""
-    bands: dict[CvssVersion, set[object]] = {}
-    for s in scores:
-        scored = s.score is not None
-        if s.source is not CvssSource.SCANNER and s.version in RANKED_VERSIONS and scored:
-            bands.setdefault(s.version, set()).add(severity_of(s.vector))
-    return any(len(found) > 1 for found in bands.values())
+    """Whether two different authorities' scored statements of one 3.x version fall in
+    different bands; one source's differing statements (two CVEs) are no conflict."""
+    said = {
+        (s.version, s.source, severity_of(s.vector))
+        for s in scores
+        if s.source is not CvssSource.SCANNER
+        and s.version in RANKED_VERSIONS
+        and s.score is not None
+    }
+    return any(
+        v == w and source != other and band != theirs
+        for v, source, band in said
+        for w, other, theirs in said
+    )
 
 
 def _chosen(scores: Sequence[CvssScore]) -> CvssScore | None:

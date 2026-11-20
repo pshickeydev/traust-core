@@ -5,7 +5,7 @@ import json
 import logging
 from collections import Counter, defaultdict
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from functools import cmp_to_key
@@ -805,8 +805,10 @@ class FindingService:
         inside the block counts over the build's load instead of re-reading it. The memo
         lives only inside the outermost block — nothing outlives the build."""
         self._shared_depth += 1
+        pinned = self._views.cvss.pinned() if self._views.cvss is not None else nullcontext()
         try:
-            yield
+            with pinned:  # and every load counts at one advisory-cvss build
+                yield
         finally:
             self._shared_depth -= 1
             if not self._shared_depth:
