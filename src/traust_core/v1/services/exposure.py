@@ -235,7 +235,9 @@ log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
-class _ManifestCoverage:
+class ManifestScanCoverage:
+    """Gaps on a scan and whether its probe can assess Docker coverage."""
+
     gaps: tuple[UnresolvedManifest, ...] | None
     current_probe: bool
 
@@ -432,7 +434,8 @@ class ExposureService:
         """Reuse a document import or a current scan; refresh an old probe even at the same SHA."""
         ref, repository = self._inventory.resolve(repository_ref_id)
         if ref.manifest_sbom_id is not None and (
-            ref.manifest_sbom_assessment_id is None or self._manifest_coverage(ref).current_probe
+            ref.manifest_sbom_assessment_id is None
+            or self._probe_coverages([ref], requeue=True)[repository_ref_id].current_probe
         ):
             with self._uow as uow:
                 return uow.sboms.get(ref.manifest_sbom_id)
@@ -543,7 +546,7 @@ class ExposureService:
         ref = self._inventory.get_ref(repository_ref_id)
         return self.manifest_coverage([ref])[repository_ref_id]
 
-    def _manifest_coverage(self, ref: RepositoryRef) -> _ManifestCoverage:
+    def _manifest_coverage(self, ref: RepositoryRef) -> ManifestScanCoverage:
         assert ref.id is not None
         return self._probe_coverages([ref])[ref.id]
 
@@ -556,22 +559,50 @@ class ExposureService:
             for ref_id, scan in self._probe_coverages(refs).items()
         }
 
-    def _probe_coverages(self, refs: Collection[RepositoryRef]) -> dict[UUID, _ManifestCoverage]:
+    def manifest_scan_coverage(
+        self, refs: Collection[RepositoryRef]
+    ) -> dict[UUID, ManifestScanCoverage]:
+        """Scan-bound gaps and probe currency, including legacy non-Docker coverage."""
+        return self._probe_coverages(refs)
+
+    def _probe_coverages(
+        self, refs: Collection[RepositoryRef], *, requeue: bool = False
+    ) -> dict[UUID, ManifestScanCoverage]:
         scan_ids = {
             ref.manifest_sbom_assessment_id for ref in refs if ref.manifest_sbom_assessment_id
         }
         scans = self._log.list_by_ids(scan_ids) if scan_ids else []
+        scans_by_id = {scan.id: scan for scan in scans}
         held: defaultdict[UUID | None, list[tuple[Assessment, Artifact]]] = defaultdict(list)
         for scan, artifact in self._log.documents(scans, [ManifestCoverageArtifact.schema]):
             held[scan.id].append((scan, artifact))
-        coverage: dict[UUID, _ManifestCoverage] = {}
+        coverage: dict[UUID, ManifestScanCoverage] = {}
         for ref in refs:
             assert ref.id is not None
             scan_id = ref.manifest_sbom_assessment_id
             if scan_id is None:
-                coverage[ref.id] = _ManifestCoverage(None, False)
+                coverage[ref.id] = ManifestScanCoverage(None, False)
                 continue
             documents = held[scan_id]
+            if requeue and len(documents) != 1:
+                scan = scans_by_id.get(scan_id)
+                if (
+                    scan is not None
+                    and scan.repository_ref_id == ref.id
+                    and scan.kind == AssessmentKind.MANIFEST_SBOM
+                    and scan.status == ASSESSMENT_COMPLETED
+                ):
+                    # Only repair missing/duplicate documents of this ref's completed scan.
+                    # Validate every duplicate first: a bad binding or corrupt artifact is
+                    # unrelated corruption, not permission to silently replace the pointer.
+                    for held_scan, artifact in documents:
+                        self._scan_coverage(ref, held_scan, artifact)
+                    log.warning(
+                        "requeueing manifest scan %s of ref %s with %s coverage documents",
+                        scan_id, ref.id, len(documents),
+                    )
+                    coverage[ref.id] = ManifestScanCoverage(None, False)
+                    continue
             if not documents:
                 raise IntegrityError(f"manifest scan {scan_id} of ref {ref.id} holds no coverage")
             if len(documents) != 1:
@@ -584,7 +615,7 @@ class ExposureService:
 
     def _scan_coverage(
         self, ref: RepositoryRef, scan: Assessment, artifact: Artifact
-    ) -> _ManifestCoverage:
+    ) -> ManifestScanCoverage:
         doc = json.loads(
             ManifestCoverageArtifact.parse(stored_bytes(self._objects, artifact)).payload
         )
@@ -607,9 +638,9 @@ class ExposureService:
         )
         identity = scan.assessor, scan.assessor_version
         if identity == (_MANIFEST_PROBE, _MANIFEST_PROBE_VERSION):
-            return _ManifestCoverage(gaps, True)
+            return ManifestScanCoverage(gaps, True)
         legacy = identity == (doc["tool"]["name"], doc["tool"]["version"])
-        return _ManifestCoverage(gaps if legacy else None, False)
+        return ManifestScanCoverage(gaps if legacy else None, False)
 
     def resolve_symbols(self, advisory_id: UUID) -> SymbolResolution:
         """The functions the advisory's fix touched: what its source publishes (Go's OSV

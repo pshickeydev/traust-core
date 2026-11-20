@@ -273,6 +273,43 @@ def _builder_flags(args: str, escape: str) -> tuple[list[str], str]:
     return flags, args[pos:]
 
 
+def _unquoted_heredoc(word: str) -> bool:
+    quote, pos = "", 0
+    while pos < len(word):
+        char = word[pos]
+        if quote == "'":
+            if char == quote:
+                quote = ""
+        elif char == "\\":
+            pos += 1
+        elif quote:
+            if char == quote:
+                quote = ""
+        elif char in "'\"":
+            quote = char
+        elif word.startswith("<<", pos):
+            return True
+        pos += 1
+    return False
+
+
+def _heredocs(args: str, *, shell: bool) -> Iterator[tuple[str, bool]]:
+    # BuildKit recognizes heredocs as complete whitespace-delimited words, not shell tokens:
+    # cat<<EOF is ambiguous and must not cause us to skip possible Docker instructions.
+    end = 0
+    for word in _WORD.finditer(args):
+        if args[end : word.start()].strip():
+            raise ValueError("invalid Dockerfile word")
+        end = word.end()
+        if match := _HEREDOC.fullmatch(word[0]):
+            [delimiter] = shlex.split(match[2])
+            yield delimiter, bool(match[1])
+        elif shell and _unquoted_heredoc(word[0]):
+            raise ValueError("ambiguous Dockerfile heredoc")
+    if args[end:].strip():
+        raise ValueError("invalid Dockerfile word")
+
+
 def _docker_instructions(text: str) -> Iterator[tuple[str, list[str], str]]:
     lines = iter(text.removeprefix("\ufeff").split("\n"))
     escape, directives = "\\", True
@@ -312,14 +349,12 @@ def _docker_instructions(text: str) -> Iterator[tuple[str, list[str], str]]:
                     continue
             except ValueError:
                 pass  # e.g. a shell test: RUN [ -f file ] && cat <<EOF
-        for word in _WORD.finditer(args):
-            if match := _HEREDOC.fullmatch(word[0]):
-                [delimiter] = shlex.split(match[2])
-                for body in lines:
-                    if (body.lstrip("\t") if match[1] else body) == delimiter:
-                        break
-                else:
-                    raise ValueError("unterminated Dockerfile heredoc")
+        for delimiter, chomp in _heredocs(args, shell=op == "run"):
+            for body in lines:
+                if (body.lstrip("\t") if chomp else body) == delimiter:
+                    break
+            else:
+                raise ValueError("unterminated Dockerfile heredoc")
 
 
 def _external_base(text: str) -> bool:

@@ -8,7 +8,7 @@ import shutil
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy.engine import Engine
@@ -18,7 +18,7 @@ from tests.v1.providers.test_forge_archive import tarball
 from tests.v1.repositories.tables.conftest import T0, Seed
 from tests.v1.services.test_exposure_impact import LODASH, Lookup, engine
 from tests.v1.services.test_exposure_sweep import FakeCheckout, FakeSbomTool
-from traust_core.v1.errors import IntegrityError, NotFoundError, ValidationError
+from traust_core.v1.errors import DocumentError, IntegrityError, NotFoundError, ValidationError
 from traust_core.v1.models.artifacts import ManifestCoverageArtifact
 from traust_core.v1.models.assessment import AssessmentKind
 from traust_core.v1.models.dependencies import (
@@ -40,7 +40,7 @@ from traust_core.v1.providers.process import ProcessRunner
 from traust_core.v1.providers.syft import SyftSbom
 from traust_core.v1.providers.tools import ToolRequest
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
-from traust_core.v1.repositories.objects import InMemoryObjectStore
+from traust_core.v1.repositories.objects import InMemoryObjectStore, ObjectKey
 from traust_core.v1.services.artifact_publishing import stored_bytes
 from traust_core.v1.services.assessment import AssessmentService
 from traust_core.v1.services.exposure import ExposureService
@@ -98,6 +98,36 @@ def coverage_runs(engine: Engine, ref: UUID) -> int:
         runs = uow.assessments.list_for_ref(ref)
     assert not [a for a in runs if a.kind == AssessmentKind.TOOL_SCAN]  # code-facts' kind
     return sum(a.kind == AssessmentKind.MANIFEST_SBOM for a in runs)
+
+
+def legacy_scan(
+    engine: Engine,
+    service: ExposureService,
+    reference: UUID,
+    unresolved: dict[str, dict[str, str]],
+    *,
+    assessor: str = "syft",
+) -> None:
+    with SqlTraustUnitOfWork(engine) as uow:
+        ref = uow.repository_refs.get(reference)
+        scan = Seed(uow).assessment(
+            ref, kind=AssessmentKind.MANIFEST_SBOM, assessor=assessor, assessor_version="1.51.1"
+        )
+        service._attach_document(
+            uow,
+            scan,
+            ManifestCoverageArtifact.from_document(
+                {
+                    "artifact": "manifest-coverage",
+                    "tool": {"name": "syft", "version": "1.51.1"},
+                    "assessment_id": str(scan.id),
+                    "sbom_id": str(ref.manifest_sbom_id),
+                    "unresolved": unresolved,
+                }
+            ),
+        )
+        uow.repository_refs.update(ref.model_copy(update={"manifest_sbom_assessment_id": scan.id}))
+        uow.commit()
 
 
 @pytest.mark.skipif(shutil.which("syft") is None, reason="syft not on PATH")
@@ -365,6 +395,12 @@ def test_requeue_upgrades_a_legacy_scan_once_at_the_same_sha_and_sbom(
     # receive the new scan's coverage merely because its SBOM id is equal.
     assert service.manifest_coverage([legacy])[reference] is None
     assert service.manifest_coverage([current])[reference] == coverage
+    old_details = service.manifest_scan_coverage([legacy])[reference]
+    new_details = service.manifest_scan_coverage([current])[reference]
+    assert old_details.gaps == () and not old_details.current_probe
+    assert old_details.for_ecosystem(Ecosystem.DOCKER) is None
+    assert old_details.for_ecosystem(Ecosystem.NPM) == ()
+    assert new_details.current_probe and new_details.gaps == coverage
     assert uptake(Ecosystem.DOCKER) == state
     assert service.record_manifest_sbom(reference) == sbom
     assert coverage_runs(engine, reference) == 2
@@ -402,6 +438,107 @@ def test_a_pointer_to_a_scan_holding_no_coverage_is_refused(engine: Engine) -> N
     assert ref.id is not None
     with pytest.raises(IntegrityError, match="holds no coverage"):
         exposure(engine).unresolved_manifests(ref.id)
+
+
+@pytest.mark.parametrize("damage", ["missing", "duplicate"])
+def test_requeue_repairs_only_damaged_coverage_on_the_refs_own_completed_scan(
+    engine: Engine, tmp_path: Path, damage: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    reference = ref_id(engine)
+    archive = FakeCheckout(tmp_path)
+    tool = FakeSbomTool(raw=NO_LODASH)
+    service = exposure(engine, tool, checkout=archive)
+    sbom = service.ingest_sbom(NO_LODASH, reference)
+    with SqlTraustUnitOfWork(engine) as uow:
+        ref = uow.repository_refs.get(reference)
+        scan = Seed(uow).assessment(ref, kind=AssessmentKind.MANIFEST_SBOM)
+        uow.repository_refs.update(ref.model_copy(update={"manifest_sbom_assessment_id": scan.id}))
+        if damage == "duplicate":
+            for path in ("a/package.json", "b/package.json"):
+                service._attach_document(
+                    uow,
+                    scan,
+                    ManifestCoverageArtifact.from_document(
+                        {
+                            "artifact": "manifest-coverage",
+                            "tool": {"name": "syft", "version": "1.51.1"},
+                            "assessment_id": str(scan.id),
+                            "sbom_id": str(sbom.id),
+                            "unresolved": {"npm": {path: "no-lockfile"}},
+                        }
+                    ),
+                )
+        uow.commit()
+    assert scan.id is not None
+    with pytest.raises(IntegrityError, match="holds no coverage|duplicate coverage"):
+        service.unresolved_manifests(reference)
+    tool.raw = b"not json"
+    with pytest.raises(ValidationError):
+        service.record_manifest_sbom(reference)
+    with SqlTraustUnitOfWork(engine) as uow:
+        assert uow.repository_refs.get(reference).manifest_sbom_assessment_id == scan.id
+    with pytest.raises(IntegrityError, match="holds no coverage|duplicate coverage"):
+        service.unresolved_manifests(reference)
+    tool.raw = NO_LODASH
+    assert service.record_manifest_sbom(reference) == sbom
+    assert service.unresolved_manifests(reference) == ()
+    assert str(scan.id) in caplog.text
+    assert len(archive.asked) == len(archive.released) == 2
+    with SqlTraustUnitOfWork(engine) as uow:
+        assert uow.repository_refs.get(reference).manifest_sbom_assessment_id != scan.id
+        assert len(uow.artifacts.list_for_assessment(scan.id)) == (2 if damage == "duplicate" else 0)
+
+
+@pytest.mark.parametrize(
+    "damage", ["bad-binding", "malformed-document", "foreign-scan", "wrong-kind"]
+)
+def test_requeue_does_not_hide_unrelated_scan_corruption(
+    engine: Engine, tmp_path: Path, damage: str
+) -> None:
+    reference = ref_id(engine)
+    archive = FakeCheckout(tmp_path)
+    service = exposure(engine, checkout=archive)
+    sbom = service.ingest_sbom(NO_LODASH, reference)
+    with SqlTraustUnitOfWork(engine) as uow:
+        ref = uow.repository_refs.get(reference)
+        seed = Seed(uow)
+        owner = (
+            seed.repository_ref(seed.repository(url="https://github.com/org/foreign"))
+            if damage == "foreign-scan" else ref
+        )
+        kind = AssessmentKind.REPO_STATE if damage == "wrong-kind" else AssessmentKind.MANIFEST_SBOM
+        scan = seed.assessment(owner, kind=kind)
+        uow.repository_refs.update(ref.model_copy(update={"manifest_sbom_assessment_id": scan.id}))
+        if damage in ("bad-binding", "malformed-document"):
+            bindings = (sbom.id, uuid4()) if damage == "bad-binding" else (sbom.id,)
+            for index, bound in enumerate(bindings):
+                service._attach_document(
+                    uow,
+                    scan,
+                    ManifestCoverageArtifact.from_document(
+                        {
+                            "artifact": "manifest-coverage",
+                            "tool": {"name": "syft", "version": "1.51.1"},
+                            "assessment_id": str(scan.id),
+                            "sbom_id": str(bound),
+                            "unresolved": {"npm": {f"{index}/package.json": "no-lockfile"}},
+                        }
+                    ),
+                )
+            if damage == "malformed-document":
+                stored = service._objects.put(ObjectKey.parse("broken-coverage.json"), b"not json")
+                seed.artifact(
+                    scan,
+                    kind=ManifestCoverageArtifact.schema,
+                    digest=stored.sha256,
+                    uri=str(stored.key),
+                )
+        uow.commit()
+    with pytest.raises(DocumentError if damage == "malformed-document" else IntegrityError):
+        service.record_manifest_sbom(reference)
+    assert archive.asked == archive.released == []
+    with SqlTraustUnitOfWork(engine) as uow:
+        assert uow.repository_refs.get(reference).manifest_sbom_assessment_id == scan.id
 
 
 class ReadClock:
@@ -584,3 +721,44 @@ def test_scan_coverage_beside_v1_reach_counts_a_shared_sbom_by_repository(
     captured = reader.report(reach, T0, coverage)
     assert any("npm: unresolved manifests in 1 repository." in s.body for s in captured.sections)
     assert "npm: unresolved manifests" not in insight.publish(view, scope).markdown
+
+
+def test_reach_report_distinguishes_legacy_unrecognized_and_missing_scans(
+    engine: Engine, tmp_path: Path
+) -> None:
+    uow = SqlTraustUnitOfWork(engine)
+    with uow:
+        seed = Seed(uow)
+        refs = [
+            seed.repository_ref(
+                seed.repository(url=f"https://github.com/org/{name}"), is_default=True
+            )
+            for name in ("legacy", "current", "unrecognized", "document")
+        ]
+        for ref in refs:
+            seed.assessment(ref, kind=AssessmentKind.REPO_STATE)
+        uow.commit()
+    legacy, current, unknown, document = refs
+    assert legacy.id and current.id and unknown.id and document.id
+    service = exposure(engine)
+    for ref in (legacy, unknown, document):
+        assert ref.id is not None
+        service.ingest_sbom(NO_LODASH, ref.id)
+    legacy_scan(
+        engine, service, legacy.id,
+        {"npm": {"a/package.json": "no-lockfile", "b/package.json": "no-lockfile"}},
+    )
+    legacy_scan(engine, service, unknown.id, {}, assessor="unrecognized-probe")
+    service.ingest_dependencies(current.id, checkout(tmp_path, locked=False))
+    portfolio = PortfolioService(uow, PortfolioPolicy(), assessment=AssessmentService(uow))
+    reader = DependencyReachView(service, portfolio)
+    model, report = reader.build_report(ViewFilter(), T0)
+    text = "\n".join(section.body for section in report.sections)
+    assert model.repositories == 4
+    assert "Repositories without scan-backed manifest coverage: 1" in text
+    assert "Repositories with an unrecognized manifest coverage probe: 1" in text
+    assert "docker: coverage unknown in 1 repository with a legacy scan." in text
+    assert "npm: unresolved manifests in 2 repositories." in text
+    # The unchanged sidecar API is conservative; the richer report is not its wire shape.
+    _, sidecar = reader.with_coverage(ViewFilter())
+    assert sidecar.model_dump(mode="json") == {"without_scan": 3, "unresolved": {"npm": 1}}

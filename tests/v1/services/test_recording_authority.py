@@ -63,11 +63,21 @@ def engine(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[Engine]:
         yield database
 
 
-def scoped(engine: Engine, tmp_path: Path, *, enabled: bool = True):
+def scoped(
+    engine: Engine,
+    tmp_path: Path,
+    *,
+    enabled: bool = True,
+    kind: RecordKind = RecordKind.VERIFICATION,
+):
     clock = MovingClock()
     context = Context(
         Config(
-            home=tmp_path, recording=RecordingConfig(verification=("verify",) if enabled else ())
+            home=tmp_path,
+            recording=RecordingConfig(
+                verification=("verify",) if enabled and kind == RecordKind.VERIFICATION else (),
+                validation=("verify",) if enabled and kind == RecordKind.VALIDATION else (),
+            ),
         ),
         clock=clock,
     )
@@ -82,7 +92,12 @@ def scoped(engine: Engine, tmp_path: Path, *, enabled: bool = True):
         WorkerId(OWNER.ref),
         LEASE,
     )
-    provenance = Provenance(run_id=order.id, source=SourceType.VERIFICATION_REPORT, occurred_at=T0)
+    source = (
+        SourceType.VALIDATION_REPORT
+        if kind == RecordKind.VALIDATION
+        else SourceType.VERIFICATION_REPORT
+    )
+    provenance = Provenance(run_id=order.id, source=source, occurred_at=T0)
     return context, ops, order, provenance, clock
 
 
@@ -101,6 +116,30 @@ def test_owned_live_lease_commits_record_work_without_extending_or_completing_it
     )
     publisher = context.artifact_publisher(PublishSpecs(PublishSpec(RunManifestArtifact)))
     assert json.loads(publisher.get(saved.artifact_id).payload)["progress"]["step"] == 3
+
+
+@pytest.mark.parametrize("kind", [RecordKind.VALIDATION, RecordKind.VERIFICATION])
+def test_reclaimed_order_rejects_old_attempt_from_same_runner(
+    engine: Engine, tmp_path: Path, kind: RecordKind
+) -> None:
+    _, ops, order, stale, clock = scoped(engine, tmp_path, kind=kind)
+    clock.at = T0 + LEASE + timedelta(seconds=1)
+    reclaimed = ops.claim(WorkerId(OWNER.ref), LEASE, order_id=order.id)
+    assert reclaimed is not None and reclaimed.started_at == clock.at
+
+    with pytest.raises(ConflictError, match="not the current recording lease attempt"):
+        ops.check_recording(order.id, OWNER, kind, order.repository_id, stale)
+    with (
+        pytest.raises(ConflictError, match="not the current recording lease attempt"),
+        ops.recording(order.id, OWNER, kind, order.repository_id, stale),
+    ):
+        ops.save_progress(order.id, OrderProgress(step=1))
+    assert ops.get(order.id).artifact_id is None
+
+    current = stale.model_copy(update={"occurred_at": reclaimed.started_at})
+    with ops.recording(order.id, OWNER, kind, order.repository_id, current):
+        ops.save_progress(order.id, OrderProgress(step=2))
+    assert ops.get(order.id).artifact_id is not None
 
 
 @pytest.mark.parametrize(
