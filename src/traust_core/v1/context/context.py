@@ -1014,7 +1014,7 @@ class Context:
             recording=ops,
         )
         rating = RatingPolicy(self.config.rating)
-        cvss = AdvisoryCvssReader(self.object_store, self.advisory_cvss_cache)
+        cvss = AdvisoryCvssReader(self.object_store, self.advisory_cvss_cache, per_request=True)
         views = FindingViewQuery(rating, self.object_store, cvss)
         findings = FindingService(
             uow,

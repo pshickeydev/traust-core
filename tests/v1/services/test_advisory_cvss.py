@@ -389,3 +389,21 @@ def counting(monkeypatch: pytest.MonkeyPatch) -> Callable[[], int]:
 
     monkeypatch.setattr(AdvisoryCvss, "from_bytes", staticmethod(parse))
     return lambda: len(calls)
+
+
+def test_a_per_request_reader_reads_which_build_once_and_keeps_it(world: World) -> None:
+    canonical = advisory(world.engine, LOG4SHELL)
+    finding(world.engine, canonical.id)
+    world.serve_log4shell()
+    world.service().refresh_advisory_documents()
+    assert canonical.id is not None
+    request = AdvisoryCvssReader(world.objects, world.cache, per_request=True)
+    with SqlTraustUnitOfWork(world.engine) as uow:
+        first = request.read(uow, [canonical.id])
+    world.at = AT + timedelta(days=1)
+    world.service().refresh_advisory_cvss()  # a newer publication, mid-request
+    with SqlTraustUnitOfWork(world.engine) as uow:
+        assert request.read(uow, [canonical.id]).built_at == first.built_at  # the same build
+        fresh = AdvisoryCvssReader(world.objects, world.cache).read(uow, [canonical.id])
+    assert fresh.built_at is not None and first.built_at is not None
+    assert fresh.built_at > first.built_at  # the next request sees it

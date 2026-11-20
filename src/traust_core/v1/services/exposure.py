@@ -2514,14 +2514,22 @@ class AdvisoryCvssCache:
 
 class AdvisoryCvssReader:
     """The latest `advisory-cvss` build, read in the caller's transaction: the door every
-    view's authority scores come through."""
+    view's authority scores come through. `per_request` reads which build once, then keeps it."""
 
-    def __init__(self, objects: ObjectStore, cache: AdvisoryCvssCache) -> None:
+    def __init__(
+        self, objects: ObjectStore, cache: AdvisoryCvssCache, *, per_request: bool = False
+    ) -> None:
         self._objects = objects
         self._cache = cache
+        self._per_request = per_request
+        self._latest: tuple[FeedSnapshot | None] | None = None
 
     def read(self, uow: TraustUnitOfWork, advisory_ids: Collection[UUID]) -> AdvisoryCvssRead:
-        latest = uow.feed_snapshots.latest(ADVISORY_CVSS_FEED)
+        # a request's many facts loads (a whole-scope read's batches) ask once, so every batch
+        # counts at the same build
+        if self._latest is None or not self._per_request:
+            self._latest = (uow.feed_snapshots.latest(ADVISORY_CVSS_FEED),)
+        (latest,) = self._latest
         if latest is None:
             return AdvisoryCvssRead(scores={}, built_at=None)
         build = self.parsed(uow, latest)
