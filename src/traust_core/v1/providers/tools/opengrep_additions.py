@@ -2,8 +2,14 @@
 
 from __future__ import annotations
 
+import ctypes
+import hashlib
 import json
+import os
 import re
+import shutil
+import stat
+import sys
 import tempfile
 from collections import Counter
 from collections.abc import Iterator, Mapping, Sequence
@@ -19,6 +25,7 @@ from traust_core.v1.providers.tools.opengrep_quality import (
     CheckedRules,
     checked_rules,
     fixture_files,
+    fixture_target,
     read_rule_text,
     rule_files,
 )
@@ -86,7 +93,7 @@ def protected_ids(root: Path, load: YamlLoader) -> set[str]:
 def _stage(
     rule: object,
     receipt: RuleReceipt,
-    dest: Path,
+    dest: Path | None,
     fixtures: Mapping[str, str],
     siblings: set[str],
     protected: Mapping[str, str],
@@ -115,20 +122,23 @@ def _stage(
         return receipt.refuse(
             "skipped-for-language", "none of the rule's languages match the checkout"
         )
-    dest.parent.mkdir()
-    dest.write_text(text, encoding="utf-8")
-    for suffix, fixture in fixtures.items():
-        dest.with_name("rule" + suffix).write_text(
-            _fixture_for_rule(fixture, receipt.rule_id, siblings) if siblings else fixture,
-            encoding="utf-8",
-        )
+    if dest is not None:
+        dest.parent.mkdir()
+        dest.write_text(text, encoding="utf-8")
+        for name, fixture in fixtures.items():
+            target = dest.parent / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(
+                _fixture_for_rule(fixture, receipt.rule_id, siblings) if siblings else fixture,
+                encoding="utf-8",
+            )
     return receipt
 
 
 def _candidates(
     source: str,
     path: Path,
-    stage: Path,
+    stage: Path | None,
     load: YamlLoader,
     protected: Mapping[str, str],
     languages: set[str] | None,
@@ -136,16 +146,23 @@ def _candidates(
     proposed: list[tuple[object, RuleReceipt, Mapping[str, str], set[str]]] = []
     refused: list[RuleReceipt] = []
     boundary = path if path.is_dir() else path.parent
+    staged_rule = Path("rule.yaml")
     for rule_file in rule_files(path):
         receipt = RuleReceipt(source=source, file=rule_file.relative_to(boundary).as_posix())
         try:
             rules = _read_rules(rule_file, path, load)
             if not rules:
                 continue
-            fixtures = {
-                fixture.name[len(rule_file.stem) :]: read_rule_text(fixture, boundary)
-                for fixture in fixture_files(rule_file)
-            }
+            fixtures = (
+                {
+                    fixture_target(rule_file, fixture, staged_rule).as_posix(): read_rule_text(
+                        fixture, boundary
+                    )
+                    for fixture in fixture_files(rule_file)
+                }
+                if stage is not None
+                else {}
+            )
         except (ValidationError, RecursionError) as error:
             reason = (
                 str(error)
@@ -169,15 +186,170 @@ def _candidates(
                 receipt.refuse("collision", f"{receipt.rule_id} is repeated in {source}")
             )
             continue
-        dest = stage / str(i) / "rule.yaml"
+        dest = stage / str(i) / "rule.yaml" if stage is not None else None
         result = _stage(rule, receipt, dest, fixtures, siblings, protected, languages)
         if result.check is not None:
             refused.append(result)
         else:
-            candidates[dest] = result
+            candidates[dest if dest is not None else Path(str(i))] = result
     if not proposed and not refused:
         refused.append(RuleReceipt(source).refuse("structure", "no authored rules found"))
     return candidates, refused
+
+
+def inspect_rules(
+    source: str, path: Path, load: YamlLoader, protected: Mapping[str, str]
+) -> tuple[tuple[RuleReceipt, ...], tuple[RuleReceipt, ...]]:
+    candidates, refused = _candidates(source, path, None, load, protected, None)
+    return tuple(candidates.values()), tuple(refused)
+
+
+_VCS = frozenset({".git", ".hg", ".svn", ".bzr"})
+_CREDITS = ("license", "licence", "notice", "copying", "authors", "copyright", "attribution")
+
+
+def _open_directory(path: Path) -> int:
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    descriptor = os.open(path.anchor, flags)
+    try:
+        for part in path.parts[1:]:
+            nested = os.open(part, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = nested
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _copy_pack(source: int, destination: Path, names: Sequence[str] | None = None) -> None:
+    for name in sorted(os.listdir(source) if names is None else names):
+        if name in _VCS:
+            continue
+        mode = os.stat(name, dir_fd=source, follow_symlinks=False).st_mode
+        target = destination / name
+        if stat.S_ISDIR(mode):
+            descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=source)
+            try:
+                target.mkdir()
+                _copy_pack(descriptor, target)
+            finally:
+                os.close(descriptor)
+        elif stat.S_ISREG(mode):
+            descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=source)
+            with os.fdopen(descriptor, "rb") as original:
+                metadata = os.fstat(original.fileno())
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise ValidationError(f"rule pack input is a link or special file: {name}")
+                with target.open("xb") as copied:
+                    shutil.copyfileobj(original, copied)
+                    os.fchmod(copied.fileno(), stat.S_IMODE(metadata.st_mode) & 0o777)
+        else:
+            raise ValidationError(f"rule pack input is a link or special file: {name}")
+
+
+@contextmanager
+def capture_rules(
+    sources: Sequence[Path], destination: Path
+) -> Iterator[tuple[Path, tuple[Path, ...], Path]]:
+    """Capture full inputs privately; no accepted path exists until publication."""
+    try:
+        destination = destination.expanduser()
+        destination = destination.parent.resolve(strict=True) / destination.name
+        if destination.exists() or destination.is_symlink():
+            raise ValidationError(f"rule pack destination already exists: {destination}")
+        boundaries = [source.resolve(strict=True) for source in sources]
+        for index, boundary in enumerate(boundaries):
+            if destination.is_relative_to(boundary) or boundary.is_relative_to(destination):
+                raise ValidationError("rule pack source and destination must not overlap")
+            if any(
+                boundary.is_relative_to(other) or other.is_relative_to(boundary)
+                for other in boundaries[:index]
+            ):
+                raise ValidationError("rule pack sources must not overlap")
+        with tempfile.TemporaryDirectory(
+            prefix=".opengrep-intake-", dir=destination.parent
+        ) as temporary:
+            snapshot = Path(temporary) / "pack"
+            snapshot.mkdir()
+            inputs = []
+            for index, source in enumerate(sources):
+                target = snapshot if len(sources) == 1 else snapshot / f"source-{index}"
+                target.mkdir(exist_ok=True)
+                mode = source.lstat().st_mode
+                if stat.S_ISDIR(mode):
+                    descriptor = _open_directory(source)
+                    try:
+                        _copy_pack(descriptor, target)
+                    finally:
+                        os.close(descriptor)
+                    inputs.append(target)
+                elif stat.S_ISREG(mode):
+                    descriptor = _open_directory(source.parent)
+                    try:
+                        with os.scandir(descriptor) as entries:
+                            names = [
+                                entry.name
+                                for entry in entries
+                                if entry.name in (source.name, source.stem)
+                                or (
+                                    entry.name.startswith(source.stem + ".")
+                                    and (
+                                        Path(entry.name).suffix not in (".yaml", ".yml")
+                                        or ".test." in entry.name
+                                    )
+                                )
+                                or entry.name.lower().startswith(_CREDITS)
+                            ]
+                        _copy_pack(descriptor, target, names)
+                    finally:
+                        os.close(descriptor)
+                    inputs.append(target / source.name)
+                else:
+                    raise ValidationError(f"rule pack input is a link or special file: {source}")
+            yield snapshot, tuple(inputs), destination
+    except OSError as error:
+        raise ValidationError(f"cannot admit rule pack into {destination}") from error
+
+
+def pack_digest(snapshot: Path) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(snapshot.rglob("*")):
+        if path.is_file():
+            digest.update(path.relative_to(snapshot).as_posix().encode() + b"\0")
+            digest.update(hashlib.sha256(path.read_bytes()).digest())
+    return digest.hexdigest()
+
+
+def publish_rules(snapshot: Path, destination: Path) -> None:
+    if sys.platform == "darwin":
+        name, flag = "renameatx_np", 0x00000004  # RENAME_EXCL
+    elif sys.platform == "linux":
+        name, flag = "renameat2", 1  # RENAME_NOREPLACE
+    else:
+        raise ValidationError("atomic no-overwrite rule admission is unavailable on this platform")
+    rename = getattr(ctypes.CDLL(None, use_errno=True), name, None)
+    if rename is None:
+        raise ValidationError("atomic no-overwrite rule admission is unavailable on this platform")
+    rename.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    rename.restype = ctypes.c_int
+    with ExitStack() as descriptors:
+        source = _open_directory(snapshot.parent)
+        descriptors.callback(os.close, source)
+        target = _open_directory(destination.parent)
+        descriptors.callback(os.close, target)
+        if (
+            rename(source, os.fsencode(snapshot.name), target, os.fsencode(destination.name), flag)
+            != 0
+        ):
+            code = ctypes.get_errno()
+            raise OSError(code, os.strerror(code), str(destination))
 
 
 @contextmanager

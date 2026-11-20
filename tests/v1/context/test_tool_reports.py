@@ -11,6 +11,7 @@ import pytest
 
 from tests.v1.conftest import commit_all, git
 from tests.v1.models.test_elf_formats import elf
+from tests.v1.providers.tools.opengrep_fixtures import write_rule
 from traust_core.v1.context import Config, Context
 from traust_core.v1.context import tool_reports as reports
 from traust_core.v1.context.config import Locations
@@ -149,6 +150,30 @@ def test_opengrep_default_facts_scan_applies_configured_and_requested_additions(
 
     replacement = reports.opengrep_report(ctx, repo, [str(baseline)])
     assert replacement["additive_rules"]["degraded"] == {}
+
+
+def test_intake_opengrep_rules_publishes_only_checked_inputs_without_activation(
+    tmp_path: Path, bindir: Path
+) -> None:
+    fake(bindir, "my-opengrep", OPENGREP)
+    ctx = context(tmp_path, opengrep_adopter_rules=str(tmp_path / "active"))
+    baseline = pack(tmp_path)
+    ctx.register_rule_pack(baseline)
+    source = write_rule(tmp_path / "proposed", "proposed-rule")
+    destination = tmp_path / "accepted"
+
+    report = reports.intake_opengrep_rules(
+        ctx, [str(source)], destination, binary="my-opengrep", timeout=60
+    )
+
+    assert report["admitted"] is True
+    assert report["destination"] == str(destination)
+    assert (destination / source.name).read_bytes() == source.read_bytes()
+    assert [check["name"] for check in report["quality_checks"]] == ["validate", "test"]
+    assert all(check["passed"] for check in report["quality_checks"])
+    assert ctx.config.locations.opengrep_adopter_rules == str(tmp_path / "active")
+    assert ctx.rule_pack == baseline
+    assert not (tmp_path / "active").exists()
 
 
 def test_opengrep_keeps_only_the_allowed_rules_and_takes_a_pack_override(

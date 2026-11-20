@@ -94,7 +94,8 @@ def read_rule_text(source: Path, boundary: Path) -> str:
     if not source.resolve().is_relative_to(boundary.resolve()):
         raise ValidationError(f"rule fixture leaves its source directory: {source}")
     try:
-        text = source.read_text(encoding="utf-8")
+        with source.open(encoding="utf-8", newline="") as stream:
+            text = stream.read()
     except (OSError, UnicodeError) as error:
         raise ValidationError(f"cannot read rule input {source.name}") from error
     return text
@@ -105,15 +106,35 @@ def rule_files(source: Path) -> Iterator[Path]:
     paths = (
         sorted({*source.rglob("*.yaml"), *source.rglob("*.yml")}) if source.is_dir() else [source]
     )
+    fixture_roots = {
+        path.with_suffix("")
+        for path in paths
+        if ".test." not in path.name and path.with_suffix("").is_dir()
+    }
     for path in paths:
-        if ".test." not in path.name and not any(
-            part.startswith(".") or part == "tests" for part in path.relative_to(root).parts[:-1]
+        if (
+            ".test." not in path.name
+            and not any(path.is_relative_to(folder) for folder in fixture_roots)
+            and not any(
+                part.startswith(".") or part == "tests"
+                for part in path.relative_to(root).parts[:-1]
+            )
         ):
             yield path
 
 
 def fixture_files(rule: Path) -> Iterator[Path]:
-    return (path for path in sorted(rule.parent.glob(rule.stem + ".*")) if _fixture(path, rule))
+    yield from (path for path in sorted(rule.parent.glob(rule.stem + ".*")) if _fixture(path, rule))
+    directory = rule.with_suffix("")
+    if directory.is_dir():
+        yield from (path for path in sorted(directory.rglob("*")) if path.is_file())
+
+
+def fixture_target(rule: Path, fixture: Path, staged_rule: Path) -> Path:
+    directory = rule.with_suffix("")
+    if fixture.is_relative_to(directory):
+        return staged_rule.with_suffix("") / fixture.relative_to(directory)
+    return staged_rule.with_name(staged_rule.stem + fixture.name[len(rule.stem) :])
 
 
 def _snapshot(
@@ -153,7 +174,7 @@ def _snapshot(
             if not authored and path != source:
                 continue
             destination.parent.mkdir(parents=True, exist_ok=True)
-            destination.write_text(text, encoding="utf-8")
+            destination.write_text(text, encoding="utf-8", newline="")
             configs.append(destination)
             if len(documents) != 1 or not authored or not isinstance(authored[0]["rules"], list):
                 problems.append(f"{path.name} must contain one rule document")
@@ -169,15 +190,16 @@ def _snapshot(
                 if str(rule.get("pattern", "")).strip().startswith("TODO"):
                     problems.append(f"{rule_id} is an unauthored skeleton")
             for fixture in fixture_files(path):
-                staged = destination.with_name("rule" + fixture.name[len(path.stem) :])
+                staged = fixture_target(path, fixture, destination)
+                staged.parent.mkdir(parents=True, exist_ok=True)
                 fixtures[staged.resolve()] = read_rule_text(fixture, boundary)
-                staged.write_text(fixtures[staged.resolve()], encoding="utf-8")
+                staged.write_text(fixtures[staged.resolve()], encoding="utf-8", newline="")
     if examples is not None:
         if len(configs) != 1:
             raise ValidationError("proposal examples require exactly one rule file")
         for name, text in examples.items():
             destination = configs[0].with_name(fixture_name(configs[0], name))
-            destination.write_text(text, encoding="utf-8")
+            destination.write_text(text, encoding="utf-8", newline="")
             fixtures[destination.resolve()] = text
     if not rules:
         problems.append("no authored rules found")
@@ -216,8 +238,31 @@ def _validate(
     )
 
 
+def _test_runs(
+    root: Path,
+    configs: Sequence[Path],
+    runner: ProcessRunner,
+    binary: str,
+    timeout: int,
+) -> Iterator[ProcessResult]:
+    directories, ordinary = [], []
+    for config in configs:
+        (directories if config.with_suffix("").is_dir() else ordinary).append(config)
+    command = [binary, "test", "--json", "--strict"]
+    if not directories:
+        yield _run(runner, [*command, str(root)], timeout)
+        return
+    if ordinary:
+        yield _run(runner, [*command, *(str(config.parent) for config in ordinary)], timeout)
+    for config in directories:
+        # Explicit files avoid older native runners opening paired directories as files.
+        targets = [str(path) for path in fixture_files(config) if not path.stem.endswith(".fixed")]
+        yield _run(runner, [*command, "--config", str(config), *targets], timeout)
+
+
 def _tests(
     root: Path,
+    configs: Sequence[Path],
     rules: Sequence[str],
     fixtures: Mapping[Path, str],
     runner: ProcessRunner,
@@ -226,22 +271,26 @@ def _tests(
 ) -> ProposalCheck:
     issues = []
     try:
-        result = _run(runner, [binary, "test", "--json", "--strict", str(root)], timeout)
-        if result.returncode != 0:
-            issues.append(f"native test exited {result.returncode}")
-        native = _Tests.model_validate_json(result.stdout)
-        if (
-            native.config_missing_tests
-            or native.config_missing_fixtests
-            or native.config_with_errors
-        ):
-            issues.append("native test reported missing fixtures or configuration errors")
+        reports = []
+        for result in _test_runs(root, configs, runner, binary, timeout):
+            if result.returncode != 0:
+                issues.append(f"native test exited {result.returncode}")
+            native = _Tests.model_validate_json(result.stdout)
+            if (
+                native.config_missing_tests
+                or native.config_missing_fixtests
+                or native.config_with_errors
+            ):
+                issues.append("native test reported missing fixtures or configuration errors")
+            reports.append(native)
         tested = set()
-        for config in native.results.values():
+        for config in (config for report in reports for config in report.results.values()):
             for rule_id, check in config.checks.items():
                 if rule_id not in rules:
                     issues.append("native test returned an unrecognized rule id")
                     continue
+                if rule_id in tested:
+                    issues.append(f"native test returned duplicate receipts for {rule_id}")
                 tested.add(rule_id)
                 annotations = [
                     example_lines(rule_id, fixtures[path])
@@ -260,12 +309,19 @@ def _tests(
                     or not any(match.expected_lines for match in check.matches.values())
                 ):
                     issues.append(f"native test did not pass {rule_id}")
-                for match in check.matches.values():
-                    if set(match.expected_lines) != set(match.reported_lines):
+                for name, match in check.matches.items():
+                    path = Path(name).resolve()
+                    if path not in fixtures:
+                        issues.append(f"native test returned an unknown fixture for {rule_id}")
+                        continue
+                    fire, _ = example_lines(rule_id, fixtures[path])
+                    if set(match.expected_lines) != fire or set(match.expected_lines) != set(
+                        match.reported_lines
+                    ):
                         issues.append(f"unexpected or missing matches for {rule_id}")
         if tested != set(rules):
             issues.append("native test did not exercise exactly the supplied rule ids")
-        if _failed_fix(native.fixtest_results):
+        if any(_failed_fix(report.fixtest_results) for report in reports):
             issues.append("native autofix test did not pass")
     except ModelValidationError:
         issues.append("native test returned invalid output")
@@ -300,7 +356,7 @@ def checked_rules(
         configs, rules, fixtures, problems = _snapshot(sources, root, examples, load)
         validation = _validate(root, runner, binary, timeout, problems)
         testing = (
-            _tests(root, rules, fixtures, runner, binary, timeout)
+            _tests(root, configs, rules, fixtures, runner, binary, timeout)
             if validation.passed
             else ProposalCheck(
                 name=ProposalCheckName.TEST,

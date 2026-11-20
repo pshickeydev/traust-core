@@ -107,17 +107,19 @@ def opengrep_report(
     )
 
 
-def opengrep_intake_report(
+def intake_opengrep_rules(
     ctx: Context,
     sources: Sequence[str],
+    destination: Path,
     *,
     pack: Path | None = None,
     timeout: int = 300,
     binary: str = "opengrep",
 ) -> Doc:
-    """Run the additive-rule gate without scanning a target or activating any rule."""
+    """Admit checked stable rule bytes into a new pack, without activating them."""
     return opengrep.intake_rules(
         sources,
+        destination,
         pack=pack or ctx.rule_pack,
         supplements=ctx.rule_pack_supplements,
         runner=_runner(ctx, ("opengrep", "git", binary), max(timeout, opengrep.SCAN_TIMEOUT)),

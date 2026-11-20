@@ -42,7 +42,11 @@ from traust_core.v1.providers.tools.adapter import adapter_result
 from traust_core.v1.providers.tools.opengrep_additions import (
     RuleBatch,
     RuleReceipt,
+    capture_rules,
+    inspect_rules,
+    pack_digest,
     protected_ids,
+    publish_rules,
     vet_rules,
 )
 from traust_core.v1.providers.tools.opengrep_quality import (
@@ -552,6 +556,7 @@ def _degraded(refused: Sequence[RuleReceipt]) -> dict[str, int]:
 
 def intake_rules(
     sources: Sequence[str],
+    destination: Path,
     *,
     pack: Path,
     supplements: Sequence[SupplementalPack],
@@ -561,17 +566,66 @@ def intake_rules(
     timeout: int,
     binary: str,
 ) -> dict[str, Any]:
-    """Vet additions without a target, without changing checked-in or enabled rules."""
+    """Publish a whole optional pack only after static policy and native checks pass."""
+    if not sources:
+        raise ValidationError("rule intake requires at least one source")
+    for source in sources:
+        local = Path(source).expanduser()
+        if not source.startswith(("https://", "http://", "git@")) and local.is_symlink():
+            raise ValidationError(f"rule pack input is a link or special file: {source}")
     gate = _AdditionGate(pack, runner, checkouts, load, binary, timeout)
-    protected = gate.reserve(supplements)
-    applied: list[RuleReceipt] = []
-    refused: list[RuleReceipt] = []
-    for source in dict.fromkeys(sources):
-        with gate.vet(source, protected, None) as (_, batch):
-            applied.extend(batch.applied)
-            refused.extend(batch.refused)
-            protected.update({r.rule_id: r.source for r in batch.applied if r.rule_id is not None})
-    return _additive_report(applied, refused)
+    resolved, workspaces = resolve_rules(sources, pack, pack, checkouts)
+    try:
+        remote_workspaces = iter(workspaces)
+        paths = tuple(
+            next(remote_workspaces).path
+            if entry["sha"] is not None
+            else Path(entry["source"]).expanduser().absolute()
+            for entry in resolved
+        )
+        with capture_rules(paths, destination) as (snapshot, inputs, destination):
+            protected = gate.reserve(supplements)
+            candidates: list[RuleReceipt] = []
+            refused: list[RuleReceipt] = []
+            for entry, path in zip(resolved, inputs, strict=True):
+                good, bad = inspect_rules(entry["source"], path, load, protected)
+                candidates.extend(good)
+                refused.extend(bad)
+                protected.update({r.rule_id: r.source for r in good if r.rule_id is not None})
+            checks: list[ProposalCheck] = []
+            digest = pack_digest(snapshot)
+            if not refused:
+                with checked_rules(
+                    inputs, runner, load=load, binary=binary, timeout=timeout
+                ) as checked:
+                    checks.extend(checked.report.checks)
+                    if not checked.report.passed:
+                        failed = next(check for check in checks if not check.passed)
+                        refused.extend(
+                            receipt.refuse(failed.name.value, failed.detail)
+                            for receipt in candidates
+                        )
+                        candidates.clear()
+            if refused:
+                refused.extend(
+                    receipt.refuse("admission", "whole pack refused; no rules installed")
+                    for receipt in candidates
+                )
+                return _additive_report((), refused) | {
+                    "admitted": False,
+                    "quality_checks": [check.model_dump(mode="json") for check in checks],
+                    "content_digest": digest,
+                }
+            publish_rules(snapshot, destination)
+            return _additive_report(candidates, ()) | {
+                "admitted": True,
+                "destination": str(destination),
+                "quality_checks": [check.model_dump(mode="json") for check in checks],
+                "content_digest": digest,
+            }
+    finally:
+        for workspace in workspaces:
+            checkouts.release(workspace)
 
 
 def _additive_report(

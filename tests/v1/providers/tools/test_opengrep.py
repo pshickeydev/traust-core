@@ -647,7 +647,7 @@ def test_explicit_output_allowlist_still_filters_admitted_additions(
     assert report["outcome"] == "succeeded"
 
 
-def test_intake_uses_the_same_gate_without_a_target_or_promotion(
+def test_intake_refuses_the_whole_pack_on_a_static_collision_without_activation(
     pack: Path, tmp_path: Path
 ) -> None:
     extra = _write_custom(
@@ -657,6 +657,7 @@ def test_intake_uses_the_same_gate_without_a_target_or_promotion(
     raw = Runner()
     report = R.intake_rules(
         [str(extra)],
+        tmp_path / "accepted",
         pack=pack,
         supplements=(),
         runner=runner(raw),
@@ -665,14 +666,17 @@ def test_intake_uses_the_same_gate_without_a_target_or_promotion(
         timeout=5,
         binary="opengrep",
     )
-    assert [r["rule_id"] for r in report["applied"]] == ["extra-rule"]
-    assert [r["check"] for r in report["refused"]] == ["collision"]
+    assert report["admitted"] is False
+    assert report["applied"] == []
+    assert {r["check"] for r in report["refused"]} == {"collision", "admission"}
+    assert "destination" not in report
+    assert not (tmp_path / "accepted").exists()
     assert all(argv[1] != "scan" for argv, _ in raw.calls)
     assert extra.read_bytes() == original
 
 
 @pytest.mark.skipif(shutil.which("opengrep") is None, reason="requires native opengrep")
-def test_native_gate_keeps_a_passing_rule_from_the_same_file_as_a_failing_rule(
+def test_native_intake_refuses_the_whole_pack_but_runtime_vetting_remains_partial(
     tmp_path: Path,
 ) -> None:
     pack = tmp_path / "pack"
@@ -688,6 +692,7 @@ def test_native_gate_keeps_a_passing_rule_from_the_same_file_as_a_failing_rule(
     )
     report = R.intake_rules(
         [str(extra)],
+        tmp_path / "accepted",
         pack=pack,
         supplements=(),
         runner=ProcessRunner(("opengrep",)),
@@ -696,8 +701,11 @@ def test_native_gate_keeps_a_passing_rule_from_the_same_file_as_a_failing_rule(
         timeout=30,
         binary="opengrep",
     )
-    assert [r["rule_id"] for r in report["applied"]] == ["extra.good"], report
-    assert [(r["rule_id"], r["check"]) for r in report["refused"]] == [("extra.bad", "test")]
+    assert report["admitted"] is False
+    assert report["applied"] == []
+    assert {r["rule_id"] for r in report["refused"]} == {"extra.good", "extra.bad"}
+    assert {r["check"] for r in report["refused"]} == {"test"}
+    assert not (tmp_path / "accepted").exists()
 
     write_rule(pack / "python", "baseline-rule")
     target = tmp_path / "checkout"
@@ -716,7 +724,9 @@ def test_native_gate_keeps_a_passing_rule_from_the_same_file_as_a_failing_rule(
         ("baseline-rule", "traust"),
         ("extra.good", f"additive:{extra}"),
     ]
-    assert scan["additive_rules"]["refused"] == report["refused"]
+    assert [(r["rule_id"], r["check"]) for r in scan["additive_rules"]["refused"]] == [
+        ("extra.bad", "test")
+    ]
 
 
 def test_a_scan_with_no_json_or_past_its_timeout_fails(pack: Path, target: Path) -> None:
