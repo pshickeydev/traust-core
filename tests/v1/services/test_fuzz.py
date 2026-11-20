@@ -28,6 +28,7 @@ from traust_core.v1.models.assessment import Assessment, AssessmentKind
 from traust_core.v1.models.common import Provenance
 from traust_core.v1.models.findings import AssessedJudgment, Decision
 from traust_core.v1.models.insight import ValidationFuzz, ViewFilter, ViewName
+from traust_core.v1.models.operations import RunOrder, WorkerId
 from traust_core.v1.models.validation import ValidationRollup
 from traust_core.v1.models.vocabulary import DispositionAssurance, SourceType, Validity
 from traust_core.v1.rendering.markdown import MarkdownRenderer
@@ -67,7 +68,7 @@ def record(
     ref: UUID,
     at: Any = WHEN,
     *,
-    run_order_id: UUID | None = None,
+    order: RunOrder | None = None,
 ) -> Assessment:
     return context.services().assessment.record(
         doc,
@@ -76,7 +77,9 @@ def record(
         "skill:create-fuzzing",
         "0.1.0",
         Provenance(run_id=uuid4(), source=SourceType.INTERACTIVE, occurred_at=at),
-        run_order_id=run_order_id,
+        run_order_id=order.id if order else None,
+        worker=WorkerId("machine:runner") if order else None,
+        lease_generation=order.lease_generation if order else None,
     )
 
 
@@ -125,14 +128,14 @@ def test_a_leased_fuzz_run_needs_a_ledger_only_for_a_reproduced_finding(
 ) -> None:
     run = recording.order(context, ref)
     with pytest.raises(ServiceError, match="requires a ledger"):
-        record(context, report(crasher("C-1")), ref, run_order_id=run)
+        record(context, report(crasher("C-1")), ref, order=run)
     with SqlTraustUnitOfWork(context.database) as uow:
         assert uow.assessments.list_for_ref(ref) == []
         assert uow.artifacts.latest_imported(FuzzReportArtifact.schema) is None
     assert finding_count(context, ref) == 0
 
-    clean = record(context, report(), ref, run_order_id=run)
-    assert clean.run_order_id == run
+    clean = record(context, report(), ref, order=run)
+    assert clean.run_order_id == run.id
     assert occurrences(context, clean) == {}
 
 

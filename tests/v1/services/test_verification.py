@@ -19,13 +19,23 @@ from sqlalchemy.engine import Engine
 from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import Seed
 from tests.v1.services.test_exposure_advisories import GRPC, FakeLookup
+from tests.v1.services.test_recording_authority import HUMAN, LEASE, OWNER
 from traust_core.v1.context import Config, Context
-from traust_core.v1.errors import IntegrityError, NotFoundError, ServiceError, ValidationError
+from traust_core.v1.context.config import RecordingConfig
+from traust_core.v1.errors import (
+    ConfigError,
+    ConflictError,
+    IntegrityError,
+    NotFoundError,
+    ServiceError,
+    ValidationError,
+)
 from traust_core.v1.models.artifacts import VerificationArtifact
 from traust_core.v1.models.common import ArtifactRef, PageRequest, Provenance
 from traust_core.v1.models.findings import Finding
 from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.models.inventory import Repository, RepositoryRef
+from traust_core.v1.models.operations import OrderRequest, RunOrder, WorkerId
 from traust_core.v1.models.remediation import VerificationFilter, WorkItem
 from traust_core.v1.models.vocabulary import (
     DispositionResolution,
@@ -255,17 +265,28 @@ def test_recording_again_changes_nothing(service: VerificationService, engine: E
     )  # type: ignore[arg-type]
 
 
+def start_verification(context: Context, world: World) -> RunOrder:
+    context.config = context.config.model_copy(
+        update={"recording": RecordingConfig(verification=("verify",))}
+    )
+    return context.services().ops.start(
+        OrderRequest(asset="verify", priority=1, repository_id=world.repo.id),
+        HUMAN,
+        WorkerId(OWNER.ref),
+        LEASE,
+    )
+
+
 @pytest.mark.parametrize("prepublished", [False, True])
 def test_failed_order_verdict_rolls_back_report_metadata_regressions_and_proofs(
     engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, prepublished: bool
 ) -> None:
     world = World(engine, findings=2)
-    service = make_context(engine, tmp_path, ledger=LedgerConfig()).services().verification
+    context = make_context(engine, tmp_path, ledger=LedgerConfig())
+    order = start_verification(context, world)
+    service = context.services().verification
     doc = report(world, {world.ids[0]: "resolved", world.ids[1]: "unresolved"})
     prior = service._publisher.publish_ref(doc) if prepublished else None
-    with SqlTraustUnitOfWork(engine) as uow:
-        order = Seed(uow).run_order(asset="verify", repository_id=world.repo.id)
-        uow.commit()
     assert order.id is not None
     origin = provenance(prior).model_copy(update={"run_id": order.id})
     decide = service._findings.decisions.record_resolution
@@ -279,7 +300,7 @@ def test_failed_order_verdict_rolls_back_report_metadata_regressions_and_proofs(
 
     monkeypatch.setattr(service._findings.decisions, "record_resolution", flaky)
     with pytest.raises(RuntimeError, match="connection lost"):
-        service.record(doc, origin, run_order_id=order.id)
+        service.record_order(doc, origin, order.id, OWNER, lease_generation=order.lease_generation)
     monkeypatch.undo()
     with SqlTraustUnitOfWork(engine) as uow:
         stored = uow.artifacts.find(None, sha256_hex(doc.payload))
@@ -289,7 +310,9 @@ def test_failed_order_verdict_rolls_back_report_metadata_regressions_and_proofs(
     assert not service.list(  # type: ignore[arg-type]
         VerificationFilter(repository_id=world.repo.id), PageRequest()
     ).items
-    got = service.record(doc, origin, run_order_id=order.id)
+    got = service.record_order(
+        doc, origin, order.id, OWNER, lease_generation=order.lease_generation
+    )
     assert {v.verdict for v in got.verdicts} == {"resolved", "unresolved"}
     with SqlTraustUnitOfWork(engine) as uow:
         assert uow.assessments.get(got.verification_id).run_order_id == order.id
@@ -457,19 +480,34 @@ def test_record_refuses_a_report_it_cannot_place(
     assert decisions(engine, world.ids[0])[-1].assessment_id is None  # nothing stated
 
 
-def test_direct_order_verification_requires_a_ledger_before_upload_and_on_replay(
-    service: VerificationService, context: Context, engine: Engine
+def test_a_separate_lease_transaction_is_refused_before_upload(
+    context: Context, engine: Engine
 ) -> None:
     world = World(engine)
-    with SqlTraustUnitOfWork(engine) as uow:
-        order = Seed(uow).run_order(asset="verify", repository_id=world.repo.id)
-        uow.commit()
+    order = start_verification(context, world)
+    assert order.id is not None
+    service = context.services().verification
+    service._recording = context.services().ops
+    origin = provenance().model_copy(update={"run_id": order.id})
+    with pytest.raises(ConfigError, match="must share a unit of work"):
+        service.record_order(
+            report(world), origin, order.id, OWNER, lease_generation=order.lease_generation
+        )
+    assert not tuple(context.object_store.list())
+
+
+def test_direct_order_verification_requires_a_ledger_before_upload_and_on_replay(
+    context: Context, engine: Engine
+) -> None:
+    world = World(engine)
+    order = start_verification(context, world)
+    service = context.services().verification
     assert order.id is not None
     origin = provenance().model_copy(update={"run_id": order.id})
     doc = report(world)
     before = decisions(engine, world.ids[0])
     with pytest.raises(ServiceError, match="requires a ledger"):
-        service.record(doc, origin, run_order_id=order.id)
+        service.record_order(doc, origin, order.id, OWNER, lease_generation=order.lease_generation)
     assert not tuple(context.object_store.list())
     assert decisions(engine, world.ids[0]) == before
     with SqlTraustUnitOfWork(engine) as uow:
@@ -477,9 +515,13 @@ def test_direct_order_verification_requires_a_ledger_before_upload_and_on_replay
         assert not uow.assessments.list_for_ref(world.patched.id)
 
     context.config = context.config.model_copy(update={"ledger": LedgerConfig()})
-    context.services().verification.record(doc, origin, run_order_id=order.id)
-    with pytest.raises(ServiceError, match="requires a ledger"):
+    context.services().verification.record_order(
+        doc, origin, order.id, OWNER, lease_generation=order.lease_generation
+    )
+    with pytest.raises(ConflictError, match="belongs to order"):
         service.record(doc, origin)
+    with pytest.raises(ServiceError, match="requires a ledger"):
+        service.record_order(doc, origin, order.id, OWNER, lease_generation=order.lease_generation)
 
 
 def test_verdicts_go_on_the_ledger_when_it_is_on(engine: Engine, tmp_path: Path) -> None:

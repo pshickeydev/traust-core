@@ -106,10 +106,11 @@ def body(context: Context, ref: UUID, doc: SecurityAuditArtifact = DOC) -> dict[
     order = leased(context, ref)
     return {
         "run_order_id": str(order.id),
+        "lease_generation": order.lease_generation,
         "repository_ref_id": str(ref),
         "payload": doc.payload.decode("utf-8"),
         "provenance": Provenance(
-            run_id=order.id, source=SourceType.VULN_SCAN_REPORT, occurred_at=order.started_at
+            run_id=order.id, source=SourceType.VULN_SCAN_REPORT, occurred_at=WHEN
         ).model_dump(mode="json"),
         "assessor_version": "1.2.3",
     }
@@ -148,6 +149,7 @@ def test_authored_claims_record_exact_bytes_and_unjudged_native_findings(
         "1.2.3",
     )
     assert str(assessment.run_order_id) == request["run_order_id"]
+    assert assessment.occurred_at == WHEN
     assert services.artifacts.payload(result.artifact_id) == payload.encode("utf-8")
     assert services.artifacts.metadata(result.artifact_id).assessment_id == assessment.id
     with SqlTraustUnitOfWork(context.database) as uow:
@@ -170,6 +172,7 @@ def test_authored_claims_record_exact_bytes_and_unjudged_native_findings(
         "1.2.3",
         Provenance.model_validate(request["provenance"]),
         run_order_id=UUID(request["run_order_id"]),
+        lease_generation=request["lease_generation"],
         principal=principal(context),
     )
     assert same == repeated
@@ -186,6 +189,12 @@ def test_authored_claims_record_exact_bytes_and_unjudged_native_findings(
         ("provenance", 422),
         ("source", 422),
         ("unknown-order", 404),
+        ("missing-generation", 422),
+        ("null-generation", 422),
+        ("zero-generation", 422),
+        ("bool-generation", 422),
+        ("string-generation", 422),
+        ("wrong-generation", 409),
         ("expired", 409),
     ],
 )
@@ -216,6 +225,18 @@ def test_authored_recording_rejects_unowned_or_mismatched_recording_context(
         request["provenance"]["source"] = SourceType.TRIAGE_REPORT.value
     elif fault == "unknown-order":
         request["run_order_id"] = str(uuid4())
+    elif fault == "missing-generation":
+        del request["lease_generation"]
+    elif fault == "null-generation":
+        request["lease_generation"] = None
+    elif fault == "zero-generation":
+        request["lease_generation"] = 0
+    elif fault == "bool-generation":
+        request["lease_generation"] = True
+    elif fault == "string-generation":
+        request["lease_generation"] = str(request["lease_generation"])
+    elif fault == "wrong-generation":
+        request["lease_generation"] += 1
     elif fault in {"asset", "expired"}:
         with SqlTraustUnitOfWork(context.database) as uow:
             held = uow.run_orders.get(UUID(request["run_order_id"]))
@@ -277,7 +298,6 @@ def test_schema_permitted_priority_keeps_original_bytes_in_explicit_authored_rec
 def test_authored_replay_never_adopts_an_unbound_or_differently_bound_assessment(
     context: Context, client: TestClient, ref: UUID, initial: str
 ) -> None:
-    context.__dict__["clock"] = FixedClock(context.clock.now())
     services = context.services()
     if initial == "unbound":
         first = services.assessment.record(
@@ -286,9 +306,7 @@ def test_authored_replay_never_adopts_an_unbound_or_differently_bound_assessment
             AssessmentKind.SECURE_CODE_CANONICAL,
             "skill:secure-code-audit",
             "1.2.3",
-            Provenance(
-                run_id=uuid4(), source=SourceType.VULN_SCAN_REPORT, occurred_at=context.clock.now()
-            ),
+            Provenance(run_id=uuid4(), source=SourceType.VULN_SCAN_REPORT, occurred_at=WHEN),
         )
         original_order = None
     else:
@@ -299,7 +317,10 @@ def test_authored_replay_never_adopts_an_unbound_or_differently_bound_assessment
         first = services.assessment.get(result.assessment_id)
         original_order = first.run_order_id
         services.ops.complete(
-            original_order, WorkerId(principal(context).ref), JobResult.succeeded()
+            original_order,
+            WorkerId(principal(context).ref),
+            JobResult.succeeded(),
+            lease_generation=request["lease_generation"],
         )
     request = body(context, ref)
     before = rows(context)
@@ -479,7 +500,7 @@ def test_sdk_claim_reclaim_recording(context: Context, ref: UUID, tmp_path: Path
         (report,) = uow.artifacts.list_for_assessment(audit.id)
         reclaimed = uow.run_orders.get(order.id)
         assert reclaimed.state == OrderState.SUCCEEDED
-        assert audit.occurred_at < reclaimed.started_at
+        assert reclaimed.lease_generation == 2
         assert audit.repository_ref_id == ref
         assert len(uow.occurrences.list_for_assessment(audit.id)) == 2
         assert len(uow.findings.list_for_repository(repository_id)) == 2
@@ -500,12 +521,13 @@ def test_explicit_dispatched_worker_start_returns_real_source_ids(
     assert started.status_code == 200, started.text
     request = {
         "run_order_id": started.json()["id"],
+        "lease_generation": started.json()["lease_generation"],
         "repository_ref_id": str(ref),
         "payload": DOC.payload.decode("utf-8"),
         "provenance": Provenance(
             run_id=UUID(started.json()["id"]),
             source=SourceType.VULN_SCAN_REPORT,
-            occurred_at=started.json()["started_at"],
+            occurred_at=WHEN,
         ).model_dump(mode="json"),
         "assessor_version": "1.2.3",
     }
@@ -537,6 +559,7 @@ def test_recording_service_needs_the_shared_operations_guard(context: Context, r
             "1.2.3",
             Provenance(run_id=uuid4(), source=SourceType.VULN_SCAN_REPORT, occurred_at=WHEN),
             run_order_id=uuid4(),
+            lease_generation=1,
             principal=principal(context),
         )
 
@@ -606,6 +629,7 @@ def test_authored_fingerprint_stamp_must_agree_with_native_intake(
 def test_same_principal_reclaim_during_staging_fences_the_old_first_write(
     context: Context, client: TestClient, ref: UUID, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    context.__dict__["clock"] = FixedClock(context.clock.now())
     request = body(context, ref)
     order_id = UUID(request["run_order_id"])
     ops = context.services().ops
@@ -620,7 +644,8 @@ def test_same_principal_reclaim_during_staging_fences_the_old_first_write(
                 uow.run_orders.update(old.model_copy(update={"lease_expires_at": old.started_at}))
                 uow.commit()
             new = ops.claim(WorkerId(old.lease_holder), timedelta(minutes=5), order_id=order_id)
-            assert new is not None and new.started_at > old.started_at
+            assert new is not None and new.lease_generation == old.lease_generation + 1
+            assert new.started_at == old.started_at
             reclaimed.append(new)
         return stored
 
@@ -628,13 +653,44 @@ def test_same_principal_reclaim_during_staging_fences_the_old_first_write(
     with monkeypatch.context() as patch:
         patch.setattr(context.object_store, "put", reclaim_after_upload)
         stale = client.post(URL, json=request, headers=runner(context))
-    assert stale.status_code == 409 and "lease attempt" in stale.json()["detail"]
+    assert stale.status_code == 409, stale.text
     (new,) = reclaimed
     after = rows(context)
     assert after.pop("run_order") != before.pop("run_order")
     assert after == before
-    request["provenance"]["occurred_at"] = new.started_at.isoformat()
-    assert client.post(URL, json=request, headers=runner(context)).status_code == 200
+    current = {**request, "lease_generation": new.lease_generation}
+    recorded = client.post(URL, json=current, headers=runner(context))
+    assert recorded.status_code == 200, recorded.text
+
+
+def test_exact_receipt_replay_after_same_worker_reclaim_uses_current_generation(
+    context: Context, client: TestClient, ref: UUID
+) -> None:
+    request = body(context, ref)
+    headers = runner(context)
+    first = client.post(URL, json=request, headers=headers)
+    assert first.status_code == 200, first.text
+    order_id = UUID(request["run_order_id"])
+    with SqlTraustUnitOfWork(context.database) as uow:
+        held = uow.run_orders.get(order_id)
+        uow.run_orders.update(held.model_copy(update={"lease_expires_at": held.started_at}))
+        uow.commit()
+    current = context.services().ops.claim(
+        WorkerId(principal(context).ref), timedelta(minutes=5), order_id=order_id
+    )
+    assert current is not None and current.lease_generation == held.lease_generation + 1
+    before = rows(context)
+    assert client.post(URL, json=request, headers=headers).status_code == 409
+    replay = client.post(
+        URL, json={**request, "lease_generation": current.lease_generation}, headers=headers
+    )
+    assert replay.status_code == 200, replay.text
+    saved, repeated = first.json(), replay.json()
+    assert repeated["assessment_id"] == saved["assessment_id"]
+    assert repeated["artifact_id"] == saved["artifact_id"]
+    assert repeated["intake"]["findings"] == saved["intake"]["findings"]
+    assert not repeated["intake"]["created"]
+    assert rows(context) == before
 
 
 @pytest.mark.parametrize("same_bytes", [True, False])
@@ -661,6 +717,7 @@ def test_overlapping_authored_requests_decide_replay_at_the_serialized_write(
                     "1.2.3",
                     Provenance.model_validate(outer["provenance"]),
                     run_order_id=UUID(outer["run_order_id"]),
+                    lease_generation=outer["lease_generation"],
                     principal=principal(context),
                 )
             )

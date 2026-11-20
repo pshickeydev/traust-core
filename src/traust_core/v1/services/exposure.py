@@ -7,6 +7,7 @@ import logging
 import re
 from collections import defaultdict
 from collections.abc import Collection, Mapping, Sequence
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
@@ -115,7 +116,7 @@ from traust_core.v1.models.findings import (
 from traust_core.v1.models.fix_commits import changed_functions, fix_commits
 from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.models.inventory import DEFAULT_FORGE_HOSTS, RepositoryRef
-from traust_core.v1.models.operations import FeedSnapshot
+from traust_core.v1.models.operations import FeedSnapshot, WorkerId
 from traust_core.v1.models.sbom_formats import parse_sbom
 from traust_core.v1.models.values import CveId, GitSha, HttpsRepoUrl
 from traust_core.v1.models.vocabulary import (
@@ -160,11 +161,13 @@ from traust_core.v1.services.artifact_publishing import (
 )
 from traust_core.v1.services.findings.intake import FindingIntake
 from traust_core.v1.services.findings.records import FindingRecords
+from traust_core.v1.services.order_binding import order_binding
 from traust_core.v1.services.portfolio import Inventory, PortfolioService
 from traust_core.v1.services.repo_checkout import RepoCheckoutService
 
 if TYPE_CHECKING:
     from traust_core.v1.services.findings.service import FindingService
+    from traust_core.v1.services.operations import OpsService
 
 FEED_ARTIFACT_KIND = "feed"
 # the per-identifier sources an advisory's names are kept from, and which names each takes
@@ -285,8 +288,10 @@ class ExposureService:
         sbom_tool: ToolProvider[bytes] | None = None,
         findings: FindingService | None = None,
         checkout: RepoCheckoutService | None = None,
+        ops: OpsService | None = None,
     ) -> None:
         self._uow = uow
+        self._ops = ops
         self._inventory = Inventory(uow, hosts)
         self._log = AssessmentLog(uow)
         self._findings = FindingRecords(uow)
@@ -430,14 +435,32 @@ class ExposureService:
         )
         return sbom
 
-    def record_manifest_sbom(self, repository_ref_id: UUID) -> Sbom:
+    def record_manifest_sbom(
+        self,
+        repository_ref_id: UUID,
+        *,
+        run_order_id: UUID | None = None,
+        worker: WorkerId | None = None,
+        lease_generation: int | None = None,
+    ) -> Sbom:
         """Reuse a document import or a current scan; refresh an old probe even at the same SHA."""
         ref, repository = self._inventory.resolve(repository_ref_id)
+        guard = order_binding(
+            self._ops,
+            self._uow,
+            run_order_id,
+            ref.repository_id,
+            worker,
+            lease_generation,
+            lock_at_commit=True,
+        )
+        if run_order_id is not None and self._require_portfolio()._uow is not self._uow:
+            raise ConfigError("order-bound manifest scans need a shared inventory transaction")
         if ref.manifest_sbom_id is not None and (
             ref.manifest_sbom_assessment_id is None
             or self._probe_coverages([ref], requeue=True)[repository_ref_id].current_probe
         ):
-            with self._uow as uow:
+            with guard, self._uow as uow:
                 return uow.sboms.get(ref.manifest_sbom_id)
         if self._checkout is None:
             raise ConfigError("record_manifest_sbom needs a checkout provider (Context wires one)")
@@ -446,7 +469,7 @@ class ExposureService:
             CheckoutRequest(repo=repository.url, ref=GitSha.parse(ref.sha), keep=MANIFESTS)
         ).data
         try:
-            self.ingest_dependencies(repository_ref_id, fetched.path)
+            self._ingest_dependencies(repository_ref_id, fetched.path, guard, run_order_id)
         finally:
             self._checkout.release(fetched)
         # a scan that read the tree before the current one records but doesn't become current
@@ -467,6 +490,15 @@ class ExposureService:
         one transaction with this scan's `manifest_sbom` assessment, its `manifest-coverage`
         record bound to both, and the commit's pointer to the scan: coverage is never read off
         another scan."""
+        return self._ingest_dependencies(repository_ref_id, checkout, nullcontext(), None)
+
+    def _ingest_dependencies(
+        self,
+        repository_ref_id: UUID,
+        checkout: Path,
+        guard: AbstractContextManager[object],
+        run_order_id: UUID | None,
+    ) -> DependencyIngest:
         sbom_tool = self._require_sbom_tool()
         portfolio = self._require_portfolio()
         unresolved = unresolved_manifests(checkout)
@@ -494,7 +526,7 @@ class ExposureService:
             for name in requirements_names(checkout)
         }
         contents = parse_sbom(scanned.data, frozenset(declared))
-        with self._uow as uow:
+        with guard, self._uow as uow:
             sbom = uow.sboms.find_by_digest(contents.digest) or self._add_sbom(
                 uow, scanned.data, contents
             )
@@ -510,6 +542,7 @@ class ExposureService:
             scan = self._log.open(
                 Assessment(
                     repository_ref_id=ref.id,
+                    run_order_id=run_order_id,
                     kind=AssessmentKind.MANIFEST_SBOM,
                     status=ASSESSMENT_COMPLETED,
                     assessor=_MANIFEST_PROBE,

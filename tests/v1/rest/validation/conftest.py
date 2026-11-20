@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -41,6 +42,7 @@ class ValidationRun:
     ) -> dict[str, object]:
         return RecordValidation(
             run_order_id=saved_id(self.order),
+            lease_generation=self.order.lease_generation,
             payload=doc.payload.decode("utf-8"),
             provenance=provenance or self.provenance,
             bindings=bindings,
@@ -58,7 +60,7 @@ def context(harness: ValidationHarness, tmp_path: Path) -> Iterator[Context]:
             recording=RecordingConfig(validation=("validate",)),
         ),
         object_store=harness.objects,
-        clock=FixedClock(NOW),
+        clock=FixedClock(NOW + timedelta(hours=1)),
     )
     context.__dict__["local_issuer"] = LocalIssuer(context.config.home, SystemClock())
     context.local_issuer.mint("validation-runner", machine=True)
@@ -92,7 +94,5 @@ def run(context: Context, client: TestClient, harness: ValidationHarness) -> Val
         claimed,
         principal,
         headers,
-        PROVENANCE.model_copy(
-            update={"run_id": saved_id(claimed), "occurred_at": claimed.started_at}
-        ),
+        PROVENANCE.model_copy(update={"run_id": saved_id(claimed)}),
     )

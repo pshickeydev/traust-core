@@ -16,6 +16,7 @@ from fastapi.testclient import TestClient
 from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.providers.test_forge_file import GITHUB, SHA
 from tests.v1.providers.test_forge_inventory import (
+    Api,
     forge,
     http,
 )
@@ -25,7 +26,7 @@ from tests.v1.rest.ops.conftest import runner
 from tests.v1.services.test_ledger import keys as keys
 from traust_core.v1.context import Config, Context
 from traust_core.v1.context.config import RecordingConfig
-from traust_core.v1.errors import ForbiddenError, PreflightError, ServiceError
+from traust_core.v1.errors import ConflictError, ForbiddenError, PreflightError, ServiceError
 from traust_core.v1.models.artifacts import TriageArtifact
 from traust_core.v1.models.common import Provenance
 from traust_core.v1.models.findings import Finding
@@ -156,10 +157,13 @@ def world(
             "findings": rows,
         }
         provenance = Provenance(
-            run_id=order.id, source=SourceType.TRIAGE_REPORT, occurred_at=order.started_at
+            run_id=order.id,
+            source=SourceType.TRIAGE_REPORT,
+            occurred_at=datetime(2026, 10, 5, tzinfo=UTC),
         )
         body = {
             "run_order_id": str(order.id),
+            "lease_generation": order.lease_generation,
             "payload": json.dumps(document, indent=3, ensure_ascii=False) + "\n\n",
             "provenance": provenance.model_dump(mode="json"),
         }
@@ -284,6 +288,22 @@ def test_triage_rejects_client_paths_and_forged_authority(world: TriageWorld, fi
     assert response.status_code == 422, response.text
 
 
+@pytest.mark.parametrize("generation", [None, 0, -1, True, "1", 1.5])
+def test_triage_needs_an_explicit_positive_integer_generation(
+    world: TriageWorld, generation: object
+) -> None:
+    body = dict(world.body)
+    if generation is None:
+        del body["lease_generation"]
+    else:
+        body["lease_generation"] = generation
+    before = recording_snapshot(world)
+    response = world.client.post(world.path, json=body, headers=runner(world.context))
+    assert response.status_code == 422, response.text
+    assert recording_snapshot(world) == before
+    assert list(world.context.object_store.list()) == []
+
+
 def test_unknown_assessment_cannot_be_replaced_by_a_report_label(world: TriageWorld) -> None:
     missing = world.client.post(
         f"/v1/assessments/{uuid4()}/triage-records", json=world.body, headers=runner(world.context)
@@ -382,6 +402,56 @@ def recording_snapshot(world: TriageWorld) -> dict:
         }
 
 
+def test_reclaim_during_forge_read_fences_triage_before_any_writes(
+    world: TriageWorld, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = Api._answer
+    fetches = 0
+    generation: int | None = None
+
+    def answer(api: Api, endpoint: str) -> str:
+        nonlocal fetches, generation
+        fetches += 1
+        if generation is None:
+            with SqlTraustUnitOfWork(world.context.database) as other:
+                if other.connection.dialect.name == "postgresql":
+                    other.connection.exec_driver_sql("SET LOCAL lock_timeout = '1s'")
+                order = other.run_orders.get(world.order_id)
+                other.run_orders.update(
+                    order.model_copy(update={"lease_expires_at": order.started_at})
+                )
+                other.commit()
+            reclaimed = world.context.services().ops.claim(
+                WorkerId(world.principal.ref), timedelta(minutes=10), order_id=world.order_id
+            )
+            assert reclaimed is not None and reclaimed.id == world.order_id
+            generation = reclaimed.lease_generation
+        return original(api, endpoint)
+
+    monkeypatch.setattr(Api, "_answer", answer)
+    headers = runner(world.context)
+    before = recording_snapshot(world)
+    objects = tuple(world.context.object_store.list())
+    stale = world.client.post(world.path, json=world.body, headers=headers)
+    assert stale.status_code == 409, stale.text
+    assert generation == world.body["lease_generation"] + 1
+    after = recording_snapshot(world)
+    assert after.pop("run_orders") != before.pop("run_orders")
+    assert after == before
+    assert tuple(world.context.object_store.list()) == objects
+    fetched = fetches
+    assert world.client.post(world.path, json=world.body, headers=headers).status_code == 409
+    assert fetches == fetched
+    body = {**world.body, "lease_generation": generation}
+    current = world.client.post(world.path, json=body, headers=headers)
+    assert current.status_code == 200, current.text
+    assert fetches > fetched
+    fetched = fetches
+    replay = world.client.post(world.path, json=body, headers=headers)
+    assert replay.status_code == 200 and replay.json() == current.json()
+    assert fetches == fetched
+
+
 @pytest.mark.parametrize("policy", ["no-ledger", "optional-signing"])
 def test_a_ready_planner_cannot_admit_an_unready_triage_writer(
     world: TriageWorld, policy: str
@@ -410,6 +480,7 @@ def test_a_ready_planner_cannot_admit_an_unready_triage_writer(
             Provenance.model_validate(world.body["provenance"]),
             run_order_id=world.order_id,
             principal=world.principal,
+            lease_generation=world.body["lease_generation"],
         )
     assert recording_snapshot(world) == before
     assert list(writer.object_store.list()) == []
@@ -493,6 +564,7 @@ def test_in_process_protected_triage_also_denies_an_unrelated_runner(world: Tria
             Provenance.model_validate(world.body["provenance"]),
             run_order_id=world.order_id,
             principal=unrelated,
+            lease_generation=world.body["lease_generation"],
         )
     assert recording_snapshot(world) == before
 
@@ -505,6 +577,7 @@ def test_in_process_protected_triage_also_denies_an_unrelated_runner(world: Tria
         ("remediation lease", 403),
         ("expired", 409),
         ("finished", 409),
+        ("wrong-generation", 409),
         ("run-id", 422),
         ("source", 422),
         ("default-deny", 403),
@@ -538,7 +611,7 @@ def test_triage_authority_and_provenance_refusals_precede_all_report_mutations(
         )
         body["run_order_id"] = str(order.id)
         body["provenance"]["run_id"] = str(order.id)
-        body["provenance"]["occurred_at"] = order.started_at.isoformat()
+        body["lease_generation"] = order.lease_generation
     elif fault in {"repository", "asset"}:
         with SqlTraustUnitOfWork(world.context.database) as uow:
             source = uow.assessments.get(world.assessment_id)
@@ -558,7 +631,7 @@ def test_triage_authority_and_provenance_refusals_precede_all_report_mutations(
         )
         body["run_order_id"] = str(order.id)
         body["provenance"]["run_id"] = str(order.id)
-        body["provenance"]["occurred_at"] = order.started_at.isoformat()
+        body["lease_generation"] = order.lease_generation
     elif fault == "expired":
         with SqlTraustUnitOfWork(world.context.database) as uow:
             order = uow.run_orders.get(world.order_id)
@@ -569,7 +642,14 @@ def test_triage_authority_and_provenance_refusals_precede_all_report_mutations(
             )
             uow.commit()
     elif fault == "finished":
-        ops.complete(world.order_id, WorkerId(world.principal.ref), JobResult.succeeded())
+        ops.complete(
+            world.order_id,
+            WorkerId(world.principal.ref),
+            JobResult.succeeded(),
+            lease_generation=body["lease_generation"],
+        )
+    elif fault == "wrong-generation":
+        body["lease_generation"] += 1
     elif fault == "run-id":
         body["provenance"]["run_id"] = str(uuid4())
     elif fault == "source":
@@ -579,9 +659,11 @@ def test_triage_authority_and_provenance_refusals_precede_all_report_mutations(
             update={"recording": RecordingConfig()}
         )
     before = recording_snapshot(world)
+    objects = tuple(world.context.object_store.list())
     response = world.client.post(world.path, json=body, headers=runner(world.context))
     assert response.status_code == status, response.text
     assert recording_snapshot(world) == before
+    assert tuple(world.context.object_store.list()) == objects
 
 
 def test_triage_replay_cannot_adopt_another_orders_assessment(world: TriageWorld) -> None:
@@ -599,7 +681,7 @@ def test_triage_replay_cannot_adopt_another_orders_assessment(world: TriageWorld
     body = json.loads(json.dumps(world.body))
     body["run_order_id"] = str(order.id)
     body["provenance"]["run_id"] = str(order.id)
-    body["provenance"]["occurred_at"] = order.started_at.isoformat()
+    body["lease_generation"] = order.lease_generation
     before = recording_snapshot(world)
     denied = world.client.post(world.path, json=body, headers=runner(world.context))
     assert denied.status_code == 409, denied.text
@@ -628,12 +710,11 @@ def test_reclaimed_triage_returns_original_and_refuses_stale_attempt_bytes_and_b
     assert claimed.status_code == 200, claimed.text
     latest = claimed.json()
     assert latest["id"] == str(world.order_id)
-    assert latest["started_at"] != world.body["provenance"]["occurred_at"]
-    current = {
-        **world.body,
-        "provenance": {**world.body["provenance"], "occurred_at": latest["started_at"]},
-    }
+    assert latest["lease_holder"] == world.principal.ref
+    assert latest["lease_generation"] == world.body["lease_generation"] + 1
+    current = {**world.body, "lease_generation": latest["lease_generation"]}
     before = recording_snapshot(world)
+    objects = tuple(world.context.object_store.list())
     replay = world.client.post(world.path, json=current, headers=headers)
     assert replay.status_code == 200 and replay.json() == first.json()
     for path, request in (
@@ -643,4 +724,11 @@ def test_reclaimed_triage_returns_original_and_refuses_stale_attempt_bytes_and_b
     ):
         refused = world.client.post(path, json=request, headers=headers)
         assert refused.status_code == 409, refused.text
+    with pytest.raises(ConflictError, match="run order binding"):
+        world.context.services().findings.decisions.record(
+            world.assessment_id,
+            TriageArtifact.parse(world.body["payload"].encode()),
+            Provenance.model_validate(world.body["provenance"]),
+        )
     assert recording_snapshot(world) == before
+    assert tuple(world.context.object_store.list()) == objects

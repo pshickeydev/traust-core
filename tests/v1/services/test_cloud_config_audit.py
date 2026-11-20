@@ -718,16 +718,34 @@ def test_an_audit_recorded_for_its_leased_order_is_that_orders_result(
         OrderRequest(asset="cloud_config_audit", priority=1, repository_id=repository_id), ALICE
     )
     assert submitted.id is not None
-    services.ops.claim(WorkerId("machine:runner"), timedelta(minutes=5), order_id=submitted.id)
+    worker = WorkerId("machine:runner")
+    held = services.ops.claim(worker, timedelta(minutes=5), order_id=submitted.id)
+    assert held is not None
     with pytest.raises(ServiceError, match="requires a ledger"):
-        services.assessment.record_audit(audit, ref, unpublished(), run_order_id=submitted.id)
+        services.assessment.record_audit(
+            audit,
+            ref,
+            unpublished(),
+            run_order_id=held.id,
+            worker=worker,
+            lease_generation=held.lease_generation,
+        )
     with SqlTraustUnitOfWork(engine) as uow:
         assert uow.assessments.list_for_ref(ref) == []
         assert uow.findings.list_for_repository(repository_id) == []
         assert uow.artifacts.latest_imported(audit.schema) is None
 
-    assessment, _ = ledger_writer(context).services().assessment.record_audit(
-        audit, ref, unpublished(), run_order_id=submitted.id
+    assessment, _ = (
+        ledger_writer(context)
+        .services()
+        .assessment.record_audit(
+            audit,
+            ref,
+            unpublished(),
+            run_order_id=held.id,
+            worker=worker,
+            lease_generation=held.lease_generation,
+        )
     )
     assert [a.id for a in services.assessment.list_for_order(submitted.id)] == [assessment.id]
 
@@ -736,9 +754,14 @@ def test_an_empty_ordered_audit_needs_no_ledger(context: Context, engine: Engine
     ref = a_ref(engine)
     run = order(context, ref)
     assessment, decisions = context.services().assessment.record_audit(
-        doc(findings=[]), ref, unpublished(), run_order_id=run
+        doc(findings=[]),
+        ref,
+        unpublished(),
+        run_order_id=run.id,
+        worker=WorkerId("machine:runner"),
+        lease_generation=run.lease_generation,
     )
-    assert assessment.run_order_id == run
+    assert assessment.run_order_id == run.id
     assert decisions == []
 
 
@@ -754,9 +777,11 @@ def test_recording_only_the_cloud_assessment_does_not_admit_its_judgments(
         "skill:test",
         "1",
         unpublished(),
-        run_order_id=run,
+        run_order_id=run.id,
+        worker=WorkerId("machine:runner"),
+        lease_generation=run.lease_generation,
     )
-    assert assessment.run_order_id == run
+    assert assessment.run_order_id == run.id
     with pytest.raises(ServiceError, match="requires a ledger"):
         service.record_audit(audit, ref, unpublished())
     with SqlTraustUnitOfWork(engine) as uow:
@@ -779,7 +804,9 @@ def test_an_audit_is_refused_for_a_fleet_wide_or_expired_order(
         ALICE,
     )
     assert submitted.id is not None
-    services.ops.claim(WorkerId("machine:runner"), timedelta(minutes=5), order_id=submitted.id)
+    worker = WorkerId("machine:runner")
+    held = services.ops.claim(worker, timedelta(minutes=5), order_id=submitted.id)
+    assert held is not None
     if scope == "expired":
         with SqlTraustUnitOfWork(engine) as uow:
             leased = uow.run_orders.get(submitted.id)
@@ -794,7 +821,12 @@ def test_an_audit_is_refused_for_a_fleet_wide_or_expired_order(
     )
     with pytest.raises(error, match=match):
         services.assessment.record_audit(
-            audit, ref, published(context, audit), run_order_id=submitted.id
+            audit,
+            ref,
+            published(context, audit),
+            run_order_id=held.id,
+            worker=worker,
+            lease_generation=held.lease_generation,
         )
     with SqlTraustUnitOfWork(engine) as uow:
         assert uow.assessments.list_for_ref(ref) == []
