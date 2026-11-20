@@ -861,8 +861,19 @@ empty coverage maps cannot rule out Docker dependencies. Requeue selected refs a
 upgrading the producer and readers: each old scan needs a new assessment, not a new SHA
 or SBOM ID. Subsequent requeues reuse that assessment. A failed refresh leaves the old
 scan attached and its Docker negative unknown; document-only imports still have no coverage.
-Do not use pre-upgrade readers to certify historical Docker negatives. Publishing the
-`unsupported-manifest` reason requires a contracts pin that admits it.
+Dependency-reach and PQC portfolio reports use legacy gaps for non-Docker ecosystems and
+separately count legacy scans with unknown Docker coverage, missing scans, and unrecognized
+probes. The older `manifest_coverage` and `package_coverage` tuple-or-None APIs, and the
+dependency-reach `with_coverage` sidecar, remain conservative: they treat a legacy scan as
+unknown across ecosystems rather than imply complete Docker coverage.
+Requeue repairs missing or duplicate coverage only for a ref's own completed manifest scan;
+duplicates must each have a valid binding. Readers still reject damaged coverage, and requeue
+does not suppress invalid bindings, malformed artifacts, or unrelated scan identities.
+Do not use pre-upgrade readers to certify historical Docker negatives. Do not deploy this
+producer or requeue scans until an approved contracts revision admitting
+`unsupported-manifest` in both the reason enum and coverage schema is merged and pinned.
+The current pin admits neither; an external Docker image fails the entire manifest ingest
+before Syft runs. Skipping Docker coverage would falsely certify it as complete.
 
 Java route ownership credits resolver receivers only when they resolve to declared
 injected fields with admitted injection initialization and no later field writes

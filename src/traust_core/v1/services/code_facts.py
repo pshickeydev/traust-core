@@ -71,7 +71,7 @@ from traust_core.v1.providers.tools import FactEnumerator, ToolRequest
 from traust_core.v1.services.artifact_publishing import ArtifactPublisher
 from traust_core.v1.services.assessment import AssessmentService
 from traust_core.v1.services.crypto_packages import CryptoPackagePolicy
-from traust_core.v1.services.exposure import ExposureService
+from traust_core.v1.services.exposure import ExposureService, ManifestScanCoverage
 
 log = logging.getLogger(__name__)
 
@@ -350,6 +350,11 @@ class CodeFactsService:
         self, refs: Collection[RepositoryRef]
     ) -> dict[UUID, tuple[UnresolvedManifest, ...] | None]:
         return self._crypto_exposure().manifest_coverage(refs)
+
+    def package_scan_coverage(
+        self, refs: Collection[RepositoryRef]
+    ) -> dict[UUID, ManifestScanCoverage]:
+        return self._crypto_exposure().manifest_scan_coverage(refs)
 
     def _crypto_exposure(self) -> ExposureService:
         if self._exposure is None:

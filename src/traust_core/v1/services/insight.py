@@ -241,7 +241,7 @@ if TYPE_CHECKING:
     from traust_core.v1.services.code_facts import CodeFactsService
     from traust_core.v1.services.compliance import ComplianceService
     from traust_core.v1.services.detection_quality import DetectionQualityService
-    from traust_core.v1.services.exposure import ExposureService
+    from traust_core.v1.services.exposure import ExposureService, ManifestScanCoverage
     from traust_core.v1.services.findings import FindingService
     from traust_core.v1.services.operations import OpsService, SpendService
     from traust_core.v1.services.portfolio import PortfolioService
@@ -3308,14 +3308,16 @@ class DependencyReachView:
     def build_report(
         self, filter: ViewFilter, generated_at: datetime
     ) -> tuple[DependencyReach, Report]:
-        model, coverage = self.with_coverage(filter)
+        model, heads = self._snapshot(filter)
+        scans = self._exposure.manifest_scan_coverage(heads)
+        coverage = _manifest_report_counts(heads, scans, model.repositories)
         return model, self.report(model, generated_at, coverage)
 
     def report(
         self,
         model: DependencyReach,
         generated_at: datetime,
-        coverage: ManifestCoverageCounts | None = None,
+        coverage: ManifestCoverageCounts | _ManifestReportCounts | None = None,
     ) -> Report:
         summary = (
             f"{model.repositories - model.unmeasured} of {model.repositories} repositories have a "
@@ -3367,18 +3369,61 @@ def _manifest_gap_counts(
     )
 
 
+@dataclass(frozen=True)
+class _ManifestReportCounts:
+    counts: ManifestCoverageCounts
+    docker_unknown: int
+    unknown_probe: int
+
+
+def _manifest_report_counts(
+    refs: Collection[RepositoryRef], scans: Mapping[UUID, ManifestScanCoverage], total: int
+) -> _ManifestReportCounts:
+    unresolved: Counter[Ecosystem] = Counter()
+    without_scan, docker_unknown, unknown_probe = total, 0, 0
+    for ref in refs:
+        assert ref.id is not None
+        if ref.manifest_sbom_assessment_id is None:
+            continue
+        without_scan -= 1
+        scan = scans[ref.id]
+        if scan.gaps is None:
+            unknown_probe += 1
+            continue
+        unresolved.update({gap.ecosystem for gap in scan.gaps})
+        if not scan.current_probe:
+            docker_unknown += 1
+    return _ManifestReportCounts(
+        ManifestCoverageCounts(without_scan=without_scan, unresolved=dict(sorted(unresolved.items()))),
+        docker_unknown,
+        unknown_probe,
+    )
+
+
 def _manifest_gap_sections(
-    coverage: ManifestCoverageCounts, unit: str, units: str
+    coverage: ManifestCoverageCounts | _ManifestReportCounts, unit: str, units: str
 ) -> tuple[Section, ...]:
+    detailed = coverage if isinstance(coverage, _ManifestReportCounts) else None
+    counts = coverage.counts if isinstance(coverage, _ManifestReportCounts) else coverage
     notes = []
-    if coverage.without_scan:
+    if counts.without_scan:
         notes.append(
-            f"{units.capitalize()} without scan-backed manifest coverage: {coverage.without_scan} "
+            f"{units.capitalize()} without scan-backed manifest coverage: {counts.without_scan} "
             "(unknown across ecosystems)."
+        )
+    if detailed is not None and detailed.unknown_probe:
+        notes.append(
+            f"{units.capitalize()} with an unrecognized manifest coverage probe: "
+            f"{detailed.unknown_probe} (unknown across ecosystems)."
+        )
+    if detailed is not None and detailed.docker_unknown:
+        notes.append(
+            f"docker: coverage unknown in {detailed.docker_unknown} "
+            f"{unit if detailed.docker_unknown == 1 else units} with a legacy scan."
         )
     notes.extend(
         f"{ecosystem}: unresolved manifests in {count} {unit if count == 1 else units}."
-        for ecosystem, count in coverage.unresolved.items()
+        for ecosystem, count in counts.unresolved.items()
     )
     return (Section(heading="Unknown manifest coverage", body="\n\n".join(notes)),) if notes else ()
 
@@ -3834,8 +3879,12 @@ class PqcPortfolioView:
         package_refs: dict[UUID | None, list[RepositoryRef]] = {}
         model = self._build(filter, package_refs)
         coverage = {
-            product: self._code_facts.package_coverage(refs).values()
-            for product, refs in package_refs.items()
+            scope.product_id: _manifest_report_counts(
+                package_refs[scope.product_id],
+                self._code_facts.package_scan_coverage(package_refs[scope.product_id]),
+                len(scope.repositories),
+            )
+            for scope in model.scopes
         }
         return model, self.report(model, generated_at, coverage)
 
@@ -3843,19 +3892,21 @@ class PqcPortfolioView:
         self,
         model: PqcPortfolio,
         generated_at: datetime,
-        coverage: Mapping[UUID | None, Collection[tuple[UnresolvedManifest, ...] | None]] | None = None,
+        coverage: Mapping[
+            UUID | None,
+            Collection[tuple[UnresolvedManifest, ...] | None] | _ManifestReportCounts,
+        ] | None = None,
     ) -> Report:
         sections = []
         for scope in model.scopes:
             sections.extend(_pqc_scope_sections(scope))
             if coverage is not None:
-                sections.extend(
-                    _manifest_gap_sections(
-                        _manifest_gap_counts(coverage[scope.product_id], len(scope.repositories)),
-                        "commit",
-                        "commits",
-                    )
+                scoped = coverage[scope.product_id]
+                counts = (
+                    scoped if isinstance(scoped, _ManifestReportCounts)
+                    else _manifest_gap_counts(scoped, len(scope.repositories))
                 )
+                sections.extend(_manifest_gap_sections(counts, "commit", "commits"))
         if model.products:
             sections.append(
                 _table_section(
