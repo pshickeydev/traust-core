@@ -9,12 +9,14 @@ import pytest
 
 from tests.v1.conftest import CheckoutForge, NoCheckouts
 from tests.v1.providers.tools.opengrep_fixtures import write_rule
+from tests.v1.providers.tools.test_opengrep_quality import NativeRunner
 from traust_core.v1.context import Config, Context
 from traust_core.v1.context.documents import yaml_documents
 from traust_core.v1.errors import ConfigError, NotFoundError, ValidationError
 from traust_core.v1.models.detection_quality import CanaryKind
 from traust_core.v1.models.rule_mining import RuleFile, SweepRepo
 from traust_core.v1.providers.process import ProcessRunner
+from traust_core.v1.providers.tools import detection_quality as sweep_provider
 from traust_core.v1.providers.tools.detection_quality import (
     GitCanaryMaterializer,
     OpengrepRulePacks,
@@ -423,8 +425,9 @@ def sweep_rule(tmp_path: Path) -> RuleFile:
     ],
 )
 def test_a_repository_the_sweep_cant_reach_is_recorded_not_raised(
-    tmp_path: Path, url: str, error: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, url: str, error: str
 ) -> None:
+    monkeypatch.setattr(sweep_provider, "ProcessRunner", lambda *args, **kwargs: NativeRunner())
     # the stand-in bare is removed, so the mirror's fetch of the https URL fails
     forge = CheckoutForge(tmp_path, "https://github.com/o/r")
     shutil.rmtree(forge.bare)
@@ -435,8 +438,9 @@ def test_a_repository_the_sweep_cant_reach_is_recorded_not_raised(
 
 
 def test_a_remote_repository_without_its_pinned_commit_is_recorded_not_raised(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr(sweep_provider, "ProcessRunner", lambda *args, **kwargs: NativeRunner())
     forge = CheckoutForge(tmp_path, "https://github.com/o/r")
     sweeper = OpengrepRuleSweep(PACK, (), forge.service(), load=yaml_documents)
     got = sweeper.scan(SweepRepo(slug="r", url=forge.url), sweep_rule(tmp_path), "opengrep", 30)

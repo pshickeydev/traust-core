@@ -16,7 +16,13 @@ from urllib.parse import urlsplit
 
 from pydantic import ValidationError as InvalidModel
 
-from traust_core.v1.errors import ConfigError, NotFoundError, ServiceError, ValidationError
+from traust_core.v1.errors import (
+    ConfigError,
+    NotFoundError,
+    ScannerError,
+    ServiceError,
+    ValidationError,
+)
 from traust_core.v1.models.detection_quality import (
     CanaryInjection,
     CanaryKind,
@@ -27,20 +33,26 @@ from traust_core.v1.models.detection_quality import (
     RuleRef,
     SeededFinding,
 )
-from traust_core.v1.models.rule_mining import ProposalCheck, RepoSweep, RuleFile, RuleHit, SweepRepo
+from traust_core.v1.models.rule_mining import RepoSweep, RuleFile, RuleHit, SweepRepo
 from traust_core.v1.models.values import GitSha, HttpsRepoUrl
 from traust_core.v1.models.vocabulary import FindingKind
 from traust_core.v1.providers.base import Readiness, on_path
 from traust_core.v1.providers.config_matrix import YamlLoader
+from traust_core.v1.providers.detection_quality import RuleSweepBatch
 from traust_core.v1.providers.process import ProcessRunner
 from traust_core.v1.providers.sources import CheckoutRequest, Checkouts, Workspace
 from traust_core.v1.providers.tools.opengrep import (
     SupplementalPack,
-    execute_scan,
+    _scan_snapshot,
     pinned_rules_source,
     rules_root,
 )
-from traust_core.v1.providers.tools.opengrep_quality import RuleQualityError
+from traust_core.v1.providers.tools.opengrep_quality import (
+    CheckedRules,
+    RuleQualityError,
+    checked_rules,
+    fixture_name,
+)
 
 GIT_TIMEOUT = 120.0
 TRAUST_PACK = "traust"
@@ -154,9 +166,41 @@ class OpengrepRuleSweep:
     def check(self, binary: str) -> Readiness:
         return on_path(binary)
 
+    @contextmanager
+    def batch(self, rule: RuleFile, binary: str, timeout: int) -> Iterator[RuleSweepBatch]:
+        """Validate once, then scan repositories using only the private checked snapshot."""
+        runner = ProcessRunner(
+            [Path(binary).name], keep_env=self._keep_env, timeout_seconds=float(timeout)
+        )
+        with checked_rules(
+            [rule.path], runner, load=self._load, binary=binary, timeout=timeout
+        ) as checked:
+            if not checked.report.passed:
+                raise RuleQualityError(checked.report)
+            yield RuleSweepBatch(
+                rule_digest=checked.digest,
+                scan=lambda repo: self._scan(repo, checked, runner, binary, timeout),
+            )
+
     def scan(self, repo: SweepRepo, rule: RuleFile, binary: str, timeout: int) -> RepoSweep:
-        """The rule's hits in one repository, or the error that stopped it (never raised)."""
-        found = RepoSweep(slug=repo.slug, url=repo.url)
+        """Rule quality raises before checkout; repository-specific failures remain results."""
+        with self.batch(rule, binary, timeout) as batch:
+            return batch.scan(repo)
+
+    def _scan(
+        self,
+        repo: SweepRepo,
+        checked: CheckedRules,
+        runner: ProcessRunner,
+        binary: str,
+        timeout: int,
+    ) -> RepoSweep:
+        found = RepoSweep(
+            slug=repo.slug,
+            url=repo.url,
+            rule_digest=checked.digest,
+            quality_checks=checked.report.checks,
+        )
         # A local checkout needs the explicit dir: prefix: a URL that happens to name an existing
         # path must never alias to it.
         workspace = None
@@ -182,51 +226,28 @@ class OpengrepRuleSweep:
                     )
                 ).data
                 target = workspace.path
-            except (ServiceError, NotFoundError, ValidationError) as e:
-                return found.model_copy(update={"error": "clone_failed", "detail": str(e)})
+            except (ServiceError, NotFoundError, ValidationError):
+                return found.model_copy(
+                    update={"error": "clone_failed", "detail": "checkout failed"}
+                )
         else:
             return found.model_copy(
                 update={"error": "unsupported url (use https://… or dir:<path>)"}
             )
-        runner = ProcessRunner(
-            [Path(binary).name], keep_env=self._keep_env, timeout_seconds=float(timeout)
-        )
         try:
-            report = execute_scan(
-                target,
-                [str(rule.path)],
-                pack=self._pack,
-                runner=runner,
-                checkouts=self._checkouts,
-                load=self._load,
-                timeout=timeout,
-                opengrep_bin=binary,
+            raw, facts, errors = _scan_snapshot(
+                target, checked.configs, frozenset(checked.report.rules), runner, binary, timeout
             )
-        except RuleQualityError as error:
-            return found.model_copy(
-                update={
-                    "error": "rule_quality_failed",
-                    "detail": str(error),
-                    "quality_checks": error.report.checks,
-                }
-            )
-        except ValidationError as error:
-            return found.model_copy(update={"error": "invalid_rules", "detail": str(error)})
-        except TimeoutError:
-            return found.model_copy(update={"error": "scan_timeout"})
-        except RuntimeError as error:
-            return found.model_copy(update={"error": "opengrep_failed", "detail": str(error)})
+        except ScannerError as error:
+            return found.model_copy(update={"error": str(error.reason), "detail": str(error)})
         finally:
             if workspace is not None:
                 self._checkouts.release(workspace)
         return found.model_copy(
             update={
-                "files_scanned": report["stats"]["files_scanned"],
-                "engine_errors": report["stats"]["errors"],
-                "facts": tuple(RuleHit.model_validate(f) for f in report["facts"]),
-                "quality_checks": tuple(
-                    ProposalCheck.model_validate(check) for check in report["quality_checks"]
-                ),
+                "files_scanned": len((raw.get("paths") or {}).get("scanned", [])),
+                "engine_errors": len(errors),
+                "facts": tuple(RuleHit.model_validate(f) for f in facts),
             }
         )
 
@@ -246,9 +267,7 @@ class OpengrepRuleSweep:
             path = root / "rule.yaml"
             path.write_text(rule, encoding="utf-8")
             for name, text in examples.items():
-                if Path(name).name != name or not Path(name).suffix:
-                    raise ValidationError(f"example must be a bare file name: {name}")
-                (root / ("rule." + name)).write_text(text, encoding="utf-8")
+                (root / fixture_name(path, name)).write_text(text, encoding="utf-8")
             if isinstance(target, Path):
                 scanned = target
             else:
@@ -260,7 +279,15 @@ class OpengrepRuleSweep:
                     (scanned / name).write_text(text, encoding="utf-8")
             repo = SweepRepo(slug="trial", url=f"dir:{scanned}")
             staged = RuleFile(path=path, ids=(), unauthored=False)
-            return self.scan(repo, staged, binary, timeout)
+            try:
+                return self.scan(repo, staged, binary, timeout)
+            except RuleQualityError as error:
+                return RepoSweep(
+                    slug="trial",
+                    error="rule_quality_failed",
+                    detail=str(error),
+                    quality_checks=error.report.checks,
+                )
 
 
 def rule_refs(root: Path, load: YamlLoader) -> dict[str, RuleRef]:
@@ -274,7 +301,7 @@ def rule_refs(root: Path, load: YamlLoader) -> dict[str, RuleRef]:
         try:
             doc = _one_document(load, path.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, ValidationError) as e:
-            raise ValidationError(f"rule file {path}: unreadable: {e}") from e
+            raise ValidationError(f"rule file {path.name}: unreadable YAML") from e
         if not (isinstance(doc, dict) and isinstance(doc.get("rules"), list)):
             continue
         for rule in doc["rules"]:

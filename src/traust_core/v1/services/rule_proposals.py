@@ -79,9 +79,9 @@ def catch_all(rule: dict[str, Any]) -> ProposalCheck:
     matching = {k: v for k, v in rule.items() if k not in ("metadata", "message", "paths")}
     for key, text in _strings(matching):
         if key in _POSITIVE and not re.search(r"[A-Za-z]", _METAVARIABLE.sub("", text)):
-            problems.append(f"{key}: {text.strip()[:60]!r} matches anything")
+            problems.append(f"{key}: matches anything")
         elif key == "pattern-regex" and not re.search(r"[A-Za-z0-9]{2}", re.sub(r"\\.", "", text)):
-            problems.append(f"{key}: {text[:60]!r} has no literal text")
+            problems.append(f"{key}: has no literal text")
     return _check(ProposalCheckName.CATCH_ALL, problems)
 
 
@@ -93,9 +93,9 @@ def paths(rule: dict[str, Any]) -> ProposalCheck:
         for glob in spec.get(key) or []:
             g = str(glob)
             if ".." in g.split("/") or g.startswith(("/", "~")):
-                problems.append(f"{key}: {g!r} leaves the tree")
+                problems.append(f"{key}: path leaves the tree")
             elif key == "include" and g.strip() in _CATCH_ALL_GLOBS:
-                problems.append(f"include: {g!r} selects every file")
+                problems.append("include: selects every file")
     return _check(ProposalCheckName.PATHS, problems)
 
 
@@ -107,8 +107,8 @@ def regexes(rule: dict[str, Any]) -> ProposalCheck:
             continue
         try:
             re.compile(text)
-        except re.error as e:
-            problems.append(f"{key}: {text[:40]!r} doesn't compile ({e})")
+        except re.error:
+            problems.append(f"{key}: regex doesn't compile")
             continue
         for what, rx in (
             ("a backreference", _BACKREFERENCE),
@@ -116,7 +116,7 @@ def regexes(rule: dict[str, Any]) -> ProposalCheck:
             ("a nested quantifier", _NESTED),
         ):
             if rx.search(text):
-                problems.append(f"{key}: {text[:40]!r} has {what}")
+                problems.append(f"{key}: has {what}")
     return _check(ProposalCheckName.REGEX, problems)
 
 

@@ -129,7 +129,7 @@ def test_opengrep_reports_the_facts_on_the_registered_pack_with_the_binary_given
         "suppressed_by_allowlist": 0,
     }
     assert report["rule_allowlist"] is None
-    assert report["supplemental_packs"] == {"applied": [], "skipped": []}
+    assert report["supplemental_packs"] == {"applied": []}
 
 
 def test_opengrep_keeps_only_the_allowed_rules_and_takes_a_pack_override(

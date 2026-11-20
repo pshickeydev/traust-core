@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from contextlib import AbstractContextManager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
@@ -33,12 +35,22 @@ class CanaryMaterializer(Protocol):
     def materialize(self, source: CanarySource) -> CanaryRepo: ...
 
 
+@dataclass(frozen=True, slots=True)
+class RuleSweepBatch:
+    rule_digest: str
+    scan: Callable[[SweepRepo], RepoSweep]
+
+
 class RuleSweeper(Protocol):
     """One rule over one repository at a time, each pinned to the commit it scans."""
 
     name: str
 
     def check(self, binary: str) -> Readiness: ...
+
+    def batch(
+        self, rule: RuleFile, binary: str, timeout: int
+    ) -> AbstractContextManager[RuleSweepBatch]: ...
 
     def scan(self, repo: SweepRepo, rule: RuleFile, binary: str, timeout: int) -> RepoSweep: ...
 

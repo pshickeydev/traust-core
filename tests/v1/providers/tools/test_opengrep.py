@@ -13,7 +13,7 @@ import pytest
 from tests.v1.conftest import CheckoutForge, NoCheckouts
 from tests.v1.providers.tools.opengrep_fixtures import native_output, write_fixture, write_rule
 from traust_core.v1.context.documents import yaml_documents
-from traust_core.v1.errors import NotFoundError, ValidationError
+from traust_core.v1.errors import NotFoundError, ScannerError, ScannerFailure, ValidationError
 from traust_core.v1.models.artifacts import AdapterResultArtifact
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.process import (
@@ -407,7 +407,7 @@ def test_the_report_carries_facts_rules_coverage_and_the_scanner_version(
         "suppressed_by_allowlist": 0,
     }
     assert report["rule_allowlist"] is None
-    assert report["supplemental_packs"] == {"applied": [], "skipped": []}
+    assert report["supplemental_packs"] == {"applied": []}
     assert report["coverage"]["detected_languages"] == ["go"]
 
 
@@ -448,7 +448,6 @@ def test_a_supplements_allowlist_filters_only_the_supplement(
     )
     assert [f["rule_id"] for f in report["facts"]] == ["traust-go-1", "go-tls-bypass"]
     assert report["supplemental_packs"]["applied"] == ["argus"]
-    assert report["supplemental_packs"]["skipped"] == []
     allowlist = report["rule_allowlist"]
     assert allowlist["source"] == (
         "rule-pack-allowlist.yaml (1 supplemental + 23 traust rule pack rules)"
@@ -491,10 +490,11 @@ def test_an_explicit_rule_allowlist_filters_every_fact(pack: Path, target: Path)
 
 
 def test_a_scan_with_no_json_or_past_its_timeout_fails(pack: Path, target: Path) -> None:
-    with pytest.raises(RuntimeError, match="opengrep produced no JSON"):
+    with pytest.raises(ScannerError, match="invalid JSON") as invalid:
         R.execute_scan(
             target, [], pack=pack, runner=runner(Runner(b"")), checkouts=NEVER, load=yaml_documents
         )
+    assert invalid.value.reason is ScannerFailure.OUTPUT
 
     class Slow(Runner):
         def run(self, argv: Any, **kw: Any) -> ProcessResult:
@@ -502,7 +502,7 @@ def test_a_scan_with_no_json_or_past_its_timeout_fails(pack: Path, target: Path)
                 raise ProcessTimeout(tuple(argv), subprocess.TimeoutExpired(argv, 5))
             return super().run(argv, **kw)
 
-    with pytest.raises(TimeoutError, match="opengrep timed out after 5s"):
+    with pytest.raises(ScannerError, match="opengrep timed out after 5s") as timeout:
         R.execute_scan(
             target,
             [],
@@ -512,6 +512,8 @@ def test_a_scan_with_no_json_or_past_its_timeout_fails(pack: Path, target: Path)
             timeout=5,
             load=yaml_documents,
         )
+    assert timeout.value.reason is ScannerFailure.TIMEOUT
+    assert timeout.value.timeout_seconds == 5
 
 
 class Refused:
@@ -757,3 +759,25 @@ def test_a_weakness_rule_hit_is_a_weakness_finding(
     )
     kinds = {f.id: f.kind for f in result.findings}
     assert kinds == {"opengrep/traust-go-plain": None, "opengrep/traust-go-weak": "weakness"}
+
+
+def test_engine_error_diagnostics_do_not_expose_native_source_text() -> None:
+    sentinel = "PRIVATE_NATIVE_SENTINEL"
+    _, errors = R.normalize(
+        {
+            "results": [],
+            "errors": [
+                {
+                    "level": sentinel,
+                    "type": sentinel,
+                    "message": f"syntax error near {sentinel}",
+                    "path": sentinel,
+                }
+            ],
+        },
+        Path("/repo"),
+    )
+    assert errors == [
+        {"level": "error", "type": "ScannerError", "message": "native scanner reported an error"}
+    ]
+    assert sentinel not in json.dumps(errors)

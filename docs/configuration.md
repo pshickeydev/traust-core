@@ -104,6 +104,10 @@ rule requires both `ruleid:` and `ok:` cases. A pinned HTTPS Git source uses the
 checkout and rules-subtree convention and must carry those fixtures too. Relative local
 sources cannot select a single file: an enabled local pack is a directory.
 
+For YAML targets use native test names such as `policy.test.yaml` or `policy.test.yml`
+beside `policy.yaml`; proposal examples and staged `rule.skeleton.yaml` drafts follow
+the same `.test.yaml` / `.test.yml` convention.
+
 Only fixture paths present in each rule's native `check.matches` count toward coverage.
 Expected autofix outputs such as `policy.fixed.py` cannot supply missing negative cases.
 
@@ -114,6 +118,22 @@ assertions, abnormal native exits, or invalid enabled sources refuse the run; th
 validation bypass or silent fallback to only the public pack. Per-rule selection still
 limits reported supplemental hits, but the supplied pack must pass quality checks.
 These checks establish fixture behavior, not real application exploitability.
+
+Adopter packs are additive. Portfolio/ledger mining, regression drafts, proposal checks,
+calibration and corpus sweeps remain available; custom packs do not replace those lanes.
+A sweep runs quality before checking out or iterating repositories, then reuses that
+operation's private snapshot. Resumable results include a digest of its rule and fixture
+paths and bytes; legacy rule-quality failures and changed inputs are rescanned. Each
+independent operation still performs native validation and strict tests: no process-global
+cache can reuse a receipt for mutable local inputs or a different runner.
+
+Reports list only `supplemental_packs.applied`; invalid packs fail instead of appearing
+as skipped supplements. Scanner transport failures raise `traust_core.v1.errors.ScannerError`;
+its `ScannerFailure` reason distinguishes `scan_timeout`, `opengrep_failed` and
+`invalid_output`, with configured timeout or exit code when available. Diagnostics contain
+bounded classifications, not native stdout/stderr or parser source excerpts. Proposal
+scan failures retain passed native receipts and fail the examples or explosion check
+with the actual scan cause.
 
 ## Feed API keys
 

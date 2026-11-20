@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 import sys
 import tempfile
@@ -22,7 +23,7 @@ from traust_core.v1.models.rule_mining import (
     example_lines,
 )
 from traust_core.v1.providers.config_matrix import YamlLoader
-from traust_core.v1.providers.process import ProcessResult, ProcessRunner
+from traust_core.v1.providers.process import ProcessResult, ProcessRunner, ProcessTimeout
 
 # The bundled scanner Python uses the process locale, not PYTHONUTF8.
 OPENGREP_ENV = {
@@ -60,6 +61,7 @@ class _Tests(Dto):
 @dataclass(frozen=True, slots=True)
 class CheckedRules:
     configs: tuple[Path, ...]
+    digest: str
     report: RuleQualityReport
 
 
@@ -79,15 +81,22 @@ def _fixture(path: Path, rule: Path) -> bool:
     )
 
 
-def _copy_text(source: Path, target: Path, boundary: Path) -> str:
+def fixture_name(rule: Path, example: str) -> str:
+    if Path(example).name != example or not Path(example).suffix:
+        raise ValidationError("example must be a bare file name with an extension")
+    name = rule.stem + "." + example
+    if Path(example).suffix in (".yaml", ".yml") and ".test." not in name:
+        name = str(Path(name).with_suffix(".test" + Path(example).suffix))
+    return name
+
+
+def _read_text(source: Path, boundary: Path) -> str:
     if not source.resolve().is_relative_to(boundary.resolve()):
         raise ValidationError(f"rule fixture leaves its source directory: {source}")
     try:
         text = source.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as error:
-        raise ValidationError(f"cannot read rule input {source}: {error}") from error
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(text, encoding="utf-8")
+        raise ValidationError(f"cannot read rule input {source.name}") from error
     return text
 
 
@@ -114,20 +123,28 @@ def _snapshot(
             if any(part.startswith(".") or part == "tests" for part in relative.parts[:-1]):
                 continue
             seen.add(path)
+            text = _read_text(path, boundary)
+            # Native pairing ignores dotted config basenames such as rule.skeleton.yaml.
+            destination = (
+                root
+                / f"source-{index}"
+                / relative.parent
+                / (relative.name + ".rules")
+                / "rule.yaml"
+            )
             try:
-                text = path.read_text(encoding="utf-8")
                 documents = load(text)
             except (OSError, UnicodeError, ValidationError) as error:
                 if path == source or "rule" in path.name:
-                    problems.append(f"cannot parse {path.name}: {error}")
+                    problems.append(f"cannot parse rule input {path.name}")
                     documents = []
                 else:
-                    raise ValidationError(f"cannot parse rule input {path}: {error}") from error
+                    raise ValidationError(f"cannot parse rule input {path.name}") from error
             authored = [d for d in documents if isinstance(d, dict) and "rules" in d]
             if not authored and path != source:
                 continue
-            destination = root / f"source-{index}" / relative
-            _copy_text(path, destination, boundary)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text(text, encoding="utf-8")
             configs.append(destination)
             if len(documents) != 1 or not authored or not isinstance(authored[0]["rules"], list):
                 problems.append(f"{path.name} must contain one rule document")
@@ -144,15 +161,14 @@ def _snapshot(
                     problems.append(f"{rule_id} is an unauthored skeleton")
             for fixture in sorted(path.parent.glob(path.stem + ".*")):
                 if _fixture(fixture, path):
-                    staged = destination.parent / fixture.name
-                    fixtures[staged.resolve()] = _copy_text(fixture, staged, boundary)
+                    staged = destination.with_name("rule" + fixture.name[len(path.stem) :])
+                    fixtures[staged.resolve()] = _read_text(fixture, boundary)
+                    staged.write_text(fixtures[staged.resolve()], encoding="utf-8")
     if examples is not None:
         if len(configs) != 1:
             raise ValidationError("proposal examples require exactly one rule file")
         for name, text in examples.items():
-            if Path(name).name != name or not Path(name).suffix:
-                raise ValidationError(f"example must be a bare file name with an extension: {name}")
-            destination = configs[0].with_name(configs[0].stem + "." + name)
+            destination = configs[0].with_name(fixture_name(configs[0], name))
             destination.write_text(text, encoding="utf-8")
             fixtures[destination.resolve()] = text
     if not rules:
@@ -170,8 +186,10 @@ def _run(runner: ProcessRunner, argv: Sequence[str], timeout: int) -> ProcessRes
     )
 
 
-def _detail(result: ProcessResult) -> str:
-    return (result.stderr + b"\n" + result.stdout).decode(errors="replace").strip()[:2000]
+def _process_failure(error: ServiceError | ValidationError) -> str:
+    if isinstance(error, ProcessTimeout):
+        return "native process timed out"
+    return "native process could not complete"
 
 
 def _validate(
@@ -182,9 +200,9 @@ def _validate(
         result = _run(runner, [binary, "validate", str(root)], timeout)
         output = (result.stdout + result.stderr).decode(errors="replace")
         if result.returncode != 0 or _SKIPPABLE_ERRORS.search(output):
-            issues.append(f"native validate exited {result.returncode}: {_detail(result)}")
+            issues.append(f"native validate exited {result.returncode} or reported errors")
     except (ServiceError, ValidationError) as error:
-        issues.append(str(error))
+        issues.append(_process_failure(error))
     return ProposalCheck(
         name=ProposalCheckName.VALIDATE, passed=not issues, detail="; ".join(issues)[:3000]
     )
@@ -202,7 +220,7 @@ def _tests(
     try:
         result = _run(runner, [binary, "test", "--json", "--strict", str(root)], timeout)
         if result.returncode != 0:
-            issues.append(f"native test exited {result.returncode}: {_detail(result)}")
+            issues.append(f"native test exited {result.returncode}")
         native = _Tests.model_validate_json(result.stdout)
         if (
             native.config_missing_tests
@@ -213,6 +231,9 @@ def _tests(
         tested = set()
         for config in native.results.values():
             for rule_id, check in config.checks.items():
+                if rule_id not in rules:
+                    issues.append("native test returned an unrecognized rule id")
+                    continue
                 tested.add(rule_id)
                 annotations = [
                     example_lines(rule_id, fixtures[path])
@@ -238,8 +259,10 @@ def _tests(
             issues.append("native test did not exercise exactly the supplied rule ids")
         if _failed_fix(native.fixtest_results):
             issues.append("native autofix test did not pass")
-    except (ServiceError, ValidationError, ModelValidationError) as error:
-        issues.append(str(error))
+    except ModelValidationError:
+        issues.append("native test returned invalid output")
+    except (ServiceError, ValidationError) as error:
+        issues.append(_process_failure(error))
     return ProposalCheck(
         name=ProposalCheckName.TEST, passed=not issues, detail="; ".join(issues)[:3000]
     )
@@ -265,7 +288,7 @@ def checked_rules(
 ) -> Iterator[CheckedRules]:
     """Validate and test a private snapshot; only that snapshot may be scanned."""
     with tempfile.TemporaryDirectory(prefix="opengrep-quality-") as temporary:
-        root = Path(temporary)
+        root = Path(temporary).resolve()
         configs, rules, fixtures, problems = _snapshot(sources, root, examples, load)
         validation = _validate(root, runner, binary, timeout, problems)
         testing = (
@@ -277,7 +300,12 @@ def checked_rules(
                 detail="not run because native validation failed",
             )
         )
+        digest = hashlib.sha256()
+        for path in sorted({*configs, *fixtures}):
+            digest.update(path.relative_to(root).as_posix().encode() + b"\0")
+            digest.update(hashlib.sha256(path.read_bytes()).digest())
         yield CheckedRules(
             configs=configs,
+            digest=digest.hexdigest(),
             report=RuleQualityReport(rules=rules, checks=(validation, testing)),
         )

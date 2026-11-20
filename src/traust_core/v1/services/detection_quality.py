@@ -1144,7 +1144,7 @@ class DetectionQualityService:
             found = sweeper.trial(
                 proposal.rule, trial, proposal.binary, proposal.timeout, examples=trial
             )
-            checks.extend(_native_checks(found))
+            checks.extend(_native_checks(found, ProposalCheckName.EXAMPLES))
             if all(c.passed for c in checks):
                 lines = {
                     f.start_line
@@ -1164,7 +1164,7 @@ class DetectionQualityService:
                 proposal.timeout,
                 examples=trial,
             )
-            native = _native_checks(found)
+            native = _native_checks(found, ProposalCheckName.EXPLOSION)
             if not all(check.passed for check in native):
                 checks.extend(native)
             elif (
@@ -1214,23 +1214,35 @@ class DetectionQualityService:
         if not (ready := sweeper.check(request.binary)).ready:
             raise ConfigError(f"opengrep not found on PATH ({request.binary}): {ready.detail}")
         rule_id = rule.rule_id(request.rule)
-        repos = (
-            request.repos[: request.limit]
-            if request.repos is not None
-            else self._sweep_repos(request.limit)
-        )
         swept = skipped = errors = hits = 0
-        for repo in repos:
-            key = _repo_key(rule_id, repo.slug)
-            if objects.exists(key):
-                skipped += 1
-                continue
-            result = sweeper.scan(repo, rule, request.binary, request.timeout)
-            result = result.model_copy(update={"rule_id": rule_id, "rule_path": str(rule.path)})
-            objects.put(key, result.model_dump_json(indent=2).encode())
-            swept += 1
-            errors += result.error is not None
-            hits += len(result.facts)
+        with sweeper.batch(rule, request.binary, request.timeout) as batch:
+            repos = (
+                request.repos[: request.limit]
+                if request.repos is not None
+                else self._sweep_repos(request.limit)
+            )
+            for repo in repos:
+                key = _repo_key(rule_id, repo.slug)
+                previous = _held(objects, key, RepoSweep)
+                if (
+                    previous is not None
+                    and previous.rule_digest == batch.rule_digest
+                    and previous.error not in {"rule_quality_failed", "invalid_rules"}
+                ):
+                    skipped += 1
+                    continue
+                result = batch.scan(repo)
+                result = result.model_copy(
+                    update={
+                        "rule_id": rule_id,
+                        "rule_path": str(rule.path),
+                        "rule_digest": batch.rule_digest,
+                    }
+                )
+                objects.put(key, result.model_dump_json(indent=2).encode())
+                swept += 1
+                errors += result.error is not None
+                hits += len(result.facts)
         log.info("swept %s over %d repos: %d hits, %d errors", rule_id, swept, hits, errors)
         return RuleSweep(
             rule_id=rule_id,
@@ -1696,21 +1708,21 @@ class DetectionQualityService:
 M = TypeVar("M", bound=BaseModel)
 
 
-def _native_checks(found: RepoSweep) -> tuple[ProposalCheck, ...]:
+def _native_checks(found: RepoSweep, stage: ProposalCheckName) -> tuple[ProposalCheck, ...]:
     required = {ProposalCheckName.VALIDATE, ProposalCheckName.TEST}
     if len(found.quality_checks) == 2 and {c.name for c in found.quality_checks} == required:
         return found.quality_checks
-    return tuple(
-        ProposalCheck(name=name, passed=False, detail="missing mandatory native quality result")
-        for name in (ProposalCheckName.VALIDATE, ProposalCheckName.TEST)
+    if found.error is not None:
+        return (_failed_check(stage, found),)
+    return (
+        ProposalCheck(name=stage, passed=False, detail="missing mandatory native quality result"),
     )
 
 
 def _failed_check(name: ProposalCheckName, found: RepoSweep) -> ProposalCheck:
     detail = (
-        found.detail
-        or found.error
-        or (f"engine_errors={found.engine_errors}, files_scanned={found.files_scanned}")
+        "; ".join(part for part in (found.error, found.detail) if part)
+        or f"engine_errors={found.engine_errors}, files_scanned={found.files_scanned}"
     )
     return ProposalCheck(name=name, passed=False, detail=f"scan failed: {detail}")
 

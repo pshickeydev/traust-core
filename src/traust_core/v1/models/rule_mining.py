@@ -377,6 +377,7 @@ class RepoSweep(Model):
     url: str | None = None
     rule_id: str = ""
     rule_path: str = ""
+    rule_digest: str | None = None
     error: str | None = None
     detail: str | None = None
     files_scanned: int | None = None

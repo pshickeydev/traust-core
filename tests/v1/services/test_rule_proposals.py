@@ -167,3 +167,19 @@ def test_explosion_caps_hits_and_the_share_of_files(
     hits: int, hit_files: int, files: int, passed: bool
 ) -> None:
     assert gate.explosion(hits, hit_files, files).passed is passed
+
+
+@pytest.mark.parametrize(
+    "proposed",
+    [
+        {"pattern-regex": "PRIVATE_RULE_SENTINEL["},
+        {"pattern-regex": r"PRIVATE_RULE_SENTINEL(x+)+"},
+        {"paths": {"include": ["../PRIVATE_RULE_SENTINEL"]}},
+    ],
+)
+def test_static_check_diagnostics_do_not_quote_private_rule_text(
+    proposed: dict[str, Any],
+) -> None:
+    checks = [check(rule(**proposed)) for check in (gate.catch_all, gate.paths, gate.regexes)]
+    assert any(not check.passed for check in checks)
+    assert all("PRIVATE_RULE_SENTINEL" not in check.detail for check in checks)

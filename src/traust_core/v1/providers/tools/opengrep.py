@@ -22,9 +22,9 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from traust_core.v1.errors import ValidationError
+from traust_core.v1.errors import ScannerError, ScannerFailure, ServiceError, ValidationError
 from traust_core.v1.models.artifacts import AdapterResultArtifact
-from traust_core.v1.models.rule_mining import ProposalCheck
+from traust_core.v1.models.rule_mining import ProposalCheck, RuleHit
 from traust_core.v1.models.values import GitSha, HttpsRepoUrl
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.config_matrix import YamlLoader
@@ -405,10 +405,13 @@ def normalize(
         )
     errors = [
         {
-            "level": e.get("level"),
-            "type": e.get("type"),
-            "message": str(e.get("message", ""))[:300],
-            "path": e.get("path"),
+            "level": e.get("level") if e.get("level") in {"warn", "warning", "error"} else "error",
+            "type": (
+                e.get("type")
+                if e.get("type") in {"ParseError", "PartialParsing", "Timeout", "RuleParseError"}
+                else "ScannerError"
+            ),
+            "message": "native scanner reported an error",
         }
         for e in raw.get("errors", [])
     ]
@@ -438,7 +441,6 @@ def execute_scan(
     """Scan only rule snapshots that passed native validation and strict fixture tests."""
     rules, held = resolve_rules(rule_sources, target, pack, checkouts)
     applied: list[str] = []
-    skipped: list[dict[str, str]] = []
     supp_allow: set[str] = set()
     quality_inputs = ExitStack()
     quality_checks: list[ProposalCheck] = []
@@ -482,25 +484,9 @@ def execute_scan(
                 raise ValidationError(f"enabled rules not found in pack: {sorted(missing)}")
             active_ids.update(ids)
             active_configs.extend(checked.configs)
-        cmd = [opengrep_bin, "scan", "--json", "--quiet", "--disable-nosem"]
-        for config in active_configs:
-            cmd += ["--config", str(config)]
-        for e in EXCLUDES:
-            cmd += ["--exclude", e]
-        # repository content must never reach the scanner's option parsing
-        cmd += ["--", str(target)]
-        try:
-            proc = runner.run(cmd, check=False, timeout_seconds=timeout, env=OPENGREP_ENV)
-        except ProcessTimeout as e:
-            raise TimeoutError(f"opengrep timed out after {timeout}s") from e
-        if proc.returncode not in (0, 1):
-            raise RuntimeError(f"opengrep scan exited {proc.returncode}")
-        try:
-            raw = json.loads(proc.stdout)
-        except json.JSONDecodeError as e:
-            raise RuntimeError("opengrep produced no JSON") from e
-
-        facts, errors = normalize(raw, target, frozenset(active_ids))
+        raw, facts, errors = _scan_snapshot(
+            target, active_configs, frozenset(active_ids), runner, opengrep_bin, timeout
+        )
         allow = rule_allow
         if allow is None and supp_allow:
             traust_ids = harness_pack_rule_ids(pack)
@@ -516,12 +502,38 @@ def execute_scan(
             suppressed = len(facts) - len(kept)
             facts = kept
 
-        og_version = (
-            runner.run([opengrep_bin, "--version"], check=False, env=OPENGREP_ENV)
-            .stdout.decode(errors="replace")
-            .strip()
-            .splitlines()[-1]
+        try:
+            version = runner.run(
+                [opengrep_bin, "--version"], check=False, timeout_seconds=timeout, env=OPENGREP_ENV
+            )
+        except ProcessTimeout as error:
+            raise ScannerError(
+                f"opengrep version probe timed out after {timeout}s",
+                reason=ScannerFailure.TIMEOUT,
+                timeout_seconds=timeout,
+            ) from error
+        except ServiceError as error:
+            raise ScannerError(
+                "opengrep version probe could not complete", reason=ScannerFailure.EXIT
+            ) from error
+        if version.returncode != 0:
+            raise ScannerError(
+                f"opengrep version probe exited {version.returncode}",
+                reason=ScannerFailure.EXIT,
+                exit_code=version.returncode,
+            )
+        version_lines = re.findall(
+            rb"(?m)^(?:opengrep )?[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}"
+            rb"(?:[-+][A-Za-z0-9.-]{1,40})?\r?$",
+            version.stdout,
         )
+        if not version_lines:
+            raise ScannerError(
+                "opengrep returned invalid version output",
+                reason=ScannerFailure.OUTPUT,
+                exit_code=version.returncode,
+            )
+        og_version = version_lines[-1].decode().strip()
         return {
             "tool": "run_opengrep",
             "version": _core_version(),
@@ -531,7 +543,7 @@ def execute_scan(
                 {k: v for k, v in r.items() if k != "config"} | {"config_paths": r["config"]}
                 for r in rules
             ],
-            "supplemental_packs": {"applied": applied, "skipped": skipped},
+            "supplemental_packs": {"applied": applied},
             "rule_allowlist": (
                 {
                     "source": allow.source,
@@ -559,6 +571,63 @@ def execute_scan(
         finally:
             for workspace in held:
                 checkouts.release(workspace)
+
+
+def _scan_snapshot(
+    target: Path,
+    configs: Sequence[Path],
+    rule_ids: frozenset[str],
+    runner: ProcessRunner,
+    binary: str,
+    timeout: int,
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+    cmd = [binary, "scan", "--json", "--quiet", "--disable-nosem"]
+    for config in configs:
+        cmd += ["--config", str(config)]
+    for excluded in EXCLUDES:
+        cmd += ["--exclude", excluded]
+    cmd += ["--", str(target)]
+    try:
+        proc = runner.run(cmd, check=False, timeout_seconds=timeout, env=OPENGREP_ENV)
+    except ProcessTimeout as error:
+        raise ScannerError(
+            f"opengrep timed out after {timeout}s",
+            reason=ScannerFailure.TIMEOUT,
+            timeout_seconds=timeout,
+        ) from error
+    except ServiceError as error:
+        raise ScannerError(
+            "opengrep scan process could not complete", reason=ScannerFailure.EXIT
+        ) from error
+    if proc.returncode not in (0, 1):
+        raise ScannerError(
+            f"opengrep scan exited {proc.returncode}",
+            reason=ScannerFailure.EXIT,
+            exit_code=proc.returncode,
+        )
+    try:
+        raw = json.loads(proc.stdout)
+        if not isinstance(raw, dict) or not isinstance(raw.get("results"), list):
+            raise ValueError("invalid scanner report")
+        if not isinstance(raw.get("errors", []), list):
+            raise ValueError("invalid scanner errors")
+        if not isinstance(raw.get("paths", {}), dict):
+            raise ValueError("invalid scanner paths")
+        if not isinstance(raw.get("skipped_rules", []), list):
+            raise ValueError("invalid skipped rules")
+        scanned = raw.get("paths", {}).get("scanned", [])
+        if not isinstance(scanned, list) or any(not isinstance(path, str) for path in scanned):
+            raise ValueError("invalid scanned paths")
+        facts, errors = normalize(raw, target, rule_ids)
+        for fact in facts:
+            RuleHit.model_validate(fact)
+    except (ValueError, TypeError, AttributeError, KeyError) as error:
+        raise ScannerError(
+            "opengrep produced invalid JSON scan output",
+            reason=ScannerFailure.OUTPUT,
+            exit_code=proc.returncode,
+        ) from error
+    return raw, facts, errors
 
 
 def format_lines(start: int | None, end: int | None) -> str:
