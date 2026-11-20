@@ -969,7 +969,10 @@ class Context:
     def _wire(self, uow: SqlTraustUnitOfWork, policy: PortfolioPolicy) -> Services:
         hosts = self.config.forge_hosts
         sources = command_source(hosts, clock=self.clock, api=self.forge_api)
-        intake = FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy(), objects=self.object_store)
+        rating = RatingPolicy(self.config.rating)
+        intake = FindingIntake(
+            uow, IdentityPolicy(), TaxonomyPolicy(), objects=self.object_store, rating=rating
+        )
         ledger = None if self.config.ledger is None else LedgerService(uow, self.config.ledger)
         identity = self.config.identity
         spend = SpendService(
@@ -1004,7 +1007,6 @@ class Context:
         )
         validation_records = ValidationRecords(uow, self.object_store, findings=FindingRecords(uow))
         precedents = FindingPrecedents(uow, validation=validation_records)
-        rating = RatingPolicy(self.config.rating)
         review = ReviewPolicy(self.config.valve_salt())
         triage_lint = Lint({TriageArtifact: [VerdictCitations()]})
         decisions = FindingDecisions(
