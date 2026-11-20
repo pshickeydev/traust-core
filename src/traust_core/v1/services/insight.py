@@ -45,6 +45,7 @@ from traust_core.v1.models.compliance import (
     DocVarianceFilter,
 )
 from traust_core.v1.models.corpus import CorpusRegistry
+from traust_core.v1.models.cvss import CvssSource
 from traust_core.v1.models.dependencies import (
     ExposureDimension,
     ExposureFilter,
@@ -95,6 +96,7 @@ from traust_core.v1.models.insight import (
     ExecutivePanel,
     ExecutiveSummary,
     ExposureDashboard,
+    FindingHeadline,
     FindingsRollup,
     FindingsTrend,
     FindingsTrendPoint,
@@ -219,6 +221,7 @@ from traust_core.v1.rendering import (
     markdown_text,
 )
 from traust_core.v1.services.findings.census import FindingCensusRow
+from traust_core.v1.services.findings.cvss import selection
 from traust_core.v1.services.findings.intake import CATEGORY
 from traust_core.v1.services.findings.rating import (
     CvssFloor,
@@ -1124,7 +1127,12 @@ class ContainerFindingsView:
             held = occurrences[finding_id]
             latest = held[-1]
             assert latest.id is not None
-            label = self._rating.severity_label(latest, view.disposition)
+            # the same authority statements, selected against this image's report
+            authority = [s.stated() for s in view.cvss.authority_scores] if view.cvss else []
+            picked = selection(
+                authority, latest.cvss_vector, reported=True, document=f"occurrence:{latest.id}"
+            )
+            label = self._rating.severity_label(latest, view.disposition, picked.chosen)
             selected = view.model_copy(
                 update={
                     "occurrence": latest,
@@ -1132,7 +1140,7 @@ class ContainerFindingsView:
                     "effective_severity": label.severity,
                     # the chain describes the occurrence the row shows — never the
                     # repository-wide latest the unselected view folded
-                    "cvss": finding_cvss(latest, label),
+                    "cvss": finding_cvss(latest, label, picked),
                     "sla_due": None,
                 }
             )
@@ -1679,6 +1687,7 @@ class _Counted:
                         title=row.title,
                         severity=row.severity,
                         cvss_score=row.cvss_score,
+                        cvss_source=row.cvss_source,
                         execution_proven=row.proven,
                         sla_due=row.sla_due,
                     )
@@ -1757,7 +1766,7 @@ class _SummaryCensus:
     urls: Mapping[UUID, str]
     audit_repositories: set[UUID]
     language_of: Mapping[UUID, str]
-    leaks: list[TopFinding] = field(default_factory=list)
+    leaks: list[FindingHeadline] = field(default_factory=list)
     themes: Counter[str] = field(default_factory=Counter)
     hardening_themes: Counter[str] = field(default_factory=Counter)
     languages: defaultdict[str, _Counting] = field(default_factory=lambda: defaultdict(_Counting))
@@ -1835,13 +1844,13 @@ def _is(view: FindingView, state: FindingState) -> bool:
     return view.state() is state
 
 
-def _top(view: FindingView, repository_url: str) -> TopFinding:
-    return TopFinding(
+def _top(view: FindingView, repository_url: str) -> FindingHeadline:
+    return FindingHeadline(
         finding_id=view.finding.id,  # type: ignore[arg-type]
         repository_url=repository_url,
         title=view.finding.title,
         severity=view.effective_severity,
-        cvss_score=view.occurrence.cvss_score if view.occurrence else None,
+        cvss_score=view.cvss_score,
         execution_proven=_proven(view),
         sla_due=view.sla_due,
     )
@@ -1868,8 +1877,9 @@ def _census_row(view: FindingView) -> FindingCensusRow:
         unverified=view.disposition is None
         or view.disposition.assurance == DispositionAssurance.CLAIMED,
         title=view.finding.title,
-        cvss_score=view.occurrence.cvss_score if view.occurrence else None,
+        cvss_score=view.cvss_score,
         sla_due=view.sla_due,
+        cvss_source=view.cvss_source,
     )
 
 
@@ -2006,7 +2016,8 @@ class FindingsTrendView:
                 repository_url=urls[v.finding.repository_id],
                 title=v.finding.title,
                 severity=v.effective_severity,
-                cvss_score=v.occurrence.cvss_score if v.occurrence else None,
+                cvss_score=v.cvss_score,
+                cvss_source=v.cvss_source,
                 accepted_at=None if last is None else last.occurred_at,
                 accepted_by=None if last is None else last.actor,
                 rationale=last and last.rationale and last.rationale[:_RATIONALE_CHARS],
@@ -4686,7 +4697,7 @@ def _themes_of(view: FindingView) -> set[str]:
     return {_THEMES[c] for c in view.cwes if c in _THEMES} or {"Other"}
 
 
-def _top_row(f: TopFinding) -> tuple[str, ...]:
+def _top_row(f: FindingHeadline) -> tuple[str, ...]:
     return (
         f.repository_url,
         f.title,
@@ -5864,7 +5875,7 @@ def _sla_profile(
     for repository, clock, owners in clocked:
         view = clock.view
         severity = view.effective_severity
-        cvss = view.occurrence.cvss_score if view.occurrence else None
+        cvss = view.cvss_score
         floored = floor is not None and cvss is not None and cvss >= floor.threshold
         if severity not in profile.slas and not floored:
             counts["out_of_profile_scope"] += 1
@@ -6253,10 +6264,18 @@ def _sarif_result(view: FindingView, rule_index: int) -> dict[str, Any]:
         properties["security-severity"] = rating[1]
     if view.cwes:
         properties["tags"] = ["security", *view.cwes]
-    if view.occurrence is not None and view.occurrence.cvss_vector:
+    selected = view.cvss.selected if view.cvss is not None else None
+    if selected is not None:  # the score the finding counts at, and who stated it
+        properties["traust/cvss"] = {
+            "vector": selected.vector,
+            "score": str(selected.score),
+            "source": selected.source.value,
+        }
+    elif view.occurrence is not None and view.occurrence.cvss_vector:
         properties["traust/cvss"] = {
             "vector": view.occurrence.cvss_vector,
             "score": str(view.occurrence.cvss_score),
+            "source": CvssSource.SCANNER.value,
         }
     if disposition is not None:
         properties["traust/disposition"] = disposition.model_dump(mode="json")

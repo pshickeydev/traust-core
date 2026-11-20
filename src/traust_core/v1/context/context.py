@@ -178,7 +178,7 @@ from traust_core.v1.services.below_range import BelowRangeService
 from traust_core.v1.services.code_facts import CodeFactsService
 from traust_core.v1.services.compliance import GATE, ComplianceService
 from traust_core.v1.services.detection_quality import DetectionQualityService
-from traust_core.v1.services.exposure import AdvisoryCvssCache, ExposureService
+from traust_core.v1.services.exposure import AdvisoryCvssCache, AdvisoryCvssReader, ExposureService
 from traust_core.v1.services.findings import (
     FindingDecisions,
     FindingIntake,
@@ -1014,7 +1014,8 @@ class Context:
             recording=ops,
         )
         rating = RatingPolicy(self.config.rating)
-        views = FindingViewQuery(rating, self.object_store)
+        cvss = AdvisoryCvssReader(self.object_store, self.advisory_cvss_cache)
+        views = FindingViewQuery(rating, self.object_store, cvss)
         findings = FindingService(
             uow,
             intake,
@@ -1024,6 +1025,7 @@ class Context:
             rating,
             self.object_store,
             windows=self.window_memo,
+            advisory_cvss=cvss,
         )
         assessment = AssessmentService(
             uow,

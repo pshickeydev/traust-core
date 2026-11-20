@@ -34,7 +34,12 @@ from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.feeds import FeedProvider, FeedSource
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.repositories.objects import InMemoryObjectStore
-from traust_core.v1.services.exposure import ADVISORY_CVSS_FEED, AdvisoryCvssCache, ExposureService
+from traust_core.v1.services.exposure import (
+    ADVISORY_CVSS_FEED,
+    AdvisoryCvssCache,
+    AdvisoryCvssReader,
+    ExposureService,
+)
 from traust_core.v1.services.findings import FindingIntake, IdentityPolicy, TaxonomyPolicy
 
 NVD = "https://nvd.test/cves?cveId=CVE-2021-44228"
@@ -108,15 +113,28 @@ def test_the_document_refresh_ranks_every_authoritys_scores_by_canonical_advisor
     assert (nist.score, nist.document) == (Decimal("10.0"), f"nvd:{LOG4SHELL}")
 
 
-def test_an_alias_asked_reads_its_canonicals_scores_keyed_as_asked(world: World) -> None:
+def test_a_finding_naming_an_alias_reads_its_canonicals_scores_with_no_lookup(
+    world: World,
+) -> None:
+    canonical = advisory(world.engine, LOG4SHELL_GHSA, LOG4SHELL)
+    alias = alias_id(world.engine, LOG4SHELL)
+    finding(world.engine, alias)  # the finding names the CVE alias row, not the canonical GHSA
+    world.serve_log4shell()
+    world.service().refresh_advisory_documents()
+    assert canonical.id is not None
+    read = world.service().advisory_cvss([alias, canonical.id])
+    assert set(read.scores) == {alias, canonical.id}  # the build keys both
+    assert read.scores[alias] == read.scores[canonical.id]
+    assert {s.source for s in read.scores[alias]} >= {CvssSource.NIST, CvssSource.GHSA}
+
+
+def test_an_alias_no_finding_names_is_not_in_the_build(world: World) -> None:
     canonical = advisory(world.engine, LOG4SHELL_GHSA, LOG4SHELL)
     finding(world.engine, canonical.id)
     world.serve_log4shell()
     world.service().refresh_advisory_documents()
-    alias = alias_id(world.engine, LOG4SHELL)
-    read = world.service().advisory_cvss([alias, canonical.id])  # type: ignore[list-item]
-    assert set(read.scores) == {alias, canonical.id}
-    assert read.scores[alias] == read.scores[canonical.id]  # type: ignore[index]
+    read = world.service().advisory_cvss([alias_id(world.engine, LOG4SHELL)])
+    assert dict(read.scores) == {}  # views read by the ids findings name, and only those
 
 
 def test_before_the_first_build_nothing_is_scored_and_no_build_time_is_claimed(
@@ -237,9 +255,9 @@ def test_a_build_whose_artifact_row_is_gone_reads_as_unreadable(world: World) ->
     with SqlTraustUnitOfWork(world.engine) as uow:
         latest = uow.feed_snapshots.latest(ADVISORY_CVSS_FEED)
     assert latest is not None and canonical.id is not None
-    svc = world.service()
     lost = latest.model_copy(update={"artifact_id": uuid4()})
-    assert svc._parsed_build(lost) is None  # never raises: the read and freshness fold
+    with SqlTraustUnitOfWork(world.engine) as uow:  # never raises: the read and freshness fold
+        assert AdvisoryCvssReader(world.objects, world.cache).parsed(uow, lost) is None
 
 
 def test_a_source_with_names_that_kept_nothing_is_named_and_the_build_is_not_fresh(
