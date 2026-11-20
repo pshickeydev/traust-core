@@ -64,7 +64,8 @@ class CvssScore(Model):
 
 
 class EffectiveCvss(Model):
-    """A finding's chosen 3.x score, the highest-ranked 4.0 beside it, and every source's."""
+    """A finding's chosen score (3.x; 4.0 only when no source has 3.x), the highest-ranked 4.0
+    beside it, and every source's."""
 
     chosen: CvssScore | None
     v4: CvssScore | None
@@ -81,7 +82,7 @@ class EffectiveCvss(Model):
 
 def cvss_base_score(vector: str) -> float | None:
     """A `CVSS:3.0/` or `CVSS:3.1/` vector's base score; None for any other, or one FIRST's
-    formula refuses (a 4.0 score is never ranked, so it isn't one of these)."""
+    formula refuses (`AdvisoryRecord.cvss_score` ranks 3.x vectors only)."""
     score = _v3_base_score(vector)
     return None if score is None else float(score)
 

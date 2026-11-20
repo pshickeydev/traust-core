@@ -1790,7 +1790,25 @@ class ExposureService:
         return FeedStatus(name=feed, fetched_at=fetched_at, max_age=max_age)
 
     def feed_statuses(self) -> list[FeedStatus]:
-        return [self.feed_status(FeedName(f)) for f in self._feeds.names()]
+        """Every whole-file feed's age, then each advisory document source's kept manifest
+        (`<source>-documents`) once it has one: a refresh that stops working goes stale."""
+        feeds = [self.feed_status(FeedName(f)) for f in self._feeds.names()]
+        return [*feeds, *self._document_feed_statuses()]
+
+    def _document_feed_statuses(self) -> list[FeedStatus]:
+        sources = [s for s in _ADVISORY_DOCUMENT_SOURCES if s in self._feed_sources.names()]
+        with self._uow as uow:
+            latest = {s: uow.feed_snapshots.latest(_documents_feed(s)) for s in sources}
+        return [
+            FeedStatus(
+                name=_documents_feed(source),
+                fetched_at=snapshot.retrieved_at,
+                max_age=self._feed_sources.get(source).max_age,
+                refresh="refresh the advisory documents (refresh_advisory_documents)",
+            )
+            for source, snapshot in latest.items()
+            if snapshot is not None
+        ]
 
     def feed_payload(self, feed: FeedName) -> bytes | None:
         """The latest snapshot's bytes; None when the feed was never fetched."""
