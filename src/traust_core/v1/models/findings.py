@@ -1241,6 +1241,16 @@ class Precedent(Model):
     reason: PrecedentReason
 
 
+class SeverityBasis(StrEnum):
+    """Which source won a finding's severity label: the CVSS band the vector computes, the
+    scanner's word for an unscored finding, a judgement's re-rating, or nothing."""
+
+    COMPUTED = "computed"
+    SCANNER = "scanner"
+    JUDGEMENT = "judgement"
+    UNRATED = "unrated"
+
+
 class FindingView(Model):
     finding: Finding
     occurrence: Occurrence | None = None
