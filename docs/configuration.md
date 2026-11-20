@@ -79,7 +79,7 @@ identity:                                 # absent: no caller can be verified (R
 | Key | Effect |
 |---|---|
 | `feeds.osv_access` | `api` (default) queries the OSV API; `air-gapped` reads exported OSV records only (`Context.use_exported_advisories`). The feeds registry no longer carries this switch |
-| `feeds.api_keys` | feed source -> the environment variable holding its API key (`{nvd: NVD_API_KEY}`). Optional: a source not named goes keyless at its lower rate limit, with no warnings; a named variable that is unset is a config error. See [Feed API keys](#feed-api-keys) |
+| `feeds.api_keys` | feed source -> the environment variable holding its API key (`{nvd: NVD_API_KEY}`). Optional: a source not named goes keyless at its lower rate limit, with no warnings; a named variable that is unset or empty logs an error and the source goes keyless. See [Feed API keys](#feed-api-keys) |
 | `execution.sandbox` | `none` (default) or `podman`: how lanes run a target's own build and test code |
 | `campaign.tracking_reference`, `campaign.display_name` | the tracking key and title reports cite |
 | `remediation.fork_org`, `remediation.patch_prefix`, `remediation.private_forge_hosts` | where fixes are pushed: the mirror org, the patch-repository name prefix the convention computes (`patch-` by default; a deployment running SCI's provisioner sets `sci-patch-`), and the deployment's own forge hosts |
@@ -155,10 +155,14 @@ feeds:
     nvd: NVD_API_KEY   # the variable's name; set NVD_API_KEY from your secret store
 ```
 
-Core reads every named variable before it registers any feed (`Context.register_feeds`),
-so a retry after setting a missing one starts clean. It refuses a key at load, never at
-the first request, when:
-- the variable is unset or empty;
+Core reads every named variable before it registers any feed (`Context.register_feeds`).
+A named variable that is unset or empty is logged at error level
+(`operation: feeds.api_key`, `outcome: keyless`), and the source keeps working keyless at
+its lower rate limit. When that source then answers 403 or 429, its error and readiness
+detail say it was sent keyless, naming the unset variable, and is most likely rate-limited.
+A new context picks the key up once the variable is set.
+
+Core refuses a key at load, never at the first request, when:
 - the source isn't registered, or declares no `api_key_header`;
 - the key holds anything but visible ASCII.
 
