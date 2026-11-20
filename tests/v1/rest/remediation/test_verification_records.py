@@ -93,15 +93,21 @@ def leased(context: Context, world: World, *, asset: str = "verify") -> RunOrder
     return order
 
 
+def bound_provenance(order: RunOrder, origin: Provenance | None = None) -> Provenance:
+    assert order.id is not None
+    changes: dict[str, object] = {"run_id": order.id}
+    if order.started_at is not None:
+        changes["occurred_at"] = order.started_at
+    return (origin or provenance()).model_copy(update=changes)
+
+
 def body(
     doc: VerificationArtifact, order: RunOrder, origin: Provenance | None = None
 ) -> dict[str, object]:
     assert order.id is not None
     return {
         "payload": doc.payload.decode("utf-8"),
-        "provenance": (
-            (origin or provenance()).model_copy(update={"run_id": order.id}).model_dump(mode="json")
-        ),
+        "provenance": bound_provenance(order, origin).model_dump(mode="json"),
         "run_order_id": str(order.id),
     }
 
@@ -130,13 +136,13 @@ def test_admission_matches_the_owner_preserves_bytes_and_replays_without_writes(
     doc = VerificationArtifact.parse(payload)
     publisher = context.artifact_publisher(PublishSpecs(PublishSpec(VerificationArtifact)))
     published = publisher.publish_ref(doc)
-    origin = provenance(published).model_copy(update={"run_id": order.id})
+    origin = bound_provenance(order, provenance(published))
     response = client.post(URL, json=body(doc, order, origin), headers=runner(context))
     assert response.status_code == 200, response.text
     got = Verification.model_validate(response.json())
     assert (got.repository_ref_id, got.verified_at, got.work_item_ids) == (
         world.patched.id,
-        WHEN,
+        order.started_at,
         (item.work_item_id,),
     )
     assert [(v.finding_id, v.verdict) for v in got.verdicts] == [(world.ids[0], "resolved")]
@@ -159,13 +165,14 @@ def test_admission_matches_the_owner_preserves_bytes_and_replays_without_writes(
         response.json(),
         context.services().verification.record_order(doc, origin, order.id, machine(context)),
     )
-    replay = client.post(
-        URL,
-        json=body(doc, order, provenance(published, at=WHEN + timedelta(hours=1))),
-        headers=runner(context),
-    )
+    replay = client.post(URL, json=body(doc, order, origin), headers=runner(context))
     assert replay.status_code == 200, replay.text
     assert replay.json() == response.json()
+    assert order.started_at is not None
+    stale = body(doc, order, origin)
+    stale["provenance"]["occurred_at"] = (order.started_at + timedelta(hours=1)).isoformat()
+    refused = client.post(URL, json=stale, headers=runner(context))
+    assert_problem(refused, 409, "not the current recording lease attempt")
     assert snapshot(context) == before
     with SqlTraustUnitOfWork(engine) as uow:
         assessment = uow.assessments.get(got.verification_id)
@@ -211,7 +218,7 @@ def test_source_verdicts_are_interpreted_only_by_the_owner(
             "propagation": propagation,
         }
     doc = VerificationArtifact.from_document(raw)
-    origin = provenance().model_copy(update={"run_id": order.id})
+    origin = bound_provenance(order)
     response = client.post(URL, json=body(doc, order, origin), headers=runner(context))
     assert response.status_code == 200, response.text
     got = Verification.model_validate(response.json())
@@ -383,7 +390,7 @@ def test_only_the_live_lease_owner_can_close_and_replay(
     order = leased(context, world)
     assert order.id is not None
     doc = report(world)
-    origin = provenance().model_copy(update={"run_id": order.id})
+    origin = bound_provenance(order)
     request = body(doc, order, origin)
     before = snapshot(context)
     configured = context.config
@@ -513,7 +520,7 @@ def test_native_order_recording_rejects_an_unverified_machine(
     with pytest.raises(ForbiddenError):
         context.services().verification.record_order(
             report(world),
-            provenance().model_copy(update={"run_id": order.id}),
+            bound_provenance(order),
             order.id,
             machine(context).model_copy(update={"verified_by": None}),
         )
@@ -533,7 +540,7 @@ def test_replay_cannot_rebind_an_existing_assessment_to_another_owned_order(
         assert first_order.id is not None
         first = context.services().verification.record_order(
             doc,
-            provenance().model_copy(update={"run_id": first_order.id}),
+            bound_provenance(first_order),
             first_order.id,
             owner,
         )
@@ -544,7 +551,7 @@ def test_replay_cannot_rebind_an_existing_assessment_to_another_owned_order(
         linked = None
     other = leased(context, world)
     assert other.id is not None
-    origin = provenance(first.artifact).model_copy(update={"run_id": other.id})
+    origin = bound_provenance(other, provenance(first.artifact))
     before = snapshot(context)
     response = client.post(URL, json=body(doc, other, origin), headers=runner(context))
     assert_problem(response, 409, "belongs to order")

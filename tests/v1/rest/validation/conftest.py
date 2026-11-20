@@ -87,6 +87,12 @@ def run(context: Context, client: TestClient, harness: ValidationHarness) -> Val
     assert response.status_code == 200, response.text
     claimed = RunOrder.model_validate(response.json())
     assert claimed.id == order.id and claimed.lease_holder == principal.ref
+    assert claimed.started_at is not None
     return ValidationRun(
-        claimed, principal, headers, PROVENANCE.model_copy(update={"run_id": saved_id(claimed)})
+        claimed,
+        principal,
+        headers,
+        PROVENANCE.model_copy(
+            update={"run_id": saved_id(claimed), "occurred_at": claimed.started_at}
+        ),
     )
