@@ -463,27 +463,43 @@ def test_real_native_admission_publishes_only_complete_behavioral_packs(
 
 @pytest.mark.skipif(not shutil.which("opengrep"), reason="real Opengrep integration")
 @pytest.mark.parametrize("file_source", [False, True])
+@pytest.mark.parametrize("valid", [False, True])
 def test_real_native_directory_fixtures_survive_admission_and_additive_scanning(
-    tmp_path: Path, file_source: bool
+    tmp_path: Path, file_source: bool, valid: bool
 ) -> None:
     config = write_rule(tmp_path / "source", "directory-rule", name="policy")
     write_rule(config.parent, "sibling-rule", name="sibling")
+    write_rule(config.parent, "second-sibling-rule", name="second-sibling")
     cases = config.with_suffix("") / "nested" / "cases.py"
     cases.parent.mkdir(parents=True)
     config.with_suffix(".py").rename(cases)
     original = cases.read_bytes()
+    second = cases.with_name("second.py")
+    second.write_bytes(original.replace(b"value", b"second_value"))
+    if not valid:
+        second.write_text(
+            "# ruleid: directory-rule\ndangerous(second_value)\n"
+            "# ok: directory-rule\ndangerous(other_value)\n"
+        )
     baseline = write_rule(tmp_path / "baseline", "baseline-rule").parent
     destination = tmp_path / "accepted"
     runner = ProcessRunner(("opengrep",))
 
     report = admit([config if file_source else config.parent], destination, runner, pack=baseline)
 
-    assert report["admitted"], report
+    assert report["admitted"] is valid, report
+    assert destination.exists() is valid
+    if not valid:
+        assert any(
+            check["name"] == "test" and not check["passed"] for check in report["quality_checks"]
+        )
+        return
     assert {check["name"] for check in report["quality_checks"] if check["passed"]} == {
         "validate",
         "test",
     }
     assert (destination / "policy" / "nested" / "cases.py").read_bytes() == original
+    assert (destination / "policy" / "nested" / "second.py").read_bytes() == second.read_bytes()
     target = tmp_path / "checkout"
     target.mkdir()
     (target / "code.py").write_bytes(original)
@@ -498,7 +514,7 @@ def test_real_native_directory_fixtures_survive_admission_and_additive_scanning(
     )
     expected = {"baseline-rule", "directory-rule"}
     if not file_source:
-        expected.add("sibling-rule")
+        expected.update({"sibling-rule", "second-sibling-rule"})
     assert {fact["rule_id"] for fact in scan["facts"]} == expected
     assert scan["additive_rules"]["refused"] == []
 

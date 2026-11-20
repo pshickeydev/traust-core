@@ -252,12 +252,13 @@ def _test_runs(
     if not directories:
         yield _run(runner, [*command, str(root)], timeout)
         return
-    if ordinary:
-        yield _run(runner, [*command, *(str(config.parent) for config in ordinary)], timeout)
+    for config in ordinary:
+        yield _run(runner, [*command, str(config.parent)], timeout)
     for config in directories:
         # Explicit files avoid older native runners opening paired directories as files.
-        targets = [str(path) for path in fixture_files(config) if not path.stem.endswith(".fixed")]
-        yield _run(runner, [*command, "--config", str(config), *targets], timeout)
+        for target in fixture_files(config):
+            if not target.stem.endswith(".fixed"):
+                yield _run(runner, [*command, "--config", str(config), str(target)], timeout)
 
 
 def _tests(
@@ -283,8 +284,27 @@ def _tests(
             ):
                 issues.append("native test reported missing fixtures or configuration errors")
             reports.append(native)
+        combined: dict[str, dict[str, _Check]] = {}
+        for report in reports:
+            if not any(config.checks for config in report.results.values()):
+                issues.append("native test returned no check receipts")
+            for name, config in report.results.items():
+                checks = combined.setdefault(name, {})
+                for rule_id, check in config.checks.items():
+                    previous = checks.get(rule_id)
+                    if previous is None:
+                        checks[rule_id] = check
+                    elif previous.matches.keys() & check.matches.keys():
+                        issues.append(f"native test returned duplicate fixtures for {rule_id}")
+                    else:
+                        checks[rule_id] = _Check(
+                            passed=previous.passed and check.passed,
+                            matches={**previous.matches, **check.matches},
+                            errors=(*previous.errors, *check.errors),
+                        )
         tested = set()
-        for config in (config for report in reports for config in report.results.values()):
+        for checks in combined.values():
+            config = _Config(checks=checks)
             for rule_id, check in config.checks.items():
                 if rule_id not in rules:
                     issues.append("native test returned an unrecognized rule id")
