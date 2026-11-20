@@ -451,8 +451,14 @@ class FeedSource:
         except (ConfigError, ValidationError) as e:
             return Readiness(ready=False, detail=f"probe URL could not be built: {e}")
         except ServiceError as e:
-            if keyed and (throttled := self._throttled(e)) is not None:
-                return Readiness(ready=False, detail=str(throttled))
+            if keyed and self._keyless is not None and e.status in _THROTTLED:
+                # host and status only, never the probe URL: `_get` already explained the error
+                return Readiness(
+                    ready=False,
+                    detail=f"{_host(probed or self.url)} answered HTTP {e.status} to the probe "
+                    f"({self.name} was {self._keyless}): most likely its keyless rate limit, "
+                    "which an API key raises",
+                )
             if e.status is not None and 400 <= e.status < 500 and e.status != 429:
                 if probed is not None and keyed and self._api_key is not None:
                     return Readiness(

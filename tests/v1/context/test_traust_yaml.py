@@ -368,6 +368,23 @@ def test_feeds_api_keys_take_registry_names_and_variable_names(tmp_path: Path, t
         Config.from_home(_home(tmp_path, text))
 
 
+def test_a_failed_registration_logs_no_keyless_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.delenv("TEST_NVD_KEY", raising=False)
+    registry = tmp_path / "feeds.yaml"
+    plain = (
+        "  plain:\n    tier: live\n    url_template: http://plain.test/{ident_upper}\n"
+        "    ident: cve\n"
+    )
+    registry.write_text(NVD_REGISTRY + plain)  # not https: the load fails
+    ctx = Context(Config.from_home(_home(tmp_path, "feeds: {api_keys: {nvd: TEST_NVD_KEY}}\n")))
+    with caplog.at_level(logging.ERROR), pytest.raises(ConfigError):
+        ctx.register_feeds(registry)
+    assert not [r for r in caplog.records if getattr(r, "operation", None) == "feeds.api_key"]
+    assert ctx.feed_sources.names() == []
+
+
 def test_a_key_set_after_a_keyless_run_is_used_by_the_next_context(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

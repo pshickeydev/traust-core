@@ -271,13 +271,27 @@ class FeedsConfig(_Model):
     def api_key_values(self) -> dict[str, str]:
         """Each named source's API key that its variable holds. Whether the value can travel in
         a header is ApiKey's check, made when the feeds load and before any registers."""
-        named = self.api_keys.items()
-        return {source: value for source, name in named if (value := os.environ.get(name))}
+        return self._resolved()[0]
 
     def unset_api_keys(self) -> dict[str, str]:
         """The named sources whose variable is unset or empty (source -> variable): they run
         keyless at the source's lower rate limit rather than failing the feeds."""
-        return {source: name for source, name in self.api_keys.items() if not os.environ.get(name)}
+        return self._resolved()[1]
+
+    def _resolved(self) -> tuple[dict[str, str], dict[str, str]]:
+        """Every named variable read through the shared secret resolver: set ones as keys, the
+        unset or empty ones (which `_read_env` refuses) apart."""
+        keys: dict[str, str] = {}
+        unset: dict[str, str] = {}
+        for source, name in self.api_keys.items():
+            try:
+                value = _read_env(name, f"feeds.api_keys.{source}")
+            except ConfigError:
+                unset[source] = name
+                continue
+            assert value is not None  # _read_env returns None only for no variable name
+            keys[source] = value
+        return keys, unset
 
 
 class ComplianceConfig(_Model):

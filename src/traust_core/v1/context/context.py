@@ -526,15 +526,6 @@ class Context:
         check_api_key_sources(registry, self.config.feeds.api_keys)
         api_keys = self.config.feeds.api_key_values()
         unset = self.config.feeds.unset_api_keys()
-        for source, variable in unset.items():
-            log.error(
-                "feeds.api_keys.%s names %s, which is unset or empty: %s runs keyless at its "
-                "lower rate limit",
-                source,
-                variable,
-                source,
-                extra={"operation": "feeds.api_key", "outcome": "keyless", "source": source},
-            )
         feeds = load_feeds(registry, http=self.http, clock=self.clock)
         sources = load_feed_sources(
             registry,
@@ -561,6 +552,16 @@ class Context:
             self.feed_sources.register(source.name, lambda source=source: source)
         self.package_sources = package_sources
         self.advisories = advisories
+        # only once the feeds registered: a failed load runs nothing, keyless or not
+        for source, variable in unset.items():
+            log.error(
+                "feeds.api_keys.%s names %s, which is unset or empty: %s runs keyless at its "
+                "lower rate limit",
+                source,
+                variable,
+                source,
+                extra={"operation": "feeds.api_key", "outcome": "keyless", "source": source},
+            )
 
     def use_exported_advisories(self, paths: Sequence[Path]) -> None:
         """Air-gapped runs: advisory reads answer from these exported OSV records only."""

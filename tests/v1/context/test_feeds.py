@@ -414,7 +414,9 @@ def _names_the_line_not_the_field(message: str, text: str, field: str) -> None:
 NVD_HEADER = SOURCES.rstrip() + "\n    api_key_header: apiKey\n"
 
 
-def _sources(tmp_path: Path, text: str, api_keys: dict[str, str]) -> dict:
+def _sources(
+    tmp_path: Path, text: str, api_keys: dict[str, str], unset: dict[str, str] | None = None
+) -> dict:
     from traust_core.v1.context.feeds import load_feed_sources
     from traust_core.v1.providers.clock import FixedClock
     from traust_core.v1.providers.http import HttpFetcher
@@ -426,6 +428,7 @@ def _sources(tmp_path: Path, text: str, api_keys: dict[str, str]) -> dict:
         probe_http=http,
         clock=FixedClock(datetime(2026, 1, 1, tzinfo=UTC)),
         api_keys=api_keys,
+        unset_api_keys=unset,
     )
     return {s.name: s for s in found}
 
@@ -470,6 +473,34 @@ def test_a_key_that_cannot_be_sent_fails_at_load(
 ) -> None:
     with pytest.raises(ConfigError, match=match):
         _sources(tmp_path, text, keys)
+
+
+@pytest.mark.parametrize(
+    ("text", "unset", "match"),
+    [
+        (NVD_HEADER, {"nvdd": "X"}, "source.s. the feeds registry .* doesn.t have"),
+        (SOURCES, {"nvd": "X"}, "declares no api_key_header"),
+        (NVD_HEADER, {"osv": "X"}, "declares no api_key_header"),
+        (NVD_HEADER, {"epss": "X"}, "declares no api_key_header"),
+        (
+            NVD_HEADER.replace(
+                "    api_key_header: apiKey\n", "    api_key_header: apiKey\n    access: disabled\n"
+            ),
+            {"nvd": "X"},
+            "sends no API key",
+        ),
+    ],
+)
+def test_an_unset_key_naming_a_source_that_cannot_take_one_fails_at_load(
+    tmp_path: Path, text: str, unset: dict[str, str], match: str
+) -> None:
+    with pytest.raises(ConfigError, match=match):
+        _sources(tmp_path, text, {}, unset)
+
+
+def test_an_unset_key_on_a_source_that_takes_one_runs_keyless(tmp_path: Path) -> None:
+    nvd = _sources(tmp_path, NVD_HEADER, {}, {"nvd": "NVD_API_KEY"})["nvd"]
+    assert nvd._api_key is None and "NVD_API_KEY" in (nvd._keyless or "")
 
 
 def test_a_cached_whole_file_feed_takes_no_key(tmp_path: Path) -> None:

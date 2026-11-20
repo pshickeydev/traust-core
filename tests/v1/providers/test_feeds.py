@@ -446,7 +446,8 @@ def test_a_keyless_refusal_of_a_keyed_source_reads_as_its_rate_limit(status: int
         nvd.document("CVE-2026-0001")
     assert raised.value.status == status and "NVD_API_KEY is unset" in str(raised.value)
     readiness = nvd.check()
-    assert not readiness.ready and "keyless rate limit" in readiness.detail
+    assert not readiness.ready and readiness.detail.count("keyless rate limit") == 1
+    assert "cveId" not in readiness.detail and "nvd.test" in readiness.detail  # host, never URL
     assert http.headers == [None, None]  # still sent, keyless
 
 

@@ -305,8 +305,11 @@ def load_feed_sources(
     found = []
     registry = _load(path).sources
     keys = dict(api_keys or {})
-    check_api_key_sources(path, keys)
-    for name in keys:
+    # every configured source, its variable set or not: an unset one runs keyless only on a
+    # source that could carry the key
+    configured = {*keys, *(unset_api_keys or {})}
+    check_api_key_sources(path, configured)
+    for name in sorted(configured):
         source = registry[name]
         if source.role in _HOST_ROLES or source.access == "disabled":
             raise ConfigError(f"feeds.api_keys names {name}, which sends no API key")
