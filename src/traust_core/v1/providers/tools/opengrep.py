@@ -1245,6 +1245,7 @@ def scan(
     load: YamlLoader,
     supplements: Sequence[SupplementalPack] = (),
     rules: Sequence[str] = (),
+    additive: Sequence[str] = (),
     rule_allow: RuleAllowlist | None = None,
     timeout: int = SCAN_TIMEOUT,
     opengrep_bin: str = "opengrep",
@@ -1266,9 +1267,15 @@ def scan(
         load=load,
         supplements=supplements,
         rule_allow=rule_allow,
+        additive=additive,
         timeout=timeout,
         opengrep_bin=opengrep_bin,
     )
+    if report["outcome"] != "succeeded" or report["stats"]["skipped_rules"]:
+        raise ScannerError(
+            "opengrep cannot produce an artifact with incomplete rule coverage",
+            reason=ScannerFailure.OUTPUT,
+        )
     return adapter_result(
         str(target),
         "opengrep",

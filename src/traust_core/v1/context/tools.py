@@ -97,6 +97,11 @@ def scanner_tools(ctx: Context) -> tuple[AdapterTool[Any], ...]:
             checkouts=ctx.checkouts,
             load=yaml_documents,
             supplements=ctx.rule_pack_supplements,
+            additive=(
+                (ctx.config.locations.opengrep_adopter_rules,)
+                if ctx.config.locations.opengrep_adopter_rules is not None
+                else ()
+            ),
         )
 
     java_opts = os.environ.get("JOERN_JAVA_OPTS", joern.DEFAULT_JAVA_OPTS)
