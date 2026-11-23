@@ -5,6 +5,8 @@ import shutil
 import subprocess
 import tempfile
 from collections.abc import Sequence
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +17,7 @@ from tests.v1.providers.tools.opengrep_fixtures import native_output, write_rule
 from traust_core.v1.context.documents import yaml_documents
 from traust_core.v1.errors import ScannerError, ScannerFailure, ValidationError
 from traust_core.v1.models.rule_mining import RuleFile, SweepRepo
+from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.process import (
     ProcessError,
     ProcessResult,
@@ -22,8 +25,16 @@ from traust_core.v1.providers.process import (
     ProcessTimeout,
 )
 from traust_core.v1.providers.tools import detection_quality as sweep_provider
+from traust_core.v1.providers.tools import opengrep_additions as additions
+from traust_core.v1.providers.tools import opengrep_quality as quality
 from traust_core.v1.providers.tools.opengrep import SupplementalPack, execute_scan
-from traust_core.v1.providers.tools.opengrep_quality import RuleQualityError, checked_rules
+from traust_core.v1.providers.tools.opengrep_quality import (
+    NativeBudget,
+    RuleQualityError,
+    SourceBudgetError,
+    SourceLimits,
+    checked_rules,
+)
 
 
 class NativeRunner:
@@ -163,7 +174,7 @@ def test_a_fixture_cannot_read_outside_the_pack(tmp_path: Path) -> None:
     outside.write_text("private = 1\n")
     config.with_suffix(".py").symlink_to(outside)
     with (
-        pytest.raises(ValidationError, match="leaves its source directory"),
+        pytest.raises(ValidationError, match="link or special file"),
         checked_rules([config.parent], NativeRunner(), load=yaml_documents),
     ):
         pass
@@ -421,3 +432,249 @@ def test_version_output_cannot_serialize_private_native_text(tmp_path: Path) -> 
         )
     assert caught.value.reason is ScannerFailure.OUTPUT
     assert "PRIVATE_NATIVE_SENTINEL" not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "limit",
+    ["files", "bytes", "rules", "fixtures", "entries", "staged_files", "staged_bytes"],
+)
+def test_shared_native_discovery_refuses_actual_source_breaches_before_native(
+    tmp_path: Path, limit: str
+) -> None:
+    config = write_rule(tmp_path / "source")
+    write_rule(config.parent, "second-rule", name="second")
+    runner = NativeRunner()
+    limits = replace(SourceLimits(), **{limit: 1})
+
+    with (
+        pytest.raises(SourceBudgetError, match=f"{limit} budget"),
+        checked_rules([config.parent], runner, load=yaml_documents, limits=limits),
+    ):
+        pytest.fail("source budgets cannot silently omit rule inputs")
+
+    assert not runner.calls
+
+
+@pytest.mark.parametrize("limit", ["files", "bytes", "entries"])
+def test_discovery_budget_is_enforced_before_parsing(tmp_path: Path, limit: str) -> None:
+    config = write_rule(tmp_path / "source")
+    limits = replace(SourceLimits(), **{limit: 0})
+
+    def no_parsing(text: str) -> list[Any]:
+        pytest.fail("an over-budget source must not reach YAML parsing")
+
+    with (
+        pytest.raises(SourceBudgetError, match=f"{limit} budget"),
+        checked_rules([config.parent], NativeRunner(), load=no_parsing, limits=limits),
+    ):
+        pass
+
+
+def test_optional_source_budget_failure_preserves_the_baseline_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    baseline = write_rule(tmp_path / "baseline", "baseline-rule").parent
+    source = write_rule(tmp_path / "source", "optional-one").parent
+    write_rule(source, "optional-two", name="second")
+    target = tmp_path / "checkout"
+    target.mkdir()
+    (target / "app.py").write_text("dangerous(value)\n")
+    limits = replace(SourceLimits(), files=2)
+    monkeypatch.setattr(quality, "SourceLimits", lambda: limits)
+    runner = NativeRunner()
+
+    result = execute_scan(
+        target,
+        (),
+        pack=baseline,
+        runner=runner,
+        checkouts=NoCheckouts(),
+        load=yaml_documents,
+        additive=[str(source)],
+    )
+
+    assert result["quality_checks"]
+    assert all(check["passed"] for check in result["quality_checks"])
+    assert result["additive_rules"]["applied"] == []
+    assert {receipt["check"] for receipt in result["additive_rules"]["refused"]} == {"source"}
+    assert [call[1] for call in runner.calls].count("validate") == 1
+    assert runner.scanned
+
+
+class SelectiveNativeRunner(NativeRunner):
+    def __init__(self) -> None:
+        super().__init__()
+        self.validated: list[tuple[str, ...]] = []
+
+    def run(self, argv: Sequence[str], **kwargs: Any) -> ProcessResult:
+        result = super().run(argv, **kwargs)
+        if argv[1] == "validate":
+            names = tuple(
+                rule["id"]
+                for path in sorted(Path(argv[-1]).rglob("*.yaml"))
+                for rule in yaml_documents(path.read_text())[0]["rules"]
+            )
+            self.validated.append(names)
+            if "rule-7" in names:
+                return replace(result, returncode=1)
+        return result
+
+
+def test_native_bisection_keeps_valid_sibling_snapshots_alive(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    for index in range(8):
+        write_rule(source, f"rule-{index}", name=f"rule-{index}")
+    runner = SelectiveNativeRunner()
+
+    with additions.vet_rules(
+        "optional",
+        [source],
+        runner,
+        load=yaml_documents,
+        binary="opengrep",
+        timeout=30,
+        protected={},
+        languages=None,
+    ) as batch:
+        assert {receipt.rule_id for receipt in batch.applied} == {
+            f"rule-{index}" for index in range(7)
+        }
+        assert [(receipt.rule_id, receipt.check) for receipt in batch.refused] == [
+            ("rule-7", "validate")
+        ]
+        assert "native validate exited 1" in batch.refused[0].reason
+        snapshots = batch.configs
+        assert all(path.is_file() and not path.is_relative_to(source) for path in snapshots)
+        assert len(snapshots) == 7
+        assert [len(group) for group in runner.validated] == [8, 4, 4, 2, 2, 1, 1]
+        assert [call[1] for call in runner.calls].count("test") == 3
+        shutil.rmtree(source)
+        assert all(path.is_file() for path in snapshots)
+
+    assert all(not path.exists() for path in snapshots)
+
+
+def test_native_bisection_work_budget_keeps_checked_siblings_and_refuses_the_rest(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    for index in range(8):
+        write_rule(source, f"rule-{index}", name=f"rule-{index}")
+    runner = SelectiveNativeRunner()
+    budget = NativeBudget(FixedClock(datetime(2026, 1, 1, tzinfo=UTC)), calls=4)
+
+    with additions.vet_rules(
+        "optional",
+        [source],
+        runner,
+        load=yaml_documents,
+        binary="opengrep",
+        timeout=30,
+        protected={},
+        languages=None,
+        budget=budget,
+    ) as batch:
+        assert {receipt.rule_id for receipt in batch.applied} == {
+            f"rule-{index}" for index in range(4)
+        }
+        assert {receipt.rule_id for receipt in batch.refused} == {
+            f"rule-{index}" for index in range(4, 8)
+        }
+        assert all(receipt.check is additions.AdditionCheck.BUDGET for receipt in batch.refused)
+        assert len(runner.calls) == 4
+        assert all(path.is_file() for path in batch.configs)
+
+
+def test_optional_native_deadline_caps_process_timeout_and_stops_bisection(tmp_path: Path) -> None:
+    source = write_rule(tmp_path / "source", "rule-7").parent
+    write_rule(source, "valid-rule", name="valid")
+
+    class AdvancingClock:
+        at = datetime(2026, 1, 1, tzinfo=UTC)
+
+        def now(self) -> datetime:
+            return self.at
+
+    clock = AdvancingClock()
+
+    class SlowNative(SelectiveNativeRunner):
+        def run(self, argv: Sequence[str], **kwargs: Any) -> ProcessResult:
+            assert kwargs["timeout_seconds"] == 2
+            result = super().run(argv, **kwargs)
+            clock.at += timedelta(seconds=2)
+            return result
+
+    runner = SlowNative()
+    budget = NativeBudget(clock, seconds=2)
+    with additions.vet_rules(
+        "optional",
+        [source],
+        runner,
+        load=yaml_documents,
+        binary="opengrep",
+        timeout=30,
+        protected={},
+        languages=None,
+        budget=budget,
+    ) as batch:
+        assert not batch.applied
+        assert len(batch.refused) == 2
+        assert all(receipt.check is additions.AdditionCheck.BUDGET for receipt in batch.refused)
+        assert len(runner.calls) == 1
+
+
+def test_rule_fixture_fanout_is_bounded_before_any_native_run(tmp_path: Path) -> None:
+    config = write_rule(tmp_path / "source")
+    document = yaml_documents(config.read_text())[0]
+    document["rules"].append({**document["rules"][0], "id": "second-rule"})
+    config.write_text(json.dumps(document))
+    fixture = config.with_suffix(".py")
+    original = fixture.read_text() + "# " + "x" * 10_000 + "\n"
+    fixture.write_text(original)
+    runner = NativeRunner()
+    limits = replace(SourceLimits(), staged_bytes=12_000)
+
+    with additions.vet_rules(
+        "optional",
+        [config.parent],
+        runner,
+        load=yaml_documents,
+        binary="opengrep",
+        timeout=30,
+        protected={},
+        languages=None,
+        limits=limits,
+    ) as batch:
+        assert not batch.applied
+        assert not batch.configs
+        assert len(batch.refused) == 1
+        assert batch.refused[0].check is additions.AdditionCheck.SOURCE
+        assert "staged_bytes budget" in batch.refused[0].reason
+        assert not runner.calls
+        assert fixture.read_text() == original
+
+
+def test_input_growth_is_reaccounted_before_the_file_is_read(tmp_path: Path) -> None:
+    source = tmp_path / "fixture.py"
+    source.write_bytes(b"first\n")
+    budget = quality.SourceBudget(replace(SourceLimits(), bytes=32))
+    budget.file(source, source.stat().st_size)
+    source.write_bytes(b"x" * 64)
+
+    with pytest.raises(SourceBudgetError, match="bytes budget"):
+        quality.read_rule_text(source, tmp_path, budget=budget)
+
+
+def test_capture_directory_depth_has_a_typed_bound(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    write_rule(source / "nested" / "deeper")
+    destination = tmp_path / "accepted"
+
+    with (
+        pytest.raises(SourceBudgetError, match="depth budget"),
+        additions.capture_rules([source], destination, limits=replace(SourceLimits(), depth=1)),
+    ):
+        pytest.fail("deep directory inputs cannot overflow recursive capture")
+
+    assert not destination.exists()
+    assert not list(tmp_path.glob(".opengrep-intake-*"))

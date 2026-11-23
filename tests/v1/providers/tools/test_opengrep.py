@@ -18,6 +18,7 @@ from traust_core.v1.models.artifacts import AdapterResultArtifact
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.process import (
     ProcessError,
+    ProcessOutputLimit,
     ProcessResult,
     ProcessRunner,
     ProcessTimeout,
@@ -593,7 +594,6 @@ def test_additions_preserve_primary_facts_and_reject_only_the_offending_rules(
         None: "parse",
         "traust-python-1": "collision",
         "supp-rule": "collision",
-        "wrong-language": "skipped-for-language",
         "bad-pattern": "catch-all",
         "extra-rule": "collision",
     }
@@ -601,7 +601,8 @@ def test_additions_preserve_primary_facts_and_reject_only_the_offending_rules(
     assert "required" in refusals["supp-rule"]["reason"]
     assert str(locale.parent) in refusals["extra-rule"]["reason"]
     assert str(another.parent) in refusals["extra-rule"]["reason"]
-    assert report["additive_rules"]["degraded"] == {str(locale.parent): 5, str(another.parent): 1}
+    assert report["additive_rules"]["degraded"] == {str(locale.parent): 4, str(another.parent): 1}
+    assert [entry["rule_id"] for entry in report["additive_rules"]["skipped"]] == ["wrong-language"]
 
 
 @pytest.mark.parametrize("timeout", [False, True])
@@ -1021,3 +1022,229 @@ def test_engine_error_diagnostics_do_not_expose_native_source_text() -> None:
         {"level": "error", "type": "ScannerError", "message": "native scanner reported an error"}
     ]
     assert sentinel not in json.dumps(errors)
+
+
+class OptionalReportRunner(AdditiveRunner):
+    def __init__(self, changes: dict[str, Any]) -> None:
+        super().__init__()
+        self.changes = changes
+
+    def run(self, argv: Any, **kwargs: Any) -> ProcessResult:
+        result = super().run(argv, **kwargs)
+        if argv[1] == "scan" and kwargs.get("max_output_bytes"):
+            report = json.loads(result.stdout) | self.changes
+            return ProcessResult(
+                result.argv, result.returncode, json.dumps(report).encode(), b"", 0.1
+            )
+        return result
+
+
+@pytest.mark.parametrize("kind", ["PartialParsing", "ParseError", "Timeout"])
+def test_optional_target_warnings_keep_valid_facts_and_report_partial_coverage(
+    pack: Path, target: Path, tmp_path: Path, kind: str
+) -> None:
+    extra = _write_custom(tmp_path / "extra", _custom("extra-rule"))
+    raw = OptionalReportRunner(
+        {
+            "errors": [{"level": "warn", "type": kind, "message": "private parse detail"}],
+            "paths": {"scanned": ["main.go", "additional.go"]},
+        }
+    )
+    report = R.execute_scan(
+        target,
+        (),
+        pack=pack,
+        runner=runner(raw),
+        checkouts=NEVER,
+        load=yaml_documents,
+        additive=(str(extra),),
+    )
+    assert {fact["rule_id"] for fact in report["facts"]} == {
+        "traust-go-1",
+        "supp-rule",
+        "extra-rule",
+    }
+    assert report["outcome"] == "degraded"
+    assert report["stats"]["files_scanned"] == 2
+    assert [error["type"] for error in report["errors"]] == [kind]
+    assert report["additive_rules"]["refused"] == []
+    assert "private parse detail" not in json.dumps(report)
+
+
+def test_optional_rule_errors_do_not_discard_other_rules_from_the_source(
+    pack: Path, target: Path, tmp_path: Path
+) -> None:
+    extra = _write_custom(tmp_path / "extra", _custom("broken-rule"), _custom("healthy-rule"))
+    raw = OptionalReportRunner(
+        {
+            "errors": [
+                {"level": "error", "type": "RuleParseError", "rule_id": "optional.broken-rule"}
+            ],
+            "skipped_rules": ["optional.broken-rule"],
+        }
+    )
+    report = R.execute_scan(
+        target,
+        (),
+        pack=pack,
+        runner=runner(raw),
+        checkouts=NEVER,
+        load=yaml_documents,
+        additive=(str(extra),),
+    )
+    assert {fact["rule_id"] for fact in report["facts"]} == {
+        "traust-go-1",
+        "supp-rule",
+        "healthy-rule",
+    }
+    assert [entry["rule_id"] for entry in report["additive_rules"]["refused"]] == ["broken-rule"]
+    assert [entry["rule_id"] for entry in report["additive_rules"]["applied"]] == ["healthy-rule"]
+    assert report["outcome"] == "degraded"
+    assert report["stats"]["skipped_rules"] == 1
+
+
+def test_native_skipped_primary_rules_are_degraded_without_an_error(
+    pack: Path, target: Path
+) -> None:
+    report = R.execute_scan(
+        target,
+        (),
+        pack=pack,
+        runner=runner(Runner({"results": [], "skipped_rules": ["traust-go-1"]})),
+        checkouts=NEVER,
+        load=yaml_documents,
+    )
+    assert report["outcome"] == "degraded"
+    assert report["stats"]["skipped_rules"] == 1
+    assert report["errors"] == []
+
+
+@pytest.mark.parametrize("failure", ["timeout", "noise"])
+def test_failed_optional_source_does_not_reserve_a_later_working_rule_id(
+    pack: Path, target: Path, tmp_path: Path, failure: str
+) -> None:
+    first = _write_custom(tmp_path / "first", _custom("extra-rule"))
+    second = _write_custom(tmp_path / "second", _custom("extra-rule"))
+
+    class FirstSourceFails(AdditiveRunner):
+        def __init__(self) -> None:
+            super().__init__()
+            self.optional_scans = 0
+
+        def run(self, argv: Any, **kwargs: Any) -> ProcessResult:
+            if argv[1] == "scan" and kwargs.get("max_output_bytes"):
+                self.optional_scans += 1
+                self.timed_out = self.optional_scans == 1 and failure == "timeout"
+                self.noisy = self.optional_scans == 1 and failure == "noise"
+            return super().run(argv, **kwargs)
+
+    report = R.execute_scan(
+        target,
+        (),
+        pack=pack,
+        runner=runner(FirstSourceFails()),
+        checkouts=NEVER,
+        load=yaml_documents,
+        additive=(str(first), str(second)),
+    )
+    assert [entry["source"] for entry in report["additive_rules"]["applied"]] == [str(second)]
+    assert [fact["origin"] for fact in report["facts"] if fact["rule_id"] == "extra-rule"] == [
+        f"additive:{second}"
+    ]
+    assert all(entry["check"] != "collision" for entry in report["additive_rules"]["refused"])
+
+
+def test_valid_but_inapplicable_optional_rules_do_not_degrade_a_checkout(
+    pack: Path, target: Path, tmp_path: Path
+) -> None:
+    extra = _write_custom(tmp_path / "extra", _custom("python-only", languages=["python"]))
+    report = R.execute_scan(
+        target,
+        (),
+        pack=pack,
+        runner=runner(AdditiveRunner()),
+        checkouts=NEVER,
+        load=yaml_documents,
+        additive=(str(extra),),
+    )
+    assert report["outcome"] == "succeeded"
+    assert report["additive_rules"]["refused"] == []
+    assert report["additive_rules"]["degraded"] == {}
+    assert [entry["rule_id"] for entry in report["additive_rules"]["skipped"]] == ["python-only"]
+
+
+def test_dart_rules_are_applied_to_dart_checkouts(pack: Path, tmp_path: Path) -> None:
+    target = tmp_path / "dart-checkout"
+    target.mkdir()
+    (target / "main.dart").write_text("void main() {}\n")
+    extra = _write_custom(tmp_path / "extra", _custom("dart-rule", languages=["dart"]))
+    report = R.execute_scan(
+        target,
+        (),
+        pack=pack,
+        runner=runner(AdditiveRunner()),
+        checkouts=NEVER,
+        load=yaml_documents,
+        additive=(str(extra),),
+    )
+    assert [entry["rule_id"] for entry in report["additive_rules"]["applied"]] == ["dart-rule"]
+    assert any(fact["rule_id"] == "dart-rule" for fact in report["facts"])
+
+
+def test_optional_output_budget_accounts_for_checkout_paths(
+    pack: Path, target: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(R, "_ADDITIVE_OUTPUT_LIMIT", 256)
+    for index in range(12):
+        (target / f"additional-{index}-long-path.go").write_text("package main\n")
+    scanned = [str(path) for path in target.iterdir()]
+    extra = _write_custom(tmp_path / "extra", _custom("extra-rule"))
+
+    class BoundedPaths(OptionalReportRunner):
+        def run(self, argv: Any, **kwargs: Any) -> ProcessResult:
+            result = super().run(argv, **kwargs)
+            limit = kwargs.get("max_output_bytes")
+            if argv[1] == "scan" and limit and len(result.stdout) > limit:
+                raise ProcessOutputLimit(result, limit)
+            return result
+
+    report = R.execute_scan(
+        target,
+        (),
+        pack=pack,
+        runner=runner(BoundedPaths({"paths": {"scanned": scanned}})),
+        checkouts=NEVER,
+        load=yaml_documents,
+        additive=(str(extra),),
+    )
+    assert report["outcome"] == "succeeded"
+    assert any(fact["rule_id"] == "extra-rule" for fact in report["facts"])
+    assert report["stats"]["files_scanned"] == len(scanned)
+
+
+def test_output_limit_is_reported_as_output_failure_without_losing_baseline(
+    pack: Path, target: Path, tmp_path: Path
+) -> None:
+    extra = _write_custom(tmp_path / "extra", _custom("extra-rule"))
+
+    class OutputLimit(AdditiveRunner):
+        def run(self, argv: Any, **kwargs: Any) -> ProcessResult:
+            if argv[1] == "scan" and (limit := kwargs.get("max_output_bytes")):
+                raise ProcessOutputLimit(
+                    ProcessResult(tuple(argv), -9, b"PRIVATE_NATIVE_OUTPUT", b"", 0.1), limit
+                )
+            return super().run(argv, **kwargs)
+
+    report = R.execute_scan(
+        target,
+        (),
+        pack=pack,
+        runner=runner(OutputLimit()),
+        checkouts=NEVER,
+        load=yaml_documents,
+        additive=(str(extra),),
+    )
+    assert {fact["rule_id"] for fact in report["facts"]} == {"traust-go-1", "supp-rule"}
+    assert report["outcome"] == "degraded"
+    assert "capture limit" in report["additive_rules"]["refused"][0]["reason"]
+    assert "PRIVATE_NATIVE_OUTPUT" not in json.dumps(report)

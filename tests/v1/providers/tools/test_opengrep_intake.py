@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 from collections.abc import Sequence
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -18,8 +19,14 @@ from traust_core.v1.context.documents import yaml_documents
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.providers.process import ProcessResult, ProcessRunner
 from traust_core.v1.providers.tools import opengrep_additions as additions
-from traust_core.v1.providers.tools.opengrep import ARGUS_RULES_REPO, execute_scan, intake_rules
-from traust_core.v1.providers.tools.opengrep_quality import checked_rules
+from traust_core.v1.providers.tools import opengrep_quality as quality
+from traust_core.v1.providers.tools.opengrep import (
+    ARGUS_RULES_REPO,
+    SupplementalPack,
+    execute_scan,
+    intake_rules,
+)
+from traust_core.v1.providers.tools.opengrep_quality import SourceLimits, checked_rules
 
 
 def admit(
@@ -289,7 +296,7 @@ def test_source_destination_overlap_is_rejected(tmp_path: Path, destination_kind
 
 
 @pytest.mark.parametrize(
-    "kind", ["file-link", "directory-link", "broken-link", "fifo", "root-link"]
+    "kind", ["file-link", "directory-link", "broken-link", "fifo", "root-link", "root-file-link"]
 )
 def test_links_and_special_inputs_are_rejected_without_following_them(
     tmp_path: Path, kind: str
@@ -308,9 +315,13 @@ def test_links_and_special_inputs_are_rejected_without_following_them(
         unsafe.symlink_to(outside / "missing")
     elif kind == "fifo":
         os.mkfifo(unsafe)
-    else:
+    elif kind == "root-link":
         alias = tmp_path / "alias"
         alias.symlink_to(source, target_is_directory=True)
+        source = alias
+    else:
+        alias = tmp_path / "alias"
+        alias.symlink_to(source / "rules.yaml")
         source = alias
     destination = tmp_path / "accepted"
     runner = NativeRunner()
@@ -433,7 +444,8 @@ def test_pinned_https_intake_preserves_fixtures_and_attribution(
     )
     assert report["admitted"]
     assert report["applied"][0]["source"] == f"{forge.url}@{sha}"
-    assert (destination / prefix / "rules.yaml").read_bytes() == config.read_bytes()
+    captured = "python/" if nested else ""
+    assert (destination / captured / "rules.yaml").read_bytes() == config.read_bytes()
     assert (destination / "LICENSE").read_text() == "Original author\n"
     assert not (destination / ".git").exists()
 
@@ -569,18 +581,24 @@ def test_publication_failure_without_other_writers_leaves_no_destination(
     assert not list(tmp_path.glob(".opengrep-intake-*"))
 
 
-def test_admission_does_not_follow_a_link_in_the_source_path(tmp_path: Path) -> None:
+@pytest.mark.parametrize("file_source", [False, True])
+def test_admission_canonicalizes_parent_links_without_following_a_source_leaf(
+    tmp_path: Path, file_source: bool
+) -> None:
     config = write_rule(tmp_path / "actual" / "nested")
     alias = tmp_path / "alias"
-    alias.symlink_to(config.parent.parent, target_is_directory=True)
+    alias.symlink_to(
+        config.parent if file_source else config.parent.parent, target_is_directory=True
+    )
+    source = alias / config.name if file_source else alias / "nested"
     destination = tmp_path / "accepted"
     runner = NativeRunner()
 
-    with pytest.raises(ValidationError):
-        admit([alias / "nested"], destination, runner)
+    report = admit([source], destination, runner)
 
-    assert not runner.calls
-    assert not destination.exists()
+    assert report["admitted"]
+    assert (destination / config.name).read_bytes() == config.read_bytes()
+    assert [call[1] for call in runner.calls] == ["validate", "test"]
     assert config.is_file()
 
 
@@ -597,5 +615,130 @@ def test_missing_atomic_publication_support_fails_closed(
 
     with pytest.raises(ValidationError, match="atomic no-overwrite rule admission is unavailable"):
         admit([config.parent], destination, NativeRunner())
+    assert not destination.exists()
+    assert not list(tmp_path.glob(".opengrep-intake-*"))
+
+
+@pytest.mark.parametrize("file_source", [False, True])
+def test_capture_budgets_all_copied_bytes_including_credit_files(
+    tmp_path: Path, file_source: bool
+) -> None:
+    config = write_rule(tmp_path / "source")
+    (config.parent / "LICENSE").write_bytes(b"x" * 4096)
+    destination = tmp_path / "accepted"
+    limits = replace(SourceLimits(), bytes=2048)
+
+    with (
+        pytest.raises(quality.SourceBudgetError, match="bytes budget"),
+        additions.capture_rules(
+            [config if file_source else config.parent], destination, limits=limits
+        ),
+    ):
+        pytest.fail("oversized credit files cannot be omitted or copied without a bound")
+
+    assert not destination.exists()
+    assert not list(tmp_path.glob(".opengrep-intake-*"))
+    assert (config.parent / "LICENSE").stat().st_size == 4096
+
+
+@pytest.mark.parametrize("file_source", [False, True])
+def test_admission_source_budget_refusal_is_a_result_without_native_or_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, file_source: bool
+) -> None:
+    config = write_rule(tmp_path / "source")
+    (config.parent / "LICENSE").write_bytes(b"x" * 4096)
+    limits = replace(SourceLimits(), bytes=2048)
+    monkeypatch.setattr(quality, "SourceLimits", lambda: limits)
+    destination = tmp_path / "accepted"
+    runner = NativeRunner()
+
+    report = admit([config if file_source else config.parent], destination, runner)
+
+    assert not report["admitted"]
+    assert not report["applied"]
+    assert {receipt["check"] for receipt in report["refused"]} == {"source"}
+    assert not runner.calls
+    assert not destination.exists()
+    assert not list(tmp_path.glob(".opengrep-intake-*"))
+
+
+def test_empty_supplement_owner_still_reserves_its_ids_before_admission(tmp_path: Path) -> None:
+    baseline = write_rule(tmp_path / "baseline", "baseline-rule").parent
+    supplement = write_rule(tmp_path / "supplement", "reserved-rule").parent
+    source = write_rule(tmp_path / "source", "reserved-rule").parent
+    destination = tmp_path / "accepted"
+    runner = NativeRunner()
+
+    report = intake_rules(
+        [str(source)],
+        destination,
+        pack=baseline,
+        supplements=(SupplementalPack("", str(supplement), ("reserved-rule",)),),
+        runner=runner,
+        checkouts=NoCheckouts(),
+        load=yaml_documents,
+        timeout=30,
+        binary="opengrep",
+    )
+
+    assert not report["admitted"]
+    assert report["applied"] == []
+    assert [receipt["check"] for receipt in report["refused"]] == ["collision"]
+    assert report["refused"][0]["rule_id"] == "reserved-rule"
+    assert not runner.calls
+    assert not destination.exists()
+
+
+@pytest.mark.parametrize("conflict", [False, True])
+def test_selected_remote_subtree_keeps_root_credits_without_copying_unrelated_links(
+    tmp_path: Path, conflict: bool
+) -> None:
+    repository = tmp_path / "repository"
+    config = write_rule(repository / "rules" / "languages" / "python")
+    (repository / "LICENSE").write_bytes(b"Repository license\n")
+    (repository / "unrelated").symlink_to(tmp_path / "private")
+    (repository / "unrelated.yaml").write_text("Not an Opengrep rule\n")
+    (repository / "LICENSES").mkdir()
+    (repository / "LICENSES" / "outside").symlink_to(tmp_path / "private")
+    root = repository / "rules" / "languages"
+    if conflict:
+        (root / "LICENSE").write_bytes(b"Subtree license\n")
+    destination = tmp_path / "accepted"
+
+    with additions.capture_rules([root], destination, attribution_roots=[repository]) as (
+        snapshot,
+        inputs,
+        _,
+    ):
+        assert inputs == (snapshot,)
+        assert (snapshot / "python" / config.name).read_bytes() == config.read_bytes()
+        assert not (snapshot / "unrelated").exists()
+        assert not (snapshot / "unrelated.yaml").exists()
+        assert not (snapshot / "LICENSES").exists()
+        attribution = snapshot / ".repository-attribution" if conflict else snapshot
+        assert (attribution / "LICENSE").read_bytes() == b"Repository license\n"
+        if conflict:
+            assert (snapshot / "LICENSE").read_bytes() == b"Subtree license\n"
+
+    assert not destination.exists()
+
+
+def test_root_attribution_bytes_share_the_source_capture_budget(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    config = write_rule(repository / "rules")
+    (repository / "LICENSE").write_bytes(b"x" * 4096)
+    destination = tmp_path / "accepted"
+
+    with (
+        pytest.raises(quality.SourceBudgetError, match="bytes budget"),
+        additions.capture_rules(
+            [config.parent],
+            destination,
+            attribution_roots=[repository],
+            limits=replace(SourceLimits(), bytes=2048),
+        ),
+    ):
+        pytest.fail("repository-root attribution cannot bypass the byte budget")
+
     assert not destination.exists()
     assert not list(tmp_path.glob(".opengrep-intake-*"))

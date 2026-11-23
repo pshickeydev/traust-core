@@ -16,11 +16,11 @@ import shutil
 from collections import Counter, defaultdict
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as package_version
 from pathlib import Path
-from typing import Any
+from typing import Any, NotRequired, TypedDict
 from urllib.parse import urlsplit
 
 from traust_core.v1.errors import (
@@ -34,12 +34,13 @@ from traust_core.v1.models import rule_checks
 from traust_core.v1.models.artifacts import AdapterResultArtifact
 from traust_core.v1.models.rule_mining import ProposalCheck, RuleHit
 from traust_core.v1.models.values import GitSha, HttpsRepoUrl
-from traust_core.v1.providers.clock import Clock
+from traust_core.v1.providers.clock import Clock, SystemClock
 from traust_core.v1.providers.config_matrix import YamlLoader
-from traust_core.v1.providers.process import ProcessRunner, ProcessTimeout
+from traust_core.v1.providers.process import ProcessOutputLimit, ProcessRunner, ProcessTimeout
 from traust_core.v1.providers.sources import CheckoutRequest, Checkouts, Workspace
 from traust_core.v1.providers.tools.adapter import adapter_result
 from traust_core.v1.providers.tools.opengrep_additions import (
+    AdditionCheck,
     RuleBatch,
     RuleReceipt,
     capture_rules,
@@ -51,7 +52,10 @@ from traust_core.v1.providers.tools.opengrep_additions import (
 )
 from traust_core.v1.providers.tools.opengrep_quality import (
     OPENGREP_ENV,
+    NativeBudget,
+    NativeBudgetError,
     RuleQualityError,
+    SourceBudgetError,
     checked_rules,
 )
 
@@ -148,6 +152,34 @@ THIN_RULE_THRESHOLD = 8
 NOSEM_RE = re.compile(r"\bnosem(?:grep)?\b", re.IGNORECASE)
 
 
+class _ReceiptDocument(TypedDict):
+    source: str
+    file: str | None
+    rule_id: str | None
+    check: str | None
+    reason: str | None
+
+
+class _CheckDocument(TypedDict):
+    name: str
+    passed: bool
+    detail: str
+
+
+class _AdditiveReport(TypedDict):
+    applied: list[_ReceiptDocument]
+    refused: list[_ReceiptDocument]
+    skipped: list[_ReceiptDocument]
+    degraded: dict[str, int]
+
+
+class _IntakeReport(_AdditiveReport):
+    admitted: bool
+    quality_checks: list[_CheckDocument]
+    content_digest: NotRequired[str]
+    destination: NotRequired[str]
+
+
 @dataclass(frozen=True, slots=True)
 class SupplementalPack:
     """An external pack the allowlist enables, and the only rule ids of it that may report."""
@@ -196,6 +228,7 @@ def _additive_languages(target: Path) -> set[str]:
         target,
         LANG_DIRS
         | {
+            ".dart": "dart",
             ".ex": "elixir",
             ".exs": "elixir",
             ".h": "header",
@@ -500,6 +533,7 @@ class _AdditionGate:
     load: YamlLoader
     binary: str
     timeout: int
+    budget: NativeBudget | None = None
 
     def reserve(self, supplements: Sequence[SupplementalPack]) -> dict[str, str]:
         ids = dict.fromkeys(protected_ids(self.pack, self.load), "traust rule pack")
@@ -538,6 +572,7 @@ class _AdditionGate:
                         binary=self.binary,
                         timeout=self.timeout,
                         protected=protected,
+                        budget=self.budget,
                         languages=languages,
                     )
                 )
@@ -545,7 +580,10 @@ class _AdditionGate:
                 detail = (
                     str(error) if isinstance(error, ValidationError) else "cannot open rule source"
                 )
-                yield [], RuleBatch((), (), (RuleReceipt(source).refuse("source", detail),))
+                yield (
+                    [],
+                    RuleBatch((), (), (RuleReceipt(source).refuse(AdditionCheck.SOURCE, detail),)),
+                )
             else:
                 yield resolved, batch
 
@@ -565,7 +603,7 @@ def intake_rules(
     load: YamlLoader,
     timeout: int,
     binary: str,
-) -> dict[str, Any]:
+) -> _IntakeReport:
     """Publish a whole optional pack only after static policy and native checks pass."""
     if not sources:
         raise ValidationError("rule intake requires at least one source")
@@ -573,17 +611,39 @@ def intake_rules(
         local = Path(source).expanduser()
         if not source.startswith(("https://", "http://", "git@")) and local.is_symlink():
             raise ValidationError(f"rule pack input is a link or special file: {source}")
-    gate = _AdditionGate(pack, runner, checkouts, load, binary, timeout)
+    gate = _AdditionGate(
+        pack,
+        runner,
+        checkouts,
+        load,
+        binary,
+        timeout,
+        NativeBudget(SystemClock(), seconds=timeout),
+    )
     resolved, workspaces = resolve_rules(sources, pack, pack, checkouts)
     try:
-        remote_workspaces = iter(workspaces)
         paths = tuple(
-            next(remote_workspaces).path
-            if entry["sha"] is not None
-            else Path(entry["source"]).expanduser().absolute()
-            for entry in resolved
+            Path(path).expanduser().absolute() for entry in resolved for path in entry["config"]
         )
-        with capture_rules(paths, destination) as (snapshot, inputs, destination):
+        attribution = tuple(
+            next(
+                (
+                    workspace.path
+                    for workspace in workspaces
+                    if Path(path).is_relative_to(workspace.path)
+                ),
+                None,
+            )
+            if entry["sha"] is not None
+            else None
+            for entry in resolved
+            for path in entry["config"]
+        )
+        with capture_rules(paths, destination, attribution_roots=attribution) as (
+            snapshot,
+            inputs,
+            destination,
+        ):
             protected = gate.reserve(supplements)
             candidates: list[RuleReceipt] = []
             refused: list[RuleReceipt] = []
@@ -596,44 +656,84 @@ def intake_rules(
             digest = pack_digest(snapshot)
             if not refused:
                 with checked_rules(
-                    inputs, runner, load=load, binary=binary, timeout=timeout
+                    inputs, runner, load=load, binary=binary, timeout=timeout, budget=gate.budget
                 ) as checked:
                     checks.extend(checked.report.checks)
                     if not checked.report.passed:
                         failed = next(check for check in checks if not check.passed)
                         refused.extend(
-                            receipt.refuse(failed.name.value, failed.detail)
-                            for receipt in candidates
+                            receipt.refuse(failed.name, failed.detail) for receipt in candidates
                         )
                         candidates.clear()
             if refused:
                 refused.extend(
-                    receipt.refuse("admission", "whole pack refused; no rules installed")
+                    receipt.refuse(
+                        AdditionCheck.ADMISSION, "whole pack refused; no rules installed"
+                    )
                     for receipt in candidates
                 )
-                return _additive_report((), refused) | {
+                return {
+                    **_additive_report((), refused),
                     "admitted": False,
-                    "quality_checks": [check.model_dump(mode="json") for check in checks],
+                    "quality_checks": _check_documents(checks),
                     "content_digest": digest,
                 }
             publish_rules(snapshot, destination)
-            return _additive_report(candidates, ()) | {
+            return {
+                **_additive_report(candidates, ()),
                 "admitted": True,
                 "destination": str(destination),
-                "quality_checks": [check.model_dump(mode="json") for check in checks],
+                "quality_checks": _check_documents(checks),
                 "content_digest": digest,
             }
+    except (SourceBudgetError, NativeBudgetError) as error:
+        return {
+            **_additive_report(
+                (),
+                [
+                    RuleReceipt(source).refuse(
+                        AdditionCheck.BUDGET
+                        if isinstance(error, NativeBudgetError)
+                        else AdditionCheck.SOURCE,
+                        str(error),
+                    )
+                    for source in sources
+                ],
+            ),
+            "admitted": False,
+            "quality_checks": [],
+        }
     finally:
         for workspace in workspaces:
             checkouts.release(workspace)
 
 
-def _additive_report(
-    applied: Sequence[RuleReceipt], refused: Sequence[RuleReceipt]
-) -> dict[str, Any]:
+def _receipt_document(receipt: RuleReceipt) -> _ReceiptDocument:
     return {
-        "applied": [asdict(receipt) for receipt in applied],
-        "refused": [asdict(receipt) for receipt in refused],
+        "source": receipt.source,
+        "file": receipt.file,
+        "rule_id": receipt.rule_id,
+        "check": str(receipt.check) if receipt.check is not None else None,
+        "reason": receipt.reason,
+    }
+
+
+def _check_documents(checks: Sequence[ProposalCheck]) -> list[_CheckDocument]:
+    return [
+        {"name": check.name.value, "passed": check.passed, "detail": check.detail}
+        for check in checks
+    ]
+
+
+def _additive_report(
+    applied: Sequence[RuleReceipt],
+    refused: Sequence[RuleReceipt],
+    skipped: Sequence[RuleReceipt] = (),
+) -> _AdditiveReport:
+    return {
+        "applied": [_receipt_document(receipt) for receipt in applied],
+        "refused": [_receipt_document(receipt) for receipt in refused],
+        "skipped": [_receipt_document(receipt) for receipt in skipped],
         "degraded": _degraded(refused),
     }
 
@@ -649,7 +749,7 @@ def _filter_additive_hits(
         matched = hits.get(receipt.rule_id or "", [])
         check = rule_checks.explosion(len(matched), len({f["file"] for f in matched}), scanned)
         if not check.passed:
-            refused.append(receipt.refuse(check.name.value, check.detail))
+            refused.append(receipt.refuse(check.name, check.detail))
         else:
             applied.append(receipt)
             kept.extend(f | {"origin": f"additive:{receipt.source}"} for f in matched)
@@ -657,9 +757,10 @@ def _filter_additive_hits(
 
 
 def _run_addition(
-    gate: _AdditionGate, batch: RuleBatch, target: Path
-) -> tuple[list[dict[str, Any]], list[RuleReceipt], list[RuleReceipt]]:
+    gate: _AdditionGate, batch: RuleBatch, target: Path, output_limit: int
+) -> _AdditiveScan:
     ids = frozenset(r.rule_id for r in batch.applied if r.rule_id is not None)
+    result = _AdditiveScan()
     try:
         raw, facts, errors = _scan_snapshot(
             target,
@@ -668,16 +769,70 @@ def _run_addition(
             gate.runner,
             gate.binary,
             gate.timeout,
-            output_limit=_ADDITIVE_OUTPUT_LIMIT,
+            output_limit=output_limit,
         )
     except ScannerError as error:
-        reason = f"optional scan failed: {error.reason.value}"
+        reason = (
+            "optional scan output capture limit exceeded"
+            if isinstance(error.__cause__, ProcessOutputLimit)
+            else f"optional scan failed: {error.reason.value}"
+        )
     else:
-        skipped = raw.get("skipped_rules", [])
-        if not errors and not skipped and all(fact["rule_id"] in ids for fact in facts):
-            return _filter_additive_hits(batch, facts, len(raw.get("paths", {}).get("scanned", [])))
-        reason = "optional scan returned errors, skipped rules, or unrecognized results"
-    return [], [], [r.refuse("scan", reason) for r in batch.applied]
+        result.errors.extend(errors)
+        result.skipped_rules = len(raw.get("skipped_rules", []))
+        failed: set[str] = set()
+        unknown = any(fact["rule_id"] not in ids for fact in facts)
+        for error in raw.get("errors", []):
+            if error.get("type") in {"ParseError", "PartialParsing", "Timeout"}:
+                continue
+            rule_id = error.get("rule_id")
+            matching = [
+                rule
+                for rule in ids
+                if isinstance(rule_id, str) and (rule_id == rule or rule_id.endswith("." + rule))
+            ]
+            if matching:
+                failed.add(max(matching, key=len))
+            else:
+                unknown = True
+        for skipped in raw.get("skipped_rules", []):
+            rule_id = (
+                skipped
+                if isinstance(skipped, str)
+                else skipped.get("rule_id")
+                if isinstance(skipped, dict)
+                else None
+            )
+            matching = [
+                rule
+                for rule in ids
+                if isinstance(rule_id, str) and (rule_id == rule or rule_id.endswith("." + rule))
+            ]
+            if matching:
+                failed.add(max(matching, key=len))
+            else:
+                unknown = True
+        if not unknown:
+            eligible = tuple(receipt for receipt in batch.applied if receipt.rule_id not in failed)
+            kept, accepted, noisy = _filter_additive_hits(
+                RuleBatch(batch.configs, eligible, ()),
+                [fact for fact in facts if fact["rule_id"] not in failed],
+                len(raw.get("paths", {}).get("scanned", [])),
+            )
+            result.facts.extend(kept)
+            result.applied.extend(accepted)
+            result.refused.extend(noisy)
+            result.refused.extend(
+                receipt.refuse(AdditionCheck.SCAN, "native scanner refused this rule")
+                for receipt in batch.applied
+                if receipt.rule_id in failed
+            )
+            if accepted:
+                result.scanned_paths.update(raw.get("paths", {}).get("scanned", []))
+            return result
+        reason = "optional scan returned unrecognized rules or rule failures"
+    result.refused.extend(receipt.refuse(AdditionCheck.SCAN, reason) for receipt in batch.applied)
+    return result
 
 
 @dataclass(slots=True)
@@ -686,6 +841,20 @@ class _AdditiveScan:
     sources: list[dict[str, Any]] = field(default_factory=list)
     applied: list[RuleReceipt] = field(default_factory=list)
     refused: list[RuleReceipt] = field(default_factory=list)
+    skipped: list[RuleReceipt] = field(default_factory=list)
+    errors: list[dict[str, Any]] = field(default_factory=list)
+    scanned_paths: set[str] = field(default_factory=set)
+    skipped_rules: int = 0
+
+
+def _additive_output_budget(target: Path) -> int:
+    paths = 0
+    for path in target.rglob("*"):
+        if path.is_file() and not any(
+            part in EXCLUDES for part in path.relative_to(target).parts[:-1]
+        ):
+            paths += len(json.dumps(str(path))) + 64
+    return _ADDITIVE_OUTPUT_LIMIT + paths
 
 
 def _scan_additions(
@@ -698,7 +867,9 @@ def _scan_additions(
         protected = gate.reserve(())
     except (ValidationError, OSError, RecursionError):
         result.refused.extend(
-            RuleReceipt(source).refuse("collision", "unable to verify the full baseline ID set")
+            RuleReceipt(source).refuse(
+                AdditionCheck.COLLISION, "unable to verify the full baseline ID set"
+            )
             for source in dict.fromkeys(sources)
         )
         return result
@@ -709,18 +880,28 @@ def _scan_additions(
         }
     )
     languages = _additive_languages(target)
+    output_limit = _additive_output_budget(target)
     for source in dict.fromkeys(sources):
         with gate.vet(source, protected, languages) as (resolved, batch):
-            result.refused.extend(batch.refused)
+            result.skipped.extend(
+                receipt for receipt in batch.refused if receipt.check == AdditionCheck.LANGUAGE
+            )
+            result.refused.extend(
+                receipt for receipt in batch.refused if receipt.check != AdditionCheck.LANGUAGE
+            )
             if not batch.applied:
                 continue
-            protected.update({r.rule_id: r.source for r in batch.applied if r.rule_id is not None})
-            matched, accepted, failed = _run_addition(gate, batch, target)
+            addition = _run_addition(gate, batch, target, output_limit)
+            accepted = addition.applied
+            protected.update({r.rule_id: r.source for r in accepted if r.rule_id is not None})
             result.applied.extend(accepted)
-            result.refused.extend(failed)
+            result.refused.extend(addition.refused)
+            result.errors.extend(addition.errors)
+            result.scanned_paths.update(addition.scanned_paths)
+            result.skipped_rules += addition.skipped_rules
             if accepted:
                 result.sources.extend(resolved)
-                result.facts.extend(matched)
+                result.facts.extend(addition.facts)
     return result
 
 
@@ -804,10 +985,19 @@ def execute_scan(
             if origin := origins.get(fact["rule_id"]):
                 fact["origin"] = origin
 
-        gate = _AdditionGate(pack, runner, checkouts, load, opengrep_bin, timeout)
+        gate = _AdditionGate(
+            pack,
+            runner,
+            checkouts,
+            load,
+            opengrep_bin,
+            timeout,
+            NativeBudget(SystemClock(), seconds=timeout),
+        )
         extra = _scan_additions(gate, additive, target, origins)
         facts.extend(extra.facts)
         rules.extend(extra.sources)
+        errors.extend(extra.errors)
         allow = rule_allow
         if allow is None and supp_allow:
             traust_ids = harness_pack_rule_ids(pack) | {
@@ -869,8 +1059,10 @@ def execute_scan(
                 for r in rules
             ],
             "supplemental_packs": {"applied": applied},
-            "additive_rules": _additive_report(extra.applied, extra.refused),
-            "outcome": "degraded" if extra.refused or errors else "succeeded",
+            "additive_rules": _additive_report(extra.applied, extra.refused, extra.skipped),
+            "outcome": (
+                "degraded" if extra.refused or errors or raw.get("skipped_rules") else "succeeded"
+            ),
             "rule_allowlist": (
                 {
                     "source": allow.source,
@@ -882,9 +1074,11 @@ def execute_scan(
             ),
             "stats": {
                 "facts": len(facts),
-                "files_scanned": len((raw.get("paths") or {}).get("scanned", [])),
+                "files_scanned": len(
+                    set(raw.get("paths", {}).get("scanned", [])) | extra.scanned_paths
+                ),
                 "errors": len(errors),
-                "skipped_rules": len(raw.get("skipped_rules", [])),
+                "skipped_rules": len(raw.get("skipped_rules", [])) + extra.skipped_rules,
                 "suppressed_by_allowlist": suppressed,
             },
             "coverage": coverage_block(target, pack),
@@ -929,6 +1123,11 @@ def _scan_snapshot(
             f"opengrep timed out after {timeout}s",
             reason=ScannerFailure.TIMEOUT,
             timeout_seconds=timeout,
+        ) from error
+    except ProcessOutputLimit as error:
+        raise ScannerError(
+            "opengrep scan output exceeded its capture limit",
+            reason=ScannerFailure.OUTPUT,
         ) from error
     except ServiceError as error:
         raise ScannerError(

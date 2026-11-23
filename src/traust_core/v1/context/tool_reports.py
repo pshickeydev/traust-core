@@ -116,7 +116,8 @@ def intake_opengrep_rules(
     timeout: int = 300,
     binary: str = "opengrep",
 ) -> Doc:
-    """Admit checked stable rule bytes into a new pack, without activating them."""
+    """Return admitted=False without publication on refusal; the CLI exits 1.
+    Path and execution errors remain typed exceptions."""
     return opengrep.intake_rules(
         sources,
         destination,
