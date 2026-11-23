@@ -26,11 +26,14 @@ class LocalCheckout:
     def __init__(self, runner: ProcessRunner, clock: Clock) -> None:
         self._runner, self._clock = runner, clock
         self._reader = GitCheckout(runner)
+        self._shared: dict[tuple[Path, str], tuple[Path, int]] = {}
 
     def check(self) -> Readiness:
         return Readiness(ready=self._runner.allows("git"), detail="git is not allowed here")
 
     def checkout(self, request: CheckoutRequest) -> Result[Workspace]:
+        if request.shared and request.writable:
+            raise ValidationError("a shared checkout must be read-only")
         repo = request.repo
         if not isinstance(repo, LocalRepoUrl):
             raise ValidationError(f"{self.name} checks out a local repository, not {repo!s}")
@@ -39,14 +42,31 @@ class LocalCheckout:
         sha = str(request.ref)
         if not self._reader.reachable(repo.path, sha):
             raise NotFoundError(f"commit {sha} is not in {repo}")
-        worktree = Path(tempfile.mkdtemp(prefix="checkout-"))
+        key = (repo.path.resolve(), sha)
+        if request.shared and key in self._shared:
+            existing, refs = self._shared[key]
+            if existing.is_dir() and self._reader.is_checkout(existing):
+                self._shared[key] = (existing, refs + 1)
+                return Result(
+                    Workspace(
+                        repo=repo, sha=request.ref, path=existing, provider=self.name, shared=True
+                    ),
+                    Acquisition(
+                        provider=self.name, acquired_at=self._clock.now(), source=str(repo)
+                    ),
+                )
+        worktree = Path(tempfile.mkdtemp(prefix="checkout-")).resolve()
         try:
             self._git(repo.path, "worktree", "add", "--quiet", "--detach", str(worktree), sha)
         except BaseException:
             shutil.rmtree(worktree, ignore_errors=True)
             raise
+        if request.shared:
+            self._shared[key] = (worktree, 1)
         return Result(
-            Workspace(repo=repo, sha=request.ref, path=worktree, provider=self.name),
+            Workspace(
+                repo=repo, sha=request.ref, path=worktree, provider=self.name, shared=request.shared
+            ),
             Acquisition(provider=self.name, acquired_at=self._clock.now(), source=str(repo)),
         )
 
@@ -54,6 +74,14 @@ class LocalCheckout:
         repo = workspace.repo
         if not isinstance(repo, LocalRepoUrl):
             raise ValidationError(f"workspace {workspace.path} is not a local origin: {repo!s}")
+        if workspace.shared:
+            key = (repo.path.resolve(), str(workspace.sha))
+            held = self._shared.get(key)
+            if held is not None and held[0] == workspace.path.resolve():
+                if held[1] > 1:
+                    self._shared[key] = (held[0], held[1] - 1)
+                    return
+                self._shared.pop(key, None)
         if workspace.path.resolve() not in self._worktrees(repo.path):
             raise ValidationError(
                 f"workspace {workspace.path} is not a worktree of {repo.path}; refusing to remove"

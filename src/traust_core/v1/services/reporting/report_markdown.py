@@ -72,6 +72,20 @@ def _metadata(meta: Report) -> str:
     ]
     present = [(label, meta[key]) for key, label in field_map if key in meta]
 
+    target = meta.get("target")
+    if isinstance(target, dict):
+        if target.get("purl"):
+            present.append(("Target PURL", f"`{target['purl']}`"))
+        if target.get("module_path"):
+            present.append(("Target Module", f"`{target['module_path']}`"))
+        if target.get("release_ref"):
+            present.append(("Release Ref", f"`{target['release_ref']}`"))
+        ver = target.get("verification")
+        if isinstance(ver, dict) and ver.get("strategy"):
+            manifests = ver.get("manifest_paths") or []
+            ver_str = f"`{ver['strategy']}` ({len(manifests)} manifest(s))"
+            present.append(("Target Verification", ver_str))
+
     lb = meta.get("loc_breakdown")
     if lb:
         loc_val = _fmt_int(lb.get("total"))

@@ -43,6 +43,9 @@ RUN_ORDER = TableSpec(
         text_column("fork_branch", nullable=True),
         timestamp_column("fork_scheduled_at", nullable=True),
         uuid_column("input_artifact_id", nullable=True),
+        text_column("target_purl", nullable=True),
+        text_column("target_sha", nullable=True),
+        text_column("target_module_path", nullable=True),
     ),
 )
 
@@ -104,8 +107,10 @@ class RunOrderRepository(MutableRecordRepository[RunOrder], Protocol):
         ...
 
     def list_for_repository(self, repository_id: UUID, state: OrderState) -> list[RunOrder]: ...
-    def find_open(self, asset: str, repository_id: UUID | None) -> RunOrder | None:
-        """An open order (planned through leased) for an asset and repository, if any."""
+    def find_open(
+        self, asset: str, repository_id: UUID | None, *, target_purl: str | None = None
+    ) -> RunOrder | None:
+        """An open order (planned..leased) for an asset, repository, and optional target PURL."""
         ...
 
     def find_by_work_item(self, work_item_id: UUID) -> RunOrder | None:
@@ -321,13 +326,20 @@ class SqlRunOrderRepository(SqlMutableRepository[RunOrder]):
             order_by=(c.priority,),
         )
 
-    def find_open(self, asset: str, repository_id: UUID | None) -> RunOrder | None:
+    def find_open(
+        self, asset: str, repository_id: UUID | None, *, target_purl: str | None = None
+    ) -> RunOrder | None:
         c = self.table.c
         subject = (
             c.repository_id.is_(None) if repository_id is None else c.repository_id == repository_id
         )
+        target_cond = (
+            c.target_purl.is_(None) if target_purl is None else c.target_purl == target_purl
+        )
         stmt = (
-            self._select().where(c.asset == asset, c.state.in_(OPEN_ORDER_STATES), subject).limit(1)
+            self._select()
+            .where(c.asset == asset, c.state.in_(OPEN_ORDER_STATES), subject, target_cond)
+            .limit(1)
         )
         row = self._execute(f"find open {asset} for {repository_id}", stmt).mappings().first()
         return None if row is None else self._to_record(row)

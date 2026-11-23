@@ -47,29 +47,86 @@ class MirrorCheckout:
         return Readiness(ready=self._runner.allows("git"), detail="git is not allowed here")
 
     def checkout(self, request: CheckoutRequest) -> Result[Workspace]:
+        if request.shared and request.writable:
+            raise ValidationError("a shared checkout must be read-only")
         sha = str(request.ref)
         mirror = self._mirror(request.repo)
         with self._locked(mirror):
-            if not self._fetch(mirror, request.repo, sha):
-                raise NotFoundError(f"commit {sha} is not in {request.repo}")
-            self._touch(mirror)
-            # Resolve macOS's symlinked temp dir before consumers relativize paths against it.
-            worktree = Path(tempfile.mkdtemp(prefix="checkout-")).resolve()
-            try:
-                self._git(mirror, "worktree", "add", "--quiet", "--detach", str(worktree), sha)
-            except BaseException:
-                shutil.rmtree(worktree, ignore_errors=True)
-                raise
+            if request.shared:
+                worktree = self._acquire_shared(mirror, request.repo, sha)
+            else:
+                if not self._fetch(mirror, request.repo, sha):
+                    raise NotFoundError(f"commit {sha} is not in {request.repo}")
+                self._touch(mirror)
+                # Resolve macOS's symlinked temp dir before consumers relativize paths against it.
+                worktree = Path(tempfile.mkdtemp(prefix="checkout-")).resolve()
+                try:
+                    self._git(mirror, "worktree", "add", "--quiet", "--detach", str(worktree), sha)
+                except BaseException:
+                    shutil.rmtree(worktree, ignore_errors=True)
+                    raise
         return Result(
-            Workspace(repo=request.repo, sha=request.ref, path=worktree, provider=self.name),
+            Workspace(
+                repo=request.repo,
+                sha=request.ref,
+                path=worktree,
+                provider=self.name,
+                shared=request.shared,
+            ),
             Acquisition(
                 provider=self.name, acquired_at=self._clock.now(), source=str(request.repo)
             ),
         )
 
+    def _shared_paths(self, mirror: Path, sha: str) -> tuple[Path, Path]:
+        base = mirror.parent / f"{mirror.stem}.shared"
+        return (base / sha).resolve(), base / f"{sha}.refs"
+
+    def _acquire_shared(self, mirror: Path, repo: HttpsRepoUrl, sha: str) -> Path:
+        worktree, refs_file = self._shared_paths(mirror, sha)
+        if (
+            worktree.is_dir()
+            and self._reader.is_checkout(worktree)
+            and self._reader.head(worktree) == sha
+        ):
+            self._touch(mirror)
+            refs = self._read_refs(refs_file) + 1
+            refs_file.write_text(f"{refs}\n", encoding="utf-8")
+            return worktree
+        if not (_healthy(mirror) and self._reachable(mirror, sha)) and not self._fetch(
+            mirror, repo, sha
+        ):
+            raise NotFoundError(f"commit {sha} is not in {repo}")
+        self._touch(mirror)
+        worktree.parent.mkdir(parents=True, exist_ok=True)
+        if worktree.exists():
+            self._git(mirror, "worktree", "remove", "--force", str(worktree), check=False)
+            shutil.rmtree(worktree, ignore_errors=True)
+        try:
+            self._git(mirror, "worktree", "add", "--quiet", "--detach", str(worktree), sha)
+        except BaseException:
+            shutil.rmtree(worktree, ignore_errors=True)
+            raise
+        refs_file.write_text("1\n", encoding="utf-8")
+        return worktree
+
+    def _read_refs(self, refs_file: Path) -> int:
+        try:
+            return max(0, int(refs_file.read_text(encoding="utf-8").strip()))
+        except (OSError, ValueError):
+            return 0
+
     def release(self, workspace: Workspace) -> None:
         mirror = self._mirror(workspace.repo)
         with self._locked(mirror):
+            if workspace.shared:
+                worktree, refs_file = self._shared_paths(mirror, str(workspace.sha))
+                if workspace.path.resolve() == worktree:
+                    remaining = self._read_refs(refs_file) - 1
+                    if remaining > 0:
+                        refs_file.write_text(f"{remaining}\n", encoding="utf-8")
+                        return
+                    refs_file.unlink(missing_ok=True)
             self._git(
                 mirror,
                 "worktree",

@@ -16,11 +16,20 @@ from traust_core.v1.errors import (
     ConflictError,
     ForbiddenError,
     NotFoundError,
+    UnresolvedTargetError,
     ValidationError,
 )
 from traust_core.v1.models.artifacts import RunManifestArtifact
 from traust_core.v1.models.common import Page, PageRequest, Provenance, TimeBucket, TimeWindow
+from traust_core.v1.models.component_target import (
+    ComponentTarget,
+    ComponentTargetRequest,
+    UnresolvedTargetReason,
+    normalize_component_commit,
+    normalize_module_path,
+)
 from traust_core.v1.models.identity import Principal
+from traust_core.v1.models.inventory import DEFAULT_FORGE_HOSTS
 from traust_core.v1.models.operations import (
     FEED_ORDER_STATES,
     FINISHED_ORDER_STATES,
@@ -78,6 +87,7 @@ from traust_core.v1.models.operations import (
     WorkerId,
     WorkLane,
 )
+from traust_core.v1.models.values import GitSha, HttpsRepoUrl, LocalRepoUrl
 from traust_core.v1.models.vocabulary import (
     ActorKind,
     AssessmentKind,
@@ -86,10 +96,12 @@ from traust_core.v1.models.vocabulary import (
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.feeds import FeedStatus
 from traust_core.v1.providers.model_catalog import ModelCatalog, ModelSpec
+from traust_core.v1.providers.sources import CheckoutRequest, Checkouts
 from traust_core.v1.providers.tools import DatabaseStatus
 from traust_core.v1.repositories.traust_ops import OpsUnitOfWork
 from traust_core.v1.services.artifact_publishing import ArtifactPublisher, AssessmentLog
 from traust_core.v1.services.assessment import AssessmentService
+from traust_core.v1.services.component_target import ComponentTargetResolver
 from traust_core.v1.services.portfolio import Inventory, PortfolioService
 from traust_core.v1.services.provider_catalog import ProviderBinding, ProviderCatalog
 
@@ -193,6 +205,9 @@ class OpsService:
         recording_starts: Sequence[RecordingStartScope] = (),
         inventory: Inventory | None = None,
         assessments: AssessmentLog | None = None,
+        checkouts: Checkouts | None = None,
+        component_targets: ComponentTargetResolver | None = None,
+        hosts: Mapping[str, str] | None = None,
     ) -> None:
         self._uow = uow
         self._clock = clock
@@ -208,6 +223,9 @@ class OpsService:
         self._recording_starts = tuple(recording_starts)
         self._inventory = inventory
         self._assessments = assessments
+        self._checkouts = checkouts
+        self._component_targets = component_targets
+        self._hosts = dict(hosts or DEFAULT_FORGE_HOSTS)
 
     def submit(
         self, request: OrderRequest, principal: Principal, config: Sequence[ConfigDigest] = ()
@@ -248,9 +266,10 @@ class OpsService:
             raise PolicyDenied(issues)
         _classifiers(lane=request.lane, event_source=request.event_source)
         self._check_work_item(request)
+        request, resolved_target = self._resolve_component_target(request)
         order = RunOrder(
             **request.model_dump(),
-            **self._config_manifest(tuple(config)),
+            **self._initial_manifest(tuple(config), resolved_target),
             **fork,
             state=OrderState.QUEUED,
             requested_by=principal.ref,
@@ -290,6 +309,63 @@ class OpsService:
                 f"work item {request.work_item_id} is not a remediation work item of "
                 f"repository {request.repository_id}"
             )
+
+    def _resolve_component_target(
+        self, request: OrderRequest
+    ) -> tuple[OrderRequest, ComponentTarget | None]:
+        """Resolve and verify a component PURL target against the registered repository at its
+        pinned SHA before queueing or leasing, replacing caller fields with the server-verified
+        tuple. Fails closed when checkout/resolver wiring is absent or verification fails."""
+        if request.target_purl is None:
+            return request, None
+        if self._inventory is None or self._checkouts is None or self._component_targets is None:
+            raise ConfigError(
+                "component target orders require inventory, checkouts, and component_targets "
+                "(Context wires them)"
+            )
+        assert request.repository_id is not None and request.target_sha is not None
+        repo = self._inventory.get_repository(request.repository_id)
+        try:
+            sha = GitSha.parse(normalize_component_commit(request.target_sha))
+        except ValidationError as e:
+            raise UnresolvedTargetError(
+                UnresolvedTargetReason.MISSING_PIN,
+                f"invalid target_sha {request.target_sha!r}: {e}",
+            ) from e
+        origin = (
+            LocalRepoUrl.parse(repo.url)
+            if repo.url.startswith("file://")
+            else HttpsRepoUrl.parse(repo.url, self._hosts)
+        )
+        try:
+            workspace = self._checkouts.checkout(
+                CheckoutRequest(repo=origin, ref=sha, shared=True)
+            ).data
+        except NotFoundError as e:
+            raise UnresolvedTargetError(
+                UnresolvedTargetReason.TAG_COMMIT_MISMATCH,
+                f"pinned commit {sha} could not be checked out from {repo.url}: {e}",
+            ) from e
+        try:
+            resolved = self._component_targets.resolve(
+                ComponentTargetRequest(
+                    purl=request.target_purl,
+                    repository=repo.url,
+                    commit=str(sha),
+                    module_path=request.target_module_path,
+                ),
+                workspace.path,
+            )
+        finally:
+            self._checkouts.release(workspace)
+        updated = request.model_copy(
+            update={
+                "target_purl": resolved.purl,
+                "target_sha": resolved.commit,
+                "target_module_path": resolved.module_path,
+            }
+        )
+        return updated, resolved
 
     def preflight(self, request: PreflightRequest, principal: Principal) -> PreflightResult:
         """May this stage run on this subject now: fail-fast courtesy; submit re-verifies."""
@@ -585,6 +661,7 @@ class OpsService:
         `worker`: the subject's planned or queued order is taken over, else a new one is stored."""
         _classifiers(lane=request.lane, event_source=request.event_source)
         self._check_work_item(request)
+        request, resolved_target = self._resolve_component_target(request)
         now = self._clock.now()
         lease = {
             "state": OrderState.LEASED,
@@ -593,9 +670,16 @@ class OpsService:
             "started_at": now,
         }
         with self._uow as uow:
-            current = uow.run_orders.find_open(request.asset, request.repository_id)
+            current = uow.run_orders.find_open(
+                request.asset, request.repository_id, target_purl=request.target_purl
+            )
             if current is None:
-                order = RunOrder(**request.model_dump(), **lease, requested_by=principal.ref)
+                order = RunOrder(
+                    **request.model_dump(),
+                    **self._initial_manifest((), resolved_target),
+                    **lease,
+                    requested_by=principal.ref,
+                )
                 saved = uow.run_orders.add(order)
             else:
                 assert current.id is not None
@@ -609,8 +693,25 @@ class OpsService:
                         f"order {current.id} runs work item {current.work_item_id}, not "
                         f"{request.work_item_id}"
                     )
-                saved = uow.run_orders.update(current.model_copy(update=lease))
-            assert saved.id is not None
+                if (
+                    current.target_purl,
+                    current.target_sha,
+                    current.target_module_path,
+                ) != (
+                    request.target_purl,
+                    request.target_sha,
+                    request.target_module_path,
+                ):
+                    raise ConflictError(
+                        f"order {current.id} targets {current.target_purl!r}, not "
+                        f"{request.target_purl!r}"
+                    )
+                extra = (
+                    self._initial_manifest((), resolved_target)
+                    if current.artifact_id is None and resolved_target is not None
+                    else {}
+                )
+                saved = uow.run_orders.update(current.model_copy(update={**lease, **extra}))
             saved = uow.run_orders.get(saved.id)
             uow.commit()
         self._uow.after_commit(
@@ -724,12 +825,14 @@ class OpsService:
         kind: RecordKind,
         repository_id: UUID,
         provenance: Provenance,
+        *,
+        target: ComponentTarget | None = None,
     ) -> RunOrder:
         """Authorize before staging bytes; recording repeats the checks under its lease lock."""
         principal = _recording_principal(principal)
         with self._uow as uow:
             order = uow.run_orders.get(order_id)
-            self._check_recording(order, principal, kind, repository_id, provenance)
+            self._check_recording(order, principal, kind, repository_id, provenance, target=target)
         return order
 
     @contextmanager
@@ -740,26 +843,36 @@ class OpsService:
         kind: RecordKind,
         repository_id: UUID,
         provenance: Provenance,
+        *,
+        target: ComponentTarget | None = None,
     ) -> Iterator[RunOrder]:
         """Authorize and serialize one leased runner's report with its domain writes."""
         principal = _recording_principal(principal)
         with self._uow.write() as uow:
             order = uow.run_orders.get_for_update(order_id)
-            self._check_recording(order, principal, kind, repository_id, provenance)
+            self._check_recording(order, principal, kind, repository_id, provenance, target=target)
             yield order
             if order.lease_expires_at <= self._clock.now():
                 raise ConflictError(f"order {order_id}: recording lease expired before commit")
             uow.commit()
 
     @contextmanager
-    def bound(self, order_id: UUID, repository_id: UUID) -> Iterator[RunOrder]:
+    def bound(
+        self,
+        order_id: UUID,
+        repository_id: UUID,
+        *,
+        target: ComponentTarget | None = None,
+    ) -> Iterator[RunOrder]:
         """Serialize writes bound to a leased order with its lease, as `recording` does for a
         runner's report: the order is locked, leased, unexpired and scoped to `repository_id`
-        from the check through the commit of the caller's writes, which commit here."""
+        (and its server-resolved component target, when present) through commit."""
         with self._uow.write() as uow:
             order = uow.run_orders.get_for_update(order_id)
             _require(order, OrderState.LEASED)
             self._require_lease(order, repository_id)
+            if order.target_purl is not None or target is not None:
+                self._check_target_binding(order, target)
             yield order
             assert order.lease_expires_at is not None
             if order.lease_expires_at <= self._clock.now():
@@ -773,6 +886,8 @@ class OpsService:
         kind: RecordKind,
         repository_id: UUID,
         provenance: Provenance,
+        *,
+        target: ComponentTarget | None = None,
     ) -> None:
         _require(order, OrderState.LEASED)
         if order.lease_holder != principal.ref:
@@ -784,6 +899,49 @@ class OpsService:
             raise ValidationError("recording provenance.run_id must equal run_order_id")
         if provenance.source != _RECORDING_SOURCES.get(kind):
             raise ValidationError("recording provenance source does not match the report kind")
+        if kind == RecordKind.ASSESSMENT:
+            self._check_target_binding(order, target)
+
+    def _check_target_binding(self, order: RunOrder, target: ComponentTarget | None) -> None:
+        """Bind an assessment recording to the order's server-resolved target (including manifest
+        verification metadata when recorded), never only repository identity."""
+        if order.target_purl is None:
+            if target is not None:
+                raise ForbiddenError(
+                    f"order {order.id}: whole-repository order refuses component report "
+                    f"for {target.purl}"
+                )
+            return
+        if target is None:
+            raise ForbiddenError(
+                f"order {order.id}: component target {order.target_purl} required; "
+                "report has no metadata.target"
+            )
+        expected_sha = (order.target_sha or "").lower()
+        expected_path = normalize_module_path(order.target_module_path or "")
+        actual_path = normalize_module_path(target.module_path)
+        if (
+            target.purl != order.target_purl
+            or target.commit.lower() != expected_sha
+            or actual_path != expected_path
+        ):
+            raise ForbiddenError(
+                f"order {order.id}: report target ({target.purl}, {target.commit}, {actual_path}) "
+                f"does not match leased order target ({order.target_purl}, {expected_sha}, "
+                f"{expected_path})"
+            )
+        if order.artifact_id is not None:
+            doc = json.loads(self._manifests.get(order.artifact_id).payload)
+            raw_expected = doc.get("component_target")
+            if raw_expected is not None:
+                expected = ComponentTarget.model_validate(raw_expected)
+                if target.model_dump(mode="json", exclude_none=True) != expected.model_dump(
+                    mode="json", exclude_none=True
+                ):
+                    raise ForbiddenError(
+                        f"order {order.id}: report metadata.target does not match server-resolved "
+                        "manifest target verification"
+                    )
 
     def _require_lease(self, order: RunOrder, repository_id: UUID) -> None:
         """A leased order's lease is live and its scope is this one repository (a fleet-wide
@@ -996,6 +1154,22 @@ class OpsService:
             self._config_manifests[config] = self._publish(None, lambda m: {**m, "config": entries})
         return {"artifact_id": self._config_manifests[config]}
 
+    def _initial_manifest(
+        self, config: tuple[ConfigDigest, ...], component_target: ComponentTarget | None
+    ) -> dict[str, UUID]:
+        if component_target is None:
+            return self._config_manifest(config)
+        target_doc = component_target.model_dump(mode="json", exclude_none=True)
+        entries = [c.model_dump(mode="json", exclude_none=True) for c in config]
+
+        def build(m: dict[str, Any]) -> dict[str, Any]:
+            out = {**m, "component_target": target_doc}
+            if entries:
+                out["config"] = entries
+            return out
+
+        return {"artifact_id": self._publish(None, build)}
+
     def requeue_expired(self) -> int:
         with self._uow as uow:
             count = uow.run_orders.requeue_expired(self._clock.now())
@@ -1121,7 +1295,14 @@ class OpsService:
             manifests[order.id] = OrderManifest.model_validate(
                 {
                     k: doc[k]
-                    for k in ("config", "approval", "sessions", "degraded", "outputs")
+                    for k in (
+                        "config",
+                        "approval",
+                        "sessions",
+                        "degraded",
+                        "outputs",
+                        "component_target",
+                    )
                     if k in doc
                 }
             )

@@ -237,6 +237,16 @@ def test_only_the_cvss_model_imports_the_cvss_library() -> None:
     assert importers == ["models/cvss.py"]
 
 
+def test_only_the_purl_model_imports_packageurl() -> None:
+    """PURL parsing is a pure value operation: the PURL model holds `packageurl`."""
+    importers = sorted(
+        str(path.relative_to(SRC))
+        for path in SRC.rglob("*.py")
+        if any(name.split(".")[0] == "packageurl" for name in _imported_modules(path))
+    )
+    assert importers == ["models/purl.py"]
+
+
 def test_only_the_syntax_module_imports_tree_sitter() -> None:
     """The grammars are core dependencies; one module loads them."""
     importers = sorted(
