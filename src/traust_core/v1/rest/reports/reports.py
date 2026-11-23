@@ -1,5 +1,6 @@
 """Reports as jobs: a request answers with the last ready build of the same request (200),
-or the build queued or already in flight (202); the file downloads once it is ready."""
+or the build queued or already in flight (202); a build that failed answers 409, naming
+why. The file downloads once it is ready."""
 
 from __future__ import annotations
 
@@ -7,6 +8,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Response
 
+from traust_core.v1.errors import ConflictError
 from traust_core.v1.models.insight import ReportFormat
 from traust_core.v1.models.reports import Report, ReportRequest, ReportStatus
 from traust_core.v1.rest.common.deps import Caller, CoreServices
@@ -17,14 +19,18 @@ router = APIRouter(tags=["reports"])
 _FILE = {"content": {f.media_type: {"schema": {"type": "string"}} for f in ReportFormat}}
 
 
-@router.post("/v1/reports", responses={**PROBLEMS(401, 422), 202: {"model": Report}})
+@router.post("/v1/reports", responses={**PROBLEMS(401, 422, 409), 202: {"model": Report}})
 def request_report(
     request: ReportRequest, caller: Caller, services: CoreServices, response: Response
 ) -> Report:
     """The last ready build of this report, format and scope (200), or the build queued or
-    already in flight (202). `refresh` builds anew; two callers asking at once share one
-    build."""
+    already in flight (202); a failed build is a 409, not an eternal in-progress. `refresh`
+    builds anew; two callers asking at once share one build."""
     report = services.reports.request(request, caller)
+    if report.status is ReportStatus.FAILED:
+        raise ConflictError(
+            f"report {report.order_id} failed: {report.reason or 'the build left no file'}"
+        )
     if report.status is not ReportStatus.READY:
         response.status_code = 202
     return report

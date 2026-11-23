@@ -118,7 +118,7 @@ def _catalog_tokens(dialect: str) -> set[str]:
     """Every identifier token the catalog can put in a statement, for the dialect."""
     dimensions, measures = catalog.SERVED[Subject.FINDINGS]
     expressions = [
-        *catalog.columns(tuple(dimensions)),
+        *catalog.columns(tuple(dimensions), dialect),
         *catalog.aggregates(tuple(measures), dialect),
         *(
             catalog.order_key(by, desc, dialect)

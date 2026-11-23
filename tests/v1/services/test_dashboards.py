@@ -183,3 +183,41 @@ def test_a_team_scoped_query_counts_the_teams_repositories(backend: str, tmp_pat
             DashboardQuery(subject="findings", team_ids=(team.id,), measures=("findings",))
         )
         assert results.rows[0].measures["findings"] == 5  # the team's repository, not the estate
+
+
+@pytest.mark.parametrize("backend", SQL_BACKENDS)
+def test_decided_keys_and_filters_are_the_same_text_on_every_engine(backend: str, tmp_path) -> None:
+    with contract_db(backend, tmp_path) as engine:
+        _seed(engine)  # one resolved (decided) finding, the rest undecided
+        service = _service(engine)
+        grouped = service.query(
+            DashboardQuery(subject="findings", measures=("findings",), group_by=("decided",))
+        )
+        keys = {row.groups["decided"] for row in grouped.rows}
+        assert keys <= {"true", "false"}  # never True/False, never 1/0
+        undecided = service.query(
+            DashboardQuery(
+                subject="findings", measures=("findings",), where={"decided": ("false",)}
+            )
+        )
+        # every seeded finding but the resolved one
+        assert undecided.rows[0].measures["findings"] == 5
+
+
+@pytest.mark.parametrize("backend", SQL_BACKENDS)
+def test_the_uncategorized_bucket_groups_and_filters_as_none(backend: str, tmp_path) -> None:
+    with contract_db(backend, tmp_path) as engine:
+        _seed(engine)  # one labelled finding, the rest uncategorized
+        service = _service(engine)
+        grouped = service.query(
+            DashboardQuery(subject="findings", measures=("findings",), group_by=("category",))
+        )
+        buckets = {row.groups["category"]: row.measures["findings"] for row in grouped.rows}
+        assert buckets["<none>"] == 5  # null is a state the queries carry, never an absence
+        assert buckets["xss"] == 1
+        only = service.query(
+            DashboardQuery(
+                subject="findings", measures=("findings",), where={"category": ("<none>",)}
+            )
+        )
+        assert only.rows[0].measures["findings"] == 5

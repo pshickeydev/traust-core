@@ -7,17 +7,27 @@ from __future__ import annotations
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.dashboard import Dimension, Measure, Subject
 
+
 # The findings subject's facts, one column each; group keys are text on the wire
 # (a repository id is its uuid string, a boolean is true/false, null is a state).
-_COLUMNS: dict[Dimension, str] = {
-    Dimension.REPOSITORY: "repository_id",
-    Dimension.STATE: "state",
-    Dimension.SEVERITY: "severity",
-    Dimension.CATEGORY: "category",
-    Dimension.DECIDED: "decided",
-    Dimension.REASON: "reason",
-    Dimension.STATUS: "status",
-}
+# `decided` renders and filters as canonical text on every engine: PostgreSQL's
+# boolean::text is true/false, SQLite's integers are not.
+def _columns(dialect: str) -> dict[Dimension, str]:
+    decided = (
+        "decided::text"
+        if dialect == "postgresql"
+        else "CASE WHEN decided THEN 'true' ELSE 'false' END"
+    )
+    return {
+        Dimension.REPOSITORY: "repository_id",
+        Dimension.STATE: "state",
+        Dimension.SEVERITY: "severity",
+        Dimension.CATEGORY: "category",
+        Dimension.DECIDED: decided,
+        Dimension.REASON: "reason",
+        Dimension.STATUS: "status",
+    }
+
 
 # the oldest open finding's age: closed findings never set it
 _OPEN_SINCE = "CASE WHEN state = 'open' THEN created_at END"
@@ -103,8 +113,9 @@ def require(
         )
 
 
-def columns(dimensions: tuple[Dimension, ...]) -> list[str]:
-    return [_COLUMNS[dimension] for dimension in dimensions]
+def columns(dimensions: tuple[Dimension, ...], dialect: str) -> list[str]:
+    served = _columns(dialect)
+    return [served[dimension] for dimension in dimensions]
 
 
 def aggregates(measures: tuple[Measure, ...], dialect: str) -> list[str]:
@@ -113,6 +124,6 @@ def aggregates(measures: tuple[Measure, ...], dialect: str) -> list[str]:
 
 
 def order_key(by: Measure | Dimension, desc: bool, dialect: str) -> str:
-    expression = _aggregates(dialect).get(by) or _COLUMNS.get(by)
+    expression = _aggregates(dialect).get(by) or _columns(dialect).get(by)
     assert expression is not None, by  # require() refused the rest
     return f"{expression} desc" if desc else expression

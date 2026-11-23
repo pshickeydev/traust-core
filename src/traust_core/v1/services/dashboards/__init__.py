@@ -35,9 +35,9 @@ class DashboardService:
         with self._uow as uow:
             facts = SqlDashboardFacts(uow.connection)
             dialect = uow.connection.dialect.name
-            columns = catalog.columns(query.group_by)
+            columns = catalog.columns(query.group_by, dialect)
             aggregates = catalog.aggregates(query.measures, dialect)
-            where_columns = catalog.columns(tuple(query.where))
+            where_columns = catalog.columns(tuple(query.where), dialect)
             predicates = list(zip(where_columns, query.where.values(), strict=True))
             order = [catalog.order_key(entry.by, entry.desc, dialect) for entry in query.order]
             rows = facts.aggregate(

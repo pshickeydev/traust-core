@@ -200,3 +200,19 @@ def test_the_worker_idles_when_nothing_is_queued_and_stops_on_request(context: C
     stop = threading.Event()
     stop.set()
     worker.run(stop)  # returns at once: nothing claimed, the stop already asked
+
+
+def test_a_request_whose_build_cannot_answer_is_a_conflict_not_in_progress(
+    context: Context, client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed or file-less build never answers 202: the request says 409, naming why."""
+    seed_critical(context)
+    request(client, context, report="executive-summary", scope={"as_of": AS_OF})
+    build_next(context)
+    services = context.services()
+    monkeypatch.setattr(
+        type(services.reports), "_built", lambda *args: None
+    )  # the ready build's file is gone
+    again = request(client, context, report="executive-summary", scope={"as_of": AS_OF})
+    assert again.status_code == 409
+    assert again.json()["status"] == 409  # the one error shape, not a report body

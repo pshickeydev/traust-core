@@ -20,7 +20,7 @@ _FINDING_FACTS = sa.text(
         SELECT f.id, f.repository_id, f.created_at,
             f.current_state AS state,
             f.current_severity AS severity,
-            f.category,
+            coalesce(f.category, '<none>') AS category,
             f.current_decided AS decided
         FROM finding f
     )
