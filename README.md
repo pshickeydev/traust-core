@@ -138,6 +138,11 @@ Merged progress does not prove a finding fixed: that remains a resolution decisi
 
 ## Historical reads and reporting correctness
 
+The `/v1/insights/*` HTTP routes are **removed** (with `/v1/findings/count` and
+`/v1/findings/summaries`): dashboards are `POST /v1/dashboards:query` and the views are
+requested as report jobs — see [Dashboards and reports](#dashboards-and-reports). The
+`InsightService` views below remain, as the report builders those jobs run.
+
 The native consumer doors above remain owned by their existing services and models.
 The remaining correctness changes are:
 
@@ -742,6 +747,35 @@ brought on by its first open; a configured database refuses until its deployment
 on. Nothing is verified about a database someone hand-changed — a later script refuses what
 does not fit, transactionally, and that refusal is the operator's to resolve with the
 contract's owners.
+
+## Dashboards and reports
+
+Dashboards are fast, filtered aggregates over the facts; reports are jobs that produce
+artifacts. Serving splits by role so a slow read can never starve a write:
+
+```bash
+traust-server --config traust.yaml --role query|command|ops|reports   # default: all
+```
+
+| Route | What |
+|---|---|
+| `POST /v1/dashboards:query` | one metrics query over the finding's stamped current answer (state, effective severity, decided, category). Subjects: `findings`, `review_items`. Every query takes the repository filter (empty = the whole estate); `group_by` ≤ 3, row cap 1,000 |
+| `POST /v1/reports` | request a report as a job: the last ready build answers 200, a queued or in-flight build 202 |
+| `GET /v1/reports/{order_id}` | the report order's status |
+| `GET /v1/reports/{order_id}/file` | the rendered file from object storage (the cache is the product: no cache layer) |
+
+The dashboard vocabulary (subjects, dimensions, measures) lives in `models/dashboard.py`, the
+single source; the SDK generates from the published models. State is the stamped fold, written
+by the same function the reads use — never recomputed on the request path.
+
+Budgets (the seeded rig, 350k findings, `make perf-load`): the dashboard query holds **40 ms
+p95** under duress beside the stamped write door (the findings rollup it replaced measured
+86 s on the same rig); a page herd — 50 users loading a whole page, five cards each, 250
+queries at once — holds **662 ms p95 with zero failures**.
+
+Removed with these routes: `/v1/insights/*`, `/v1/findings/count`, `/v1/findings/summaries`.
+The dashboard query answers count and summaries; the insight views live on as the report
+builders behind `POST /v1/reports` (relocating them into the reports domain is a follow-up).
 
 ## Run the REST API locally
 
