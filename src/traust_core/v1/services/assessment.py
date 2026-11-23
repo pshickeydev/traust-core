@@ -75,7 +75,11 @@ from traust_core.v1.models.assessment import (
 from traust_core.v1.models.cloud_config import audit_candidates, audit_judgments
 from traust_core.v1.models.code_facts import SymbolFact
 from traust_core.v1.models.common import ArtifactRef, Page, PageRequest, Provenance
-from traust_core.v1.models.component_target import ComponentTarget, normalize_module_path
+from traust_core.v1.models.component_target import (
+    ComponentTarget,
+    canonical_component_purl,
+    normalize_module_path,
+)
 from traust_core.v1.models.findings import (
     CandidateFormat,
     Decision,
@@ -171,7 +175,8 @@ def _extract_component_target(doc: AssessmentArtifact) -> ComponentTarget | None
     except pydantic.ValidationError as e:
         raise ValidationError(f"invalid metadata.target: {e}") from e
     normalized_path = normalize_module_path(parsed.module_path)
-    return parsed.model_copy(update={"module_path": normalized_path})
+    normalized_purl = canonical_component_purl(parsed.purl)
+    return parsed.model_copy(update={"purl": normalized_purl, "module_path": normalized_path})
 
 
 def touches(location: str, paths: Collection[str]) -> bool:
@@ -1003,11 +1008,12 @@ class AssessmentService:
     ) -> Assessment | None:
         if as_of is not None and as_of.utcoffset() is None:
             raise ValidationError("as_of must be timezone-aware")
+        normalized_purl = canonical_component_purl(target_purl) if target_purl is not None else None
         spellings = self._kind_spellings(kind)
         with self._uow as uow:
             rows = [
                 uow.assessments.latest(
-                    repository_ref_id, value, status, as_of=as_of, target_purl=target_purl
+                    repository_ref_id, value, status, as_of=as_of, target_purl=normalized_purl
                 )
                 for value in spellings
             ]
@@ -1067,7 +1073,11 @@ class AssessmentService:
                     repository_ref_id=filter.repository_ref_id,
                     kind=kind,
                     status=filter.status,
-                    target_purl=filter.target_purl,
+                    target_purl=(
+                        canonical_component_purl(filter.target_purl)
+                        if filter.target_purl is not None
+                        else None
+                    ),
                     limit=page.limit + 1,
                     after=after,
                 )
@@ -1092,12 +1102,13 @@ class AssessmentService:
         """The repository's newest completed or degraded assessment across all its refs
         (whole-repository only when `target_purl` is None, else scoped to that PURL)."""
         self._inventory.get_repository(repository_id)
+        normalized_purl = canonical_component_purl(target_purl) if target_purl is not None else None
         with self._uow as uow:
             found = uow.assessment_reads.latest_for_repository(
                 repository_id,
                 self._kind_spellings(kind),
                 (ASSESSMENT_COMPLETED, ASSESSMENT_DEGRADED),
-                target_purl=target_purl,
+                target_purl=normalized_purl,
             )
         if found is None:
             raise NotFoundError(f"no recorded {kind} assessment for repository {repository_id}")
@@ -1117,6 +1128,8 @@ class AssessmentService:
         repository_ids: Collection[UUID],
         kind: AssessmentKind | None,
         page: PageRequest,
+        *,
+        target_purl: str | None = None,
     ) -> Page[Assessment]:
         """The assessments across every ref of these repositories, newest first and
         cursor-paged under the collection listing's own discipline: the batched
@@ -1124,6 +1137,7 @@ class AssessmentService:
         consumer that wants the whole history follows the cursor (the SDK's
         paged iterators do)."""
         after = page.position()
+        normalized_purl = canonical_component_purl(target_purl) if target_purl is not None else None
         refs = [r.id for r in self._inventory.list_refs_of(repository_ids) if r.id]
         kinds = self._kind_spellings(kind) if kind is not None else [None]
         with self._uow as uow:
@@ -1131,7 +1145,11 @@ class AssessmentService:
                 self._read(row)
                 for spelling in kinds
                 for row in uow.assessments.search(
-                    repository_ref_ids=refs, kind=spelling, limit=page.limit + 1, after=after
+                    repository_ref_ids=refs,
+                    kind=spelling,
+                    target_purl=normalized_purl,
+                    limit=page.limit + 1,
+                    after=after,
                 )
             ]
         rows.sort(key=lambda a: (a.occurred_at, a.id), reverse=True)

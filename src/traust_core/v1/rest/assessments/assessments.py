@@ -61,7 +61,7 @@ def list_assessments(
                 f"list assessments for at most {MAX_REPOSITORY_IDS} repositories per request"
             )
         return assessments.list_for_repositories(
-            repository_ids, kind, PageRequest(limit=limit, cursor=cursor)
+            repository_ids, kind, PageRequest(limit=limit, cursor=cursor), target_purl=target_purl
         )
     filter = AssessmentFilter(
         repository_ref_id=repository_ref_id, kind=kind, status=status, target_purl=target_purl

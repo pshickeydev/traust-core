@@ -25,6 +25,7 @@ from traust_core.v1.models.component_target import (
     ComponentTarget,
     ComponentTargetRequest,
     UnresolvedTargetReason,
+    canonical_component_purl,
     normalize_component_commit,
     normalize_module_path,
 )
@@ -334,7 +335,7 @@ class OpsService:
             ) from e
         origin = (
             LocalRepoUrl.parse(repo.url)
-            if repo.url.startswith("file://")
+            if repo.url.startswith(("file:", "/"))
             else HttpsRepoUrl.parse(repo.url, self._hosts)
         )
         try:
@@ -544,9 +545,12 @@ class OpsService:
         otherwise returned unchanged."""
         _classifiers(lane=request.lane, event_source=request.event_source)
         self._check_work_item(request)
-        manifest = self._config_manifest(tuple(config))
+        request, resolved_target = self._resolve_component_target(request)
+        manifest = self._initial_manifest(tuple(config), resolved_target)
         with self._uow as uow:
-            current = uow.run_orders.find_open(request.asset, request.repository_id)
+            current = uow.run_orders.find_open(
+                request.asset, request.repository_id, target_purl=request.target_purl
+            )
             if current is None:
                 saved = uow.run_orders.add(
                     RunOrder(
@@ -557,6 +561,19 @@ class OpsService:
                     )
                 )
             elif current.state == OrderState.PLANNED:
+                if (
+                    current.target_purl,
+                    current.target_sha,
+                    current.target_module_path,
+                ) != (
+                    request.target_purl,
+                    request.target_sha,
+                    request.target_module_path,
+                ):
+                    raise ConflictError(
+                        f"order {current.id} targets {current.target_purl!r}, not "
+                        f"{request.target_purl!r}"
+                    )
                 route = request.model_dump(include={"priority", "lane", "rule", "event_source"})
                 update = {**route, **manifest}
                 if all(getattr(current, field) == value for field, value in update.items()):
@@ -917,17 +934,19 @@ class OpsService:
                 f"order {order.id}: component target {order.target_purl} required; "
                 "report has no metadata.target"
             )
+        expected_purl = canonical_component_purl(order.target_purl)
+        actual_purl = canonical_component_purl(target.purl)
         expected_sha = (order.target_sha or "").lower()
         expected_path = normalize_module_path(order.target_module_path or "")
         actual_path = normalize_module_path(target.module_path)
         if (
-            target.purl != order.target_purl
+            actual_purl != expected_purl
             or target.commit.lower() != expected_sha
             or actual_path != expected_path
         ):
             raise ForbiddenError(
-                f"order {order.id}: report target ({target.purl}, {target.commit}, {actual_path}) "
-                f"does not match leased order target ({order.target_purl}, {expected_sha}, "
+                f"order {order.id}: report target ({actual_purl}, {target.commit}, {actual_path}) "
+                f"does not match leased order target ({expected_purl}, {expected_sha}, "
                 f"{expected_path})"
             )
         if order.artifact_id is not None:
@@ -935,9 +954,13 @@ class OpsService:
             raw_expected = doc.get("component_target")
             if raw_expected is not None:
                 expected = ComponentTarget.model_validate(raw_expected)
-                if target.model_dump(mode="json", exclude_none=True) != expected.model_dump(
+                expected_norm = expected.model_copy(
+                    update={"purl": canonical_component_purl(expected.purl)}
+                )
+                actual_norm = target.model_copy(update={"purl": actual_purl})
+                if actual_norm.model_dump(
                     mode="json", exclude_none=True
-                ):
+                ) != expected_norm.model_dump(mode="json", exclude_none=True):
                     raise ForbiddenError(
                         f"order {order.id}: report metadata.target does not match server-resolved "
                         "manifest target verification"

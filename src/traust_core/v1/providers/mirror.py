@@ -89,13 +89,14 @@ class MirrorCheckout:
             and self._reader.is_checkout(worktree)
             and self._reader.head(worktree) == sha
         ):
+            self._fetch_tags(mirror, repo)
             self._touch(mirror)
             refs = self._read_refs(refs_file) + 1
             refs_file.write_text(f"{refs}\n", encoding="utf-8")
             return worktree
-        if not (_healthy(mirror) and self._reachable(mirror, sha)) and not self._fetch(
-            mirror, repo, sha
-        ):
+        if _healthy(mirror) and self._reachable(mirror, sha):
+            self._fetch_tags(mirror, repo)
+        elif not self._fetch(mirror, repo, sha):
             raise NotFoundError(f"commit {sha} is not in {repo}")
         self._touch(mirror)
         worktree.parent.mkdir(parents=True, exist_ok=True)
@@ -119,23 +120,54 @@ class MirrorCheckout:
     def release(self, workspace: Workspace) -> None:
         mirror = self._mirror(workspace.repo)
         with self._locked(mirror):
+            if not _healthy(mirror):
+                raise ValidationError(
+                    f"workspace {workspace.path} is not a worktree of {workspace.repo}; "
+                    "refusing to remove"
+                )
+            target = workspace.path.resolve()
+            owned = self._worktrees(mirror)
             if workspace.shared:
                 worktree, refs_file = self._shared_paths(mirror, str(workspace.sha))
-                if workspace.path.resolve() == worktree:
-                    remaining = self._read_refs(refs_file) - 1
-                    if remaining > 0:
-                        refs_file.write_text(f"{remaining}\n", encoding="utf-8")
-                        return
-                    refs_file.unlink(missing_ok=True)
+                if target != worktree or target not in owned:
+                    raise ValidationError(
+                        f"workspace {workspace.path} is not the shared worktree for "
+                        f"{workspace.repo}@{workspace.sha}; refusing to remove"
+                    )
+                remaining = self._read_refs(refs_file) - 1
+                if remaining > 0:
+                    refs_file.write_text(f"{remaining}\n", encoding="utf-8")
+                    return
+                refs_file.unlink(missing_ok=True)
+            elif target not in owned:
+                raise ValidationError(
+                    f"workspace {workspace.path} is not a worktree of {workspace.repo}; "
+                    "refusing to remove"
+                )
             self._git(
                 mirror,
                 "worktree",
                 "remove",
                 "--force",
-                str(workspace.path),
+                str(target),
                 check=False,
             )
-            shutil.rmtree(workspace.path, ignore_errors=True)
+            shutil.rmtree(target, ignore_errors=True)
+            self._git(mirror, "worktree", "prune", check=False)
+
+    def _worktrees(self, mirror: Path) -> set[Path]:
+        """Registered worktrees owned by `mirror` (excluding the bare mirror itself)."""
+        listed = self._runner.run(
+            ["git", "-C", str(mirror), *HARDENED, "worktree", "list", "--porcelain"],
+            check=False,
+        ).stdout.decode(errors="replace")
+        worktrees = [
+            line.removeprefix("worktree ")
+            for line in listed.splitlines()
+            if line.startswith("worktree ")
+        ]
+        mirror_resolved = mirror.resolve()
+        return {Path(w).resolve() for w in worktrees if Path(w).resolve() != mirror_resolved}
 
     def refresh(self, repo: HttpsRepoUrl, head: GitSha) -> None:
         """Fetch the repo's mirror so it holds `head` (seeding it when absent); a commit the
@@ -255,6 +287,24 @@ class MirrorCheckout:
                 log.info("mirror fetch %s in %.1fs", repo, time.monotonic() - started)
                 return True
         return False
+
+    def _fetch_tags(self, mirror: Path, repo: HttpsRepoUrl) -> None:
+        """Refresh remote tags into an existing mirror without recreating worktrees."""
+        env = self._fetch_env(repo)
+        self._runner.run(
+            [
+                "git",
+                "-C",
+                str(mirror),
+                *HARDENED,
+                "fetch",
+                "--quiet",
+                "--prune",
+                str(repo),
+                "+refs/tags/*:refs/tags/*",
+            ],
+            env=env,
+        )
 
     def _reachable(self, mirror: Path, sha: str) -> bool:
         return self._reader.reachable(mirror, sha) and bool(

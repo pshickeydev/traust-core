@@ -232,7 +232,7 @@ class ComponentTargetResolver:
             )
 
         return ComponentTarget(
-            purl=purl.raw,
+            purl=purl.canonical,
             repository=request.repository,
             commit=commit,
             module_path=cand.module_path,

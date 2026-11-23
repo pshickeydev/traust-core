@@ -129,14 +129,13 @@ def _scan_maven(files: list[TreeFile]) -> list[PackageManifestCandidate]:
         parent_artifact = (
             _xml_child_text(parent_el, "artifactId") if parent_el is not None else None
         )
-        parent_version = (
-            _resolve_maven_prop(_xml_child_text(parent_el, "version"), local_props)
-            if parent_el is not None
-            else None
+        raw_parent_version = (
+            _xml_child_text(parent_el, "version") if parent_el is not None else None
         )
 
         matched_parent_rel: str | None = None
-        if parent_el is not None and parent_group and parent_artifact and parent_version:
+        parent_version: str | None = None
+        if parent_el is not None and parent_group and parent_artifact and raw_parent_version:
             rel_el = next((c for c in parent_el if _xml_tag(c) == "relativePath"), None)
             if rel_el is None:
                 target_rel = _resolve_maven_parent_rel(mod_dir, "../pom.xml")
@@ -145,13 +144,18 @@ def _scan_maven(files: list[TreeFile]) -> list[PackageManifestCandidate]:
             else:
                 # Explicit empty `<relativePath/>` disables local parent lookup in Maven.
                 target_rel = None
-            if (
-                target_rel is not None
-                and target_rel != rel_path
-                and target_rel in parsed_by_rel
-                and coords_by_rel[target_rel] == (parent_group, parent_artifact, parent_version)
-            ):
-                matched_parent_rel = target_rel
+            if target_rel is not None and target_rel != rel_path and target_rel in parsed_by_rel:
+                candidate_props = {**parsed_by_rel[target_rel][2], **local_props}
+                candidate_parent_version = _resolve_maven_prop(raw_parent_version, candidate_props)
+                if candidate_parent_version is not None and coords_by_rel[target_rel] == (
+                    parent_group,
+                    parent_artifact,
+                    candidate_parent_version,
+                ):
+                    matched_parent_rel = target_rel
+                    parent_version = candidate_parent_version
+            if matched_parent_rel is None:
+                parent_version = _resolve_maven_prop(raw_parent_version, local_props)
 
         parent_props = parsed_by_rel[matched_parent_rel][2] if matched_parent_rel else {}
         props = {**parent_props, **local_props}

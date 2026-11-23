@@ -55,6 +55,7 @@ class Purl:
     name: str
     version: str | None
     subpath: str | None
+    canonical: str
 
     @property
     def ecosystem(self) -> Ecosystem | None:
@@ -69,6 +70,13 @@ def parse_purl(raw: str) -> Purl:
     """Parse a PURL string via `packageurl-python`; raises `ValueError` on invalid input."""
     text = raw.strip()
     parsed = PackageURL.from_string(text)
+    canonical = PackageURL(
+        type=parsed.type,
+        namespace=parsed.namespace,
+        name=parsed.name,
+        version=parsed.version,
+        subpath=parsed.subpath,
+    ).to_string()
     return Purl(
         raw=text,
         type=parsed.type,
@@ -76,6 +84,7 @@ def parse_purl(raw: str) -> Purl:
         name=parsed.name,
         version=parsed.version or None,
         subpath=parsed.subpath or None,
+        canonical=canonical,
     )
 
 

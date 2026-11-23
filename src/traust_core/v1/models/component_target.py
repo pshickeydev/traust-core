@@ -53,6 +53,7 @@ def normalize_component_commit(raw: str) -> str:
 
 class ParsedPurl(Model):
     raw: str
+    canonical: str
     type: str
     namespace: str | None = None
     name: str
@@ -92,12 +93,18 @@ class ParsedPurl(Model):
         )
         return cls(
             raw=text,
+            canonical=parsed.canonical,
             type=parsed.type,
             namespace=parsed.namespace,
             name=parsed.name,
             version=parsed.version,
             subpath=subpath,
         )
+
+
+def canonical_component_purl(raw: str) -> str:
+    """Return the canonical versioned PURL string used as the dedup/lookup/binding key."""
+    return ParsedPurl.parse(raw).canonical
 
 
 class ComponentTargetVerification(Model):

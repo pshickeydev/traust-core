@@ -348,3 +348,76 @@ def test_mismatched_purl_and_module_path_cannot_obtain_a_lease_or_queue(
         target_purl="pkg:maven/org.springframework/spring-beans@7.1.0",
     )
     assert latest.target_purl == "pkg:maven/org.springframework/spring-beans@7.1.0"
+
+    # 7. Repository-set listing filters by target_purl (including equivalent PURL spelling).
+    listed_beans = client.get(
+        "/v1/assessments",
+        headers=_auth(person_tok),
+        params={
+            "repository_ids": [repo_id],
+            "target_purl": "pkg:maven/org.springframework/spring-beans@7.1.0?classifier=sources",
+        },
+    )
+    assert listed_beans.status_code == 200, listed_beans.text
+    assert len(listed_beans.json()["items"]) == 1
+    assert (
+        listed_beans.json()["items"][0]["target_purl"]
+        == "pkg:maven/org.springframework/spring-beans@7.1.0"
+    )
+
+    listed_other = client.get(
+        "/v1/assessments",
+        headers=_auth(person_tok),
+        params={
+            "repository_ids": [repo_id],
+            "target_purl": "pkg:maven/org.springframework/spring-context@7.1.0",
+        },
+    )
+    assert listed_other.status_code == 200, listed_other.text
+    assert listed_other.json()["items"] == []
+
+    # 8. OpsService.plan resolves component targets, rejects unverified hints, and deduplicates.
+    from traust_core.v1.errors import UnresolvedTargetError
+    from traust_core.v1.models.identity import Principal
+    from traust_core.v1.models.operations import OrderRequest
+    from traust_core.v1.models.vocabulary import ActorKind
+
+    planner = Principal(
+        identity="engine", display="Engine", kind=ActorKind.MACHINE, verified_by="oidc"
+    )
+    with pytest.raises(UnresolvedTargetError):
+        context.services().ops.plan(
+            OrderRequest(
+                asset=AssetName("sci_scan"),
+                priority=1,
+                repository_id=UUID(repo_id),
+                target_purl="pkg:maven/org.springframework/spring-beans@7.1.0",
+                target_sha=spring.commit,
+                target_module_path="spring-context",
+            ),
+            planner,
+        )
+    planned_1 = context.services().ops.plan(
+        OrderRequest(
+            asset=AssetName("sci_scan"),
+            priority=1,
+            repository_id=UUID(repo_id),
+            target_purl="pkg:maven/org.springframework/spring-context@7.1.0",
+            target_sha=spring.commit,
+        ),
+        planner,
+    )
+    assert planned_1.target_module_path == "spring-context"
+    assert planned_1.artifact_id is not None
+    assert context.services().ops.manifest(planned_1.id).component_target is not None
+    planned_2 = context.services().ops.plan(
+        OrderRequest(
+            asset=AssetName("sci_scan"),
+            priority=1,
+            repository_id=UUID(repo_id),
+            target_purl="pkg:maven/org.springframework/spring-context@7.1.0",
+            target_sha=spring.commit,
+        ),
+        planner,
+    )
+    assert planned_2.id == planned_1.id

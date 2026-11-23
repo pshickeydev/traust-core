@@ -525,3 +525,91 @@ def test_component_commit_rejects_64_hex_and_normalizes_uppercase(tmp_path: Path
         ),
     )
     assert model.commit == sha
+
+
+def test_maven_child_pom_resolves_root_defined_revision_in_parent_version(tmp_path: Path) -> None:
+    repo = tmp_path / "maven-revision"
+    sha = _init_repo(
+        repo,
+        {
+            "pom.xml": (
+                "<project>\n"
+                "  <groupId>org.example</groupId>\n"
+                "  <artifactId>parent-bom</artifactId>\n"
+                "  <version>${revision}</version>\n"
+                "  <properties><revision>3.4.5</revision></properties>\n"
+                "</project>\n"
+            ),
+            "child-mod/pom.xml": (
+                "<project>\n"
+                "  <parent>\n"
+                "    <groupId>org.example</groupId>\n"
+                "    <artifactId>parent-bom</artifactId>\n"
+                "    <version>${revision}</version>\n"
+                "  </parent>\n"
+                "  <artifactId>child-mod</artifactId>\n"
+                "</project>\n"
+            ),
+        },
+        tags=("v3.4.5",),
+    )
+    target = _resolver().resolve(
+        ComponentTargetRequest(
+            purl="pkg:maven/org.example/child-mod@3.4.5",
+            repository="https://github.com/example/maven-revision",
+            commit=sha,
+        ),
+        repo,
+    )
+    assert target.module_path == "child-mod"
+    assert target.verification.strategy is ComponentTargetStrategy.SHARED_RELEASE
+    assert target.verification.manifest_paths == ("child-mod/pom.xml", "pom.xml")
+
+
+def test_equivalent_purl_spellings_canonicalize_to_same_key(tmp_path: Path) -> None:
+    repo = tmp_path / "canon-purls"
+    sha = _init_repo(
+        repo,
+        {
+            "package.json": '{"name": "root", "private": true, "workspaces": ["packages/*"]}',
+            "packages/cache/package.json": '{"name": "@acme/cache-lib", "version": "1.2.0"}',
+            "libs/core/pyproject.toml": '[project]\nname = "LangChain_Core"\nversion = "1.8.4"\n',
+        },
+        tags=("v1.2.0", "langchain-core==1.8.4"),
+    )
+    resolver = _resolver()
+    npm_literal = resolver.resolve(
+        ComponentTargetRequest(
+            purl="pkg:npm/@acme/cache-lib@1.2.0",
+            repository="https://github.com/example/canon-purls",
+            commit=sha,
+        ),
+        repo,
+    )
+    npm_encoded = resolver.resolve(
+        ComponentTargetRequest(
+            purl="pkg:npm/%40acme/cache-lib@1.2.0?vcs_url=git+https://example.com",
+            repository="https://github.com/example/canon-purls",
+            commit=sha,
+        ),
+        repo,
+    )
+    assert npm_literal.purl == npm_encoded.purl == "pkg:npm/%40acme/cache-lib@1.2.0"
+
+    py_mixed = resolver.resolve(
+        ComponentTargetRequest(
+            purl="pkg:PyPI/LangChain_Core@1.8.4?classifier=wheel",
+            repository="https://github.com/example/canon-purls",
+            commit=sha,
+        ),
+        repo,
+    )
+    py_canon = resolver.resolve(
+        ComponentTargetRequest(
+            purl="pkg:pypi/langchain-core@1.8.4",
+            repository="https://github.com/example/canon-purls",
+            commit=sha,
+        ),
+        repo,
+    )
+    assert py_mixed.purl == py_canon.purl == "pkg:pypi/langchain-core@1.8.4"
