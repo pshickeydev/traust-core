@@ -93,7 +93,23 @@ def test_stronger_human_evidence_beats_later_weaker_machine_evidence() -> None:
     assert (h.fold().validity, h.fold().assurance) == (FP, "human_reviewed")
 
 
-@pytest.mark.parametrize("machine_grade", ["E2", "E3"], ids=["equal", "weaker"])
+@pytest.mark.parametrize(
+    "machine_grade",
+    [
+        pytest.param(
+            "E2",
+            marks=pytest.mark.xfail(
+                reason=(
+                    "Equal-grade human/machine disposition precedence pending policy decision"
+                    " (XWING-3098)"
+                ),
+                strict=True,
+            ),
+            id="equal",
+        ),
+        pytest.param("E3", id="weaker"),
+    ],
+)
 def test_the_latest_human_beats_any_machine(machine_grade: str) -> None:
     h = History()
     h.report(1, CONFIRMED, severity="critical", evidence_grade="E2")

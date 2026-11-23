@@ -470,14 +470,14 @@ def test_requeue_repairs_only_damaged_coverage_on_the_refs_own_completed_scan(
                 )
         uow.commit()
     assert scan.id is not None
-    with pytest.raises(IntegrityError, match="holds no coverage|duplicate coverage"):
+    with pytest.raises(IntegrityError, match=r"holds no coverage|duplicate coverage"):
         service.unresolved_manifests(reference)
     tool.raw = b"not json"
     with pytest.raises(ValidationError):
         service.record_manifest_sbom(reference)
     with SqlTraustUnitOfWork(engine) as uow:
         assert uow.repository_refs.get(reference).manifest_sbom_assessment_id == scan.id
-    with pytest.raises(IntegrityError, match="holds no coverage|duplicate coverage"):
+    with pytest.raises(IntegrityError, match=r"holds no coverage|duplicate coverage"):
         service.unresolved_manifests(reference)
     tool.raw = NO_LODASH
     assert service.record_manifest_sbom(reference) == sbom
@@ -486,7 +486,9 @@ def test_requeue_repairs_only_damaged_coverage_on_the_refs_own_completed_scan(
     assert len(archive.asked) == len(archive.released) == 2
     with SqlTraustUnitOfWork(engine) as uow:
         assert uow.repository_refs.get(reference).manifest_sbom_assessment_id != scan.id
-        assert len(uow.artifacts.list_for_assessment(scan.id)) == (2 if damage == "duplicate" else 0)
+        assert len(uow.artifacts.list_for_assessment(scan.id)) == (
+            2 if damage == "duplicate" else 0
+        )
 
 
 @pytest.mark.parametrize(
@@ -504,7 +506,8 @@ def test_requeue_does_not_hide_unrelated_scan_corruption(
         seed = Seed(uow)
         owner = (
             seed.repository_ref(seed.repository(url="https://github.com/org/foreign"))
-            if damage == "foreign-scan" else ref
+            if damage == "foreign-scan"
+            else ref
         )
         kind = AssessmentKind.REPO_STATE if damage == "wrong-kind" else AssessmentKind.MANIFEST_SBOM
         scan = seed.assessment(owner, kind=kind)
@@ -745,7 +748,9 @@ def test_reach_report_distinguishes_legacy_unrecognized_and_missing_scans(
         assert ref.id is not None
         service.ingest_sbom(NO_LODASH, ref.id)
     legacy_scan(
-        engine, service, legacy.id,
+        engine,
+        service,
+        legacy.id,
         {"npm": {"a/package.json": "no-lockfile", "b/package.json": "no-lockfile"}},
     )
     legacy_scan(engine, service, unknown.id, {}, assessor="unrecognized-probe")

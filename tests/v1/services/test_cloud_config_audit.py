@@ -788,8 +788,17 @@ def test_recording_only_the_cloud_assessment_does_not_admit_its_judgments(
         lease_generation=run.lease_generation,
     )
     assert assessment.run_order_id == run.id
-    with pytest.raises(ServiceError, match="requires a ledger"):
+    with pytest.raises(ConflictError, match="belongs to order"):
         service.record_audit(audit, ref, unpublished())
+    with pytest.raises(ServiceError, match="requires a ledger"):
+        service.record_audit(
+            audit,
+            ref,
+            unpublished(),
+            run_order_id=run.id,
+            worker=WorkerId("machine:runner"),
+            lease_generation=run.lease_generation,
+        )
     with SqlTraustUnitOfWork(engine) as uow:
         assert uow.decisions.list_for_assessments([assessment.id]) == []
         assert uow.occurrences.list_for_assessment(assessment.id) == []

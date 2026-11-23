@@ -258,7 +258,9 @@ def test_a_non_crypto_fact_from_the_enumerator_is_an_integrity_error(engine: Eng
         code_facts.crypto(commit.id, CHECKOUT)
 
 
-def test_crypto_package_observations_keep_their_scan_coverage(engine: Engine, tmp_path: Path) -> None:
+def test_crypto_package_observations_keep_their_scan_coverage(
+    engine: Engine, tmp_path: Path
+) -> None:
     commit = ref(engine)
     assert commit.id is not None
     empty_sbom = b'{"bomFormat":"CycloneDX","components":[]}'

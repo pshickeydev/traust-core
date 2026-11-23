@@ -371,8 +371,10 @@ def _external_base(text: str) -> bool:
         if op == "copy":
             for flag in flags:
                 key, _, source = flag.lower().partition("=")
-                if key == "--from" and source not in stages and not (
-                    source.isascii() and source.isdecimal() and int(source) < stage_count
+                if (
+                    key == "--from"
+                    and source not in stages
+                    and not (source.isascii() and source.isdecimal() and int(source) < stage_count)
                 ):
                     return True
     return False

@@ -3394,7 +3394,9 @@ def _manifest_report_counts(
         if not scan.current_probe:
             docker_unknown += 1
     return _ManifestReportCounts(
-        ManifestCoverageCounts(without_scan=without_scan, unresolved=dict(sorted(unresolved.items()))),
+        ManifestCoverageCounts(
+            without_scan=without_scan, unresolved=dict(sorted(unresolved.items()))
+        ),
         docker_unknown,
         unknown_probe,
     )
@@ -3823,7 +3825,9 @@ class PqcPortfolioView:
         without_sbom = 0
         for row in rows:
             try:
-                ref, packages = self._code_facts.package_observations(row.readiness.repository_ref_id)
+                ref, packages = self._code_facts.package_observations(
+                    row.readiness.repository_ref_id
+                )
             except NoManifestSbomError:
                 without_sbom += 1
                 continue
@@ -3875,7 +3879,9 @@ class PqcPortfolioView:
         )
         return tuple(index)
 
-    def build_report(self, filter: ViewFilter, generated_at: datetime) -> tuple[PqcPortfolio, Report]:
+    def build_report(
+        self, filter: ViewFilter, generated_at: datetime
+    ) -> tuple[PqcPortfolio, Report]:
         package_refs: dict[UUID | None, list[RepositoryRef]] = {}
         model = self._build(filter, package_refs)
         coverage = {
@@ -3895,7 +3901,8 @@ class PqcPortfolioView:
         coverage: Mapping[
             UUID | None,
             Collection[tuple[UnresolvedManifest, ...] | None] | _ManifestReportCounts,
-        ] | None = None,
+        ]
+        | None = None,
     ) -> Report:
         sections = []
         for scope in model.scopes:
@@ -3903,7 +3910,8 @@ class PqcPortfolioView:
             if coverage is not None:
                 scoped = coverage[scope.product_id]
                 counts = (
-                    scoped if isinstance(scoped, _ManifestReportCounts)
+                    scoped
+                    if isinstance(scoped, _ManifestReportCounts)
                     else _manifest_gap_counts(scoped, len(scope.repositories))
                 )
                 sections.extend(_manifest_gap_sections(counts, "commit", "commits"))
@@ -3996,8 +4004,9 @@ class PqcVendorsView:
         summary = (
             f"Claims v{model.version} (updated {model.updated}): curated status claims dated per "
             "row; re-verify before external use. The delegated / blocked-external class: crypto "
-            "the fleet cannot fix locally, sorted worst first. Observed counts are the repositories "
-            f"whose default-branch manifest SBOM holds a vendor's packages ({measured} of "
+            "the fleet cannot fix locally, sorted worst first. Observed counts are the "
+            "repositories whose default-branch manifest SBOM holds a vendor's packages "
+            f"({measured} of "
             f"{model.repositories} measured; the rest are not measured, not zero)."
             " A zero count does not prove absence where manifest coverage is unknown."
         )

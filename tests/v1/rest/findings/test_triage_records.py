@@ -704,7 +704,8 @@ def test_reclaimed_triage_returns_original_and_refuses_stale_attempt_bytes_and_b
             seed.occurrence(finding, other)
         uow.commit()
     claimed = world.client.post(
-        "/v1/orders/claim", json={"order_id": str(world.order_id), "lease_seconds": 60},
+        "/v1/orders/claim",
+        json={"order_id": str(world.order_id), "lease_seconds": 60},
         headers=headers,
     )
     assert claimed.status_code == 200, claimed.text

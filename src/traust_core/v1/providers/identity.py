@@ -103,7 +103,7 @@ class TokenIdentityProvider:
     def check(self) -> Readiness:
         """Probe each trusted issuer's verification keys without minting a token."""
         gaps = []
-        for index, (name, issuer) in enumerate(self._issuers.items()):
+        for index, (name, _issuer) in enumerate(self._issuers.items()):
             setting = f"identity.issuers[{index}]"
             client = self._remote.get(name)
             if not name.strip() or name == LOCAL_ISSUER:

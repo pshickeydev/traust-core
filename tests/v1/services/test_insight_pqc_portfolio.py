@@ -219,9 +219,7 @@ def test_crypto_package_report_distinguishes_unbacked_sboms_from_observed_packag
 ) -> None:
     world = World(engine, None)
     positive = world.ref()
-    empty = world.ref(
-        url=f"{URL}-unbacked", sbom=b'{"bomFormat":"CycloneDX","components":[]}'
-    )
+    empty = world.ref(url=f"{URL}-unbacked", sbom=b'{"bomFormat":"CycloneDX","components":[]}')
     world.pqc.record(positive, report(), PROVENANCE)
     world.pqc.record(empty, report(metadata=meta(f"{URL}-unbacked")), PROVENANCE)
     view = PqcPortfolioView(world.pqc, world.code_facts, world.portfolio)

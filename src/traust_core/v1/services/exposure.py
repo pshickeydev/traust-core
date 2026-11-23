@@ -657,7 +657,9 @@ class ExposureService:
                         self._scan_coverage(ref, held_scan, artifact)
                     log.warning(
                         "requeueing manifest scan %s of ref %s with %s coverage documents",
-                        scan_id, ref.id, len(documents),
+                        scan_id,
+                        ref.id,
+                        len(documents),
                     )
                     coverage[ref.id] = ManifestScanCoverage(None, False)
                     continue
@@ -819,9 +821,7 @@ class ExposureService:
             )
         gaps = {p.ecosystem: coverage.for_ecosystem(p.ecosystem) for p, _ in candidates}
         held = [
-            (package, rows)
-            for package, rows in candidates
-            if rows or gaps[package.ecosystem] != ()
+            (package, rows) for package, rows in candidates if rows or gaps[package.ecosystem] != ()
         ]
         prepared = []
         for package, rows in held if any(rows for _, rows in held) else candidates:
