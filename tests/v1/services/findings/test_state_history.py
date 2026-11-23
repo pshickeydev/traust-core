@@ -215,3 +215,24 @@ def test_restamp_all_stamps_every_finding_decided_or_not(engine: Engine) -> None
         )
     assert rows[str(identified.id)] == ("open", "high", False)
     assert rows[str(refuted.id)][0] == "false_positive" and bool(rows[str(refuted.id)][2])
+
+
+def test_a_branch_scoped_resolution_never_closes_the_default_line(engine: Engine) -> None:
+    """The stamp folds the unsaved draft: its line comes from its ref, not from an id it
+    does not have yet, so a branch statement cannot resolve the default line's finding."""
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        repository = seed.repository(url="https://github.com/example/branch-close")
+        seed.repository_ref(repository, is_default=True)
+        branch = seed.repository_ref(repository, name="feature-x")
+        finding = seed.finding(repository)
+        uow.commit()
+    assert branch.id is not None
+    service = decisions_service(engine)
+    service.decide(_say(finding.id, resolution="resolved", repository_ref_id=branch.id), ALICE)
+    with SqlTraustUnitOfWork(engine) as uow:
+        (said,) = uow.decisions.list_for_finding(finding.id)
+        assert said.folded_state == "open"  # the branch statement does not close the finding
+        row = uow.findings.get(finding.id)
+        fresh = state_history.fold(uow, RATING, finding.id, row.kind, [said])
+        assert (said.folded_state, said.folded_severity) == (fresh.state, fresh.severity)

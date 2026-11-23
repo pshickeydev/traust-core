@@ -177,15 +177,21 @@ class FindingIntake:
         )
 
     def _restamp(self, finding_ids: Iterable[UUID]) -> None:
-        # after the commit, in short batches: a rescan never holds a finding's row while a
-        # person decides on it (the stamp is refolded from what is recorded: it trails, never
+        # after the commit, in short batches on their own connections: a rescan never holds
+        # a finding's row while a person decides on it, and the stamp never joins a caller's
+        # open transaction (the stamp is refolded from what is recorded: it trails, never
         # diverges)
         ids = list(dict.fromkeys(finding_ids))
-        for start in range(0, len(ids), _RESTAMP_BATCH):
-            with self._uow as uow:
-                for finding_id in ids[start : start + _RESTAMP_BATCH]:
-                    state_history.restamp(uow, self._rating, finding_id)
-                uow.commit()
+
+        def batches() -> None:
+            for start in range(0, len(ids), _RESTAMP_BATCH):
+                with self._uow.independent() as uow:
+                    for finding_id in ids[start : start + _RESTAMP_BATCH]:
+                        state_history.restamp(uow, self._rating, finding_id, self._cvss)
+                    uow.commit()
+
+        # a caller's open transaction owns the wait; with none open, the batches run now
+        self._uow.after_commit(batches)
 
     def check(self, repository_id: UUID, candidates: Sequence[FindingCandidate]) -> None:
         """Refuse, writing nothing, what `accept` would refuse: lets a caller check before it

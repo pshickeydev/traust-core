@@ -91,11 +91,19 @@ def _app(config: Config, config_path: Path | None, role: Role = Role.ALL):
     return create_app(context, role)
 
 
-def _report_worker(config: Config, config_path: Path | None) -> int:
+def _report_context(config: Config, config_path: Path | None) -> Context:
+    """The reports role's context, wired like the API's: feeds registered, the rate card
+    when the deployment ships one — a freshness report names its feed sources."""
     context = Context(config)
     context.configure_logging()
+    context.register_feeds()
     if (rate_card := _rate_card(config_path)) is not None:
         context.register_model_catalog(rate_card)
+    return context
+
+
+def _report_worker(config: Config, config_path: Path | None) -> int:
+    context = _report_context(config, config_path)
     services = context.services()
     worker = ReportWorker(
         services.ops, services.reports, WorkerId(f"reports-{socket.gethostname()}-{os.getpid()}")

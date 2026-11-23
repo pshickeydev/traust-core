@@ -168,3 +168,18 @@ def test_the_oldest_open_age_ignores_closed_findings(backend: str, tmp_path) -> 
         )
         age = results.rows[0].measures["oldest_open_age"]
         assert age is not None and age < 1  # days: the open ones are new; the resolved one is not
+
+
+@pytest.mark.parametrize("backend", SQL_BACKENDS)
+def test_a_team_scoped_query_counts_the_teams_repositories(backend: str, tmp_path) -> None:
+    with contract_db(backend, tmp_path) as engine:
+        seeded = _seed(engine)
+        with SqlTraustUnitOfWork(engine) as uow:
+            team = Seed(uow).team()
+            Seed(uow).ownership(repository_id=seeded["repo"], team=team)
+            uow.commit()
+        assert team.id is not None
+        results = _service(engine).query(
+            DashboardQuery(subject="findings", team_ids=(team.id,), measures=("findings",))
+        )
+        assert results.rows[0].measures["findings"] == 5  # the team's repository, not the estate

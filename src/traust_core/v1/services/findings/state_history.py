@@ -71,7 +71,8 @@ def fold(
     if judged:
         lines: dict[UUID, bool] = {}
         if any(d.assessment_id is not None or d.repository_ref_id is not None for d in judged):
-            refs = Inventory(uow).census_refs_of([finding_id])
+            repository_id = uow.findings.get(finding_id).repository_id
+            refs = Inventory(uow).census_refs_of([repository_id])
             log = AssessmentLog(uow)
             assessments = {d.assessment_id for d in judged if d.assessment_id is not None}
             rows = {row.id: row for row in log.census_by_ids(assessments)} if assessments else {}

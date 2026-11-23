@@ -220,3 +220,8 @@ def test_the_reports_role_runs_the_report_worker_and_no_server(
         server.main(["--config", str(config), "--role", "reports"])
     assert exited.value.code == 0
     assert isinstance(ran["worker"], ReportWorker) and "uvicorn" not in ran
+
+
+def test_the_report_context_registers_the_feeds_the_api_path_gets(tmp_path: Path) -> None:
+    context = server._report_context(Config(home=tmp_path), None)
+    assert context.feed_sources.names()  # a freshness report names its feed sources

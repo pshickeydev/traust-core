@@ -77,11 +77,7 @@ class DashboardService:
                 if ref.repository_id is not None
             )
         for team in query.team_ids:
-            ids.update(
-                repository.id
-                for repository in self._portfolio.list_owned_repositories(team, None)
-                if repository.id is not None
-            )
+            ids.update(self._portfolio.list_owned_repositories(team, None))
         return frozenset(ids)
 
 

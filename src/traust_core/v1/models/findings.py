@@ -1125,7 +1125,7 @@ def effective_decisions(
 
 
 def folded_resolutions(
-    decisions: Sequence[Decision], on_default_line: Mapping[UUID, bool]
+    decisions: Sequence[Decision], on_default_line: Mapping[UUID | None, bool]
 ) -> list[Decision]:
     """The resolving decisions `Disposition.fold` reads resolution from: the default line's,
     else the line-free ones."""
@@ -1150,9 +1150,9 @@ def _strongest(statements: Sequence[_Statement], field: str) -> _Statement | Non
     return next(s for s in reversed(candidates) if s.strength == strength)
 
 
-def _on_line(said: Sequence[_Statement], lines: Mapping[UUID, bool]) -> list[_Statement]:
+def _on_line(said: Sequence[_Statement], lines: Mapping[UUID | None, bool]) -> list[_Statement]:
     resolving = [s for s in said if s.decision.resolution in _JUDGEMENTS["resolution"]]
-    default = [s for s in resolving if s.decision.id is not None and lines.get(s.decision.id)]
+    default = [s for s in resolving if lines.get(s.decision.id)]
     return default or [s for s in resolving if s.decision.id not in lines]
 
 
@@ -1206,7 +1206,7 @@ class Disposition(Model):
         cls,
         finding_id: UUID,
         decisions: Sequence[Any],
-        on_default_line: Mapping[UUID, bool] | None = None,
+        on_default_line: Mapping[UUID | None, bool] | None = None,
         *,
         normalize: Callable[[Any], Any] = normalize_decision,
     ) -> Disposition:
