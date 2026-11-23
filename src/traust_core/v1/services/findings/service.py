@@ -90,8 +90,6 @@ from traust_core.v1.services.artifact_publishing import (
 from traust_core.v1.services.findings.census import (
     FindingCensus,
     FindingCensusRow,
-    ProjectedCensus,
-    ProjectedRollup,
 )
 from traust_core.v1.services.findings.claims import FindingClaims, retained_claim_artifact
 from traust_core.v1.services.findings.decisions import FindingDecisions
@@ -847,14 +845,6 @@ class FindingService:
         with self._uow as uow:
             for rows in self._census.rows(uow, repository_ids, as_of):
                 count(rows)
-
-    def projected_census(self, repository_ids: Collection[UUID]) -> ProjectedRollup:
-        """The rollup's counted facts off the stamped projection: grouped tallies for the
-        unclaimed bulk, census rows for the claim-carrying few, the top cut bounded — the
-        same counted facts the fold serves, at a fraction of its cost. Point-in-time
-        consumers keep `census`: the projection is the current fold only."""
-        with self._uow as uow:
-            return self._projected.rows(uow, repository_ids)
 
     def on_ref(self, repository_ref_id: UUID) -> list[FindingView]:
         """Findings reported on this named line, with resolution folded on that line."""
