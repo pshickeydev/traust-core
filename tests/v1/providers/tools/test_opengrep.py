@@ -891,7 +891,12 @@ def test_scan_forwards_the_supplements_and_never_loads_config(
 
     def execute(_target: Path, _sources: Any, **kw: Any) -> dict[str, Any]:
         seen.update(kw)
-        return {"facts": [], "opengrep_version": "test"}
+        return {
+            "facts": [],
+            "opengrep_version": "test",
+            "outcome": "succeeded",
+            "stats": {"skipped_rules": 0},
+        }
 
     monkeypatch.setattr(R, "execute_scan", execute)
     monkeypatch.setattr(R.shutil, "which", lambda _: "/usr/bin/opengrep")
@@ -907,8 +912,51 @@ def test_scan_forwards_the_supplements_and_never_loads_config(
         load=yaml_documents,
         clock=clock,
         supplements=(supplement,),
+        additive=("custom-pack",),
     )
     assert seen["supplements"] == (supplement,)
+    assert seen["additive"] == ("custom-pack",)
+
+
+@pytest.mark.parametrize(
+    "partial",
+    [
+        {"skipped_rules": ["PRIVATE_NATIVE_SENTINEL"]},
+        {"errors": [{"type": "ParseError", "message": "PRIVATE_NATIVE_SENTINEL"}]},
+    ],
+)
+def test_artifact_scan_refuses_partial_native_coverage_without_disclosing_output(
+    pack: Path, target: Path, monkeypatch: pytest.MonkeyPatch, partial: dict[str, Any]
+) -> None:
+    monkeypatch.setattr(R.shutil, "which", lambda _: "/usr/bin/opengrep")
+    with pytest.raises(ScannerError, match="incomplete rule coverage") as caught:
+        R.scan(
+            target,
+            pack,
+            runner=runner(Runner({"results": [], **partial})),
+            checkouts=NEVER,
+            clock=FIXED_CLOCK,
+            load=yaml_documents,
+        )
+    assert caught.value.reason == ScannerFailure.OUTPUT
+    assert "PRIVATE_NATIVE_SENTINEL" not in str(caught.value)
+
+
+def test_artifact_scan_cannot_combine_replacement_and_additive_sources(
+    pack: Path, target: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(R.shutil, "which", lambda _: "/usr/bin/opengrep")
+    with pytest.raises(ValidationError, match="cannot be combined"):
+        R.scan(
+            target,
+            pack,
+            rules=("replacement",),
+            additive=("custom-pack",),
+            runner=runner(Runner()),
+            checkouts=NEVER,
+            clock=FIXED_CLOCK,
+            load=yaml_documents,
+        )
 
 
 def test_scan_refuses_a_missing_target_or_binary(
