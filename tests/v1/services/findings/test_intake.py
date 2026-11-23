@@ -11,6 +11,7 @@ from uuid import UUID, uuid4
 
 import pydantic
 import pytest
+import sqlalchemy as sa
 from sqlalchemy.engine import Engine
 
 from tests.v1.conftest import SQL_BACKENDS, contract_db
@@ -667,3 +668,39 @@ def test_a_moved_repositorys_findings_keep_their_identity(engine: Engine, target
         original.fingerprint,
     )
     assert [o.assessment_id for o in got["occurrences"]] == [first, second]
+
+
+def _stamp(engine: Engine, finding_id: UUID) -> tuple[str | None, str | None]:
+    with SqlTraustUnitOfWork(engine) as uow:
+        return uow.connection.execute(
+            sa.text("SELECT current_state, current_severity FROM finding WHERE id = :id"),
+            {"id": str(finding_id)},
+        ).one()
+
+
+def test_the_restamp_after_a_standalone_intake_commits(engine: Engine, target: Target) -> None:
+    """The stamp batches commit on their own connections, so a standalone intake's
+    restamp survives its scope."""
+    run = audit(engine, target)
+    result = intake(engine).accept(run, [candidate(target)])
+    finding_id = result.findings[Label("OPERATOR-abcdef0-001")]
+    assert _stamp(engine, finding_id) == ("open", "high")
+
+
+def test_the_restamp_never_joins_the_callers_open_transaction(
+    engine: Engine, target: Target
+) -> None:
+    """A rescan inside a caller's transaction: the stamp waits for that transaction's
+    commit and runs on its own connection, so its row locks never ride the caller's."""
+    run = audit(engine, target)
+    service = intake(engine)
+    with service._uow as uow:
+        result = service.accept(run, [candidate(target)])
+        finding_id = result.findings[Label("OPERATOR-abcdef0-001")]
+        mid = uow.connection.execute(
+            sa.text("SELECT current_severity FROM finding WHERE id = :id"),
+            {"id": str(finding_id)},
+        ).scalar_one()
+        assert mid is None  # not joined: the restamp waits for the commit
+        uow.commit()
+    assert _stamp(engine, finding_id) == ("open", "high")

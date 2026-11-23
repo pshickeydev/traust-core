@@ -269,7 +269,7 @@ class FindingCensus:
         decisions: Mapping[UUID, Sequence[CensusDecision]],
         categories: Mapping[UUID, str | None],
         claims: Mapping[UUID, Sequence[ApprovedClaim]],
-        lines: Mapping[UUID, bool],
+        lines: Mapping[UUID | None, bool],
         authority: Mapping[UUID, Sequence[CvssScore]],
     ) -> FindingCensusRow | None:
         finding_id, repository_id, kind, title, _, advisory_id = finding

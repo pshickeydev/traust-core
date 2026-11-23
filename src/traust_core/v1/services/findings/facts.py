@@ -39,7 +39,7 @@ class FindingFacts:
     cwes: Mapping[UUID, Sequence[str]]
     labels: Mapping[UUID, Sequence[FindingLabel]]
     assessments: Mapping[UUID, Assessment]
-    lines: Mapping[UUID, bool]
+    lines: Mapping[UUID | None, bool]
     claims: Mapping[UUID, Sequence[ApprovedClaim]] = field(default_factory=dict)
     # every authority's scores by the advisory a finding names: today's, whatever `until` is
     authority: Mapping[UUID, Sequence[CvssScore]] = field(default_factory=dict)
@@ -162,9 +162,10 @@ def decision_lines(
     baselines: Mapping[UUID, Assessment],
     refs: Sequence[RepositoryRef],
     repository_ref_id: UUID | None = None,
-) -> dict[UUID, bool]:
+) -> dict[UUID | None, bool]:
     """Assessments are ref-bound; unscoped human statements remain line-free.
-    Without an observed default branch, default-line reads cannot split a repository's refs."""
+    Without an observed default branch, default-line reads cannot split a repository's refs.
+    The one unsaved decision a stamp folds keys its line by None."""
     if repository_ref_id is None:
         observed = {r.repository_id for r in refs if r.is_default}
         refs = [r for r in refs if r.repository_id in observed]
@@ -180,10 +181,9 @@ def decision_lines(
         if judged is not None and judged.baseline_assessment_id is not None:
             judged = baselines[judged.baseline_assessment_id]
         ref = judged.repository_ref_id if judged is not None else d.repository_ref_id
-        if (
-            d.id is not None
-            and ref is not None
-            and (ref in on or ref in named or (judged is not None and ref in recorded))
-        ):
+        qualifies = ref is not None and (
+            ref in on or ref in named or (judged is not None and ref in recorded)
+        )
+        if qualifies:
             lines[d.id] = ref in on
     return lines

@@ -58,6 +58,9 @@ Python 3.11+ library. The platform API lives in `traust_core.v1`. Overview: [REA
   - lists are paged with a cursor (`Page`); filters are query parameters on the collection
   - every request carries a request ID (accept `X-Request-ID` or W3C `traceparent`, else mint one), returned in the response and in every log line it causes
   - one structured access-log line per request: method, route, status, duration, request ID, caller
+- **Dashboards and reports are separate domains.** `services/dashboards/` answers `POST /v1/dashboards:query` with one SQL statement over the facts (`SqlDashboardFacts`) — catalog-bounded, repository-id-filtered, state read from the stamped fold (`decision.folded_state`), never recomputed per request; `dashboards/` never imports the fold (`all_in`, `census_fold`, the findings aggregation). `services/reports.py` runs reports as jobs: a request queues a `report` order, the reports role builds it in its own process, and the published artifact records its scope. The two domains never import each other
+- The dashboard catalog (subjects, dimensions, measures) is `models/dashboard.py` — the single source of truth; contracts holds no vocabulary, and the SDK generates from core's published models
+- **Serving splits by role** (`rest/roles.py`): `traust-server --role query|command|ops|reports`, default `all`. Every route belongs to exactly one role; health and identity serve in every role; the reports role serves no routes — it is the worker that builds report orders
 
 ## Contracts
 
