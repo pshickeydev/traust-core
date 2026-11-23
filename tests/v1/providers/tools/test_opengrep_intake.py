@@ -6,6 +6,7 @@ import os
 import shutil
 from collections.abc import Sequence
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -17,6 +18,7 @@ from tests.v1.providers.tools.opengrep_fixtures import write_rule
 from tests.v1.providers.tools.test_opengrep_quality import NativeRunner
 from traust_core.v1.context.documents import yaml_documents
 from traust_core.v1.errors import ValidationError
+from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.process import ProcessResult, ProcessRunner
 from traust_core.v1.providers.tools import opengrep_additions as additions
 from traust_core.v1.providers.tools import opengrep_quality as quality
@@ -27,6 +29,8 @@ from traust_core.v1.providers.tools.opengrep import (
     intake_rules,
 )
 from traust_core.v1.providers.tools.opengrep_quality import SourceLimits, checked_rules
+
+FIXED_CLOCK = FixedClock(datetime(2026, 1, 1, tzinfo=UTC))
 
 
 def admit(
@@ -44,6 +48,7 @@ def admit(
         load=yaml_documents,
         timeout=30,
         binary="opengrep",
+        clock=FIXED_CLOCK,
     )
 
 
@@ -101,6 +106,14 @@ def test_file_admission_keeps_paired_fixtures_and_credits_not_neighbor_rules(
     config = write_rule(tmp_path / "source", "selected-rule", name="selected")
     write_rule(config.parent, "neighbor-rule", name="neighbor")
     (config.parent / "LICENSE.txt").write_bytes(b"License\n")
+    for name in ("LICENSE", "NOTICE.private", "AUTHORS"):
+        unrelated = config.parent / name
+        unrelated.mkdir()
+        (unrelated / "private.txt").write_text("Unrelated private content\n")
+    private = tmp_path / "private.txt"
+    private.write_text("Private symlink target\n")
+    (config.parent / "COPYING").symlink_to(private)
+    (config.parent / "COPYRIGHT").symlink_to(config.parent / "LICENSE", target_is_directory=True)
     destination = tmp_path / "accepted"
 
     report = admit([config], destination, NativeRunner())
@@ -441,6 +454,7 @@ def test_pinned_https_intake_preserves_fixtures_and_attribution(
         load=yaml_documents,
         timeout=30,
         binary="opengrep",
+        clock=FIXED_CLOCK,
     )
     assert report["admitted"]
     assert report["applied"][0]["source"] == f"{forge.url}@{sha}"
@@ -495,12 +509,26 @@ def test_real_native_directory_fixtures_survive_admission_and_additive_scanning(
         )
     baseline = write_rule(tmp_path / "baseline", "baseline-rule").parent
     destination = tmp_path / "accepted"
-    runner = ProcessRunner(("opengrep",))
+
+    class RecordingRunner(ProcessRunner):
+        def __init__(self) -> None:
+            super().__init__(("opengrep",))
+            self.calls: list[tuple[str, ...]] = []
+
+        def run(self, argv: Sequence[str], **kwargs: Any) -> ProcessResult:
+            self.calls.append(tuple(argv))
+            return super().run(argv, **kwargs)
+
+    runner = RecordingRunner()
 
     report = admit([config if file_source else config.parent], destination, runner, pack=baseline)
 
     assert report["admitted"] is valid, report
     assert destination.exists() is valid
+    native_tests = [call for call in runner.calls if call[1] == "test"]
+    assert sum("--config" in call for call in native_tests) == 2
+    assert sum("--config" not in call for call in native_tests) == (0 if file_source else 1)
+    assert all(len(call) == (7 if "--config" in call else 5) for call in native_tests)
     if not valid:
         assert any(
             check["name"] == "test" and not check["passed"] for check in report["quality_checks"]
@@ -523,6 +551,7 @@ def test_real_native_directory_fixtures_survive_admission_and_additive_scanning(
         checkouts=NoCheckouts(),
         load=yaml_documents,
         additive=[str(destination)],
+        clock=FIXED_CLOCK,
     )
     expected = {"baseline-rule", "directory-rule"}
     if not file_source:
@@ -679,6 +708,7 @@ def test_empty_supplement_owner_still_reserves_its_ids_before_admission(tmp_path
         load=yaml_documents,
         timeout=30,
         binary="opengrep",
+        clock=FIXED_CLOCK,
     )
 
     assert not report["admitted"]
@@ -742,3 +772,41 @@ def test_root_attribution_bytes_share_the_source_capture_budget(tmp_path: Path) 
 
     assert not destination.exists()
     assert not list(tmp_path.glob(".opengrep-intake-*"))
+
+
+def test_intake_uses_callers_deadline_before_publishing(tmp_path: Path) -> None:
+    class AdvancingClock:
+        instant = datetime(2026, 1, 1, tzinfo=UTC)
+
+        def now(self) -> datetime:
+            return self.instant
+
+    clock = AdvancingClock()
+
+    class SlowValidation(NativeRunner):
+        def run(self, argv: Sequence[str], **kwargs: Any) -> ProcessResult:
+            result = super().run(argv, **kwargs)
+            if argv[1] == "validate":
+                clock.instant += timedelta(seconds=3)
+            return result
+
+    config = write_rule(tmp_path / "source")
+    baseline = tmp_path / "baseline"
+    baseline.mkdir()
+    destination = tmp_path / "accepted"
+    report = intake_rules(
+        [str(config.parent)],
+        destination,
+        pack=baseline,
+        supplements=(),
+        runner=SlowValidation(),
+        clock=clock,
+        checkouts=NoCheckouts(),
+        load=yaml_documents,
+        timeout=2,
+        binary="opengrep",
+    )
+
+    assert report["admitted"] is False
+    assert any(item["check"] == "budget" for item in report["refused"])
+    assert not destination.exists()

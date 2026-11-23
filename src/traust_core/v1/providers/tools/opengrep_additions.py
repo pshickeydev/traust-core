@@ -20,7 +20,6 @@ from pathlib import Path
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.models import rule_checks
 from traust_core.v1.models.rule_mining import ProposalCheckName
-from traust_core.v1.providers.clock import SystemClock
 from traust_core.v1.providers.config_matrix import YamlLoader
 from traust_core.v1.providers.process import ProcessRunner
 from traust_core.v1.providers.tools.opengrep_quality import (
@@ -32,6 +31,7 @@ from traust_core.v1.providers.tools.opengrep_quality import (
     checked_rules,
     fixture_files,
     fixture_target,
+    native_calls,
     read_rule_text,
     rule_files,
 )
@@ -284,6 +284,7 @@ def _copy_pack(
     budget: SourceBudget,
     names: Sequence[str] | None = None,
     depth: int = 0,
+    regular_only: Sequence[str] = (),
 ) -> None:
     if depth > budget.limits.depth:
         raise SourceBudgetError("rule source exceeds depth budget")
@@ -300,6 +301,8 @@ def _copy_pack(
             continue
         budget.entry(destination / name)
         mode = os.stat(name, dir_fd=source, follow_symlinks=False).st_mode
+        if name in regular_only and not stat.S_ISREG(mode):
+            raise ValidationError(f"rule pack credit is not a regular file: {name}")
         target = destination / name
         if stat.S_ISDIR(mode):
             descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=source)
@@ -358,7 +361,7 @@ def _copy_attribution(root: Path, source: Path, target: Path, budget: SourceBudg
             budget.entry(attribution)
             attribution.mkdir()
             target = attribution
-        _copy_pack(descriptor, target, budget, names)
+        _copy_pack(descriptor, target, budget, names, regular_only=names)
     finally:
         os.close(descriptor)
 
@@ -411,22 +414,25 @@ def capture_rules(
                     descriptor = _open_directory(source.parent)
                     try:
                         names = []
+                        credits = []
                         with os.scandir(descriptor) as entries:
                             for entry in entries:
                                 budget.entry(source.parent / entry.name)
-                                if (
-                                    entry.name in (source.name, source.stem)
-                                    or (
-                                        entry.name.startswith(source.stem + ".")
-                                        and (
-                                            Path(entry.name).suffix not in (".yaml", ".yml")
-                                            or ".test." in entry.name
-                                        )
+                                paired = entry.name in (source.name, source.stem) or (
+                                    entry.name.startswith(source.stem + ".")
+                                    and (
+                                        Path(entry.name).suffix not in (".yaml", ".yml")
+                                        or ".test." in entry.name
                                     )
-                                    or entry.name.lower().startswith(_CREDITS)
+                                )
+                                if paired:
+                                    names.append(entry.name)
+                                elif entry.name.lower().startswith(_CREDITS) and stat.S_ISREG(
+                                    entry.stat(follow_symlinks=False).st_mode
                                 ):
                                     names.append(entry.name)
-                        _copy_pack(descriptor, target, budget, names)
+                                    credits.append(entry.name)
+                        _copy_pack(descriptor, target, budget, names, regular_only=credits)
                     finally:
                         os.close(descriptor)
                     inputs.append(target / source.name)
@@ -491,10 +497,10 @@ def vet_rules(
     protected: Mapping[str, str],
     languages: set[str] | None,
     limits: SourceLimits | None = None,
-    budget: NativeBudget | None = None,
+    budget: NativeBudget,
 ) -> Iterator[RuleBatch]:
     """Isolate native failures by bounded bisection, retaining accepted snapshots."""
-    native_budget = budget if budget is not None else NativeBudget(SystemClock(), seconds=timeout)
+    native_budget = budget
     source_budget = SourceBudget(limits)
     with tempfile.TemporaryDirectory(prefix="opengrep-additive-") as tmp, ExitStack() as held:
         candidates: dict[Path, RuleReceipt] = {}
@@ -509,6 +515,7 @@ def vet_rules(
                 )
                 candidates.update(good)
                 refused.extend(bad)
+            native_budget.plan(native_calls(tuple(candidates)) + 128, extend=True)
         except (SourceBudgetError, NativeBudgetError) as error:
             check = (
                 AdditionCheck.BUDGET

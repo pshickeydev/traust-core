@@ -36,6 +36,8 @@ from traust_core.v1.providers.tools.opengrep_quality import (
     checked_rules,
 )
 
+FIXED_CLOCK = FixedClock(datetime(2026, 1, 1, tzinfo=UTC))
+
 
 class NativeRunner:
     def __init__(self, failure: str = "") -> None:
@@ -120,6 +122,7 @@ def test_failed_native_quality_never_scans_the_checkout(tmp_path: Path, failure:
             runner=runner,
             checkouts=NoCheckouts(),
             load=yaml_documents,
+            clock=FIXED_CLOCK,
         )
     assert not runner.scanned
 
@@ -190,6 +193,7 @@ def test_an_abnormal_scan_exit_is_not_accepted_because_json_exists(tmp_path: Pat
             runner=NativeRunner("scan-exit"),
             checkouts=NoCheckouts(),
             load=yaml_documents,
+            clock=FIXED_CLOCK,
         )
     assert caught.value.reason is ScannerFailure.EXIT
     assert caught.value.exit_code == 7
@@ -211,6 +215,7 @@ def test_real_native_gate_enables_a_namespaced_local_adopter_rule(tmp_path: Path
         checkouts=NoCheckouts(),
         load=yaml_documents,
         supplements=(SupplementalPack("acme", str(custom.parent), ("acme.security.rule",)),),
+        clock=FIXED_CLOCK,
     )
     assert {fact["rule_id"] for fact in result["facts"]} == {"builtin-rule", "acme.security.rule"}
     assert result["supplemental_packs"]["applied"] == ["acme"]
@@ -235,6 +240,7 @@ def test_invalid_adopter_behavior_does_not_fall_back_to_builtin_rules(tmp_path: 
             checkouts=NoCheckouts(),
             load=yaml_documents,
             supplements=(SupplementalPack("acme", str(custom.parent), ("acme-rule",)),),
+            clock=FIXED_CLOCK,
         )
 
 
@@ -429,6 +435,7 @@ def test_version_output_cannot_serialize_private_native_text(tmp_path: Path) -> 
             runner=SensitiveVersion(),
             checkouts=NoCheckouts(),
             load=yaml_documents,
+            clock=FIXED_CLOCK,
         )
     assert caught.value.reason is ScannerFailure.OUTPUT
     assert "PRIVATE_NATIVE_SENTINEL" not in str(caught.value)
@@ -491,6 +498,7 @@ def test_optional_source_budget_failure_preserves_the_baseline_scan(
         checkouts=NoCheckouts(),
         load=yaml_documents,
         additive=[str(source)],
+        clock=FIXED_CLOCK,
     )
 
     assert result["quality_checks"]
@@ -535,6 +543,7 @@ def test_native_bisection_keeps_valid_sibling_snapshots_alive(tmp_path: Path) ->
         timeout=30,
         protected={},
         languages=None,
+        budget=NativeBudget(FixedClock(datetime(2026, 1, 1, tzinfo=UTC))),
     ) as batch:
         assert {receipt.rule_id for receipt in batch.applied} == {
             f"rule-{index}" for index in range(7)
@@ -643,6 +652,7 @@ def test_rule_fixture_fanout_is_bounded_before_any_native_run(tmp_path: Path) ->
         timeout=30,
         protected={},
         languages=None,
+        budget=NativeBudget(FixedClock(datetime(2026, 1, 1, tzinfo=UTC))),
         limits=limits,
     ) as batch:
         assert not batch.applied
@@ -678,3 +688,71 @@ def test_capture_directory_depth_has_a_typed_bound(tmp_path: Path) -> None:
 
     assert not destination.exists()
     assert not list(tmp_path.glob(".opengrep-intake-*"))
+
+
+@pytest.mark.parametrize(("ordinary_count", "fixture_count"), [(129, 2), (1, 130)])
+def test_large_mixed_packs_plan_single_target_native_work(
+    tmp_path: Path, ordinary_count: int, fixture_count: int
+) -> None:
+    source = tmp_path / "source"
+    for index in range(ordinary_count):
+        write_rule(source, f"ordinary-{index}", name=f"ordinary-{index}")
+    directory = write_rule(source, "directory-rule", name="directory")
+    original = directory.with_suffix(".py").read_text()
+    directory.with_suffix(".py").unlink()
+    cases = directory.with_suffix("") / "nested"
+    cases.mkdir(parents=True)
+    for index in range(fixture_count):
+        (cases / f"case-{index}.py").write_text(original)
+
+    class DirectoryRunner(NativeRunner):
+        def run(self, argv: Sequence[str], **kwargs: Any) -> ProcessResult:
+            if "--config" not in argv:
+                if argv[1] == "test":
+                    assert len(argv) == 5
+                return super().run(argv, **kwargs)
+            assert len(argv) == 7
+            self.calls.append(tuple(argv))
+            config, fixture = Path(argv[-2]), Path(argv[-1])
+            rule_id = yaml_documents(config.read_text())[0]["rules"][0]["id"]
+            fire, _ = quality.example_lines(rule_id, fixture.read_text())
+            check = {
+                "passed": True,
+                "errors": [],
+                "matches": {
+                    str(fixture): {
+                        "expected_lines": sorted(fire),
+                        "reported_lines": sorted(fire),
+                    }
+                },
+            }
+            data = {
+                "results": {str(config): {"checks": {rule_id: check}}},
+                "config_missing_tests": [],
+                "config_missing_fixtests": [],
+                "config_with_errors": [],
+                "fixtest_results": {},
+            }
+            return ProcessResult(tuple(argv), 0, json.dumps(data).encode(), b"", 0.01)
+
+    budget = NativeBudget(FixedClock(datetime(2026, 1, 1, tzinfo=UTC)))
+    for _ in range(2):
+        runner = DirectoryRunner()
+        with additions.vet_rules(
+            "optional",
+            [source],
+            runner,
+            load=yaml_documents,
+            binary="opengrep",
+            timeout=30,
+            protected={},
+            languages=None,
+            budget=budget,
+        ) as batch:
+            assert not batch.refused
+            assert len(batch.applied) == ordinary_count + 1
+            assert len(batch.configs) == ordinary_count + 1
+            assert all(config.is_file() for config in batch.configs)
+            assert len(runner.calls) == 2 + fixture_count
+            assert sum(call[1] == "test" and "--config" not in call for call in runner.calls) == 1
+            assert sum("--config" in call for call in runner.calls) == fixture_count

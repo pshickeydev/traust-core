@@ -23,6 +23,8 @@ from pathlib import Path
 from typing import Any, NotRequired, TypedDict
 from urllib.parse import urlsplit
 
+from pydantic import JsonValue
+
 from traust_core.v1.errors import (
     ScannerError,
     ScannerFailure,
@@ -34,7 +36,7 @@ from traust_core.v1.models import rule_checks
 from traust_core.v1.models.artifacts import AdapterResultArtifact
 from traust_core.v1.models.rule_mining import ProposalCheck, RuleHit
 from traust_core.v1.models.values import GitSha, HttpsRepoUrl
-from traust_core.v1.providers.clock import Clock, SystemClock
+from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.config_matrix import YamlLoader
 from traust_core.v1.providers.process import ProcessOutputLimit, ProcessRunner, ProcessTimeout
 from traust_core.v1.providers.sources import CheckoutRequest, Checkouts, Workspace
@@ -150,6 +152,25 @@ THIN_RULE_THRESHOLD = 8
 # The target's own suppression comments (`# nosemgrep`, `// nosem: rule-id`) are repository
 # content, not exemptions: the scan runs with --disable-nosem and flags such facts nosem_marked.
 NOSEM_RE = re.compile(r"\bnosem(?:grep)?\b", re.IGNORECASE)
+
+
+class _FactDocument(TypedDict):
+    rule_id: str
+    severity_hint: str
+    file: str
+    start_line: int
+    end_line: int
+    message: str
+    cwe: list[str]
+    owasp: list[str]
+    owasp_llm: list[str]
+    confidence: JsonValue
+    kind: JsonValue
+    taint: bool
+    snippet: str
+    test_path: bool
+    nosem_marked: bool
+    origin: NotRequired[str]
 
 
 class _ReceiptDocument(TypedDict):
@@ -466,9 +487,9 @@ def _strings(value: Any) -> list[str]:
 
 def normalize(
     raw: dict[str, Any], target: Path, rule_ids: frozenset[str] = frozenset()
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+) -> tuple[list[_FactDocument], list[dict[str, Any]]]:
     """opengrep's JSON as (facts, engine errors)."""
-    facts = []
+    facts: list[_FactDocument] = []
     for r in raw.get("results", []):
         extra = r.get("extra", {})
         meta = extra.get("metadata", {}) or {}
@@ -533,7 +554,7 @@ class _AdditionGate:
     load: YamlLoader
     binary: str
     timeout: int
-    budget: NativeBudget | None = None
+    budget: NativeBudget
 
     def reserve(self, supplements: Sequence[SupplementalPack]) -> dict[str, str]:
         ids = dict.fromkeys(protected_ids(self.pack, self.load), "traust rule pack")
@@ -599,6 +620,7 @@ def intake_rules(
     pack: Path,
     supplements: Sequence[SupplementalPack],
     runner: ProcessRunner,
+    clock: Clock,
     checkouts: Checkouts,
     load: YamlLoader,
     timeout: int,
@@ -618,7 +640,7 @@ def intake_rules(
         load,
         binary,
         timeout,
-        NativeBudget(SystemClock(), seconds=timeout),
+        NativeBudget(clock, seconds=timeout),
     )
     resolved, workspaces = resolve_rules(sources, pack, pack, checkouts)
     try:
@@ -739,9 +761,9 @@ def _additive_report(
 
 
 def _filter_additive_hits(
-    batch: RuleBatch, facts: list[dict[str, Any]], scanned: int
-) -> tuple[list[dict[str, Any]], list[RuleReceipt], list[RuleReceipt]]:
-    hits: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    batch: RuleBatch, facts: list[_FactDocument], scanned: int
+) -> tuple[list[_FactDocument], list[RuleReceipt], list[RuleReceipt]]:
+    hits: dict[str, list[_FactDocument]] = defaultdict(list)
     for fact in facts:
         hits[fact["rule_id"]].append(fact)
     kept, applied, refused = [], [], []
@@ -837,7 +859,7 @@ def _run_addition(
 
 @dataclass(slots=True)
 class _AdditiveScan:
-    facts: list[dict[str, Any]] = field(default_factory=list)
+    facts: list[_FactDocument] = field(default_factory=list)
     sources: list[dict[str, Any]] = field(default_factory=list)
     applied: list[RuleReceipt] = field(default_factory=list)
     refused: list[RuleReceipt] = field(default_factory=list)
@@ -911,6 +933,7 @@ def execute_scan(
     *,
     pack: Path,
     runner: ProcessRunner,
+    clock: Clock,
     checkouts: Checkouts,
     load: YamlLoader,
     supplements: Sequence[SupplementalPack] = (),
@@ -992,7 +1015,7 @@ def execute_scan(
             load,
             opengrep_bin,
             timeout,
-            NativeBudget(SystemClock(), seconds=timeout),
+            NativeBudget(clock, seconds=timeout),
         )
         extra = _scan_additions(gate, additive, target, origins)
         facts.extend(extra.facts)
@@ -1103,7 +1126,7 @@ def _scan_snapshot(
     timeout: int,
     *,
     output_limit: int | None = None,
-) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+) -> tuple[dict[str, Any], list[_FactDocument], list[dict[str, Any]]]:
     cmd = [binary, "scan", "--json", "--quiet", "--disable-nosem"]
     for config in configs:
         cmd += ["--config", str(config)]
@@ -1170,7 +1193,7 @@ def format_lines(start: int | None, end: int | None) -> str:
     return f"{start}-{end}" if end and end != start else str(start)
 
 
-def _describe(fact: dict[str, Any]) -> str:
+def _describe(fact: _FactDocument) -> str:
     text = fact.get("message") or ""
     if fact.get("nosem_marked"):
         note = (
@@ -1181,7 +1204,7 @@ def _describe(fact: dict[str, Any]) -> str:
     return text
 
 
-def _findings(facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _findings(facts: list[_FactDocument]) -> list[dict[str, Any]]:
     findings = []
     unidentified = 0
     for fact in facts:
@@ -1238,6 +1261,7 @@ def scan(
         rules,
         pack=pack,
         runner=runner,
+        clock=clock,
         checkouts=checkouts,
         load=load,
         supplements=supplements,

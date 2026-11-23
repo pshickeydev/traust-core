@@ -99,20 +99,30 @@ class NativeBudgetError(ValidationError):
 class NativeBudget:
     clock: Clock
     seconds: float = 300
-    calls: int = 128
+    calls: int | None = None
     _started: datetime = field(init=False, repr=False)
+    _automatic: bool = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._started = self.clock.now()
+        self._automatic = self.calls is None
+
+    def plan(self, calls: int, *, extend: bool = False) -> None:
+        if self.calls is None:
+            self.calls = calls
+        elif extend and self._automatic:
+            self.calls += calls
 
     def remaining(self) -> float:
         remaining = self.seconds - (self.clock.now() - self._started).total_seconds()
-        if self.calls <= 0 or remaining <= 0:
+        if (self.calls is not None and self.calls <= 0) or remaining <= 0:
             raise NativeBudgetError("optional rule vetting budget exhausted")
         return remaining
 
     def timeout(self, requested: float) -> float:
         remaining = self.remaining()
+        if self.calls is None:
+            raise NativeBudgetError("optional rule vetting work was not planned")
         self.calls -= 1
         return min(requested, remaining)
 
@@ -287,6 +297,7 @@ def _snapshot(
             # Native pairing ignores dotted config basenames such as rule.skeleton.yaml.
             destination = (
                 root
+                / ("directory-fixtures" if path.with_suffix("").is_dir() else "ordinary")
                 / f"source-{index}"
                 / relative.parent
                 / (relative.name + ".rules")
@@ -383,6 +394,23 @@ def _validate(
     )
 
 
+def _test_targets(root: Path, configs: Sequence[Path]) -> Iterator[tuple[str, ...]]:
+    directories, ordinary = [], []
+    for config in configs:
+        (directories if config.with_suffix("").is_dir() else ordinary).append(config)
+    if ordinary or not directories:
+        yield (str(root / "ordinary"),)
+    for config in directories:
+        # Explicit files avoid older native runners opening paired directories as files.
+        for target in fixture_files(config):
+            if not target.stem.endswith(".fixed"):
+                yield ("--config", str(config), str(target))
+
+
+def native_calls(configs: Sequence[Path]) -> int:
+    return 1 + sum(1 for _ in _test_targets(Path(), configs))
+
+
 def _test_runs(
     root: Path,
     configs: Sequence[Path],
@@ -391,22 +419,8 @@ def _test_runs(
     timeout: int,
     budget: NativeBudget | None,
 ) -> Iterator[ProcessResult]:
-    directories, ordinary = [], []
-    for config in configs:
-        (directories if config.with_suffix("").is_dir() else ordinary).append(config)
-    command = [binary, "test", "--json", "--strict"]
-    if not directories:
-        yield _run(runner, [*command, str(root)], timeout, budget)
-        return
-    for config in ordinary:
-        yield _run(runner, [*command, str(config.parent)], timeout, budget)
-    for config in directories:
-        # Explicit files avoid older native runners opening paired directories as files.
-        for target in fixture_files(config):
-            if not target.stem.endswith(".fixed"):
-                yield _run(
-                    runner, [*command, "--config", str(config), str(target)], timeout, budget
-                )
+    for target in _test_targets(root, configs):
+        yield _run(runner, [binary, "test", "--json", "--strict", *target], timeout, budget)
 
 
 def _tests(
@@ -529,6 +543,8 @@ def checked_rules(
         configs, rules, fixtures, problems = _snapshot(
             sources, root, examples, load, SourceBudget(limits)
         )
+        if budget is not None:
+            budget.plan(native_calls(configs))
         validation = _validate(root, runner, binary, timeout, problems, budget)
         testing = (
             _tests(root, configs, rules, fixtures, runner, binary, timeout, budget)
