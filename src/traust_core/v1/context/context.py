@@ -179,7 +179,12 @@ from traust_core.v1.services.code_facts import CodeFactsService
 from traust_core.v1.services.compliance import GATE, ComplianceService
 from traust_core.v1.services.dashboards import DashboardService
 from traust_core.v1.services.detection_quality import DetectionQualityService
-from traust_core.v1.services.exposure import AdvisoryCvssCache, AdvisoryCvssReader, ExposureService
+from traust_core.v1.services.exposure import (
+    AdvisoryCvssCache,
+    AdvisoryCvssReader,
+    ExposureService,
+    StoredAdvisories,
+)
 from traust_core.v1.services.findings import (
     FindingDecisions,
     FindingIntake,
@@ -1076,6 +1081,7 @@ class Context:
             symbols=self.symbols,
             rating=rating,
             recording=ops,
+            advisories=StoredAdvisories(uow),
         )
         portfolio = PortfolioService(
             uow,

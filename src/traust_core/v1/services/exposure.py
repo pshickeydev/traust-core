@@ -2417,6 +2417,22 @@ def _in_range(
     return True if True in verdicts else None if None in verdicts or not verdicts else False
 
 
+class StoredAdvisories:
+    """The canonical advisory a stored identifier or alias names: a read of what core keeps,
+    never a fetch. Report intake uses it to identify a report's dependency finding the way an
+    impact analysis identifies its own (`ExposureKey`)."""
+
+    def __init__(self, uow: TraustUnitOfWork) -> None:
+        self._uow = uow
+
+    def canonical(self, identifier: str) -> Advisory | None:
+        with self._uow as uow:
+            found = uow.advisories.find_by_identifier(identifier)
+            if found is None or found.alias_of_id is None:
+                return found
+            return uow.advisories.get(found.alias_of_id)
+
+
 def _exposure_candidate(
     repository_id: UUID, doc: ImpactAnalysisArtifact, record: AdvisoryRecord, canonical: Advisory
 ) -> FindingCandidate:

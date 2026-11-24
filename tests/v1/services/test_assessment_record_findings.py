@@ -224,3 +224,72 @@ def test_recording_a_vuln_scan_needs_intake(context: Any, ref: UUID) -> None:
         service.record(
             VULN, ref, AssessmentKind.VULN_SCAN_CANONICAL, "skill:test", "0.1.0", provenance()
         )
+
+
+def _store_advisory(context: Any, identifier: str, *aliases: str) -> UUID:
+    from traust_core.v1.models.dependencies import Advisory
+
+    with SqlTraustUnitOfWork(context.database) as uow:
+        canonical = uow.advisories.get_or_add(Advisory(identifier=identifier))
+        assert canonical.id is not None
+        for alias in aliases:
+            uow.advisories.get_or_add(Advisory(identifier=alias, alias_of_id=canonical.id))
+        uow.commit()
+    return canonical.id
+
+
+def _dependency_finding(label: str, advisory: str) -> dict[str, Any]:
+    return finding(
+        label,
+        "go.mod",
+        title=f"{advisory} in google.golang.org/grpc",
+        category="supply-chain",
+        cwes=["CWE-1395"],
+        dependency={
+            "advisory": advisory,
+            "module": "google.golang.org/grpc",
+            "ecosystem": "go",
+            "installed_version": "v1.56.0",
+            "classification": "likely_affected",
+            "evidence_level": "manifest",
+        },
+    )
+
+
+def test_a_report_dependency_on_a_stored_advisory_is_the_exposure_finding(
+    context: Any, ref: UUID
+) -> None:
+    """A report finding whose dependency names a stored advisory is identified the way an
+    impact analysis identifies its dependency finding: (repository, advisory, package)."""
+    canonical = _store_advisory(context, "GHSA-m425-mq94-257g", "CVE-2023-44487")
+    first = record(
+        context,
+        report(_dependency_finding("GRPC-1", "GHSA-m425-mq94-257g")),
+        ref,
+        AssessmentKind.CONTAINER,
+    )
+    # a later audit names the CVE alias, at another path: still the same finding
+    alias = _dependency_finding("GRPC-9", "CVE-2023-44487")
+    alias["locations"] = [{"path": "vendor/modules.txt"}]
+    second = record(context, report(alias), ref, AssessmentKind.CONTAINER)
+    [a] = _occurrences(context, first.id)
+    [b] = _occurrences(context, second.id)
+    assert a.finding_id == b.finding_id
+    with SqlTraustUnitOfWork(context.database) as uow:
+        found = uow.findings.get(a.finding_id)
+    assert (found.advisory_id, found.fingerprint_algo) == (canonical, "exposure-v1")
+
+
+def test_a_report_dependency_on_an_unknown_advisory_keeps_its_report_identity(
+    context: Any, ref: UUID
+) -> None:
+    assessment = record(
+        context,
+        report(_dependency_finding("GRPC-1", "GHSA-xxxx-yyyy-zzzz")),
+        ref,
+        AssessmentKind.CONTAINER,
+    )
+    [o] = _occurrences(context, assessment.id)
+    with SqlTraustUnitOfWork(context.database) as uow:
+        found = uow.findings.get(o.finding_id)
+    assert found.advisory_id is None and found.fingerprint_algo != "exposure-v1"
