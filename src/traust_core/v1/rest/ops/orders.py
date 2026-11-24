@@ -94,7 +94,7 @@ def claim(body: ClaimRequest, ops: Ops, runner: Runner, request: Request) -> Run
 )
 def start(body: StartRecordingRequest, ops: Ops, caller: Caller, request: Request) -> RunOrder:
     """Start the caller's explicitly dispatched recording run within its server-owned scope;
-    an order awaiting a person's approval is never taken over."""
+    only a queued (admitted) order is taken over, never a planned or awaiting-approval one."""
     order = ops.start_recording(body.order, caller, timedelta(seconds=body.lease_seconds))
     assert order.id is not None
     request.state.order_id = order.id

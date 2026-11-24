@@ -605,8 +605,8 @@ class OpsService:
         self, request: OrderRequest, principal: Principal, worker: WorkerId, lease_for: timedelta
     ) -> RunOrder:
         """A run its runner has already begun (by hand, or a cron job beside the engine), leased to
-        `worker`: the subject's planned or queued order is taken over, one awaiting a person's
-        approval never is, else a new one is stored."""
+        `worker`: the subject's queued (admitted) order is taken over, a planned or awaiting-
+        approval one never is, else a new one is stored."""
         _classifiers(lane=request.lane, event_source=request.event_source)
         self._check_work_item(request)
         now = self._clock.now()
@@ -633,7 +633,13 @@ class OpsService:
                         f"order {current.id}: {current.asset} is awaiting approval — approve it "
                         f"(POST /v1/orders/{current.id}/approve) rather than take it over"
                     )
-                if current.state not in (OrderState.PLANNED, OrderState.QUEUED):
+                if current.state is OrderState.PLANNED:
+                    # not yet admitted: the pack's menu, approval and budget haven't run on it
+                    raise ConflictError(
+                        f"order {current.id}: {current.asset} is awaiting admission — take it "
+                        "over once the engine has queued it"
+                    )
+                if current.state is not OrderState.QUEUED:
                     raise ConflictError(
                         f"order {current.id}: {current.asset} is already {current.state}"
                     )

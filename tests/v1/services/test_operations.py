@@ -364,13 +364,38 @@ def test_start_stores_a_run_already_underway_leased_to_its_runner(engine: Engine
     assert done.state == OrderState.SUCCEEDED
 
 
-@pytest.mark.parametrize("state", ["planned", "queued"])
-def test_start_takes_over_the_subjects_waiting_order(engine: Engine, state: str) -> None:
-    waiting = seeded(engine, asset="feeds_cache", state=state)
+def test_start_takes_over_the_subjects_queued_order(engine: Engine) -> None:
+    waiting = seeded(engine, asset="feeds_cache", state="queued")
     order = ops(engine).start(OrderRequest(asset="feeds_cache", priority=1), OPERATOR, W1, LEASE)
     assert order.id == waiting.id
     assert (order.state, order.lease_holder, order.priority) == (OrderState.LEASED, W1, 5)
     assert ops(engine).claim(W2, LEASE) is None
+
+
+def test_start_refuses_a_planned_order_admission_has_not_seen(engine: Engine) -> None:
+    waiting = seeded(engine, asset="feeds_cache", state="planned")
+    with pytest.raises(ConflictError, match="awaiting admission"):
+        ops(engine).start(OrderRequest(asset="feeds_cache", priority=1), OPERATOR, W1, LEASE)
+    assert ops(engine).get(waiting.id).state == OrderState.PLANNED
+
+
+def test_a_submitted_gated_order_is_taken_over_only_once_admitted_and_approved(
+    engine: Engine,
+) -> None:
+    """The start door can't jump admission: a person's submitted order is refused while
+    planned and while held for approval, and taken over once approval has queued it."""
+    service = ops(engine)
+    submitted = service.submit(OrderRequest(asset="feeds_cache", priority=1), OPERATOR)
+    assert submitted.id is not None
+    start = OrderRequest(asset="feeds_cache", priority=1)
+    with pytest.raises(ConflictError, match="awaiting admission"):
+        service.start(start, OPERATOR, W1, LEASE)
+    service.request_approval(submitted.id)
+    with pytest.raises(ConflictError, match="awaiting approval"):
+        service.start(start, OPERATOR, W1, LEASE)
+    service.approve(submitted.id, OPERATOR)
+    taken = service.start(start, OPERATOR, W1, LEASE)
+    assert (taken.id, taken.state) == (submitted.id, OrderState.LEASED)
 
 
 def test_start_refuses_to_create_a_new_door_only_order(engine: Engine) -> None:
