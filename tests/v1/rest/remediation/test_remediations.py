@@ -45,11 +45,11 @@ def schedule(
     engine: Engine, repository_id: str, finding_ids: list[str], branch: str = BRANCH
 ) -> dict[str, object]:
     """The request, on the repository's remediation fork (ForkPolicy: the convention's plain
-    traust-patch-<name> in the fork org)."""
+    patch-<name> in the fork org)."""
     with SqlTraustUnitOfWork(engine) as uow:
         url = uow.repositories.get(UUID(repository_id)).url
     return {
-        "fork_url": f"https://github.com/mirror-org/traust-patch-{url.rsplit('/', 1)[-1]}",
+        "fork_url": f"https://github.com/mirror-org/patch-{url.rsplit('/', 1)[-1]}",
         "fork_branch": branch,
         "findings": [{"finding_id": f, "repository_id": repository_id} for f in finding_ids],
     }
