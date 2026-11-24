@@ -238,3 +238,38 @@ def test_a_location_path_keeps_its_backslashes_inside_its_code_span() -> None:
     md = render_report(report)
     assert "`src\\auth\\login.go" in md
     assert "src\\\\auth" not in md
+
+
+def _not_affected_row(rationale: str) -> str:
+    report = copy.deepcopy(valid_report())
+    entry = copy.deepcopy(NOT_AFFECTED)
+    entry["rationale"] = rationale
+    report["not_affected"] = [entry]
+    return next(line for line in render_report(report).splitlines() if "CVE-2024-0001" in line)
+
+
+def _live_pipes(row: str) -> int:
+    """Pipes a GFM table splits on: those after an even run of backslashes."""
+    return len(re.findall(r"(?<!\\)(?:\\\\)*\|", row))
+
+
+def test_content_escapes_are_left_inert() -> None:
+    """A rationale's own Markdown escape (an escaped image marker) is not doubled into an
+    active image."""
+    row = _not_affected_row("see \\![alt](https://example.org/pixel)")
+    assert "see \\![alt](https://example.org/pixel)" in row
+    assert "\\\\![alt]" not in row
+
+
+def test_a_pipe_after_a_backslash_inside_a_code_span_stays_in_its_cell() -> None:
+    row = _not_affected_row("the ` x\\|y ` span")
+    assert _live_pipes(row) == 7, row
+
+
+def test_a_long_backtick_run_renders_in_linear_time() -> None:
+    import time
+
+    start = time.monotonic()
+    row = _not_affected_row("`" * 20000 + "|")
+    assert time.monotonic() - start < 1.0
+    assert _live_pipes(row) == 7

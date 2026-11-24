@@ -14,7 +14,6 @@ Report = dict[str, Any]
 # backtick run so evidence can't break out of its block.
 _CTRL_RX = re.compile("[\\x00-\\x08\\x0b\\x0c\\x0e-\\x1f\\x7f\\u202a-\\u202e\\u2066-\\u2069]")
 _BACKTICK_RUN_RX = re.compile(r"`+")
-_CODE_SPAN_RX = re.compile(r"(`+)(.+?)\1")
 
 _SEVERITY_ORDER = ["critical", "high", "medium", "low", "informational"]
 _PEACH_BOUNDARY_LABELS = {
@@ -38,18 +37,16 @@ def _clean_block(text: Any) -> str:
 
 
 def _cell(text: Any) -> str:
-    """One table cell, every pipe escaped. Backslashes double only outside code spans, where
-    `\\|` would leave a live pipe; inside one they are literal (a path keeps its separators)."""
-    clean, out, pos = _clean_inline(text), [], 0
-    for span in _CODE_SPAN_RX.finditer(clean):
-        out += [_escape_text(clean[pos : span.start()]), span.group(0).replace("|", "\\|")]
-        pos = span.end()
-    out.append(_escape_text(clean[pos:]))
+    """One table cell: each pipe ends up after an odd run of backslashes, so it stays escaped
+    in or out of a code span; nothing else changes, so content's own escapes stay inert."""
+    out: list[str] = []
+    run = 0
+    for ch in _clean_inline(text):
+        if ch == "|" and run % 2 == 0:
+            out.append("\\")
+        out.append(ch)
+        run = run + 1 if ch == "\\" else 0
     return "".join(out)
-
-
-def _escape_text(text: str) -> str:
-    return text.replace("\\", "\\\\").replace("|", "\\|")
 
 
 def _fence_for(code: str) -> str:
