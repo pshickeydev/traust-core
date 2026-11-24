@@ -220,7 +220,7 @@ class ReportWorker:
         except Exception:
             log.exception("report order %s failed", order.id)
             result = JobResult.failed(OrderReason.RUNNER_CRASHED)
-        self._ops.complete(order.id, self._worker, result)
+        self._ops.complete(order.id, self._worker, result, lease_generation=order.lease_generation)
         return order.id
 
     def run(self, stop: threading.Event, idle: float = 2.0) -> None:

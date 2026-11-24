@@ -158,16 +158,16 @@ def test_reclaim_during_manifest_publication_fences_the_old_writer(
 ) -> None:
     first = leased(engine)
     service = ops(engine)
-    publish = service._publish
+    stage = service._stage_manifest
     current: RunOrder | None = None
 
-    def publish_then_reclaim(prior: UUID | None, change: Change) -> UUID:
+    def stage_then_reclaim(prior: UUID | None, change: Change):
         nonlocal current
-        artifact_id = publish(prior, change)
+        staged = stage(prior, change)
         current = reclaim_at_same_clock(engine, first)
-        return artifact_id
+        return staged
 
-    monkeypatch.setattr(service, "_publish", publish_then_reclaim)
+    monkeypatch.setattr(service, "_stage_manifest", stage_then_reclaim)
     generation = first.lease_generation
     with pytest.raises(ConflictError):
         if transition == "session":

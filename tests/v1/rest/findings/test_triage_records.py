@@ -469,7 +469,7 @@ def test_a_ready_planner_cannot_admit_an_unready_triage_writer(
     writer.__dict__["database"] = world.context.database
     before = recording_snapshot(world)
     message = "requires a ledger" if ledger is None else "ledger.required: true"
-    with pytest.raises(ServiceError, match=message):
+    with pytest.raises(PreflightError, match=message):
         create_app(writer)
     decisions = writer.services().findings.decisions
     assert decisions.prepare(world.assessment_id).items
