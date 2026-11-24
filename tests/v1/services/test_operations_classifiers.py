@@ -156,6 +156,7 @@ def test_registered_feed_and_view_keys_preserve_their_domain_identifiers(
 
     context.feeds.register("tenant-feed", never_fetch)
     submitted = services.ops.submit(OrderRequest(asset="feeds_cache", priority=1), OPERATOR)
+    services.ops.admit(submitted.id)  # the engine's admission tick queues the planned order
     claimed = services.ops.claim(W1, LEASE)
     assert claimed is not None and claimed.id == submitted.id
     counts = {"tenant-feed": 2, "loc": 1, "db-stale": 1, "osv_unanswered": 3}

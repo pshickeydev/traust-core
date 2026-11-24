@@ -20,8 +20,9 @@ from traust_core.v1.errors import (
 )
 from traust_core.v1.models.artifacts import RunManifestArtifact
 from traust_core.v1.models.common import Page, PageRequest, Provenance, TimeBucket, TimeWindow
-from traust_core.v1.models.identity import Principal
+from traust_core.v1.models.identity import Principal, ref_is_human
 from traust_core.v1.models.operations import (
+    DOOR_ONLY_ASSETS,
     FEED_ORDER_STATES,
     FINISHED_ORDER_STATES,
     REMEDIATE_FINDING,
@@ -180,6 +181,13 @@ class PolicyDenied(ForbiddenError):
         return self.deny_issues[0].code
 
 
+def _refuse_door_only(asset: AssetName) -> None:
+    if asset in DOOR_ONLY_ASSETS:
+        raise ForbiddenError(
+            f"{asset} is queued only by its scheduling door: POST /v1/remediations"
+        )
+
+
 class OpsService:
     def __init__(
         self,
@@ -212,8 +220,11 @@ class OpsService:
     def submit(
         self, request: OrderRequest, principal: Principal, config: Sequence[ConfigDigest] = ()
     ) -> RunOrder:
-        """Queue an order directly, with the config it must run under in its run manifest."""
-        return self._queue(request, principal, config)
+        """Store the order a person asked for as planned, with the config it must run under in
+        its run manifest; the engine's admission (pack menu, approval holds, budget) queues it."""
+        self._check_request(request, principal)
+        _refuse_door_only(request.asset)
+        return self._store(request, principal, config, OrderState.PLANNED)
 
     def schedule_fix(
         self, request: OrderRequest, principal: Principal, fork_url: str, fork_branch: str
@@ -222,22 +233,18 @@ class OpsService:
         it checked them against ForkPolicy and git's branch rules), stamped as checked."""
         if request.asset != "remediate_finding" or request.work_item_id is None:
             raise ValidationError("fork facts ride only a remediate_finding order naming its item")
-        return self._queue(
+        self._check_request(request, principal)
+        return self._store(
             request,
             principal,
             (),
+            OrderState.QUEUED,
             fork_url=fork_url,
             fork_branch=fork_branch,
             fork_scheduled_at=self._clock.now(),
         )
 
-    def _queue(
-        self,
-        request: OrderRequest,
-        principal: Principal,
-        config: Sequence[ConfigDigest],
-        **fork: object,
-    ) -> RunOrder:
+    def _check_request(self, request: OrderRequest, principal: Principal) -> None:
         issues = self._policy_issues(
             asset=request.asset,
             repository_id=request.repository_id,
@@ -248,11 +255,20 @@ class OpsService:
             raise PolicyDenied(issues)
         _classifiers(lane=request.lane, event_source=request.event_source)
         self._check_work_item(request)
+
+    def _store(
+        self,
+        request: OrderRequest,
+        principal: Principal,
+        config: Sequence[ConfigDigest],
+        state: OrderState,
+        **fork: object,
+    ) -> RunOrder:
         order = RunOrder(
             **request.model_dump(),
             **self._config_manifest(tuple(config)),
             **fork,
-            state=OrderState.QUEUED,
+            state=state,
             requested_by=principal.ref,
         )
         with self._uow as uow:
@@ -260,8 +276,9 @@ class OpsService:
             uow.commit()
         self._uow.after_commit(
             lambda: log.info(
-                "order %s queued actor_kind=%s",
+                "order %s %s actor_kind=%s",
                 saved.id,
+                saved.state,
                 principal.kind,
                 extra={"order_id": str(saved.id), "actor_kind": str(principal.kind)},
             )
@@ -301,6 +318,7 @@ class OpsService:
         )
         if issues:
             raise PolicyDenied(issues)
+        _refuse_door_only(request.asset)
         return PreflightResult(
             allowed=True,
             asset=request.asset,
@@ -464,8 +482,9 @@ class OpsService:
         self, request: OrderRequest, principal: Principal, config: Sequence[ConfigDigest] = ()
     ) -> RunOrder:
         """Store a routed request as planned, with the config in force (the pack version) in its
-        run manifest; an open order for the same subject is re-ranked while still planned,
-        otherwise returned unchanged."""
+        run manifest; an open order for the same subject is re-ranked while still planned (a
+        person's submitted order keeps the route they chose), otherwise returned unchanged."""
+        _refuse_door_only(request.asset)
         _classifiers(lane=request.lane, event_source=request.event_source)
         self._check_work_item(request)
         manifest = self._config_manifest(tuple(config))
@@ -481,6 +500,10 @@ class OpsService:
                     )
                 )
             elif current.state == OrderState.PLANNED:
+                if ref_is_human(current.requested_by):
+                    # A person asked for this order through the submit door, with the route they
+                    # chose; the engine re-ranks only what it planned itself (a machine's ref).
+                    return current
                 route = request.model_dump(include={"priority", "lane", "rule", "event_source"})
                 update = {**route, **manifest}
                 if all(getattr(current, field) == value for field, value in update.items()):
@@ -582,7 +605,8 @@ class OpsService:
         self, request: OrderRequest, principal: Principal, worker: WorkerId, lease_for: timedelta
     ) -> RunOrder:
         """A run its runner has already begun (by hand, or a cron job beside the engine), leased to
-        `worker`: the subject's planned or queued order is taken over, else a new one is stored."""
+        `worker`: the subject's queued (admitted) order is taken over, a planned or awaiting-
+        approval one never is, else a new one is stored."""
         _classifiers(lane=request.lane, event_source=request.event_source)
         self._check_work_item(request)
         now = self._clock.now()
@@ -595,12 +619,27 @@ class OpsService:
         with self._uow as uow:
             current = uow.run_orders.find_open(request.asset, request.repository_id)
             if current is None:
+                # Taking over the scheduling door's queued order below is a runner's move; only
+                # a door that stores a new order refuses a door-only asset.
+                _refuse_door_only(request.asset)
                 order = RunOrder(**request.model_dump(), **lease, requested_by=principal.ref)
                 saved = uow.run_orders.add(order)
             else:
                 assert current.id is not None
                 current = uow.run_orders.get_for_update(current.id)
-                if current.state not in (OrderState.PLANNED, OrderState.QUEUED):
+                if current.state is OrderState.AWAITING_APPROVAL:
+                    # admission held this order for a person; the start door must not release it
+                    raise ConflictError(
+                        f"order {current.id}: {current.asset} is awaiting approval — approve it "
+                        f"(POST /v1/orders/{current.id}/approve) rather than take it over"
+                    )
+                if current.state is OrderState.PLANNED:
+                    # not yet admitted: the pack's menu, approval and budget haven't run on it
+                    raise ConflictError(
+                        f"order {current.id}: {current.asset} is awaiting admission — take it "
+                        "over once the engine has queued it"
+                    )
+                if current.state is not OrderState.QUEUED:
                     raise ConflictError(
                         f"order {current.id}: {current.asset} is already {current.state}"
                     )

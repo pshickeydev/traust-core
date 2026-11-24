@@ -151,14 +151,13 @@ def test_verified_machine_starts_its_scoped_run_and_can_record(
     assert context.services().ops.get(order.id) == order
 
 
-@pytest.mark.parametrize("state", ["planned", "queued"])
-def test_start_reuses_waiting_order_without_replacing_its_admission_fields(
-    context: Context, client: TestClient, state: str
+def test_start_reuses_a_queued_order_without_replacing_its_admission_fields(
+    context: Context, client: TestClient
 ) -> None:
     body = request(context)
     with SqlTraustUnitOfWork(context.database) as uow:
         held = Seed(uow).run_order(
-            asset="verify", repository_id=body.order.repository_id, state=state, priority=8
+            asset="verify", repository_id=body.order.repository_id, state="queued", priority=8
         )
         uow.commit()
     response = client.post(URL, json=body.model_dump(mode="json"), headers=runner(context))
@@ -170,7 +169,7 @@ def test_start_reuses_waiting_order_without_replacing_its_admission_fields(
     assert len(orders(context).items) == 1
 
 
-@pytest.mark.parametrize("state", ["leased", "awaiting_approval"])
+@pytest.mark.parametrize("state", ["leased", "awaiting_approval", "planned"])
 def test_start_never_steals_an_active_lease_or_bypasses_approval(
     context: Context, client: TestClient, state: str
 ) -> None:

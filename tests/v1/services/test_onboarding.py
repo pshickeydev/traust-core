@@ -13,7 +13,7 @@ from sqlalchemy.engine import Engine
 from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import T0
 from tests.v1.services.test_portfolio_sync import Forge, listed, url
-from traust_core.v1.errors import ValidationError
+from traust_core.v1.errors import ForbiddenError, ValidationError
 from traust_core.v1.models.identity import IdentitySource, Principal
 from traust_core.v1.models.inventory import OrgName, ProductSlug, RefName, TeamName
 from traust_core.v1.models.observation import ComparisonStatus
@@ -23,7 +23,12 @@ from traust_core.v1.models.onboarding import (
     PlannedOrder,
     RepositorySpec,
 )
-from traust_core.v1.models.operations import AssetName, OrderRequest, OrderState
+from traust_core.v1.models.operations import (
+    REMEDIATE_FINDING,
+    AssetName,
+    OrderRequest,
+    OrderState,
+)
 from traust_core.v1.models.vocabulary import ActorKind
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.sources import RepoInfo, SourceError
@@ -154,6 +159,18 @@ def test_onboard_registers_everything_and_plans_the_baseline_once(
     assert forge.calls.count("list_org github.com/example-org") == 2
 
 
+def test_onboarding_refuses_a_door_only_asset_in_its_baseline(
+    onboarding: OnboardingService, uow: SqlTraustUnitOfWork
+) -> None:
+    """The baseline plans through the same door as the engine, so a door-only asset in it is
+    refused there, naming the scheduling door — never planned as an unscheduled fix."""
+    ask = request(label="Example", repositories=[{"url": API}], baseline=[REMEDIATE_FINDING])
+    with pytest.raises(ForbiddenError, match="POST /v1/remediations"):
+        onboarding.onboard(ask, OPERATOR)
+    with uow:
+        assert uow.run_orders.search(limit=10) == []
+
+
 def test_a_registered_product_onboards_without_a_label(
     onboarding: OnboardingService, portfolio: PortfolioService
 ) -> None:
@@ -194,7 +211,7 @@ def test_an_onboarded_repository_is_a_subject_when_the_forge_names_a_default_bra
     order = onboarding._ops.submit(
         OrderRequest(asset=AUDIT, priority=0, repository_id=repository_id), OPERATOR
     )
-    assert order.state is OrderState.QUEUED
+    assert order.state is OrderState.PLANNED
 
 
 def test_onboarding_shows_a_default_line_it_couldnt_import_and_a_retry_imports_it(

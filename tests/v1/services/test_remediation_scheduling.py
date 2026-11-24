@@ -1337,16 +1337,18 @@ def test_a_direct_order_names_only_a_work_item_of_its_own_repository(
             )
     assert len(queued_orders(engine, repository_id)) == 1  # only the scheduled one
     assert queued_orders(engine, other_repository) == []
-    named = ops.submit(
-        OrderRequest(
-            asset=REMEDIATE_FINDING,
-            priority=0,
-            repository_id=repository_id,
-            work_item_id=scheduled.work_item.work_item_id,
-        ),
-        PERSON,
-    )
-    assert named.work_item_id == scheduled.work_item.work_item_id
+    # even a well-formed direct submit is refused: the scheduling door owns the asset
+    with pytest.raises(ForbiddenError, match="POST /v1/remediations"):
+        ops.submit(
+            OrderRequest(
+                asset=REMEDIATE_FINDING,
+                priority=0,
+                repository_id=repository_id,
+                work_item_id=scheduled.work_item.work_item_id,
+            ),
+            PERSON,
+        )
+    assert len(queued_orders(engine, repository_id)) == 1  # still only the scheduled one
 
 
 def test_a_retry_after_a_failed_attempt_is_a_new_work_item(

@@ -8,7 +8,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from enum import StrEnum
 from functools import cache
-from typing import TYPE_CHECKING, NewType
+from typing import TYPE_CHECKING, Final, NewType
 from uuid import UUID
 
 import pydantic
@@ -50,6 +50,11 @@ class RecordKind(StrEnum):
 # The native remediation-scheduling asset: contracts' recording config has no remediation
 # section yet, so its orders ride the triage allowlist and only this name tells them apart.
 REMEDIATE_FINDING = AssetName("remediate_finding")
+
+# Assets one door owns: every door that stores an order refuses them (a direct submit,
+# preflight, plan, a start with no order to take over), because only their door checks the
+# facts they need (remediate_finding's fork facts) before queueing them.
+DOOR_ONLY_ASSETS: Final[frozenset[AssetName]] = frozenset({REMEDIATE_FINDING})
 
 # The rules the remediation trigger's orders carry, keyed by the work item that is the
 # effort: "remediation:<id>" (an attempt) and "verify-remediation:<id>" (its verification).
