@@ -415,12 +415,14 @@ class RemediationItem(Model):
 
 
 class RemediationInput(SkillInput):
-    """What the skill patches: the work item, its findings, where to push."""
+    """What the skill patches: the work item, its findings, where to push, and the machine
+    identity the fix commit is authored under."""
 
     work_item: WorkItem
     items: tuple[RemediationItem, ...]
     fork: Fork
     fix_branch: str
+    committer: str
 
 
 class CheckOutcome(StrEnum):

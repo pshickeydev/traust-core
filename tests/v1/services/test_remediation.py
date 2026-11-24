@@ -123,6 +123,16 @@ def test_a_patch_prefix_is_name_characters_only() -> None:
             RemediationConfig(fork_org="o", patch_prefix=bad)
 
 
+def test_the_committer_is_a_machine_identity() -> None:
+    assert ForkPolicy(RemediationConfig(), FORGES).committer == "traust-remediation"
+    assert ForkPolicy(RemediationConfig(committer="sci-remediation"), FORGES).committer == (
+        "sci-remediation"
+    )
+    for bad in ("Shaun Smith", "shaun", "-remediation", "a.b-remediation"):
+        with pytest.raises(pydantic.ValidationError):
+            RemediationConfig(committer=bad)
+
+
 def test_a_github_repo_without_a_fork_org_is_a_config_error() -> None:
     with pytest.raises(ConfigError, match=r"remediation\.fork_org"):
         fork("https://github.com/o/r", RemediationConfig())
@@ -478,6 +488,7 @@ def test_prepare_hands_the_skill_the_findings_the_commit_and_where_to_push(
     assert only.strategy == "bound-resource"
     assert given.fork.owner == "mirror-org" and given.fork.visibility == "private"
     assert given.fix_branch == f"fix/{found.id}/unbounded-read-of-the-body"
+    assert given.committer == "traust-remediation"
 
 
 def test_record_attaches_the_report_links_its_tickets_and_moves_the_item(
