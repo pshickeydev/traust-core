@@ -435,9 +435,40 @@ def check_metadata_target(report: Report, result: ReportValidation) -> None:
         for mp in verification.get("manifest_paths") or ():
             if isinstance(mp, str):
                 try:
-                    normalize_module_path(mp)
+                    norm_mp = normalize_module_path(mp)
                 except UnresolvedTargetError as e:
                     result.error(f"metadata.target.verification.manifest_paths: {e}")
+                else:
+                    if norm_mp == "." or norm_mp != mp:
+                        result.error(
+                            f"metadata.target.verification.manifest_paths entry {mp!r} must be a "
+                            "normalized repo-relative file path"
+                        )
+        strategy = verification.get("strategy")
+        has_prov = "provenance" in verification
+        prov = verification.get("provenance")
+        if strategy == "external_provenance":
+            if not isinstance(prov, dict) or not all(
+                isinstance(prov.get(k), str) and prov.get(k).strip()
+                for k in ("source", "ref", "digest")
+            ):
+                result.error(
+                    "metadata.target.verification.provenance requires non-empty source, ref, and "
+                    "digest when strategy is 'external_provenance'"
+                )
+            elif "manifest_version" in prov and (
+                not isinstance(prov["manifest_version"], str)
+                or not prov["manifest_version"].strip()
+            ):
+                result.error(
+                    "metadata.target.verification.provenance.manifest_version must be a "
+                    "non-empty string when present"
+                )
+        elif has_prov:
+            result.error(
+                "metadata.target.verification.provenance must be omitted when strategy is "
+                f"{strategy!r}"
+            )
 
 
 def _cross_validate_review_surfaces(report: Report, result: ReportValidation) -> None:

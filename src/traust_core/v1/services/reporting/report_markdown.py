@@ -85,6 +85,12 @@ def _metadata(meta: Report) -> str:
             manifests = ver.get("manifest_paths") or []
             ver_str = f"`{ver['strategy']}` ({len(manifests)} manifest(s))"
             present.append(("Target Verification", ver_str))
+            prov = ver.get("provenance")
+            if isinstance(prov, dict) and prov.get("source") and prov.get("digest"):
+                prov_str = f"`{prov['source']}` (`{prov.get('ref', '')}`, `{prov['digest']}`)"
+                if prov.get("manifest_version"):
+                    prov_str += f" [manifest_version=`{prov['manifest_version']}`]"
+                present.append(("Target Provenance", prov_str))
 
     lb = meta.get("loc_breakdown")
     if lb:

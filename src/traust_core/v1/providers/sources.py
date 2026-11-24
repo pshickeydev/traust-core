@@ -26,6 +26,7 @@ class CheckoutRequest(Dto):
     # Reuse a ref-counted read-only worktree per (repo, sha); never combined with writable=True.
     shared: bool = False
     # Glob patterns of the files to keep (a basename, or a path when it holds "/"); None keeps all.
+    refresh_tags: bool = False
     keep: tuple[str, ...] | None = None
 
 

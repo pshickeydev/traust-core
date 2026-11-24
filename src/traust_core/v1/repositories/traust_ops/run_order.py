@@ -7,7 +7,7 @@ from uuid import UUID
 
 import sqlalchemy as sa
 
-from traust_core.v1.errors import NotFoundError
+from traust_core.v1.errors import NotFoundError, ValidationError
 from traust_core.v1.models.operations import OPEN_ORDER_STATES, OrderState, RunOrder
 from traust_core.v1.repositories.tables import (
     TRAUST_OPS,
@@ -108,9 +108,14 @@ class RunOrderRepository(MutableRecordRepository[RunOrder], Protocol):
 
     def list_for_repository(self, repository_id: UUID, state: OrderState) -> list[RunOrder]: ...
     def find_open(
-        self, asset: str, repository_id: UUID | None, *, target_purl: str | None = None
+        self,
+        asset: str,
+        repository_id: UUID | None,
+        *,
+        target_purl: str | None = None,
+        target_sha: str | None = None,
     ) -> RunOrder | None:
-        """An open order (planned..leased) for an asset, repository, and optional target PURL."""
+        """An open order (planned..leased) for an asset, repository, and optional (PURL, SHA)."""
         ...
 
     def find_by_work_item(self, work_item_id: UUID) -> RunOrder | None:
@@ -327,18 +332,31 @@ class SqlRunOrderRepository(SqlMutableRepository[RunOrder]):
         )
 
     def find_open(
-        self, asset: str, repository_id: UUID | None, *, target_purl: str | None = None
+        self,
+        asset: str,
+        repository_id: UUID | None,
+        *,
+        target_purl: str | None = None,
+        target_sha: str | None = None,
     ) -> RunOrder | None:
         c = self.table.c
         subject = (
             c.repository_id.is_(None) if repository_id is None else c.repository_id == repository_id
         )
-        target_cond = (
-            c.target_purl.is_(None) if target_purl is None else c.target_purl == target_purl
-        )
+        if target_purl is None:
+            if target_sha is not None:
+                raise ValidationError("target_sha requires target_purl")
+            target_conds = (c.target_purl.is_(None), c.target_sha.is_(None))
+        else:
+            if target_sha is None or not target_sha.strip():
+                raise ValidationError("target_sha is required when target_purl is set")
+            target_conds = (
+                c.target_purl == target_purl,
+                c.target_sha == target_sha.strip().lower(),
+            )
         stmt = (
             self._select()
-            .where(c.asset == asset, c.state.in_(OPEN_ORDER_STATES), subject, target_cond)
+            .where(c.asset == asset, c.state.in_(OPEN_ORDER_STATES), subject, *target_conds)
             .limit(1)
         )
         row = self._execute(f"find open {asset} for {repository_id}", stmt).mappings().first()

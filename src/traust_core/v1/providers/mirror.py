@@ -31,6 +31,8 @@ FETCH_TIMEOUT_SECONDS = 600.0
 # https only: an insteadOf rewrite can never hand the fetch an ext:: transport helper.
 _FETCH_ENV = {"GIT_ALLOW_PROTOCOL": "https", "GIT_TERMINAL_PROMPT": "0"}
 _LAST_USE = "traust-last-checkout"
+TAG_REFRESH_TTL_SECONDS = 60.0
+_TAGS_REFRESHED = "traust-tags-refreshed"
 _REPO_URL = TypeAdapter(HttpsRepoUrl)
 
 
@@ -53,7 +55,9 @@ class MirrorCheckout:
         mirror = self._mirror(request.repo)
         with self._locked(mirror):
             if request.shared:
-                worktree = self._acquire_shared(mirror, request.repo, sha)
+                worktree = self._acquire_shared(
+                    mirror, request.repo, sha, refresh_tags=request.refresh_tags
+                )
             else:
                 if not self._fetch(mirror, request.repo, sha):
                     raise NotFoundError(f"commit {sha} is not in {request.repo}")
@@ -82,20 +86,22 @@ class MirrorCheckout:
         base = mirror.parent / f"{mirror.stem}.shared"
         return (base / sha).resolve(), base / f"{sha}.refs"
 
-    def _acquire_shared(self, mirror: Path, repo: HttpsRepoUrl, sha: str) -> Path:
+    def _acquire_shared(
+        self, mirror: Path, repo: HttpsRepoUrl, sha: str, *, refresh_tags: bool = False
+    ) -> Path:
         worktree, refs_file = self._shared_paths(mirror, sha)
         if (
             worktree.is_dir()
             and self._reader.is_checkout(worktree)
             and self._reader.head(worktree) == sha
         ):
-            self._fetch_tags(mirror, repo)
+            self._maybe_fetch_tags(mirror, repo, force=refresh_tags)
             self._touch(mirror)
             refs = self._read_refs(refs_file) + 1
             refs_file.write_text(f"{refs}\n", encoding="utf-8")
             return worktree
         if _healthy(mirror) and self._reachable(mirror, sha):
-            self._fetch_tags(mirror, repo)
+            self._maybe_fetch_tags(mirror, repo, force=refresh_tags)
         elif not self._fetch(mirror, repo, sha):
             raise NotFoundError(f"commit {sha} is not in {repo}")
         self._touch(mirror)
@@ -220,15 +226,36 @@ class MirrorCheckout:
                 return
             yield True
 
+    def _object_format(self, mirror: Path) -> str | None:
+        res = self._runner.run(
+            ["git", "-C", str(mirror), *HARDENED, "rev-parse", "--show-object-format"],
+            check=False,
+        )
+        return res.stdout.decode().strip() if res.returncode == 0 else None
+
     def _fetch(self, mirror: Path, repo: HttpsRepoUrl, sha: str) -> bool:
+        expected_format = "sha256" if len(sha) == 64 else "sha1"
+        created = False
         if not _healthy(mirror):
-            self._runner.run(["git", "init", "--bare", "--quiet", str(mirror)])
+            self._runner.run(
+                [
+                    "git",
+                    "init",
+                    "--bare",
+                    "--quiet",
+                    f"--object-format={expected_format}",
+                    str(mirror),
+                ]
+            )
             self._touch(mirror)
+            created = True
+        elif self._object_format(mirror) != expected_format:
+            return False
         self._git(mirror, "config", "remote.origin.url", str(repo))
         started = time.monotonic()
         env = self._fetch_env(repo)
         fetch = ["git", "-C", str(mirror), *HARDENED, "fetch", "--quiet"]
-        self._runner.run(
+        fetch_res = self._runner.run(
             [
                 *fetch,
                 "--prune",
@@ -237,8 +264,17 @@ class MirrorCheckout:
                 "+refs/tags/*:refs/tags/*",
             ],
             env=env,
+            check=False,
         )
+        if fetch_res.returncode:
+            if b"mismatched algorithms" in fetch_res.stderr:
+                if created:
+                    shutil.rmtree(mirror, ignore_errors=True)
+                return False
+            raise ProcessError(fetch_res)
         if self._reachable(mirror, sha):
+            if self._reader.tags_at(mirror, sha):
+                self._mark_tags_refreshed(mirror)
             log.info("mirror fetch %s in %.1fs", repo, time.monotonic() - started)
             return True
         advertised = self._runner.run(
@@ -290,6 +326,25 @@ class MirrorCheckout:
                 return True
         return False
 
+    def _maybe_fetch_tags(self, mirror: Path, repo: HttpsRepoUrl, *, force: bool = False) -> None:
+        if not force and self._tags_fresh(mirror):
+            return
+        self._fetch_tags(mirror, repo)
+
+    def _tags_fresh(self, mirror: Path) -> bool:
+        marker = mirror / _TAGS_REFRESHED
+        try:
+            refreshed_at = float(marker.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            return False
+        elapsed = self._clock.now().timestamp() - refreshed_at
+        return 0.0 <= elapsed < TAG_REFRESH_TTL_SECONDS
+
+    def _mark_tags_refreshed(self, mirror: Path) -> None:
+        (mirror / _TAGS_REFRESHED).write_text(
+            f"{self._clock.now().timestamp()}\n", encoding="utf-8"
+        )
+
     def _fetch_tags(self, mirror: Path, repo: HttpsRepoUrl) -> None:
         """Refresh remote tags into an existing mirror without recreating worktrees."""
         env = self._fetch_env(repo)
@@ -307,6 +362,7 @@ class MirrorCheckout:
             ],
             env=env,
         )
+        self._mark_tags_refreshed(mirror)
 
     def _reachable(self, mirror: Path, sha: str) -> bool:
         return self._reader.reachable(mirror, sha) and bool(

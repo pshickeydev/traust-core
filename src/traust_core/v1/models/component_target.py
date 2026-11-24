@@ -2,10 +2,18 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from enum import StrEnum
+from typing import Any
 from urllib.parse import unquote
 
-from pydantic import field_validator
+from pydantic import (
+    Field,
+    SerializerFunctionWrapHandler,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 from traust_core.v1.errors import UnresolvedTargetError, ValidationError
 from traust_core.v1.models.base import Model
@@ -25,16 +33,25 @@ class UnresolvedTargetReason(StrEnum):
     PRIVATE_ROOT_ONLY = "private_root_only"
     SUPPLIED_PATH_CONFLICT = "supplied_path_conflict"
     AMBIGUOUS_MODULE_MATCH = "ambiguous_module_match"
+    PROVENANCE_UNVERIFIED = "provenance_unverified"
+    PROVENANCE_MISMATCH = "provenance_mismatch"
 
 
 def normalize_module_path(path: str) -> str:
-    """Normalize a repo-relative module directory path; rejects traversal and empty/root markers."""
+    """Normalize a repo-relative module directory path ('.' for repo root); rejects traversal."""
     cleaned = path.strip().replace("\\", "/")
+    if not cleaned or cleaned.startswith("/"):
+        raise UnresolvedTargetError(
+            UnresolvedTargetReason.SUPPLIED_PATH_CONFLICT,
+            f"invalid module path {path!r}",
+        )
     while cleaned.startswith("./"):
         cleaned = cleaned[2:]
     cleaned = cleaned.strip("/")
+    if not cleaned or cleaned == ".":
+        return "."
     parts = [p for p in cleaned.split("/") if p]
-    if not parts or any(p in (".", "..") for p in parts):
+    if not parts or any(p in (".", "..") or not p.strip() for p in parts):
         raise UnresolvedTargetError(
             UnresolvedTargetReason.SUPPLIED_PATH_CONFLICT,
             f"invalid module path {path!r}",
@@ -43,12 +60,8 @@ def normalize_module_path(path: str) -> str:
 
 
 def normalize_component_commit(raw: str) -> str:
-    """Normalize and enforce a 40-char lowercase git commit SHA matching `report.schema.json`."""
-    cleaned = raw.strip().lower()
-    sha = str(GitSha.parse(cleaned))
-    if len(sha) != 40:
-        raise ValidationError(f"commit must be a 40-char SHA, got {raw!r}")
-    return sha
+    """Normalize and enforce a 40- or 64-char lowercase git commit SHA."""
+    return str(GitSha.parse(raw.strip().lower()))
 
 
 class ParsedPurl(Model):
@@ -107,9 +120,55 @@ def canonical_component_purl(raw: str) -> str:
     return ParsedPurl.parse(raw).canonical
 
 
+class ComponentTargetProvenance(Model):
+    source: str = Field(min_length=1)
+    ref: str = Field(min_length=1)
+    digest: str = Field(min_length=1)
+    manifest_version: str | None = Field(default=None, min_length=1)
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        document = handler(self)
+        if self.manifest_version is None:
+            document.pop("manifest_version", None)
+        return document
+
+
+class VerifiedProvenanceClaim(Model):
+    purl: str = Field(min_length=1)
+    repository: str = Field(min_length=1)
+    commit: str = Field(min_length=1)
+    source: str = Field(min_length=1)
+    ref: str = Field(min_length=1)
+    digest: str = Field(min_length=1)
+    manifest_version: str | None = Field(default=None, min_length=1)
+
+
 class ComponentTargetVerification(Model):
     strategy: ComponentTargetStrategy
-    manifest_paths: tuple[str, ...]
+    manifest_paths: tuple[str, ...] = Field(min_length=1)
+    provenance: ComponentTargetProvenance | None = None
+
+    @model_validator(mode="after")
+    def _check_provenance_strategy_consistency(self) -> ComponentTargetVerification:
+        is_external = self.strategy == ComponentTargetStrategy.EXTERNAL_PROVENANCE
+        has_provenance = self.provenance is not None
+        if is_external and not has_provenance:
+            raise ValueError(
+                "verification.provenance is required when strategy is 'external_provenance'"
+            )
+        if not is_external and has_provenance:
+            raise ValueError(
+                f"verification.provenance must be omitted when strategy is '{self.strategy}'"
+            )
+        return self
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        document = handler(self)
+        if self.provenance is None:
+            document.pop("provenance", None)
+        return document
 
 
 class ComponentTarget(Model):
@@ -119,6 +178,13 @@ class ComponentTarget(Model):
     module_path: str
     release_ref: str | None = None
     verification: ComponentTargetVerification
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        document = handler(self)
+        if self.release_ref is None:
+            document.pop("release_ref", None)
+        return document
 
     @field_validator("commit")
     @classmethod
@@ -136,6 +202,7 @@ class ComponentTargetRequest(Model):
     release_ref: str | None = None
     module_path: str | None = None
     ref_kind: str | None = None
+    provenance_record: Mapping[str, Any] | None = None
 
 
 class PackageManifestCandidate(Model):
@@ -144,7 +211,9 @@ class PackageManifestCandidate(Model):
     version: str | None = None
     module_path: str
     manifest_paths: tuple[str, ...]
+    project_name: str | None = None
     is_private: bool = False
     is_workspace_root: bool = False
     is_workspace_member: bool = False
     inherits_root_version: bool = False
+    is_dynamic_version: bool = False

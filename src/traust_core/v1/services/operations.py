@@ -142,6 +142,9 @@ _COMPLETED_ORDER_STATES: Final[tuple[OrderState, ...]] = (
     OrderState.SUCCEEDED,
     OrderState.DEGRADED,
 )
+_TRANSIENT_ORDER_REQUEST_FIELDS: Final[frozenset[str]] = frozenset(
+    {"target_release_ref", "target_provenance"}
+)
 
 S = TypeVar("S", contravariant=True)
 E = TypeVar("E", contravariant=True)
@@ -269,7 +272,7 @@ class OpsService:
         self._check_work_item(request)
         request, resolved_target = self._resolve_component_target(request)
         order = RunOrder(
-            **request.model_dump(),
+            **request.model_dump(exclude=_TRANSIENT_ORDER_REQUEST_FIELDS),
             **self._initial_manifest(tuple(config), resolved_target),
             **fork,
             state=OrderState.QUEUED,
@@ -338,27 +341,43 @@ class OpsService:
             if repo.url.startswith(("file:", "/"))
             else HttpsRepoUrl.parse(repo.url, self._hosts)
         )
-        try:
-            workspace = self._checkouts.checkout(
-                CheckoutRequest(repo=origin, ref=sha, shared=True)
-            ).data
-        except NotFoundError as e:
-            raise UnresolvedTargetError(
-                UnresolvedTargetReason.TAG_COMMIT_MISMATCH,
-                f"pinned commit {sha} could not be checked out from {repo.url}: {e}",
-            ) from e
-        try:
-            resolved = self._component_targets.resolve(
-                ComponentTargetRequest(
-                    purl=request.target_purl,
-                    repository=repo.url,
-                    commit=str(sha),
-                    module_path=request.target_module_path,
-                ),
-                workspace.path,
-            )
-        finally:
-            self._checkouts.release(workspace)
+        target_request = ComponentTargetRequest(
+            purl=request.target_purl,
+            repository=repo.url,
+            commit=str(sha),
+            release_ref=request.target_release_ref,
+            module_path=request.target_module_path,
+            provenance_record=request.target_provenance,
+        )
+        refreshed = False
+        while True:
+            try:
+                workspace = self._checkouts.checkout(
+                    CheckoutRequest(repo=origin, ref=sha, shared=True, refresh_tags=refreshed)
+                ).data
+            except NotFoundError as e:
+                raise UnresolvedTargetError(
+                    UnresolvedTargetReason.TAG_COMMIT_MISMATCH,
+                    f"pinned commit {sha} could not be checked out from {repo.url}: {e}",
+                ) from e
+            try:
+                resolved = self._component_targets.resolve(target_request, workspace.path)
+                break
+            except UnresolvedTargetError as e:
+                if (
+                    not refreshed
+                    and isinstance(origin, HttpsRepoUrl)
+                    and e.reason
+                    in (
+                        UnresolvedTargetReason.TAG_COMMIT_MISMATCH,
+                        UnresolvedTargetReason.NO_MANIFEST_MATCH,
+                    )
+                ):
+                    refreshed = True
+                    continue
+                raise
+            finally:
+                self._checkouts.release(workspace)
         updated = request.model_copy(
             update={
                 "target_purl": resolved.purl,
@@ -549,30 +568,34 @@ class OpsService:
         manifest = self._initial_manifest(tuple(config), resolved_target)
         with self._uow as uow:
             current = uow.run_orders.find_open(
-                request.asset, request.repository_id, target_purl=request.target_purl
+                request.asset,
+                request.repository_id,
+                target_purl=request.target_purl,
+                target_sha=request.target_sha,
             )
             if current is None:
                 saved = uow.run_orders.add(
                     RunOrder(
-                        **request.model_dump(),
+                        **request.model_dump(exclude=_TRANSIENT_ORDER_REQUEST_FIELDS),
                         **manifest,
                         state=OrderState.PLANNED,
                         requested_by=principal.ref,
                     )
                 )
             elif current.state == OrderState.PLANNED:
-                if (
+                current_target = (
                     current.target_purl,
                     current.target_sha,
                     current.target_module_path,
-                ) != (
+                )
+                requested_target = (
                     request.target_purl,
                     request.target_sha,
                     request.target_module_path,
-                ):
+                )
+                if current_target != requested_target:
                     raise ConflictError(
-                        f"order {current.id} targets {current.target_purl!r}, not "
-                        f"{request.target_purl!r}"
+                        f"order {current.id} targets {current_target!r}, not {requested_target!r}"
                     )
                 route = request.model_dump(include={"priority", "lane", "rule", "event_source"})
                 update = {**route, **manifest}
@@ -671,6 +694,99 @@ class OpsService:
             )
         return order
 
+    def _verified_manifest_target(self, order: RunOrder) -> ComponentTarget | None:
+        """Return the Core-verified ComponentTarget stored in an existing order's run manifest."""
+        if order.artifact_id is None:
+            return None
+        doc = json.loads(self._manifests.get(order.artifact_id).payload)
+        raw_target = doc.get("component_target")
+        if raw_target is None:
+            return None
+        return ComponentTarget.model_validate(raw_target)
+
+    def _try_takeover_verified_component_order(
+        self,
+        request: OrderRequest,
+        principal: Principal,
+        worker: WorkerId,
+        lease_for: timedelta,
+    ) -> RunOrder | None:
+        """Take over an existing planned/queued component order reusing its Core-verified
+        manifest when the caller supplies no fresh provenance envelope or release_ref."""
+        if (
+            request.target_purl is None
+            or request.target_provenance is not None
+            or request.target_release_ref is not None
+        ):
+            return None
+        assert request.target_sha is not None
+        canon_purl = canonical_component_purl(request.target_purl)
+        try:
+            canon_sha = str(GitSha.parse(normalize_component_commit(request.target_sha)))
+        except ValidationError as e:
+            raise UnresolvedTargetError(
+                UnresolvedTargetReason.MISSING_PIN,
+                f"invalid target_sha {request.target_sha!r}: {e}",
+            ) from e
+        req_module = (
+            normalize_module_path(request.target_module_path)
+            if request.target_module_path is not None
+            else None
+        )
+        now = self._clock.now()
+        lease = {
+            "state": OrderState.LEASED,
+            "lease_holder": worker,
+            "lease_expires_at": now + lease_for,
+            "started_at": now,
+        }
+        with self._uow as uow:
+            current = uow.run_orders.find_open(
+                request.asset,
+                request.repository_id,
+                target_purl=canon_purl,
+                target_sha=canon_sha,
+            )
+            if current is None:
+                return None
+            assert current.id is not None
+            current = uow.run_orders.get_for_update(current.id)
+            if current.state not in (OrderState.PLANNED, OrderState.QUEUED):
+                raise ConflictError(
+                    f"order {current.id}: {current.asset} is already {current.state}"
+                )
+            if request.work_item_id not in (None, current.work_item_id):
+                raise ConflictError(
+                    f"order {current.id} runs work item {current.work_item_id}, not "
+                    f"{request.work_item_id}"
+                )
+            if req_module is not None and req_module != current.target_module_path:
+                raise ConflictError(
+                    f"order {current.id} targets "
+                    f"{(current.target_purl, current.target_sha, current.target_module_path)!r}, "
+                    f"not {(canon_purl, canon_sha, req_module)!r}"
+                )
+            verified = self._verified_manifest_target(current)
+            if (
+                verified is None
+                or canonical_component_purl(verified.purl) != canon_purl
+                or verified.commit.lower() != canon_sha.lower()
+                or verified.module_path != current.target_module_path
+            ):
+                return None
+            saved = uow.run_orders.update(current.model_copy(update=lease))
+            saved = uow.run_orders.get(saved.id)
+            uow.commit()
+        self._uow.after_commit(
+            lambda: log.info(
+                "order %s started actor_kind=%s",
+                saved.id,
+                principal.kind,
+                extra={"order_id": str(saved.id), "actor_kind": str(principal.kind)},
+            )
+        )
+        return saved
+
     def start(
         self, request: OrderRequest, principal: Principal, worker: WorkerId, lease_for: timedelta
     ) -> RunOrder:
@@ -678,6 +794,9 @@ class OpsService:
         `worker`: the subject's planned or queued order is taken over, else a new one is stored."""
         _classifiers(lane=request.lane, event_source=request.event_source)
         self._check_work_item(request)
+        taken = self._try_takeover_verified_component_order(request, principal, worker, lease_for)
+        if taken is not None:
+            return taken
         request, resolved_target = self._resolve_component_target(request)
         now = self._clock.now()
         lease = {
@@ -688,11 +807,14 @@ class OpsService:
         }
         with self._uow as uow:
             current = uow.run_orders.find_open(
-                request.asset, request.repository_id, target_purl=request.target_purl
+                request.asset,
+                request.repository_id,
+                target_purl=request.target_purl,
+                target_sha=request.target_sha,
             )
             if current is None:
                 order = RunOrder(
-                    **request.model_dump(),
+                    **request.model_dump(exclude=_TRANSIENT_ORDER_REQUEST_FIELDS),
                     **self._initial_manifest((), resolved_target),
                     **lease,
                     requested_by=principal.ref,
@@ -710,18 +832,19 @@ class OpsService:
                         f"order {current.id} runs work item {current.work_item_id}, not "
                         f"{request.work_item_id}"
                     )
-                if (
+                current_target = (
                     current.target_purl,
                     current.target_sha,
                     current.target_module_path,
-                ) != (
+                )
+                requested_target = (
                     request.target_purl,
                     request.target_sha,
                     request.target_module_path,
-                ):
+                )
+                if current_target != requested_target:
                     raise ConflictError(
-                        f"order {current.id} targets {current.target_purl!r}, not "
-                        f"{request.target_purl!r}"
+                        f"order {current.id} targets {current_target!r}, not {requested_target!r}"
                     )
                 extra = (
                     self._initial_manifest((), resolved_target)

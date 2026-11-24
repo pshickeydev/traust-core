@@ -277,3 +277,98 @@ def test_shared_release_without_shared_flag_preserves_other_holder_on_mirror_and
         assert ws_owned.path.is_dir()
     owner.release(ws_owned)
     assert not ws_owned.path.exists()
+
+
+def test_mirror_shared_checkout_throttles_tag_refresh_within_ttl_and_refreshes_after_expiry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    forge = Forge(tmp_path)
+    (forge.work / "spring-beans").mkdir(parents=True, exist_ok=True)
+    sha = forge.commit("spring-beans/Cache.java", b"public class Cache {}\n")
+    git(forge.bare, "update-ref", "refs/tags/v7.1.0", str(sha))
+    cfg = tmp_path / "gitconfig"
+    cfg.write_text(f'[url "file://{forge.bare}"]\n\tinsteadOf = {URL}\n', encoding="utf-8")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(cfg))
+
+    clock = FixedClock(AT)
+    spy = SpyRunner(LocalForge(allowed=("git",), keep_env=("PATH", "HOME", "GIT_CONFIG_GLOBAL")))
+    mirror = MirrorCheckout(spy, clock, tmp_path / "mirrors", ForgeApi(NoHttp(), {}))
+
+    ws1 = mirror.checkout(CheckoutRequest(repo=URL, ref=sha, shared=True)).data
+    fetches_after_1 = sum(1 for a in spy.argv if "fetch" in a)
+
+    # Consecutive sibling checkouts within the 60s TTL skip redundant remote tag fetches.
+    clock._at = AT + timedelta(seconds=10)
+    ws2 = mirror.checkout(CheckoutRequest(repo=URL, ref=sha, shared=True)).data
+    ws3 = mirror.checkout(CheckoutRequest(repo=URL, ref=sha, shared=True)).data
+    fetches_within_ttl = sum(1 for a in spy.argv if "fetch" in a)
+    assert fetches_within_ttl == fetches_after_1
+
+    # Explicit refresh_tags=True bypasses the TTL immediately to pick up a newly pushed tag.
+    git(forge.bare, "update-ref", "refs/tags/v7.1.1", str(sha))
+    ws_forced = mirror.checkout(
+        CheckoutRequest(repo=URL, ref=sha, shared=True, refresh_tags=True)
+    ).data
+    fetches_after_forced = sum(1 for a in spy.argv if "fetch" in a)
+    assert fetches_after_forced == fetches_within_ttl + 1
+    assert "v7.1.1" in git(ws_forced.path, "tag", "--points-at", str(sha)).splitlines()
+
+    # Once the TTL expires, new remote tags are also fetched automatically.
+    git(forge.bare, "update-ref", "refs/tags/v7.1.2", str(sha))
+    clock._at = AT + timedelta(seconds=75)
+    ws4 = mirror.checkout(CheckoutRequest(repo=URL, ref=sha, shared=True)).data
+    fetches_after_ttl = sum(1 for a in spy.argv if "fetch" in a)
+    assert fetches_after_ttl == fetches_after_forced + 1
+    assert "v7.1.2" in git(ws4.path, "tag", "--points-at", str(sha)).splitlines()
+
+    for ws in (ws1, ws2, ws3, ws_forced, ws4):
+        mirror.release(ws)
+
+
+def test_mirror_checkout_handles_sha256_remote_repository(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from traust_core.v1.errors import NotFoundError
+    from traust_core.v1.models.component_target import ComponentTargetRequest
+    from traust_core.v1.models.values import GitSha
+    from traust_core.v1.providers.checkout import GitCheckout
+    from traust_core.v1.services.component_target import ComponentTargetResolver
+
+    forge = Forge(tmp_path, object_format="sha256")
+    sha = forge.commit("setup.cfg", b"[metadata]\nname = sha256-pkg\nversion = 2.0.0\n")
+    assert len(str(sha)) == 64
+    git(forge.bare, "update-ref", "refs/tags/v2.0.0", str(sha))
+    cfg = tmp_path / "gitconfig"
+    cfg.write_text(f'[url "file://{forge.bare}"]\n\tinsteadOf = {URL}\n', encoding="utf-8")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(cfg))
+
+    runner = LocalForge(allowed=("git",), keep_env=("PATH", "HOME", "GIT_CONFIG_GLOBAL"))
+    mirror = MirrorCheckout(runner, FixedClock(AT), tmp_path / "mirrors", ForgeApi(NoHttp(), {}))
+
+    # Shared and non-shared remote checkouts both work against a SHA-256 remote.
+    ws_shared = mirror.checkout(CheckoutRequest(repo=URL, ref=sha, shared=True)).data
+    ws_solo = mirror.checkout(CheckoutRequest(repo=URL, ref=sha, shared=False)).data
+    try:
+        assert (ws_shared.path / "setup.cfg").is_file()
+        assert (ws_solo.path / "setup.cfg").is_file()
+        resolver = ComponentTargetResolver(GitCheckout(runner))
+        resolved = resolver.resolve(
+            ComponentTargetRequest(
+                purl="pkg:pypi/sha256-pkg@2.0.0",
+                repository=str(URL),
+                commit=str(sha),
+                module_path=".",
+            ),
+            ws_shared.path,
+        )
+        assert resolved.commit == str(sha)
+        assert resolved.module_path == "."
+
+        # Requesting a 40-hex SHA against the SHA-256 mirror fails cleanly with NotFoundError.
+        with pytest.raises(NotFoundError):
+            mirror.checkout(CheckoutRequest(repo=URL, ref=GitSha.parse("a" * 40), shared=False))
+    finally:
+        mirror.release(ws_shared)
+        mirror.release(ws_solo)
+    assert not ws_shared.path.exists()
+    assert not ws_solo.path.exists()

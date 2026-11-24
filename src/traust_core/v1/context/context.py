@@ -142,6 +142,7 @@ from traust_core.v1.providers.pqc import PqcScanner, PqcScanTool
 from traust_core.v1.providers.priv_profile import PrivProfiler
 from traust_core.v1.providers.process import ProcessRunner
 from traust_core.v1.providers.product_definitions import ProductDefinitionsCache
+from traust_core.v1.providers.provenance import DsseProvenanceVerifier, ProvenanceVerifier
 from traust_core.v1.providers.report_files import ReportFiles
 from traust_core.v1.providers.route_guards import RouteGuardMatrix
 from traust_core.v1.providers.rule_drafts import RuleDraftDirectory
@@ -351,11 +352,13 @@ class Context:
         clock: Clock | None = None,
         object_store: ObjectStore | None = None,
         process: ProcessRunner | None = None,
+        provenance_verifier: ProvenanceVerifier | None = None,
     ) -> None:
         self.config = config
         self.clock: Clock = clock or SystemClock()
         self._object_store = object_store
         self._process = process
+        self._provenance_verifier = provenance_verifier
         self.tools: ProviderRegistry[ToolProvider[Any]] = ProviderRegistry("tool")
         self.sources: ProviderRegistry[SourceProvider] = ProviderRegistry("source")
         self.feeds: ProviderRegistry[FeedProvider] = ProviderRegistry("feed")
@@ -1000,8 +1003,15 @@ class Context:
             self.model_catalog,
             inventory=Inventory(uow, hosts),
         )
+        provenance_verifier = self._provenance_verifier
+        if provenance_verifier is None and (
+            trust_path := self.config.locations.provenance_trust_path()
+        ):
+            provenance_verifier = DsseProvenanceVerifier.from_file(trust_path)
         component_targets = ComponentTargetResolver(
-            self.git, PackageManifestScanner(yaml_documents)
+            self.git,
+            PackageManifestScanner(yaml_documents),
+            provenance_verifier=provenance_verifier,
         )
         ops = OpsService(
             uow,

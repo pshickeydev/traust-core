@@ -360,14 +360,18 @@ def _seed_component_orders(engine: sa.Engine) -> tuple[UUID, str]:
             return repo_id, target_purl
         repos = conn.exec_driver_sql("SELECT id FROM traust.repository LIMIT 100").scalars().all()
         rows = []
-        sha = "f" * 40
+        sha_a = "f" * 40
+        sha_b = "e" * 40
         for rid in repos:
             rows.append((rid, "sci_scan", "queued", 1, "human:perf", None, None, None))
             rows.append(
-                (rid, "sci_scan", "queued", 1, "human:perf", target_purl, sha, "spring-beans")
+                (rid, "sci_scan", "queued", 1, "human:perf", target_purl, sha_a, "spring-beans")
             )
             rows.append(
-                (rid, "sci_scan", "queued", 1, "human:perf", sibling_purl, sha, "spring-context")
+                (rid, "sci_scan", "queued", 1, "human:perf", target_purl, sha_b, "spring-beans")
+            )
+            rows.append(
+                (rid, "sci_scan", "queued", 1, "human:perf", sibling_purl, sha_a, "spring-context")
             )
         conn.exec_driver_sql(
             "INSERT INTO traust_ops.run_order "
@@ -387,8 +391,12 @@ def test_find_open_component_target_purl_uses_partial_index(
     repo_id, target_purl = _seed_component_orders(engine)
 
     def lookup(uow: SqlTraustUnitOfWork) -> None:
-        found = uow.run_orders.find_open("sci_scan", repo_id, target_purl=target_purl)
-        assert found is not None and found.target_purl == target_purl
+        found = uow.run_orders.find_open(
+            "sci_scan", repo_id, target_purl=target_purl, target_sha="f" * 40
+        )
+        assert (
+            found is not None and found.target_purl == target_purl and found.target_sha == "f" * 40
+        )
 
     (stmt,) = explained(lookup)
     fast(stmt, "idx_ops_run_order_target_purl", 5)

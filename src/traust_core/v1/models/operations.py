@@ -8,7 +8,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from enum import StrEnum
 from functools import cache
-from typing import TYPE_CHECKING, NewType
+from typing import TYPE_CHECKING, Any, NewType
 from uuid import UUID
 
 import pydantic
@@ -196,6 +196,8 @@ OPEN_ORDER_STATES = (
     OrderState.LEASED,
 )
 
+MAX_TARGET_PROVENANCE_BYTES = 65_536
+
 
 class OrderRequest(Model):
     """What admission puts on the queue: one asset for one partition, routed or not."""
@@ -213,12 +215,27 @@ class OrderRequest(Model):
     target_purl: str | None = None
     target_sha: str | None = None
     target_module_path: str | None = None
+    target_release_ref: str | None = None
+    target_provenance: dict[str, Any] | None = None
 
     @pydantic.model_validator(mode="after")
     def _component_target_fields(self) -> OrderRequest:
         if self.target_module_path is not None and not self.target_module_path.strip():
             raise ValueError("target_module_path must be non-empty when supplied")
-        fields = (self.target_purl, self.target_sha, self.target_module_path)
+        if self.target_release_ref is not None and not self.target_release_ref.strip():
+            raise ValueError("target_release_ref must be non-empty when supplied")
+        if self.target_provenance is not None:
+            if not self.target_provenance:
+                raise ValueError("target_provenance must be non-empty when supplied")
+            if len(json.dumps(self.target_provenance)) > MAX_TARGET_PROVENANCE_BYTES:
+                raise ValueError(f"target_provenance exceeds {MAX_TARGET_PROVENANCE_BYTES} bytes")
+        fields = (
+            self.target_purl,
+            self.target_sha,
+            self.target_module_path,
+            self.target_release_ref,
+            self.target_provenance,
+        )
         if any(f is not None for f in fields):
             if not (
                 self.target_purl is not None
