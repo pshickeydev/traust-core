@@ -1245,6 +1245,16 @@ MACHINE = Principal(
 )
 
 
+def test_preflight_refuses_a_door_only_asset_as_submit_does(engine: Engine) -> None:
+    """The courtesy check gives submit's answer: a door-only asset is refused by both."""
+    repo = subject(engine)
+    seeded(engine, asset="triage", repository_id=repo, state="succeeded")
+    with pytest.raises(ForbiddenError, match="POST /v1/remediations"):
+        gated(engine).preflight(
+            PreflightRequest(asset="remediate_finding", repository_id=repo), OPERATOR
+        )
+
+
 def test_preflight_allows_a_stage_whose_prior_record_exists(engine: Engine) -> None:
     repo = subject(engine)
     seeded(engine, asset="assessment", repository_id=repo, state="succeeded")
@@ -1388,11 +1398,11 @@ def test_remediation_follows_triage_not_another_remediation_order(engine: Engine
             OrderRequest(asset="remediate_finding", priority=1, repository_id=repo), OPERATOR
         )
     seeded(engine, asset="triage", repository_id=repo, state="succeeded")
-    # the orders door no longer takes remediate_finding (the scheduling door owns it), so
-    # the gate's answer for it is preflight's — the same code path submit enforces
-    assert remediating.preflight(
-        PreflightRequest(asset="remediate_finding", repository_id=repo), OPERATOR
-    ).allowed
+    # past the ordering gate now: what refuses it is the door rule (the scheduling door owns it)
+    with pytest.raises(ForbiddenError, match="POST /v1/remediations"):
+        remediating.preflight(
+            PreflightRequest(asset="remediate_finding", repository_id=repo), OPERATOR
+        )
 
 
 def test_verification_follows_remediation_not_ordinary_triage(engine: Engine) -> None:

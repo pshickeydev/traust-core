@@ -181,6 +181,14 @@ class PolicyDenied(ForbiddenError):
         return self.deny_issues[0].code
 
 
+def _refuse_door_only(asset: AssetName) -> None:
+    """A door-only asset is queued only by its own door, never by a submit."""
+    if asset in DOOR_ONLY_ASSETS:
+        raise ForbiddenError(
+            f"{asset} is queued only by its scheduling door: POST /v1/remediations"
+        )
+
+
 class OpsService:
     def __init__(
         self,
@@ -216,10 +224,7 @@ class OpsService:
         """Store the order a person asked for as planned, with the config it must run under in
         its run manifest; the engine's admission (pack menu, approval holds, budget) queues it."""
         self._check_request(request, principal)
-        if request.asset in DOOR_ONLY_ASSETS:
-            raise ForbiddenError(
-                f"{request.asset} is queued only by its scheduling door: POST /v1/remediations"
-            )
+        _refuse_door_only(request.asset)
         return self._store(request, principal, config, OrderState.PLANNED)
 
     def schedule_fix(
@@ -315,6 +320,7 @@ class OpsService:
         )
         if issues:
             raise PolicyDenied(issues)
+        _refuse_door_only(request.asset)
         return PreflightResult(
             allowed=True,
             asset=request.asset,
