@@ -81,7 +81,10 @@ def _error_source(exc: Exception) -> str | None:
 def problem(request: Request, exc: Exception) -> JSONResponse:
     """One error shape (RFC 9457): the typed core error decides the status, once, here."""
     status = status_of(exc)
-    if status == HTTPStatus.INTERNAL_SERVER_ERROR:
+    # a relayed upstream failure (SourceError's 502: a repository's forge didn't answer) is
+    # logged like a 500 — ours to see in the error log; the structured line carries no
+    # message, so a token the forge's error text might hold can never leak
+    if status == HTTPStatus.INTERNAL_SERVER_ERROR or isinstance(exc, SourceError):
         route = request.scope.get("route")
         with correlation_scope(
             request.state.request_id,

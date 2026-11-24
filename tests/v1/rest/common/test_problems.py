@@ -104,6 +104,23 @@ def test_a_bug_is_logged_once_and_its_internals_stay_inside(
     assert [r.getMessage() for r in caplog.records] == ["GET /raise/{kind} failed"]
 
 
+def test_a_relayed_upstream_failure_logs_the_structured_line(
+    context: Context, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A forge that didn't answer (the 502) reaches the error log like a 500 does — the
+    same structured line, no message, so nothing the forge's error text holds can leak."""
+    with (
+        caplog.at_level(logging.ERROR, logger="traust_core.v1.rest.common.problems"),
+        TestClient(failing(context), raise_server_exceptions=False) as client,
+    ):
+        response = client.get("/raise/source", headers={"X-Request-ID": "r2"})
+    assert response.status_code == 502
+    (record,) = caplog.records
+    assert record.getMessage() == "GET /raise/{kind} failed"
+    assert record.error_type == "SourceError"
+    assert "forge didn't answer" not in caplog.text  # the line is structured, never the message
+
+
 def test_unknown_method_does_not_enter_error_log(caplog: pytest.LogCaptureFixture) -> None:
     secret = "SYNTHETICNEVERREALTOKEN"
     request = Request({"type": "http", "method": secret, "path": "/fail", "headers": []})

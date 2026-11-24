@@ -287,6 +287,26 @@ def test_a_default_line_the_forge_couldnt_give_fails_the_import_and_a_retry_impo
     assert forge.calls.count(f"info {fork}") == 2  # a linked fork with its line isn't asked
 
 
+def test_an_empty_repository_imports_without_a_default_line(
+    portfolio: PortfolioService,
+) -> None:
+    """The forge answered that the default branch names no commit (an empty repository):
+    registered like any repository, just without a default line — the forge answered, so
+    it is not an outage to fail on."""
+    repo = url("example-org/empty")
+    forge = Forge(
+        described=RepoInfo(repo=repo, visibility="public", default_branch="main"),
+        head_error=SourceError(
+            f"{repo}: no commit on branch main",
+            ComparisonStatus.ERROR,
+            empty_repository=True,
+        ),
+    )
+    (repository_id,) = sync(portfolio, forge).import_repository(repo).added
+    assert portfolio.inventory.default_line(repository_id) is None
+    assert portfolio.get_repository(repository_id).url == str(repo)
+
+
 def test_import_branch_on_the_default_line_returns_its_latest_flagged_head(
     portfolio: PortfolioService,
 ) -> None:

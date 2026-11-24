@@ -12,7 +12,7 @@ from sqlalchemy.engine import Engine
 from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import T0
 from tests.v1.services.test_portfolio_sync import Forge, listed, url
-from traust_core.v1.errors import ForbiddenError, ValidationError
+from traust_core.v1.errors import ForbiddenError, NotFoundError, ValidationError
 from traust_core.v1.models.identity import IdentitySource, Principal
 from traust_core.v1.models.inventory import OrgName, ProductSlug, RefName, TeamName
 from traust_core.v1.models.observation import ComparisonStatus
@@ -29,7 +29,7 @@ from traust_core.v1.models.operations import (
     OrderState,
 )
 from traust_core.v1.models.values import HttpsRepoUrl
-from traust_core.v1.models.vocabulary import ActorKind
+from traust_core.v1.models.vocabulary import ActorKind, LivenessStatus
 from traust_core.v1.providers.base import Result
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.sources import RepoInfo, SourceError
@@ -232,6 +232,51 @@ def test_a_default_line_the_forge_couldnt_give_fails_closed_and_a_retry_imports_
     result = onboarding.onboard(ask, OPERATOR)
     with uow:
         assert uow.repository_refs.default(result.repository_ids[0]) is not None
+
+
+def test_an_empty_repository_onboards_without_a_default_ref(
+    onboarding: OnboardingService, uow: SqlTraustUnitOfWork, forge: Forge
+) -> None:
+    """The forge answered that the repository is empty: registered as before, just no
+    default line yet — an empty repository is not an outage."""
+    forge.described = RepoInfo(repo=API, default_branch="main", visibility="public")
+    forge.head_error = SourceError(
+        f"{API}: no commit on branch main", ComparisonStatus.ERROR, empty_repository=True
+    )
+    result = onboarding.onboard(request(label="Example", repositories=[{"url": API}]), OPERATOR)
+    with uow:
+        assert uow.repositories.get(result.repository_ids[0]).url == str(API)
+        assert uow.repository_refs.default(result.repository_ids[0]) is None
+
+
+def test_a_new_url_the_forge_says_does_not_exist_is_the_callers_not_found(
+    onboarding: OnboardingService, uow: SqlTraustUnitOfWork, forge: Forge
+) -> None:
+    """The forge's own no-such-repository names a request core can't satisfy: the caller's
+    404, not a relayed outage (a known repository's MISSING stays the #474 carve-out)."""
+    forge.info_error = SourceError(
+        f"{API}: the forge reports no such repository",
+        ComparisonStatus.ERROR,
+        liveness_status=LivenessStatus.MISSING,
+    )
+    with pytest.raises(NotFoundError, match="no such repository"):
+        onboarding.onboard(request(label="Example", repositories=[{"url": API}]), OPERATOR)
+    assert counts(uow) == (1, 0)  # the product only: no repository was written
+
+
+def test_a_branch_named_in_the_spec_with_no_commit_is_the_callers_not_found(
+    onboarding: OnboardingService, uow: SqlTraustUnitOfWork, forge: Forge
+) -> None:
+    """The forge answered that the branch the spec names has no commit: the caller's 404
+    naming what the forge said, not a 502."""
+    forge.described = RepoInfo(repo=API, default_branch="main", visibility="public")
+    forge.head_error = SourceError(
+        f"{API}: no commit on branch dev", ComparisonStatus.ERROR, empty_repository=True
+    )
+    with pytest.raises(NotFoundError, match="no commit on branch dev"):
+        onboarding.onboard(
+            request(label="Example", repositories=[{"url": API, "refs": ["dev"]}]), OPERATOR
+        )
 
 
 class Outage(Forge):

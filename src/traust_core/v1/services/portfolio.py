@@ -1992,10 +1992,17 @@ class PortfolioSync:
         return report
 
     def _head_of(self, info: RepoInfo) -> GitSha | None:
-        """The default branch's head; None when the forge names no default branch."""
+        """The default branch's head; None when the forge names no default branch or no
+        commit on it (an empty repository: the forge answered, so the import carries on
+        without a default line, as it does without a named branch)."""
         if info.default_branch is None:
             return None
-        return self._sources.head(info.repo, info.default_branch).data
+        try:
+            return self._sources.head(info.repo, info.default_branch).data
+        except SourceError as e:
+            if not e.empty_repository:
+                raise
+            return None
 
     def _record_info(self, repository_id: UUID, info: RepoInfo, head: GitSha | None) -> None:
         """What an import learned from the forge: the visibility it reports (None: it didn't

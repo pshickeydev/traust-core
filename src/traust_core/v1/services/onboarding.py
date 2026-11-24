@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from uuid import UUID
 
-from traust_core.v1.errors import ValidationError
+from traust_core.v1.errors import NotFoundError, TraustError, ValidationError
 from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.inventory import OrgName
 from traust_core.v1.models.onboarding import (
@@ -15,6 +15,7 @@ from traust_core.v1.models.onboarding import (
     RepositorySpec,
 )
 from traust_core.v1.models.operations import OrderRequest
+from traust_core.v1.models.vocabulary import LivenessStatus
 from traust_core.v1.providers.clock import Clock, SystemClock
 from traust_core.v1.providers.sources import RepoInfo, SourceError
 from traust_core.v1.services.operations import OpsService
@@ -101,7 +102,10 @@ class OnboardingService:
             self._portfolio.assign_owner(repository_id, spec.team, self._clock.now())
         return repository_id
 
-    def _forge_refused(self, what: str, e: SourceError) -> SourceError:
+    def _forge_refused(self, what: str, e: SourceError) -> TraustError:
+        # the forge's own no is the caller's 404; only a forge that didn't answer is a 502
+        if e.liveness_status is LivenessStatus.MISSING or e.empty_repository:
+            return NotFoundError(f"onboarding {what}: {e}")
         return SourceError(
             f"onboarding {what}: the forge didn't answer ({e.observation_status}): {e}",
             e.observation_status,
