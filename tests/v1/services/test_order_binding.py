@@ -24,7 +24,7 @@ def _call_names(node: ast.AST) -> set[str]:
 
 
 def _forwarded_method(func: ast.FunctionDef | ast.AsyncFunctionDef) -> str | None:
-    """Return `target` when `func` is a pure wrapper `return self.<svc>.<target>(..., lease_generation=...)`."""
+    """Return `target` for a wrapper `return self.<svc>.<target>(..., lease_generation=...)`."""
     body = [
         stmt
         for stmt in func.body

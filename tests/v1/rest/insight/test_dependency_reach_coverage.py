@@ -16,7 +16,7 @@ from traust_core.v1 import contracts
 from traust_core.v1.context import Config, Context
 from traust_core.v1.errors import ViewContractError
 from traust_core.v1.models.assessment import AssessmentKind
-from traust_core.v1.models.insight import ViewFilter, ViewName
+from traust_core.v1.models.insight import ReportFormat, ViewFilter, ViewName
 from traust_core.v1.providers.syft import SyftSbom
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services.identity import IdentityConfig
@@ -49,13 +49,17 @@ def test_v1_http_reach_beside_scan_bound_coverage(
     services = context.services()
     reader = DependencyReachView(services.exposure, services.portfolio)
     cases: dict[str, Any] = {}
-    url = "/v1/insights/dependency-reach"
     dependencies = f"/v1/refs/{ref.id}/dependencies"
 
+    def render_report() -> str:
+        return services.insight.render(
+            ViewName.DEPENDENCY_REACH, ViewFilter(), ReportFormat.MARKDOWN
+        ).body
+
     def capture(case: str, unmeasured: int, without_scan: int, unresolved: dict[str, int]) -> None:
-        response = client.get(url, headers=headers)
-        assert response.status_code == 200, response.text
-        wire = response.json()
+        wire = services.insight.build(ViewName.DEPENDENCY_REACH, ViewFilter()).model_dump(
+            mode="json"
+        )
         model, gaps = reader.with_coverage(ViewFilter())
         assert model.model_dump(mode="json") == wire
         assert set(wire) == {"repositories", "unmeasured", "ecosystems", "shared"}
@@ -70,10 +74,9 @@ def test_v1_http_reach_beside_scan_bound_coverage(
     capture("never-scanned", 1, 1, {})
     assert cases["never-scanned"]["reach"]["shared"] == []
     assert client.get(dependencies, headers=headers).status_code == 404
-    report = client.get(f"{url}/report", headers=headers)
-    assert report.status_code == 200
-    assert "Repositories without scan-backed manifest coverage: 1" in report.text
-    assert "No manifests recorded" in report.text
+    report = render_report()
+    assert "Repositories without scan-backed manifest coverage: 1" in report
+    assert "No manifests recorded" in report
 
     services.exposure.ingest_sbom(empty, ref.id)
     capture("document-only", 0, 1, {})
@@ -85,9 +88,9 @@ def test_v1_http_reach_beside_scan_bound_coverage(
     assert cases["document-only"]["reach"] == cases["measured-empty"]["reach"]
     rows = client.get(dependencies, headers=headers)
     assert rows.status_code == 200 and rows.json() == []
-    report = client.get(f"{url}/report", headers=headers)
-    assert report.status_code == 200 and "No manifest packages observed" in report.text
-    assert "Unknown manifest coverage" not in report.text
+    report = render_report()
+    assert "No manifest packages observed" in report
+    assert "Unknown manifest coverage" not in report
 
     checkout(tree, locked=False)
     services.exposure.ingest_dependencies(ref.id, tree)
@@ -109,7 +112,7 @@ def test_v1_http_reach_beside_scan_bound_coverage(
     assert rows.status_code == 200
     [row] = rows.json()
     assert (row["package"]["name"], row["dependency"]["version"]) == ("left-pad", "1.3.0")
-    report = client.get(f"{url}/report", headers=headers)
-    assert report.status_code == 200 and "npm: unresolved manifests in 1 repository." in report.text
-    assert "| npm | left-pad | 1 |" in report.text
+    report = render_report()
+    assert "npm: unresolved manifests in 1 repository." in report
+    assert "| npm | left-pad | 1 |" in report
     (tmp_path / "i8-reach-cases.json").write_text(json.dumps(cases, indent=2) + "\n")
