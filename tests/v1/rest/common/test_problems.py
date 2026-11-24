@@ -20,6 +20,8 @@ from traust_core.v1.errors import (
     ServiceError,
     ValidationError,
 )
+from traust_core.v1.models.observation import ComparisonStatus
+from traust_core.v1.providers.sources import SourceError
 from traust_core.v1.repositories.sql import SqlRepository
 from traust_core.v1.rest.app import create_app
 from traust_core.v1.rest.common.problems import problem
@@ -34,6 +36,7 @@ def failing(context: Context) -> FastAPI:
         "not-found": NotFoundError("no such thing"),
         "conflict": ConflictError("already done"),
         "validation": ValidationError("bad value"),
+        "source": SourceError("forge didn't answer", ComparisonStatus.UNREACHABLE),
         "service": ServiceError("upstream broke"),
         "bug": RuntimeError("secret internals"),
     }
@@ -58,6 +61,7 @@ def failing(context: Context) -> FastAPI:
         ("not-found", 404, "no such thing"),
         ("conflict", 409, "already done"),
         ("validation", 422, "bad value"),
+        ("source", 502, "forge didn't answer"),
         ("service", 500, "Internal Server Error"),
         ("bug", 500, "Internal Server Error"),
     ],

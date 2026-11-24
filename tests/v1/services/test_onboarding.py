@@ -3,8 +3,7 @@ SQLite and Postgres."""
 
 from __future__ import annotations
 
-import logging
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 
 import pytest
@@ -29,7 +28,9 @@ from traust_core.v1.models.operations import (
     OrderRequest,
     OrderState,
 )
+from traust_core.v1.models.values import HttpsRepoUrl
 from traust_core.v1.models.vocabulary import ActorKind
+from traust_core.v1.providers.base import Result
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.sources import RepoInfo, SourceError
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
@@ -75,8 +76,7 @@ def forge() -> Forge:
     return Forge(listed("example-org/api", "example-org/cli"), heads={"main": "c" * 40})
 
 
-@pytest.fixture
-def onboarding(
+def onboarding_service(
     uow: SqlTraustUnitOfWork, portfolio: PortfolioService, forge: Forge
 ) -> OnboardingService:
     clock = FixedClock(T0)
@@ -88,6 +88,13 @@ def onboarding(
     )
     sync = PortfolioSync(portfolio, forge, clock=clock)  # type: ignore[arg-type]
     return OnboardingService(portfolio, sync, ops, clock=clock)
+
+
+@pytest.fixture
+def onboarding(
+    uow: SqlTraustUnitOfWork, portfolio: PortfolioService, forge: Forge
+) -> OnboardingService:
+    return onboarding_service(uow, portfolio, forge)
 
 
 def request(**kw: object) -> OnboardingRequest:
@@ -179,20 +186,18 @@ def test_a_registered_product_onboards_without_a_label(
     assert (result.product_id, result.repository_ids, result.order_ids) == (product.id, (), ())
 
 
-def test_onboarding_a_known_repository_shows_a_forge_refresh_it_couldnt_make(
+def test_onboarding_a_known_repository_whose_forge_wont_answer_fails_closed(
     onboarding: OnboardingService,
     portfolio: PortfolioService,
+    uow: SqlTraustUnitOfWork,
     forge: Forge,
-    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    known = portfolio.register_repository(API, public=True)  # no upstream linked yet
+    portfolio.register_repository(API, public=True)  # no upstream linked yet
     forge.info_error = SourceError("forge down", ComparisonStatus.UNREACHABLE)
-    with caplog.at_level(logging.WARNING, logger="traust_core.v1.services.onboarding"):
-        result = onboarding.onboard(request(label="Example", repositories=[{"url": API}]), OPERATOR)
-    assert result.repository_ids == (known.id,)  # still onboarded
-    assert len(result.skipped) == 1 and "forge facts not refreshed" in result.skipped[0]
-    assert f"onboarding repository {known.id}: forge facts not refreshed" in caplog.text
-    assert str(API) not in caplog.text  # the log names the id, not the URL
+    with pytest.raises(SourceError, match=str(API)) as raised:
+        onboarding.onboard(request(label="Example", repositories=[{"url": API}]), OPERATOR)
+    assert "unreachable" in str(raised.value)  # the reason the caller sees
+    assert counts(uow) == (1, 1)  # the product and the known repository, nothing more
 
 
 def test_an_onboarded_repository_is_a_subject_when_the_forge_names_a_default_branch(
@@ -214,17 +219,46 @@ def test_an_onboarded_repository_is_a_subject_when_the_forge_names_a_default_bra
     assert order.state is OrderState.PLANNED
 
 
-def test_onboarding_shows_a_default_line_it_couldnt_import_and_a_retry_imports_it(
+def test_a_default_line_the_forge_couldnt_give_fails_closed_and_a_retry_imports_it(
     onboarding: OnboardingService, uow: SqlTraustUnitOfWork, forge: Forge
 ) -> None:
     forge.described = RepoInfo(repo=API, default_branch="main", visibility="public")
     forge.head_error = SourceError("forge down", ComparisonStatus.UNREACHABLE)
     ask = request(label="Example", repositories=[{"url": API}])
-    result = onboarding.onboard(ask, OPERATOR)
-    assert len(result.skipped) == 1 and "default line not imported" in result.skipped[0]
-    with uow:
-        assert uow.repository_refs.default(result.repository_ids[0]) is None
+    with pytest.raises(SourceError, match="forge down"):
+        onboarding.onboard(ask, OPERATOR)
+    assert counts(uow) == (1, 0)  # the product only: no half-registered repository
     forge.head_error = None
-    assert onboarding.onboard(ask, OPERATOR).skipped == ()
+    result = onboarding.onboard(ask, OPERATOR)
     with uow:
         assert uow.repository_refs.default(result.repository_ids[0]) is not None
+
+
+class Outage(Forge):
+    """Answers every repository but one, the way an outage would."""
+
+    def __init__(
+        self, listing: Sequence[RepoInfo], heads: dict[str, str], down: HttpsRepoUrl
+    ) -> None:
+        super().__init__(listing, heads=heads)
+        self._down = down
+
+    def info(self, repo: HttpsRepoUrl) -> Result[RepoInfo]:
+        if repo == self._down:
+            raise SourceError(f"{repo.host}: connection refused", ComparisonStatus.UNREACHABLE)
+        return super().info(repo)
+
+
+def test_a_forge_failure_on_one_repository_aborts_the_onboarding(
+    uow: SqlTraustUnitOfWork, portfolio: PortfolioService
+) -> None:
+    """The service's per-repository failure mode is the one it already had for a ref the
+    forge couldn't give: the request fails, repositories already onboarded stay."""
+    forge = Outage(listed("example-org/api"), {"main": "c" * 40}, CLI)
+    onboarding = onboarding_service(uow, portfolio, forge)
+    ask = request(label="Example", repositories=[{"url": API}, {"url": CLI}])
+    with pytest.raises(SourceError, match="example-org/cli"):
+        onboarding.onboard(ask, OPERATOR)
+    with uow:
+        urls = [r.url for r in uow.repositories.search(limit=100, after=None)]
+    assert urls == [str(API)]  # api onboarded before the failure, cli never written

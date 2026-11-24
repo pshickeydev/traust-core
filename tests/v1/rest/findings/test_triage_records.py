@@ -337,7 +337,7 @@ def test_forge_failure_is_not_treated_as_missing_citation_evidence(
         "traust_core.v1.context.context.command_source", lambda *args, **kwargs: provider
     )
     response = world.client.post(world.path, json=world.body, headers=runner(world.context))
-    assert response.status_code == 500
+    assert response.status_code == 502  # the forge is an upstream core relays, not a bug
     with SqlTraustUnitOfWork(world.context.database) as uow:
         source = uow.assessments.get(world.assessment_id)
         assert uow.assessments.list_for_refs([source.repository_ref_id], "triage") == []

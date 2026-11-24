@@ -21,6 +21,7 @@ from traust_core.v1.errors import (
 from traust_core.v1.models.base import Dto
 from traust_core.v1.models.operations import DenyCode, DenyIssue
 from traust_core.v1.providers.correlation import correlation_scope
+from traust_core.v1.providers.sources import SourceError
 
 log = logging.getLogger(__name__)
 
@@ -34,6 +35,9 @@ STATUS: tuple[tuple[type[Exception], HTTPStatus], ...] = (
     (NotFoundError, HTTPStatus.NOT_FOUND),
     (ConflictError, HTTPStatus.CONFLICT),
     (IntegrityError, HTTPStatus.CONFLICT),
+    # an upstream core depends on didn't answer (a repository's forge): ours to relay, not
+    # the caller's request and not an internal bug
+    (SourceError, HTTPStatus.BAD_GATEWAY),
     # before ValidationError: a view outside its own contract is Core's fault, not the request's
     (ViewContractError, HTTPStatus.INTERNAL_SERVER_ERROR),
     (ValidationError, HTTPStatus.UNPROCESSABLE_ENTITY),

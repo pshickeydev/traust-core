@@ -1935,10 +1935,6 @@ def _registered(doc: CorpusRegistryArtifact, product: Product) -> CorpusSubject:
     return subject
 
 
-def _why(e: SourceError | ValidationError) -> object:
-    return e.observation_status if isinstance(e, SourceError) else e
-
-
 class PortfolioSync:
     """Brings forge listings and the declared ownership source into the portfolio."""
 
@@ -1970,49 +1966,46 @@ class PortfolioSync:
     def import_repository(self, url: HttpsRepoUrl) -> SyncReport:
         """Register one repository with the visibility its forge reports and its fork's
         upstream linked. A known repository with no upstream is asked again on import unless
-        its latest observation recorded the forge's answer that it isn't a fork."""
+        its latest observation recorded the forge's answer that it isn't a fork. A forge
+        that doesn't answer raises before anything is written: no half-registered row."""
         known = self._portfolio.find_repository(url)
         if known is not None and known.id is not None:
             if known.upstream_id is None and self._portfolio.fork_answer(known.id) is not False:
                 # lineage not known yet: the forge may name a parent, or correct a parent
-                # placeholder's visibility. A forge outage, or a host the forge provider
-                # can't ask, still returns the known id.
+                # placeholder's visibility. A forge that doesn't answer raises here; its own
+                # positive word that there is no such repository is the disposition's
+                # evidence, not onboarding's to weigh (Qodo #474: the vacated URL stays).
                 try:
                     info = self._sources.info(url).data
-                except (SourceError, ValidationError) as e:
-                    return SyncReport(
-                        unchanged=(known.id,),
-                        skipped=(f"{url}: forge facts not refreshed: {_why(e)}",),
-                    )
-                return SyncReport(unchanged=(known.id,), skipped=self._record_info(known.id, info))
+                except SourceError as e:
+                    if e.liveness_status is not LivenessStatus.MISSING:
+                        raise
+                    return SyncReport(unchanged=(known.id,))
+                self._record_info(known.id, info, self._head_of(info))
             return SyncReport(unchanged=(known.id,))
         info = self._sources.info(url).data
+        # the head is asked before the row is written: a forge that can't answer leaves no
+        # half-registered repository
+        head = self._head_of(info)
         report = self._register(url, info.visibility)
-        skipped = self._record_info((*report.added, *report.unchanged)[0], info)
-        return report + SyncReport(skipped=skipped)
+        self._record_info((*report.added, *report.unchanged)[0], info, head)
+        return report
 
-    def _record_info(self, repository_id: UUID, info: RepoInfo) -> tuple[str, ...]:
+    def _head_of(self, info: RepoInfo) -> GitSha | None:
+        """The default branch's head; None when the forge names no default branch."""
+        if info.default_branch is None:
+            return None
+        return self._sources.head(info.repo, info.default_branch).data
+
+    def _record_info(self, repository_id: UUID, info: RepoInfo, head: GitSha | None) -> None:
         """What an import learned from the forge: the visibility it reports (None: it didn't
         say), a fork's parent, and the default branch's line — the observation's default ref
-        without needing a run, so an imported repository is a subject from the start. A head
-        the forge couldn't give is skipped, and holds back the parent link that would settle
-        a fork's import, so the next import asks again."""
-        head, skipped = None, ()
-        if info.default_branch is not None:
-            try:
-                head = self._sources.head(info.repo, info.default_branch).data
-            except (SourceError, ValidationError) as e:
-                skipped = (f"{info.repo}: default line not imported: {_why(e)}",)
-        parent = (
-            None
-            if skipped
-            else _fork_parent_url(info.repo.host, info.fork, info.parent, self._hosts)
-        )
+        without needing a run, so an imported repository is a subject from the start."""
+        parent = _fork_parent_url(info.repo.host, info.fork, info.parent, self._hosts)
         self._portfolio.record_repo_info(repository_id, _is_public(info.visibility), parent)
         if head is not None:
             assert info.default_branch is not None
             self._portfolio.mark_default_branch(repository_id, head, RefName(info.default_branch))
-        return skipped
 
     def import_branch(
         self, repository_id: UUID, url: HttpsRepoUrl, branch: RefName

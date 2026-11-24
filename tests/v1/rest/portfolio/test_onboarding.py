@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import pytest
 from fastapi.testclient import TestClient
 
 from tests.v1.rest.conftest import bearer, same_as_in_process
+from tests.v1.services.test_portfolio_sync import Forge
 from traust_core.v1.context import Context
+from traust_core.v1.models.observation import ComparisonStatus
 from traust_core.v1.models.onboarding import OnboardingRequest
+from traust_core.v1.providers.sources import SourceError
 
 REPO = "https://github.com/example-org/api"
 
@@ -53,3 +57,38 @@ def test_onboarding_needs_a_token(context: Context, client: TestClient) -> None:
     req = {"product": "example", "label": "Example"}
     assert client.post("/v1/onboarding", json=req).status_code == 401
     assert client.post("/v1/onboarding/plan", json=req).status_code == 401
+
+
+def test_onboard_fails_closed_with_502_when_the_forge_doesnt_answer(
+    context: Context, client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A forge outage is the caller's to see (502, the host and the reason), never a
+    half-registered repository."""
+    down = Forge(info_error=SourceError("forge down", ComparisonStatus.UNREACHABLE))
+    monkeypatch.setattr("traust_core.v1.context.context.command_source", lambda *a, **k: down)
+    made = client.post(
+        "/v1/onboarding",
+        json={"product": "example", "label": "Example", "repositories": [{"url": REPO}]},
+        headers=bearer(context),
+    )
+    assert made.status_code == 502
+    assert made.headers["content-type"] == "application/problem+json"
+    detail = made.json()["detail"]
+    assert REPO in detail and "unreachable" in detail and "forge down" in detail
+    listed = client.get("/v1/repositories", headers=bearer(context)).json()["items"]
+    assert listed == []  # nothing was written for the repository
+
+
+def test_plan_fails_closed_with_502_when_the_forge_listing_doesnt_answer(
+    context: Context, client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    down = Forge(error=SourceError("forge down", ComparisonStatus.UNREACHABLE))
+    monkeypatch.setattr("traust_core.v1.context.context.command_source", lambda *a, **k: down)
+    made = client.post(
+        "/v1/onboarding/plan",
+        json={"product": "example", "label": "Example", "org": "example-org"},
+        headers=bearer(context),
+    )
+    assert made.status_code == 502
+    detail = made.json()["detail"]
+    assert "org example-org on github.com" in detail and "unreachable" in detail
