@@ -230,3 +230,11 @@ def test_a_report_with_not_affected_passes_the_contract_and_renders() -> None:
     report["not_affected"] = [NOT_AFFECTED]
     assert contracts.schema_errors("report", report) == []
     assert "Not Affected (Eliminated with Evidence)" in render_report(report)
+
+
+def test_a_location_path_keeps_its_backslashes_inside_its_code_span() -> None:
+    report = copy.deepcopy(valid_report())
+    report["findings"][0]["locations"] = [{"path": "src\\auth\\login.go", "lines": "3"}]
+    md = render_report(report)
+    assert "`src\\auth\\login.go" in md
+    assert "src\\\\auth" not in md
