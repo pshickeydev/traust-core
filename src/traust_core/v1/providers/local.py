@@ -104,6 +104,7 @@ class LocalCheckout:
                         ),
                     )
                 if worktree.exists():
+                    self._git(repo.path, "worktree", "unlock", str(worktree), check=False)
                     self._git(
                         repo.path, "worktree", "remove", "--force", str(worktree), check=False
                     )
@@ -113,8 +114,16 @@ class LocalCheckout:
                     self._git(
                         repo.path, "worktree", "add", "--quiet", "--detach", str(worktree), sha
                     )
+                    self._git(
+                        repo.path, "worktree", "lock", "--reason", "traust-shared", str(worktree)
+                    )
                 except BaseException:
+                    self._git(repo.path, "worktree", "unlock", str(worktree), check=False)
+                    self._git(
+                        repo.path, "worktree", "remove", "--force", str(worktree), check=False
+                    )
                     shutil.rmtree(worktree, ignore_errors=True)
+                    self._git(repo.path, "worktree", "prune", check=False)
                     raise
                 refs_file.write_text("1\n", encoding="utf-8")
                 return Result(
@@ -146,7 +155,7 @@ class LocalCheckout:
             raise ValidationError(f"workspace {workspace.path} is not a local origin: {repo!s}")
         target = workspace.path.resolve()
         with self._locked(repo.path):
-            owned = self._worktrees(repo.path)
+            owned, locked = self._worktree_state(repo.path)
             worktree, refs_file = self._shared_paths(repo.path, str(workspace.sha))
             shared_root = worktree.parent
             is_managed_shared = target == worktree or target.is_relative_to(shared_root)
@@ -161,10 +170,16 @@ class LocalCheckout:
                     refs_file.write_text(f"{remaining}\n", encoding="utf-8")
                     return
                 refs_file.unlink(missing_ok=True)
+                self._git(repo.path, "worktree", "unlock", str(target), check=False)
             elif target not in owned:
                 raise ValidationError(
                     f"workspace {workspace.path} is not a worktree of {repo.path}; "
                     "refusing to remove"
+                )
+            elif target in locked:
+                raise ValidationError(
+                    f"workspace {workspace.path} is a locked shared worktree managed by another "
+                    "cache; refusing to remove"
                 )
             self._git(repo.path, "worktree", "remove", "--force", str(target), check=False)
             shutil.rmtree(target, ignore_errors=True)
@@ -172,18 +187,29 @@ class LocalCheckout:
             # materialized repository re-runs clean even when the directory is already gone
             self._git(repo.path, "worktree", "prune", check=False)
 
-    def _worktrees(self, repo: Path) -> set[Path]:
-        """The worktrees git registered under `repo`, never its own main one: the only paths
-        release removes, so a forged or foreign path is refused, never deleted."""
+    def _worktree_state(self, repo: Path) -> tuple[set[Path], set[Path]]:
+        """(owned, locked) secondary worktrees git registered under `repo`, never its main one."""
         listed = self._runner.run(
             ["git", "-C", str(repo), *HARDENED, "worktree", "list", "--porcelain"], check=False
         ).stdout.decode(errors="replace")
-        worktrees = [
-            line.removeprefix("worktree ")
-            for line in listed.splitlines()
-            if line.startswith("worktree ")
-        ]
-        return {Path(worktree).resolve() for worktree in worktrees[1:]}
+        entries: list[tuple[Path, bool]] = []
+        current: Path | None = None
+        is_locked = False
+        for line in listed.splitlines():
+            if line.startswith("worktree "):
+                if current is not None:
+                    entries.append((current, is_locked))
+                current = Path(line.removeprefix("worktree ")).resolve()
+                is_locked = False
+            elif line == "locked" or line.startswith("locked "):
+                is_locked = True
+        if current is not None:
+            entries.append((current, is_locked))
+        secondary = entries[1:]
+        return (
+            {path for path, _ in secondary},
+            {path for path, flag in secondary if flag},
+        )
 
     def _git(self, repo: Path, *args: str, check: bool = True) -> None:
         self._runner.run(["git", "-C", str(repo), *HARDENED, *args], check=check)

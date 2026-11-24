@@ -255,3 +255,25 @@ def test_shared_release_without_shared_flag_preserves_other_holder_on_mirror_and
     # Final release from another fresh instance removes the shared worktree.
     LocalCheckout(ProcessRunner(allowed=("git",)), FixedClock(AT), shared_dir).release(lh2)
     assert not lh2.path.exists()
+
+    # Cross-config-home protection: a second LocalCheckout with a different shared_dir cannot
+    # remove a live shared worktree (even with shared=False), because git worktree lock metadata
+    # classifies it independently of caller config.
+    other_shared_dir = tmp_path / "other-config-home-shared"
+    owner = LocalCheckout(ProcessRunner(allowed=("git",)), FixedClock(AT), shared_dir)
+    foreign = LocalCheckout(ProcessRunner(allowed=("git",)), FixedClock(AT), other_shared_dir)
+    ws_owned = owner.checkout(CheckoutRequest(repo=local_url, ref=local_sha, shared=True)).data
+    for shared_flag in (False, True):
+        with pytest.raises(ValidationError, match="refusing to remove"):
+            foreign.release(
+                Workspace(
+                    repo=local_url,
+                    sha=local_sha,
+                    path=ws_owned.path,
+                    provider=foreign.name,
+                    shared=shared_flag,
+                )
+            )
+        assert ws_owned.path.is_dir()
+    owner.release(ws_owned)
+    assert not ws_owned.path.exists()
