@@ -20,11 +20,12 @@ _FILE = {
     "description": "The built file, named by `Content-Disposition`",
     "content": {
         # json is the report document itself: the view's model, an object whose shape varies
-        # by report; the other formats are its text renders.
+        # by report; the other formats are its text renders. json first: generators type a
+        # download by its first media type.
         f.media_type: {
             "schema": {"type": "object"} if f is ReportFormat.JSON else {"type": "string"}
         }
-        for f in ReportFormat
+        for f in sorted(ReportFormat, key=lambda f: f is not ReportFormat.JSON)
     },
     "headers": {
         "Content-Disposition": {

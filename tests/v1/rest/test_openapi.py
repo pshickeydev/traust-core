@@ -98,6 +98,7 @@ def test_the_report_file_route_declares_the_media_types_the_handler_serves(
         "responses"
     ]["200"]
     assert set(response["content"]) == {f.media_type for f in ReportFormat}
+    assert next(iter(response["content"])) == "application/json"  # generators read the first
     assert response["content"]["application/json"]["schema"] == {"type": "object"}
     for media in ("text/markdown", "text/html", "text/csv"):
         assert response["content"][media]["schema"] == {"type": "string"}
