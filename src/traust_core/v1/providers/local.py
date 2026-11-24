@@ -4,9 +4,14 @@ materialized at a deterministic sha."""
 
 from __future__ import annotations
 
+import fcntl
+import hashlib
+import os
 import shutil
 import tempfile
 import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 from traust_core.v1.errors import NotFoundError, ValidationError
@@ -24,14 +29,44 @@ class LocalCheckout:
 
     name = "git-local"
 
-    def __init__(self, runner: ProcessRunner, clock: Clock) -> None:
+    def __init__(self, runner: ProcessRunner, clock: Clock, shared_dir: Path | None = None) -> None:
         self._runner, self._clock = runner, clock
         self._reader = GitCheckout(runner)
-        self._shared: dict[tuple[Path, str], tuple[Path, int]] = {}
+        self._shared_dir = shared_dir
         self._lock = threading.Lock()
 
     def check(self) -> Readiness:
         return Readiness(ready=self._runner.allows("git"), detail="git is not allowed here")
+
+    def _shared_root(self) -> Path:
+        if self._shared_dir is not None:
+            return self._shared_dir
+        return Path(tempfile.gettempdir()) / f"traust-local-shared-{os.getuid()}"
+
+    def _shared_base(self, repo_path: Path) -> Path:
+        digest = hashlib.sha256(str(repo_path.resolve()).encode("utf-8")).hexdigest()[:16]
+        return (self._shared_root() / digest).resolve()
+
+    def _shared_paths(self, repo_path: Path, sha: str) -> tuple[Path, Path]:
+        base = self._shared_base(repo_path)
+        return (base / sha).resolve(), base / f"{sha}.refs"
+
+    def _read_refs(self, refs_file: Path) -> int:
+        try:
+            return max(0, int(refs_file.read_text(encoding="utf-8").strip()))
+        except (OSError, ValueError):
+            return 0
+
+    @contextmanager
+    def _locked(self, repo_path: Path) -> Iterator[None]:
+        base = self._shared_base(repo_path)
+        base.mkdir(parents=True, exist_ok=True)
+        with self._lock, (base / "shared.lock").open("a") as held:
+            fcntl.flock(held.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(held.fileno(), fcntl.LOCK_UN)
 
     def checkout(self, request: CheckoutRequest) -> Result[Workspace]:
         if request.shared and request.writable:
@@ -44,28 +79,36 @@ class LocalCheckout:
         sha = str(request.ref)
         if not self._reader.reachable(repo.path, sha):
             raise NotFoundError(f"commit {sha} is not in {repo}")
-        key = (repo.path.resolve(), sha)
         if request.shared:
-            with self._lock:
-                if key in self._shared:
-                    existing, refs = self._shared[key]
-                    if existing.is_dir() and self._reader.is_checkout(existing):
-                        self._shared[key] = (existing, refs + 1)
-                        return Result(
-                            Workspace(
-                                repo=repo,
-                                sha=request.ref,
-                                path=existing,
-                                provider=self.name,
-                                shared=True,
-                            ),
-                            Acquisition(
-                                provider=self.name,
-                                acquired_at=self._clock.now(),
-                                source=str(repo),
-                            ),
-                        )
-                worktree = Path(tempfile.mkdtemp(prefix="checkout-")).resolve()
+            with self._locked(repo.path):
+                worktree, refs_file = self._shared_paths(repo.path, sha)
+                if (
+                    worktree.is_dir()
+                    and self._reader.is_checkout(worktree)
+                    and self._reader.head(worktree) == sha
+                ):
+                    refs = self._read_refs(refs_file) + 1
+                    refs_file.write_text(f"{refs}\n", encoding="utf-8")
+                    return Result(
+                        Workspace(
+                            repo=repo,
+                            sha=request.ref,
+                            path=worktree,
+                            provider=self.name,
+                            shared=True,
+                        ),
+                        Acquisition(
+                            provider=self.name,
+                            acquired_at=self._clock.now(),
+                            source=str(repo),
+                        ),
+                    )
+                if worktree.exists():
+                    self._git(
+                        repo.path, "worktree", "remove", "--force", str(worktree), check=False
+                    )
+                    shutil.rmtree(worktree, ignore_errors=True)
+                    self._git(repo.path, "worktree", "prune", check=False)
                 try:
                     self._git(
                         repo.path, "worktree", "add", "--quiet", "--detach", str(worktree), sha
@@ -73,7 +116,7 @@ class LocalCheckout:
                 except BaseException:
                     shutil.rmtree(worktree, ignore_errors=True)
                     raise
-                self._shared[key] = (worktree, 1)
+                refs_file.write_text("1\n", encoding="utf-8")
                 return Result(
                     Workspace(
                         repo=repo,
@@ -102,33 +145,32 @@ class LocalCheckout:
         if not isinstance(repo, LocalRepoUrl):
             raise ValidationError(f"workspace {workspace.path} is not a local origin: {repo!s}")
         target = workspace.path.resolve()
-        key = (repo.path.resolve(), str(workspace.sha))
-        with self._lock:
-            held = self._shared.get(key)
-            if held is not None and held[0] == target:
-                if held[1] > 1:
-                    self._shared[key] = (held[0], held[1] - 1)
+        with self._locked(repo.path):
+            owned = self._worktrees(repo.path)
+            worktree, refs_file = self._shared_paths(repo.path, str(workspace.sha))
+            shared_root = worktree.parent
+            is_managed_shared = target == worktree or target.is_relative_to(shared_root)
+            if workspace.shared or is_managed_shared:
+                if target != worktree or target not in owned:
+                    raise ValidationError(
+                        f"workspace {workspace.path} is not the shared worktree for "
+                        f"{repo}@{workspace.sha}; refusing to remove"
+                    )
+                remaining = self._read_refs(refs_file) - 1
+                if remaining > 0:
+                    refs_file.write_text(f"{remaining}\n", encoding="utf-8")
                     return
-                self._shared.pop(key, None)
-                self._remove_worktree(repo.path, workspace.path)
-                return
-            if workspace.shared or any(path == target for path, _ in self._shared.values()):
+                refs_file.unlink(missing_ok=True)
+            elif target not in owned:
                 raise ValidationError(
-                    f"workspace {workspace.path} is not the shared worktree for "
-                    f"{repo}@{workspace.sha}; refusing to remove"
+                    f"workspace {workspace.path} is not a worktree of {repo.path}; "
+                    "refusing to remove"
                 )
-        self._remove_worktree(repo.path, workspace.path)
-
-    def _remove_worktree(self, repo_path: Path, workspace_path: Path) -> None:
-        if workspace_path.resolve() not in self._worktrees(repo_path):
-            raise ValidationError(
-                f"workspace {workspace_path} is not a worktree of {repo_path}; refusing to remove"
-            )
-        self._git(repo_path, "worktree", "remove", "--force", str(workspace_path), check=False)
-        shutil.rmtree(workspace_path, ignore_errors=True)
-        # the worktree registered in the source repository's own worktrees/ dir; prune so a
-        # materialized repository re-runs clean even when the directory is already gone
-        self._git(repo_path, "worktree", "prune", check=False)
+            self._git(repo.path, "worktree", "remove", "--force", str(target), check=False)
+            shutil.rmtree(target, ignore_errors=True)
+            # the worktree registered in the source repository's own worktrees/ dir; prune so a
+            # materialized repository re-runs clean even when the directory is already gone
+            self._git(repo.path, "worktree", "prune", check=False)
 
     def _worktrees(self, repo: Path) -> set[Path]:
         """The worktrees git registered under `repo`, never its own main one: the only paths

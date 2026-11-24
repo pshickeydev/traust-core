@@ -230,22 +230,28 @@ def test_shared_release_without_shared_flag_preserves_other_holder_on_mirror_and
     (repo / "README.md").write_text("shared\n", encoding="utf-8")
     local_sha = GitSha.parse(commit_all(repo, "init"))
     local_url = LocalRepoUrl.parse(repo.as_uri())
-    local = LocalCheckout(ProcessRunner(allowed=("git",)), FixedClock(AT))
-    lh1 = local.checkout(CheckoutRequest(repo=local_url, ref=local_sha, shared=True)).data
-    lh2 = local.checkout(CheckoutRequest(repo=local_url, ref=local_sha, shared=True)).data
+    shared_dir = tmp_path / "local-shared"
+    local_a = LocalCheckout(ProcessRunner(allowed=("git",)), FixedClock(AT), shared_dir)
+    local_b = LocalCheckout(ProcessRunner(allowed=("git",)), FixedClock(AT), shared_dir)
+    lh1 = local_a.checkout(CheckoutRequest(repo=local_url, ref=local_sha, shared=True)).data
+    lh2 = local_b.checkout(CheckoutRequest(repo=local_url, ref=local_sha, shared=True)).data
     assert lh1.path == lh2.path
 
+    # Cross-instance mismatched SHA targeting a managed shared worktree is refused.
+    local_c = LocalCheckout(ProcessRunner(allowed=("git",)), FixedClock(AT), shared_dir)
     with pytest.raises(ValidationError, match="refusing to remove"):
-        local.release(
+        local_c.release(
             Workspace(
-                repo=local_url, sha=other_sha, path=lh1.path, provider=local.name, shared=False
+                repo=local_url, sha=other_sha, path=lh1.path, provider=local_c.name, shared=False
             )
         )
     assert lh2.path.is_dir()
 
-    local.release(
-        Workspace(repo=local_url, sha=local_sha, path=lh1.path, provider=local.name, shared=False)
+    # Cross-instance release with shared=False still decrements the on-disk refcount.
+    local_c.release(
+        Workspace(repo=local_url, sha=local_sha, path=lh1.path, provider=local_c.name, shared=False)
     )
     assert lh2.path.is_dir()
-    local.release(lh2)
+    # Final release from another fresh instance removes the shared worktree.
+    LocalCheckout(ProcessRunner(allowed=("git",)), FixedClock(AT), shared_dir).release(lh2)
     assert not lh2.path.exists()

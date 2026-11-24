@@ -456,7 +456,11 @@ class Context:
                 self.config.locations.mirror_cache_dir(self.config.home),
                 self.forge_api,
             ),
-            LocalCheckout(self.process, self.clock),
+            LocalCheckout(
+                self.process,
+                self.clock,
+                self.config.locations.mirror_cache_dir(self.config.home) / "_local-shared",
+            ),
         )
 
     @cached_property
