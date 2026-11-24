@@ -182,7 +182,6 @@ class PolicyDenied(ForbiddenError):
 
 
 def _refuse_door_only(asset: AssetName) -> None:
-    """A door-only asset is queued only by its own door, never by a submit."""
     if asset in DOOR_ONLY_ASSETS:
         raise ForbiddenError(
             f"{asset} is queued only by its scheduling door: POST /v1/remediations"
@@ -246,7 +245,6 @@ class OpsService:
         )
 
     def _check_request(self, request: OrderRequest, principal: Principal) -> None:
-        """The gates every stored request passes, whatever door it came through."""
         issues = self._policy_issues(
             asset=request.asset,
             repository_id=request.repository_id,
