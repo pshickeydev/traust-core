@@ -102,8 +102,6 @@ class OnboardingService:
         return repository_id
 
     def _forge_refused(self, what: str, e: SourceError) -> SourceError:
-        """The typed error a caller sees when the forge didn't answer: what was being
-        onboarded and why, never a token."""
         return SourceError(
             f"onboarding {what}: the forge didn't answer ({e.observation_status}): {e}",
             e.observation_status,
@@ -123,8 +121,6 @@ class OnboardingService:
         return list(specs.values())
 
     def _listed(self, org: OrgName, host: str) -> list[RepoInfo]:
-        """The organisation's repositories on its host; a forge that doesn't answer fails
-        the onboarding."""
         try:
             return self._sync.list_org(org, host)
         except SourceError as e:
