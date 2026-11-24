@@ -600,7 +600,9 @@ def test_the_worklist_leaves_out_the_corrections_records():
     assert harness.repository_id in {r.id for r in worklist.items}
 
 
-def test_onboarding_plans_nothing_for_a_dispositioned_repository(monkeypatch: pytest.MonkeyPatch):
+def test_onboarding_plans_nothing_for_a_dispositioned_repository(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """The collector re-registering a vacated URL must not re-enter the repository
     through onboarding's baseline: the universe rule covers the onboarding door."""
     import pathlib
