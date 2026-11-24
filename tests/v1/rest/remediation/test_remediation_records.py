@@ -27,6 +27,7 @@ from traust_core.v1.models.operations import (
     AssetName,
     JobResult,
     OrderRequest,
+    OrderState,
     RecordingStartScope,
     RunOrder,
     WorkerId,
@@ -506,6 +507,11 @@ def test_explicit_worker_start_records_exact_report_bytes_under_its_native_order
     world = World(engine)
     opened(context, world)
     assert world.repo.id is not None
+    with SqlTraustUnitOfWork(context.database) as uow:
+        # only the scheduling door queues remediate_finding; the worker's explicit start
+        # takes the door's queued order over rather than storing a new one
+        queued = Seed(uow).run_order(asset=ASSET, priority=1, repository_id=world.repo.id)
+        uow.commit()
     scope = RecordingStartScope(
         principal=machine(context).ref,
         assets=(ASSET,),
@@ -524,6 +530,7 @@ def test_explicit_worker_start_records_exact_report_bytes_under_its_native_order
     )
     assert started.status_code == 200, started.text
     order = RunOrder.model_validate(started.json())
+    assert order.id == queued.id and order.state == OrderState.LEASED
     raw = json.loads(report(world).payload)
     raw["title"] += " — remédiation"
     payload = (" \n" + json.dumps(raw, ensure_ascii=False, indent=3) + "\n\t").encode("utf-8")

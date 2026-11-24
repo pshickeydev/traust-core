@@ -20,7 +20,7 @@ from traust_core.v1.errors import (
 )
 from traust_core.v1.models.artifacts import RunManifestArtifact
 from traust_core.v1.models.common import Page, PageRequest, Provenance, TimeBucket, TimeWindow
-from traust_core.v1.models.identity import Principal
+from traust_core.v1.models.identity import Principal, ref_is_human
 from traust_core.v1.models.operations import (
     DOOR_ONLY_ASSETS,
     FEED_ORDER_STATES,
@@ -482,8 +482,9 @@ class OpsService:
         self, request: OrderRequest, principal: Principal, config: Sequence[ConfigDigest] = ()
     ) -> RunOrder:
         """Store a routed request as planned, with the config in force (the pack version) in its
-        run manifest; an open order for the same subject is re-ranked while still planned,
-        otherwise returned unchanged."""
+        run manifest; an open order for the same subject is re-ranked while still planned (a
+        person's submitted order keeps the route they chose), otherwise returned unchanged."""
+        _refuse_door_only(request.asset)
         _classifiers(lane=request.lane, event_source=request.event_source)
         self._check_work_item(request)
         manifest = self._config_manifest(tuple(config))
@@ -499,6 +500,10 @@ class OpsService:
                     )
                 )
             elif current.state == OrderState.PLANNED:
+                if ref_is_human(current.requested_by):
+                    # A person asked for this order through the submit door, with the route they
+                    # chose; the engine re-ranks only what it planned itself (a machine's ref).
+                    return current
                 route = request.model_dump(include={"priority", "lane", "rule", "event_source"})
                 update = {**route, **manifest}
                 if all(getattr(current, field) == value for field, value in update.items()):
@@ -614,6 +619,9 @@ class OpsService:
         with self._uow as uow:
             current = uow.run_orders.find_open(request.asset, request.repository_id)
             if current is None:
+                # Taking over the scheduling door's queued order below is a runner's move; only
+                # a door that stores a new order refuses a door-only asset.
+                _refuse_door_only(request.asset)
                 order = RunOrder(**request.model_dump(), **lease, requested_by=principal.ref)
                 saved = uow.run_orders.add(order)
             else:

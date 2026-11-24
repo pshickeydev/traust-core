@@ -422,6 +422,10 @@ def test_triage_authority_and_provenance_refusals_precede_all_report_mutations(
         with SqlTraustUnitOfWork(world.context.database) as uow:
             source = uow.assessments.get(world.assessment_id)
             repository_id = uow.repository_refs.get(source.repository_ref_id).repository_id
+            # only the scheduling door queues remediate_finding; the runner's start takes
+            # the door's order over rather than storing a new one
+            Seed(uow).run_order(asset="remediate_finding", priority=1, repository_id=repository_id)
+            uow.commit()
         order = ops.start(
             OrderRequest(asset="remediate_finding", priority=1, repository_id=repository_id),
             world.principal,

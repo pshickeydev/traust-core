@@ -51,7 +51,8 @@ class RecordKind(StrEnum):
 # section yet, so its orders ride the triage allowlist and only this name tells them apart.
 REMEDIATE_FINDING = AssetName("remediate_finding")
 
-# Assets one door owns: a direct submit refuses them, because only their door checks the
+# Assets one door owns: every door that stores an order refuses them (a direct submit,
+# preflight, plan, a start with no order to take over), because only their door checks the
 # facts they need (remediate_finding's fork facts) before queueing them.
 DOOR_ONLY_ASSETS: Final[frozenset[AssetName]] = frozenset({REMEDIATE_FINDING})
 
