@@ -337,7 +337,7 @@ def test_forge_failure_is_not_treated_as_missing_citation_evidence(
         "traust_core.v1.context.context.command_source", lambda *args, **kwargs: provider
     )
     response = world.client.post(world.path, json=world.body, headers=runner(world.context))
-    assert response.status_code == 500
+    assert response.status_code == 502  # the forge is an upstream core relays, not a bug
     with SqlTraustUnitOfWork(world.context.database) as uow:
         source = uow.assessments.get(world.assessment_id)
         assert uow.assessments.list_for_refs([source.repository_ref_id], "triage") == []
@@ -422,6 +422,10 @@ def test_triage_authority_and_provenance_refusals_precede_all_report_mutations(
         with SqlTraustUnitOfWork(world.context.database) as uow:
             source = uow.assessments.get(world.assessment_id)
             repository_id = uow.repository_refs.get(source.repository_ref_id).repository_id
+            # only the scheduling door queues remediate_finding; the runner's start takes
+            # the door's order over rather than storing a new one
+            Seed(uow).run_order(asset="remediate_finding", priority=1, repository_id=repository_id)
+            uow.commit()
         order = ops.start(
             OrderRequest(asset="remediate_finding", priority=1, repository_id=repository_id),
             world.principal,

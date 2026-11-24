@@ -816,6 +816,7 @@ def order(context: Context, ref: UUID | None, *, lease: bool = True, expired: bo
         OrderRequest(asset="full_audit", priority=1, repository_id=repository_id), OPERATOR
     )
     assert submitted.id is not None
+    services.ops.admit(submitted.id)  # the engine's admission tick queues the planned order
     if lease:
         services.ops.claim(WorkerId("machine:runner"), timedelta(minutes=5), order_id=submitted.id)
     if expired:

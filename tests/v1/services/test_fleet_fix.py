@@ -680,7 +680,8 @@ def test_apply_refuses_an_order_no_person_approved(
     fix = service.record(spec(), provenance())
     ops = context.services().ops
     request = OrderRequest(asset=FLEET_FIX_ORDER, priority=0, repository_id=r0)
-    ops.submit(request, HUMAN)
+    submitted = ops.submit(request, HUMAN)
+    ops.admit(submitted.id)  # the engine's admission tick queues the planned order
     queued = ops.claim(WORKER, LEASE, (FLEET_FIX_ORDER,))
     assert queued is not None and queued.id is not None
     with pytest.raises(ForbiddenError, match="is not for fleet fix"):

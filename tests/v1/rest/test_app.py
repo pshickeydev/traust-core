@@ -5,6 +5,7 @@ import logging
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Barrier
+from uuid import UUID
 
 import pytest
 from fastapi.testclient import TestClient
@@ -82,6 +83,7 @@ def test_created_and_selected_order_ids_reach_service_and_access_events(
             json={"order": {"asset": "command_result", "priority": 1}},
             headers={**bearer(context), "X-Request-ID": "submit-1"},
         ).json()
+        context.services().ops.admit(UUID(submitted["id"]))  # the engine's admission tick
         claimed = client.post(
             "/v1/orders/claim",
             json={"lease_seconds": 300},
@@ -92,7 +94,7 @@ def test_created_and_selected_order_ids_reach_service_and_access_events(
         json.loads(line) for line in (tmp_path / "logs" / "traust.log").read_text().splitlines()
     ]
     for request_id, outcome, actor_kind in (
-        ("submit-1", "queued", "human"),
+        ("submit-1", "planned", "human"),
         ("claim-1", "leased", "machine"),
     ):
         service = next(

@@ -68,6 +68,12 @@ OPERATOR = Principal(
     display="operator",
     verified_by=IdentitySource.OIDC,
 )
+PLANNER = Principal(
+    identity="engine",
+    kind=ActorKind("machine"),
+    display="engine",
+    verified_by=IdentitySource.DATABASE,
+)
 RESULTS = {
     Outcome.SUCCEEDED: JobResult.succeeded(),
     Outcome.DEGRADED: JobResult.partly({"unreachable": 2}),
@@ -146,28 +152,48 @@ def test_order_event_does_not_log_requester_email(
 ) -> None:
     with caplog.at_level(logging.INFO, logger="traust_core.v1.services.operations"):
         ops(engine).submit(OrderRequest(asset="feeds_cache", priority=3), OPERATOR)
-    assert "queued" in caplog.text
+    assert "planned" in caplog.text
     assert OPERATOR.identity not in caplog.text
 
 
-def test_queued_event_does_not_precede_an_outer_rollback(
+def test_an_order_event_does_not_precede_an_outer_rollback(
     engine: Engine, caplog: pytest.LogCaptureFixture
 ) -> None:
     service = ops(engine)
     with caplog.at_level(logging.INFO, logger="traust_core.v1.services.operations"):
         with service._uow:
             order = service.submit(OrderRequest(asset="feeds_cache", priority=3), OPERATOR)
-            assert "queued" not in caplog.text
-        assert "queued" not in caplog.text
+            assert "planned" not in caplog.text
+        assert "planned" not in caplog.text
     with pytest.raises(NotFoundError):
         stored(engine, order)
 
 
-def test_submit_queues_the_asset_for_its_requester(engine: Engine) -> None:
+def test_submit_plans_the_asset_for_its_requester(engine: Engine) -> None:
     order = ops(engine).submit(OrderRequest(asset="feeds_cache", priority=3), OPERATOR)
     assert stored(engine, order) == order
-    assert (order.asset, order.lane, order.state) == ("feeds_cache", None, OrderState.QUEUED)
+    assert (order.asset, order.lane, order.state) == ("feeds_cache", None, OrderState.PLANNED)
     assert order.requested_by == f"human:{OPERATOR.identity}"
+
+
+def test_a_submitted_order_runs_once_admission_queues_it(engine: Engine) -> None:
+    """Submit plans, admission (the engine's tick) queues, a runner claims: one path for
+    every order, whatever door asked for it."""
+    service = ops(engine)
+    order = service.submit(OrderRequest(asset="feeds_cache", priority=3), OPERATOR)
+    assert service.claim(W1, LEASE) is None
+    assert service.admit(order.id).state == OrderState.QUEUED
+    claimed = service.claim(W1, LEASE)
+    assert claimed is not None and claimed.id == order.id
+
+
+def test_submit_refuses_a_door_only_asset(engine: Engine) -> None:
+    """remediate_finding is queued only by the remediation scheduling door, which sets its
+    fork facts after its checks; the orders door refuses it."""
+    with pytest.raises(ForbiddenError, match="POST /v1/remediations"):
+        ops(engine).submit(OrderRequest(asset="remediate_finding", priority=1), OPERATOR)
+    with SqlTraustUnitOfWork(engine) as uow:
+        assert uow.run_orders.search(asset="remediate_finding", limit=10) == []
 
 
 def test_submit_refuses_an_order_both_routed_and_injected(engine: Engine) -> None:
@@ -338,21 +364,93 @@ def test_start_stores_a_run_already_underway_leased_to_its_runner(engine: Engine
     assert done.state == OrderState.SUCCEEDED
 
 
-@pytest.mark.parametrize("state", ["planned", "queued"])
-def test_start_takes_over_the_subjects_waiting_order(engine: Engine, state: str) -> None:
-    waiting = seeded(engine, asset="feeds_cache", state=state)
+def test_start_takes_over_the_subjects_queued_order(engine: Engine) -> None:
+    waiting = seeded(engine, asset="feeds_cache", state="queued")
     order = ops(engine).start(OrderRequest(asset="feeds_cache", priority=1), OPERATOR, W1, LEASE)
     assert order.id == waiting.id
     assert (order.state, order.lease_holder, order.priority) == (OrderState.LEASED, W1, 5)
     assert ops(engine).claim(W2, LEASE) is None
 
 
-@pytest.mark.parametrize("state", ["leased", "awaiting_approval"])
-def test_start_refuses_a_subject_already_running_or_held(engine: Engine, state: str) -> None:
-    held = seeded(engine, asset="feeds_cache", **in_state(state))
+def test_start_refuses_a_planned_order_admission_has_not_seen(engine: Engine) -> None:
+    waiting = seeded(engine, asset="feeds_cache", state="planned")
+    with pytest.raises(ConflictError, match="awaiting admission"):
+        ops(engine).start(OrderRequest(asset="feeds_cache", priority=1), OPERATOR, W1, LEASE)
+    assert ops(engine).get(waiting.id).state == OrderState.PLANNED
+
+
+def test_a_submitted_gated_order_is_taken_over_only_once_admitted_and_approved(
+    engine: Engine,
+) -> None:
+    """The start door can't jump admission: a person's submitted order is refused while
+    planned and while held for approval, and taken over once approval has queued it."""
+    service = ops(engine)
+    submitted = service.submit(OrderRequest(asset="feeds_cache", priority=1), OPERATOR)
+    assert submitted.id is not None
+    start = OrderRequest(asset="feeds_cache", priority=1)
+    with pytest.raises(ConflictError, match="awaiting admission"):
+        service.start(start, OPERATOR, W1, LEASE)
+    service.request_approval(submitted.id)
+    with pytest.raises(ConflictError, match="awaiting approval"):
+        service.start(start, OPERATOR, W1, LEASE)
+    service.approve(submitted.id, OPERATOR)
+    taken = service.start(start, OPERATOR, W1, LEASE)
+    assert (taken.id, taken.state) == (submitted.id, OrderState.LEASED)
+
+
+def test_start_refuses_to_create_a_new_door_only_order(engine: Engine) -> None:
+    """A start with no order to take over stores a new order, so the door-only rule refuses
+    it as a submit would: only the scheduling door queues the asset."""
+    repo = seeded_repository(engine)
+    with pytest.raises(ForbiddenError, match="POST /v1/remediations"):
+        ops(engine).start(
+            OrderRequest(asset="remediate_finding", priority=1, repository_id=repo),
+            OPERATOR,
+            W1,
+            LEASE,
+        )
+    with SqlTraustUnitOfWork(engine) as uow:
+        assert uow.run_orders.search(asset="remediate_finding", limit=10) == []
+
+
+def test_start_takes_over_the_order_the_scheduling_door_queued(engine: Engine) -> None:
+    """The door-only rule refuses new orders, never the run the door asked for: a runner
+    takes over the door's queued order, fork facts and all."""
+    repo = seeded_repository(engine)
+    queued = seeded(
+        engine,
+        asset="remediate_finding",
+        state="queued",
+        priority=0,
+        repository_id=repo,
+        requested_by="machine:remediation-scheduling",
+        fork_url="https://github.com/mirror-org/fix",
+        fork_branch="fix/finding",
+    )
+    order = ops(engine).start(
+        OrderRequest(asset="remediate_finding", priority=0, repository_id=repo), OPERATOR, W1, LEASE
+    )
+    assert (order.id, order.state, order.lease_holder) == (queued.id, OrderState.LEASED, W1)
+    assert (order.fork_url, order.fork_branch) == (
+        "https://github.com/mirror-org/fix",
+        "fix/finding",
+    )
+
+
+def test_start_refuses_to_take_over_an_order_awaiting_approval(engine: Engine) -> None:
+    """Admission held the order for a person; the start door must not release it around the
+    approval the pack asked for."""
+    held = seeded(engine, asset="feeds_cache", **in_state("awaiting_approval"))
+    with pytest.raises(ConflictError, match="awaiting approval"):
+        ops(engine).start(OrderRequest(asset="feeds_cache", priority=1), OPERATOR, W2, LEASE)
+    assert stored(engine, held).state == "awaiting_approval"
+
+
+def test_start_refuses_a_subject_already_running(engine: Engine) -> None:
+    held = seeded(engine, asset="feeds_cache", **in_state("leased"))
     with pytest.raises(ConflictError):
         ops(engine).start(OrderRequest(asset="feeds_cache", priority=1), OPERATOR, W2, LEASE)
-    assert stored(engine, held).state == state
+    assert stored(engine, held).state == "leased"
 
 
 def test_start_leaves_finished_orders_and_other_subjects_alone(engine: Engine) -> None:
@@ -682,12 +780,31 @@ def test_plan_replay_does_not_update_or_log_unchanged_route(
 
 
 def test_plan_re_ranks_the_planned_order_for_the_same_subject(engine: Engine) -> None:
+    """The engine re-ranks what it planned itself, while the order is still planned."""
     repo, service = seeded_repository(engine), ops(engine)
-    first = service.plan(OrderRequest(asset="diff_scan", priority=5, repository_id=repo), OPERATOR)
+    first = service.plan(OrderRequest(asset="diff_scan", priority=5, repository_id=repo), PLANNER)
     again = OrderRequest(asset="diff_scan", priority=1, repository_id=repo, lane="diff-scan")
-    second = service.plan(again, OPERATOR)
+    second = service.plan(again, PLANNER)
     assert second.id == first.id
     assert (stored(engine, first).priority, stored(engine, first).lane) == (1, "diff-scan")
+
+
+def test_plan_leaves_a_persons_submitted_order_its_chosen_route(engine: Engine) -> None:
+    """A submitted order is planned with the route its requester chose, and still names them
+    as requester; a later engine tick (or an onboarding baseline) re-planning the subject
+    must not overwrite that route."""
+    repo, service = subject(engine), gated(engine)
+    submitted = service.submit(
+        OrderRequest(asset="diff_scan", priority=3, repository_id=repo, lane="diff-scan"), OPERATOR
+    )
+    assert (
+        service.plan(
+            OrderRequest(asset="diff_scan", priority=1, repository_id=repo, lane="deps-lane"),
+            PLANNER,
+        )
+        == submitted
+    )
+    assert (stored(engine, submitted).priority, stored(engine, submitted).lane) == (3, "diff-scan")
 
 
 @pytest.mark.parametrize("state", ["awaiting_approval", "queued", "leased"])
@@ -729,6 +846,19 @@ def test_plan_refuses_an_order_both_routed_and_injected(engine: Engine) -> None:
     request = OrderRequest(asset="diff_scan", priority=1, rule="rule-4", event_source="cve")
     with pytest.raises(ConflictError):
         ops(engine).plan(request, OPERATOR)
+
+
+def test_plan_refuses_a_door_only_asset(engine: Engine) -> None:
+    """The door-only rule holds at every door that stores an order, not only submit and
+    preflight: the engine's planning, and an onboarding baseline through it, reach the same
+    refusal — only the scheduling door queues the asset."""
+    repo = seeded_repository(engine)
+    with pytest.raises(ForbiddenError, match="POST /v1/remediations"):
+        ops(engine).plan(
+            OrderRequest(asset="remediate_finding", priority=1, repository_id=repo), PLANNER
+        )
+    with SqlTraustUnitOfWork(engine) as uow:
+        assert uow.run_orders.search(asset="remediate_finding", limit=10) == []
 
 
 def test_plan_refuses_an_order_for_an_unregistered_repository(engine: Engine) -> None:
@@ -926,9 +1056,9 @@ def test_plan_records_the_pack_version_and_orders_share_one_manifest(engine: Eng
 def test_replanning_with_a_new_pack_version_moves_the_manifest(engine: Engine) -> None:
     repo = seeded_repository(engine)
     request = OrderRequest(asset="diff_scan", priority=1, repository_id=repo)
-    first = ops(engine).plan(request, OPERATOR, [PACK])
+    first = ops(engine).plan(request, PLANNER, [PACK])
     newer = ConfigDigest(name="pack:security", digest="b" * 64)
-    again = ops(engine).plan(request, OPERATOR, [newer])
+    again = ops(engine).plan(request, PLANNER, [newer])
     assert again.id == first.id and again.artifact_id != first.artifact_id
     assert manifest(engine, again)["config"] == [{"name": "pack:security", "digest": "b" * 64}]
 
@@ -1217,6 +1347,16 @@ MACHINE = Principal(
 )
 
 
+def test_preflight_refuses_a_door_only_asset_as_submit_does(engine: Engine) -> None:
+    """The courtesy check gives submit's answer: a door-only asset is refused by both."""
+    repo = subject(engine)
+    seeded(engine, asset="triage", repository_id=repo, state="succeeded")
+    with pytest.raises(ForbiddenError, match="POST /v1/remediations"):
+        gated(engine).preflight(
+            PreflightRequest(asset="remediate_finding", repository_id=repo), OPERATOR
+        )
+
+
 def test_preflight_allows_a_stage_whose_prior_record_exists(engine: Engine) -> None:
     repo = subject(engine)
     seeded(engine, asset="assessment", repository_id=repo, state="succeeded")
@@ -1294,7 +1434,7 @@ def test_submit_accepts_what_preflight_allowed(engine: Engine) -> None:
     order = gated(engine).submit(
         OrderRequest(asset="triage", priority=1, repository_id=repo), OPERATOR
     )
-    assert order.state == OrderState.QUEUED
+    assert order.state == OrderState.PLANNED
 
 
 def test_the_gate_follows_the_configured_asset_names(engine: Engine) -> None:
@@ -1312,7 +1452,7 @@ def test_the_gate_follows_the_configured_asset_names(engine: Engine) -> None:
     order = audit_gated.submit(
         OrderRequest(asset="triage", priority=1, repository_id=repo), OPERATOR
     )
-    assert order.state == OrderState.QUEUED
+    assert order.state == OrderState.PLANNED
 
 
 def test_a_predecessor_that_did_not_run_does_not_unlock_the_next_stage(engine: Engine) -> None:
@@ -1360,10 +1500,11 @@ def test_remediation_follows_triage_not_another_remediation_order(engine: Engine
             OrderRequest(asset="remediate_finding", priority=1, repository_id=repo), OPERATOR
         )
     seeded(engine, asset="triage", repository_id=repo, state="succeeded")
-    order = remediating.submit(
-        OrderRequest(asset="remediate_finding", priority=1, repository_id=repo), OPERATOR
-    )
-    assert order.state == OrderState.QUEUED
+    # past the ordering gate now: what refuses it is the door rule (the scheduling door owns it)
+    with pytest.raises(ForbiddenError, match="POST /v1/remediations"):
+        remediating.preflight(
+            PreflightRequest(asset="remediate_finding", repository_id=repo), OPERATOR
+        )
 
 
 def test_verification_follows_remediation_not_ordinary_triage(engine: Engine) -> None:
@@ -1391,7 +1532,7 @@ def test_verification_follows_remediation_not_ordinary_triage(engine: Engine) ->
     order = remediating.submit(
         OrderRequest(asset="verify", priority=1, repository_id=repo), OPERATOR
     )
-    assert order.state == OrderState.QUEUED
+    assert order.state == OrderState.PLANNED
 
 
 def test_verification_keeps_a_prerequisite_when_remediation_is_not_wired(engine: Engine) -> None:
@@ -1415,7 +1556,7 @@ def test_verification_keeps_a_prerequisite_when_remediation_is_not_wired(engine:
     assert denied.value.deny_code == "ordering_violated"
     seeded(engine, asset="triage", repository_id=repo, state="succeeded")
     order = unwired.submit(OrderRequest(asset="verify", priority=1, repository_id=repo), OPERATOR)
-    assert order.state == OrderState.QUEUED
+    assert order.state == OrderState.PLANNED
 
 
 def test_an_asset_bound_to_two_kinds_outside_the_config_is_a_config_error(engine: Engine) -> None:

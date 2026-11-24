@@ -723,6 +723,7 @@ def test_an_audit_recorded_for_its_leased_order_is_that_orders_result(
         OrderRequest(asset="cloud_config_audit", priority=1, repository_id=repository_id), ALICE
     )
     assert submitted.id is not None
+    services.ops.admit(submitted.id)  # the engine's admission tick queues the planned order
     services.ops.claim(WorkerId("machine:runner"), timedelta(minutes=5), order_id=submitted.id)
     assessment, _ = services.assessment.record_audit(
         audit, ref, published(context, audit), run_order_id=submitted.id
@@ -745,6 +746,7 @@ def test_an_audit_is_refused_for_a_fleet_wide_or_expired_order(
         ALICE,
     )
     assert submitted.id is not None
+    services.ops.admit(submitted.id)  # the engine's admission tick queues the planned order
     services.ops.claim(WorkerId("machine:runner"), timedelta(minutes=5), order_id=submitted.id)
     if scope == "expired":
         with SqlTraustUnitOfWork(engine) as uow:

@@ -234,12 +234,14 @@ def test_the_adopter_fields_default_and_read(tmp_path: Path) -> None:
             "feeds: {osv_access: air-gapped}\n"
             "execution: {sandbox: podman}\n"
             "campaign: {tracking_reference: SEC-1, display_name: Q4}\n"
-            "remediation: {fork_org: mirrors, private_forge_hosts: [git.example.invalid]}\n",
+            "remediation: {fork_org: mirrors, private_forge_hosts: [git.example.invalid],"
+            " committer: sci-remediation}\n",
         )
     )
     assert (config.feeds.osv_access, config.execution.sandbox) == ("air-gapped", "podman")
     assert (config.campaign.tracking_reference, config.campaign.display_name) == ("SEC-1", "Q4")
     assert config.remediation.private_forge_hosts == ("git.example.invalid",)
+    assert config.remediation.committer == "sci-remediation"
 
 
 def test_forge_tokens_sit_beside_forge_hosts(

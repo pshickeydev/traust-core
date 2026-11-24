@@ -165,12 +165,15 @@ _SEVERITY_RANK = {s: i for i, s in enumerate(SEVERITY_ORDER)}
 
 class RemediationConfig(Model):
     """Where fixes are pushed: the deployment's mirror org, its patch-repository name prefix
-    and its own forge hosts."""
+    and its own forge hosts; and the machine identity fix commits are authored under."""
 
     fork_org: OrgName | None = None
     private_forge_hosts: tuple[str, ...] = ()
     patch_prefix: str = pydantic.Field(default="patch-", pattern=r"^[A-Za-z0-9_][A-Za-z0-9._-]*$")
     fix_branch_prefix: str = pydantic.Field(default="fix", pattern=r"^[A-Za-z0-9._-]+$")
+    committer: str = pydantic.Field(
+        default="traust-remediation", pattern=r"^[a-z0-9][a-z0-9-]*-remediation$"
+    )
 
     @pydantic.field_validator("private_forge_hosts")
     @classmethod
@@ -183,7 +186,7 @@ class RemediationConfig(Model):
 
 
 class ForkPolicy:
-    """Where fixes go: the inventory's private mirror, else the sci-patch-<name> convention in
+    """Where fixes go: the inventory's private mirror, else the fork-prefix convention in
     the fork org for GitHub, else the repository itself on the deployment's own forge; never
     a public repository."""
 
@@ -244,7 +247,7 @@ class ForkPolicy:
         )
 
     def before_convention(self, repository_url: str) -> Fork | None:
-        """The fork this policy answered before the sci-patch convention: the bare repository
+        """The fork this policy answered before the prefix convention: the bare repository
         name in the fork org, GitHub only — None where today's answer was already the old
         one's (a registered mirror, or the repository itself on a private forge)."""
         upstream = _url(repository_url)
@@ -254,6 +257,11 @@ class ForkPolicy:
         return self.of(
             HttpsRepoUrl("github.com", f"{self._config.fork_org}/{name}"), ForkVisibility.PRIVATE
         )
+
+    @property
+    def committer(self) -> str:
+        """The machine identity fix commits are authored under (`<name>@localhost`)."""
+        return self._config.committer
 
     def fix_branch(self, finding_id: UUID, title: str) -> str:
         slug = re.sub(r"[^A-Za-z0-9]+", "-", title).strip("-").lower()[:40]
@@ -376,7 +384,7 @@ class RemediationService:
 
     def prepare(self, work_item_id: UUID) -> RemediationInput:
         """What the skill patches: the findings as they stand with their latest validation and
-        audit suggestion, the commit, the fork and branch."""
+        audit suggestion, the commit, the fork and branch, and the commit's machine author."""
         item = self.get(work_item_id)
         subject = self._inventory.subject(item.repository_ref_id, work_item_id)
         views = self._findings.list_by_ids(item.finding_ids)
@@ -408,6 +416,7 @@ class RemediationService:
             fix_branch=order.fork_branch
             if order is not None and order.fork_branch is not None
             else self._forks.fix_branch(views[0].finding.id, views[0].finding.title),  # type: ignore[arg-type]
+            committer=self._forks.committer,
         )
 
     def _scheduled_fork(self, order: RunOrder, repository_url: str) -> Fork:
@@ -589,7 +598,7 @@ class RemediationService:
     def vouched(self, order: RunOrder, forks: dict[UUID, Fork | None] | None = None) -> bool:
         """Whether scheduling vouches for the order's fork facts: its scheduling stamp
         (contracts#130), or, for an order from before the stamp, today's fork policy — or
-        the bare name that policy answered before the sci-patch convention — read once per
+        the bare name that policy answered before the prefix convention — read once per
         repository into `forks` when given."""
         if (
             order.fork_scheduled_at is not None
@@ -608,7 +617,7 @@ class RemediationService:
 
     def _vouched_before_convention(self, order: RunOrder) -> bool:
         """Whether an unstamped order names the bare fork the policy answered before the
-        sci-patch convention: an era's door-set facts stay vouched across the change — the
+        prefix convention: an era's door-set facts stay vouched across the change — the
         bare name is computed from the repository, never read off the order, and a fork the
         inventory has since proven another upstream's never vouches."""
         if order.fork_url is None or order.fork_branch is None:
