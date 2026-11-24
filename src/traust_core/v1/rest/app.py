@@ -61,7 +61,6 @@ def create_app(context: Context, role: Role = Role.ALL) -> FastAPI:
     default_openapi = app.openapi
 
     def openapi() -> dict[str, Any]:
-        """The spec, every operation carrying `x-traust-role` (`roles.serving_role`)."""
         spec = default_openapi()
         for path, item in spec["paths"].items():
             for method, operation in item.items():
