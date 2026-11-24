@@ -187,3 +187,65 @@ def test_mirror_release_refuses_unowned_directory_and_preserves_contents(
     assert real_ws.path.is_dir()
     mirror.release(real_ws)
     assert not real_ws.path.exists()
+
+
+def test_shared_release_without_shared_flag_preserves_other_holder_on_mirror_and_local(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from traust_core.v1.providers.sources import Workspace
+
+    # 1. MirrorCheckout: two holders; releasing first with shared=False decrements refcount
+    #    rather than deleting the live shared worktree out from under holder 2.
+    forge = Forge(tmp_path)
+    (forge.work / "spring-beans").mkdir(parents=True, exist_ok=True)
+    sha = forge.commit("spring-beans/Cache.java", b"public class Cache {}\n")
+    other_sha = GitSha.parse("b" * 40)
+    cfg = tmp_path / "gitconfig"
+    cfg.write_text(f'[url "file://{forge.bare}"]\n\tinsteadOf = {URL}\n', encoding="utf-8")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(cfg))
+
+    spy = SpyRunner(LocalForge(allowed=("git",), keep_env=("PATH", "HOME", "GIT_CONFIG_GLOBAL")))
+    mirror = MirrorCheckout(spy, FixedClock(AT), tmp_path / "mirrors", ForgeApi(NoHttp(), {}))
+    h1 = mirror.checkout(CheckoutRequest(repo=URL, ref=sha, shared=True)).data
+    h2 = mirror.checkout(CheckoutRequest(repo=URL, ref=sha, shared=True)).data
+    assert h1.path == h2.path
+
+    # Mismatched SHA targeting a managed shared worktree is refused without deletion.
+    with pytest.raises(ValidationError, match="refusing to remove"):
+        mirror.release(
+            Workspace(repo=URL, sha=other_sha, path=h1.path, provider=mirror.name, shared=False)
+        )
+    assert h2.path.is_dir()
+
+    # Omitting shared=True still follows the ref-counted shared release path.
+    mirror.release(Workspace(repo=URL, sha=sha, path=h1.path, provider=mirror.name, shared=False))
+    assert h2.path.is_dir()
+    mirror.release(h2)
+    assert not h2.path.exists()
+
+    # 2. LocalCheckout: same two-holder protection when shared=False is passed.
+    repo = tmp_path / "local-two-holders"
+    repo.mkdir()
+    git(repo, "init", "-q")
+    (repo / "README.md").write_text("shared\n", encoding="utf-8")
+    local_sha = GitSha.parse(commit_all(repo, "init"))
+    local_url = LocalRepoUrl.parse(repo.as_uri())
+    local = LocalCheckout(ProcessRunner(allowed=("git",)), FixedClock(AT))
+    lh1 = local.checkout(CheckoutRequest(repo=local_url, ref=local_sha, shared=True)).data
+    lh2 = local.checkout(CheckoutRequest(repo=local_url, ref=local_sha, shared=True)).data
+    assert lh1.path == lh2.path
+
+    with pytest.raises(ValidationError, match="refusing to remove"):
+        local.release(
+            Workspace(
+                repo=local_url, sha=other_sha, path=lh1.path, provider=local.name, shared=False
+            )
+        )
+    assert lh2.path.is_dir()
+
+    local.release(
+        Workspace(repo=local_url, sha=local_sha, path=lh1.path, provider=local.name, shared=False)
+    )
+    assert lh2.path.is_dir()
+    local.release(lh2)
+    assert not lh2.path.exists()

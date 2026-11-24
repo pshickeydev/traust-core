@@ -101,17 +101,22 @@ class LocalCheckout:
         repo = workspace.repo
         if not isinstance(repo, LocalRepoUrl):
             raise ValidationError(f"workspace {workspace.path} is not a local origin: {repo!s}")
-        if workspace.shared:
-            with self._lock:
-                key = (repo.path.resolve(), str(workspace.sha))
-                held = self._shared.get(key)
-                if held is not None and held[0] == workspace.path.resolve():
-                    if held[1] > 1:
-                        self._shared[key] = (held[0], held[1] - 1)
-                        return
-                    self._shared.pop(key, None)
+        target = workspace.path.resolve()
+        key = (repo.path.resolve(), str(workspace.sha))
+        with self._lock:
+            held = self._shared.get(key)
+            if held is not None and held[0] == target:
+                if held[1] > 1:
+                    self._shared[key] = (held[0], held[1] - 1)
+                    return
+                self._shared.pop(key, None)
                 self._remove_worktree(repo.path, workspace.path)
-            return
+                return
+            if workspace.shared or any(path == target for path, _ in self._shared.values()):
+                raise ValidationError(
+                    f"workspace {workspace.path} is not the shared worktree for "
+                    f"{repo}@{workspace.sha}; refusing to remove"
+                )
         self._remove_worktree(repo.path, workspace.path)
 
     def _remove_worktree(self, repo_path: Path, workspace_path: Path) -> None:

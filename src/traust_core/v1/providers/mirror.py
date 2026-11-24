@@ -127,8 +127,10 @@ class MirrorCheckout:
                 )
             target = workspace.path.resolve()
             owned = self._worktrees(mirror)
-            if workspace.shared:
-                worktree, refs_file = self._shared_paths(mirror, str(workspace.sha))
+            worktree, refs_file = self._shared_paths(mirror, str(workspace.sha))
+            shared_root = worktree.parent
+            is_managed_shared = target == worktree or target.is_relative_to(shared_root)
+            if workspace.shared or is_managed_shared:
                 if target != worktree or target not in owned:
                     raise ValidationError(
                         f"workspace {workspace.path} is not the shared worktree for "
