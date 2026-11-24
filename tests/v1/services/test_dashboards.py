@@ -221,3 +221,91 @@ def test_the_uncategorized_bucket_groups_and_filters_as_none(backend: str, tmp_p
             )
         )
         assert only.rows[0].measures["findings"] == 5
+
+
+def _seed_products(engine: Engine) -> dict[str, object]:
+    """Three repositories: one ships in two products, one in one, one in none."""
+    with SqlTraustUnitOfWork(engine) as uow:
+        s = Seed(uow)
+        shared = s.repository(url="https://github.com/example-org/shared")
+        alone = s.repository(url="https://github.com/example-org/alone")
+        unshipped = s.repository(url="https://github.com/example-org/unshipped")
+        shared_ref = s.repository_ref(shared)
+        alone_ref = s.repository_ref(alone)
+        unshipped_ref = s.repository_ref(unshipped)
+        alpha = s.product(slug="alpha", name="Alpha")
+        beta = s.product(slug="beta", name="Beta")
+        alpha_release = s.release(product=alpha)
+        beta_release = s.release(product=beta)
+        s.component(release=alpha_release, ref=shared_ref)
+        s.component(release=alpha_release, ref=alone_ref)
+        s.component(release=beta_release, ref=shared_ref)
+        for repository, ref, title in (
+            (shared, shared_ref, "In both products"),
+            (shared, shared_ref, "Also in both products"),
+            (shared, shared_ref, "Third in both products"),
+            (alone, alone_ref, "Only in alpha"),
+            (unshipped, unshipped_ref, "In no product"),
+        ):
+            audit = s.assessment(ref, occurred_at=T0)
+            s.occurrence(s.finding(repository, title=title), audit, severity="high")
+        uow.commit()
+        return {"shared": shared.id, "alone": alone.id, "unshipped": unshipped.id}
+
+
+@pytest.mark.parametrize("backend", SQL_BACKENDS)
+def test_grouping_by_product_counts_each_products_estate(backend: str, tmp_path) -> None:
+    with contract_db(backend, tmp_path) as engine:
+        _seed_products(engine)
+        service = _service(engine)
+
+        results = service.query(
+            DashboardQuery(subject="findings", measures=("findings",), group_by=("product",))
+        )
+
+        assert {row.groups["product"]: row.measures["findings"] for row in results.rows} == {
+            "alpha": 4.0,  # the shared repository's three and alpha's own
+            "beta": 3.0,  # the shared repository's three again: its estate too
+            None: 1.0,  # the unshipped repository's finding groups under no product
+        }
+
+
+@pytest.mark.parametrize("backend", SQL_BACKENDS)
+def test_a_product_filter_counts_a_shared_repository_once(backend: str, tmp_path) -> None:
+    with contract_db(backend, tmp_path) as engine:
+        _seed_products(engine)
+        service = _service(engine)
+
+        results = service.query(
+            DashboardQuery(
+                subject="findings", measures=("findings",), where={"product": ("alpha", "beta")}
+            )
+        )
+
+        assert results.rows[0].measures["findings"] == 4.0  # not 7: no double count
+
+
+@pytest.mark.parametrize("backend", SQL_BACKENDS)
+def test_product_grouping_and_filtering_read_slugs(backend: str, tmp_path) -> None:
+    with contract_db(backend, tmp_path) as engine:
+        _seed_products(engine)
+        service = _service(engine)
+
+        both = service.query(
+            DashboardQuery(
+                subject="findings",
+                measures=("findings",),
+                group_by=("product", "severity"),
+                where={"product": ("beta",)},
+            )
+        )
+
+        assert [(row.groups["product"], row.groups["severity"]) for row in both.rows] == [
+            ("beta", "high")
+        ]
+        with pytest.raises(ValidationError, match="does not group by"):
+            service.query(
+                DashboardQuery(
+                    subject="review_items", measures=("review_items",), group_by=("product",)
+                )
+            )

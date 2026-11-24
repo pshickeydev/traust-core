@@ -13,8 +13,8 @@ from uuid import uuid4
 import pytest
 from sqlalchemy.dialects import postgresql, sqlite
 
-from traust_core.v1.models.dashboard import DashboardQuery, Subject
-from traust_core.v1.repositories.traust.findings.dashboard_facts import _FACTS
+from traust_core.v1.models.dashboard import DashboardQuery, Dimension, Subject
+from traust_core.v1.repositories.traust.findings.dashboard_facts import _facts_sql
 from traust_core.v1.services.dashboards import DashboardService, catalog
 from traust_core.v1.services.portfolio import PortfolioPolicy, PortfolioService
 
@@ -94,6 +94,19 @@ def _adversarial() -> list[DashboardQuery]:
             order=({"by": "oldest_open_age", "desc": True},),
             limit=1,
         ),
+        DashboardQuery(
+            subject="findings",
+            measures=("findings", "repositories"),
+            group_by=("product", "severity"),
+            where={"product": _PAYLOADS, "state": ("open",)},
+            order=({"by": "findings", "desc": True}, {"by": "product"}),
+        ),
+        DashboardQuery(
+            subject="findings",
+            measures=("findings",),
+            where={"product": ("alpha", "beta")},
+            order=({"by": "findings", "desc": True},),
+        ),
     ]
 
 
@@ -107,9 +120,10 @@ def _compiled(query: DashboardQuery, dialect: str) -> str:
     return connection.statements[0]
 
 
-def _clause(sql: str) -> str:
+def _clause(query: DashboardQuery, sql: str) -> str:
     """The part the request produced: everything after the fixed facts CTE."""
-    facts = _FACTS[Subject.FINDINGS].text
+    products = Dimension.PRODUCT in (*query.group_by, *query.where)
+    facts = _facts_sql(Subject.FINDINGS, products)
     assert sql.startswith(facts)
     return sql[len(facts) :]
 
@@ -118,13 +132,16 @@ def _catalog_tokens(dialect: str) -> set[str]:
     """Every identifier token the catalog can put in a statement, for the dialect."""
     dimensions, measures = catalog.SERVED[Subject.FINDINGS]
     expressions = [
-        *catalog.columns(tuple(dimensions), dialect),
-        *catalog.aggregates(tuple(measures), dialect),
-        *(
-            catalog.order_key(by, desc, dialect)
-            for by in (*dimensions, *measures)
-            for desc in (False, True)
-        ),
+        expression
+        for products in (False, True)
+        for expression in (
+            *catalog.aggregates(tuple(measures), dialect, products=products),
+            *(
+                catalog.order_key(by, desc, dialect, products=products)
+                for by in (*dimensions, *measures)
+                for desc in (False, True)
+            ),
+        )
     ]
     return {
         token.lower()
@@ -139,7 +156,8 @@ def test_every_identifier_in_the_compiled_statement_comes_from_the_catalog(
 ) -> None:
     allowed = _catalog_tokens(dialect) | _STRUCTURE
     for query in _adversarial():
-        clause = re.sub(r"__\[POSTCOMPILE_[A-Za-z0-9_]*\]", " ", _clause(_compiled(query, dialect)))
+        sql = _compiled(query, dialect)
+        clause = re.sub(r"__\[POSTCOMPILE_[A-Za-z0-9_]*\]", " ", _clause(query, sql))
         used = {token.lower() for token in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", clause)}
         unexplained = {token for token in used if token not in allowed}
         assert not unexplained, f"identifiers not in the catalog: {unexplained}"
@@ -156,7 +174,7 @@ def test_no_request_value_appears_in_the_compiled_statement(dialect: str) -> Non
 @pytest.mark.parametrize("dialect", ["sqlite", "postgresql"])
 def test_the_compiled_limit_never_exceeds_the_row_cap(dialect: str) -> None:
     for query in _adversarial():
-        clause = _clause(_compiled(query, dialect))
+        clause = _clause(query, _compiled(query, dialect))
         limit = re.search(r"LIMIT (\d+)", clause)
         assert limit is not None
         assert int(limit.group(1)) <= 1000

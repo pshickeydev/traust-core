@@ -759,7 +759,7 @@ traust-server --config traust.yaml --role query|command|ops|reports   # default:
 
 | Route | What |
 |---|---|
-| `POST /v1/dashboards:query` | one metrics query over the finding's stamped current answer (state, effective severity, decided, category). Subjects: `findings`, `review_items`. Every query takes the repository filter (empty = the whole estate); `group_by` ≤ 3, row cap 1,000 |
+| `POST /v1/dashboards:query` | one metrics query over the finding's stamped current answer (state, effective severity, decided, category, and the shipped product's slug — `findings` groups and filters by `product`; a repository shipping in several products counts in each product's row and once under a multi-product filter, `None` when nothing ships it). Subjects: `findings`, `review_items`. Every query takes the repository filter (empty = the whole estate); `group_by` ≤ 3, row cap 1,000 |
 | `POST /v1/reports` | request a report as a job: the last ready build answers 200, a queued or in-flight build 202 |
 | `GET /v1/reports/{order_id}` | the report order's status |
 | `GET /v1/reports/{order_id}/file` | the rendered file from object storage (the cache is the product: no cache layer) |
