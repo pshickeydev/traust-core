@@ -221,6 +221,34 @@ def _dependency_audit(dep: Report, n: int) -> str:
     return "\n".join(parts)
 
 
+def _not_affected(entries: list[Report], n: int) -> str:
+    rows = []
+    for e in entries:
+        dep = e["dependency"]
+        evidence = dep.get("classification", "")
+        if dep.get("evidence_level"):
+            evidence += f" ({dep['evidence_level']})"
+        source = dep.get("impact_artifact") or e.get("reference", "")
+        rows.append(
+            [
+                dep["advisory"],
+                dep["module"],
+                dep.get("installed_version", ""),
+                evidence,
+                e["rationale"],
+                source,
+            ]
+        )
+    headers = ["Advisory", "Module", "Installed", "Evidence", "Rationale", "Source"]
+    return "\n".join(
+        [
+            f"## {n}. Not Affected (Eliminated with Evidence)\n",
+            "Matched advisories eliminated as not affected: recorded, not filed as findings.\n",
+            _table(headers, rows),
+        ]
+    )
+
+
 def _negative_results(results: list[Report], n: int) -> str:
     parts = [f"## {n}. Negative Results (Verified Clean)\n"]
     for r in results:
@@ -314,6 +342,7 @@ def render_report(report: Report) -> str:
     n = 6
     for key, section in (
         ("dependency_audit", _dependency_audit),
+        ("not_affected", _not_affected),
         ("negative_results", _negative_results),
         ("peach_isolation_review", _peach_isolation_review),
         ("asvs_coverage", _asvs_coverage),

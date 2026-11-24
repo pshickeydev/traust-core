@@ -155,3 +155,57 @@ def test_a_finding_shows_its_owasp_llm_categories(reporting: ReportingService) -
     report["findings"][0]["owasp_llm_references"] = ["LLM05", "LLM06"]
     assert "**OWASP LLM**" in _render(reporting, report)
     assert "LLM05, LLM06" in _render(reporting, report)
+
+
+NOT_AFFECTED = {
+    "dependency": {
+        "advisory": "CVE-2024-0001",
+        "module": "golang.org/x/net",
+        "ecosystem": "go",
+        "installed_version": "v0.33.0",
+        "classification": "version_not_in_range",
+        "evidence_level": "manifest",
+        "impact_artifact": "impact row: widget@abcdef0",
+    },
+    "rationale": "At or past the fix in every source's range.",
+}
+
+
+def test_not_affected_renders_each_eliminated_match_with_its_evidence() -> None:
+    report = copy.deepcopy(valid_report())
+    report["dependency_audit"] = {"prose": "Go modules reviewed."}
+    report["not_affected"] = [NOT_AFFECTED]
+    md = render_report(report)
+    assert md.index("## 6. Dependency Audit") < md.index(
+        "## 7. Not Affected (Eliminated with Evidence)"
+    )
+    assert (
+        "| CVE-2024-0001 | golang.org/x/net | v0.33.0 | version_not_in_range (manifest) | "
+        "At or past the fix in every source's range. | impact row: widget@abcdef0 |"
+    ) in md
+
+
+def test_not_affected_cites_a_vendor_reference_when_there_is_no_impact_row() -> None:
+    report = copy.deepcopy(valid_report())
+    entry = copy.deepcopy(NOT_AFFECTED)
+    del entry["dependency"]["impact_artifact"], entry["dependency"]["evidence_level"]
+    entry["dependency"]["classification"] = "not_imported"
+    entry["reference"] = "RHSA-2024:0001"
+    report["not_affected"] = [entry]
+    assert "| not_imported | At or past the fix in every source's range. | RHSA-2024:0001 |" in (
+        render_report(report)
+    )
+
+
+def test_not_affected_text_cannot_break_out_of_its_cell() -> None:
+    report = copy.deepcopy(valid_report())
+    entry = copy.deepcopy(NOT_AFFECTED)
+    entry["rationale"] = "a|b\n## Injected"
+    report["not_affected"] = [entry]
+    md = render_report(report)
+    assert "a\\|b ## Injected" in md
+    assert "\n## Injected" not in md
+
+
+def test_a_report_without_not_affected_renders_no_such_section() -> None:
+    assert "Not Affected" not in render_report(copy.deepcopy(valid_report()))
