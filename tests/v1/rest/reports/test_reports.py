@@ -216,3 +216,26 @@ def test_a_request_whose_build_cannot_answer_is_a_conflict_not_in_progress(
     again = request(client, context, report="executive-summary", scope={"as_of": AS_OF})
     assert again.status_code == 409
     assert again.json()["status"] == 409  # the one error shape, not a report body
+
+
+def test_a_late_report_losing_its_lease_does_not_stop_the_worker(
+    context: Context,
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A lost/reclaimed lease at completion logs a warning and lets the worker keep claiming."""
+    from traust_core.v1.errors import ConflictError
+
+    report = request(client, context, report="findings-rollup").json()
+    services = context.services()
+    worker = ReportWorker(services.ops, services.reports, WorkerId("reports-test"))
+
+    def lost_lease(*_: object, **__: object) -> None:
+        raise ConflictError("lease generation mismatch")
+
+    monkeypatch.setattr(services.ops, "complete", lost_lease)
+    with caplog.at_level("WARNING"):
+        assert str(worker.run_once()) == report["order_id"]
+    assert "lost its lease before completion" in caplog.text
+    assert worker.run_once() is None
