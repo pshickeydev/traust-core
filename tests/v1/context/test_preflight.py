@@ -512,3 +512,24 @@ def test_manifest_sbom_requires_syft_installed_and_allowed(
     else:
         with pytest.raises(PreflightError, match=message):
             ctx.preflight([SBOM_REQUIREMENT])
+
+
+def test_check_recording_server_collects_ledger_identity_and_salt_gaps_together(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from traust_core.v1.context.preflight import check_recording_server
+
+    traust_yaml = (
+        COMPLETE
+        + "recording:\n  triage: [triage]\n"
+        + "identity:\n  trust_local: false\n"
+        + "review:\n  valve_salt_env: MISSING_VALVE_SALT\n"
+    )
+    monkeypatch.delenv("MISSING_VALVE_SALT", raising=False)
+    ctx = context(tmp_path, monkeypatch, traust_yaml=traust_yaml)
+    with pytest.raises(PreflightError) as exc:
+        check_recording_server(ctx)
+    details = str(exc.value)
+    assert "ledger" in details
+    assert "identity:" in details
+    assert "MISSING_VALVE_SALT" in details

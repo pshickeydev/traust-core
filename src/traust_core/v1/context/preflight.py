@@ -152,9 +152,13 @@ def check_recording_server(ctx: Context) -> None:
     if not (decision_writer or recording.assessment):
         return
     triage = any(asset != REMEDIATE_FINDING for asset in recording.triage)
+    gaps: list[str] = []
     if decision_writer:
-        LedgerService.require_order_config(ctx.config.ledger, signed=triage)
-    gaps = _identity_findings(ctx)
+        try:
+            LedgerService.require_order_config(ctx.config.ledger, signed=triage)
+        except ServiceError as error:
+            gaps.append(str(error))
+    gaps.extend(_identity_findings(ctx))
     if triage:
         gaps.extend(_salt_findings(ctx))
     if gaps:

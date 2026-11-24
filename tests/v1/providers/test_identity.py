@@ -566,3 +566,22 @@ def test_the_credential_store_keeps_a_login_for_its_owner_only(tmp_path: Path) -
     assert oct((tmp_path / "home" / "credentials.json").stat().st_mode & 0o777) == "0o600"
     store.clear()
     assert store.load() is None
+
+
+def test_jwks_error_logs_issuer_and_cause(caplog: pytest.LogCaptureFixture) -> None:
+    provider = TokenIdentityProvider(
+        [
+            TrustedIssuer(
+                issuer="https://broken-idp.example", jwks_url="https://broken-idp.example/jwks"
+            )
+        ]
+    )
+    client = provider._remote["https://broken-idp.example"]
+    client.get_signing_keys = lambda refresh=True: (_ for _ in ()).throw(  # type: ignore[method-assign]
+        jwt.PyJWKClientError("malformed jwks payload")
+    )
+    with caplog.at_level("WARNING", logger="traust_core.v1.providers.identity"):
+        readiness = provider.check()
+    assert not readiness.ready
+    assert "https://broken-idp.example" in caplog.text
+    assert "malformed jwks payload" in caplog.text

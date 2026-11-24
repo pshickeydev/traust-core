@@ -845,3 +845,118 @@ def test_an_audit_is_refused_for_a_fleet_wide_or_expired_order(
         )
     with SqlTraustUnitOfWork(engine) as uow:
         assert uow.assessments.list_for_ref(ref) == []
+
+
+def test_reclaimed_ordered_audit_reuses_same_bytes_with_fresh_event_time_and_refuses_mutated_bytes(
+    context: Context, engine: Engine
+) -> None:
+    ref, audit = a_ref(engine), doc()
+    writer = ledger_writer(context)
+    services = writer.services()
+    repository_id = services.portfolio.inventory.get_ref(ref).repository_id
+    submitted = services.ops.submit(
+        OrderRequest(asset="cloud_config_audit", priority=1, repository_id=repository_id), ALICE
+    )
+    assert submitted.id is not None
+    w1, w2 = WorkerId("machine:runner-1"), WorkerId("machine:runner-2")
+    first_claim = services.ops.claim(w1, timedelta(minutes=5), order_id=submitted.id)
+    assert first_claim is not None
+
+    first_time = datetime(2026, 11, 20, 12, 0, tzinfo=UTC)
+    first_assessment, first_decisions = services.assessment.record_audit(
+        audit,
+        ref,
+        unpublished().model_copy(update={"occurred_at": first_time}),
+        run_order_id=submitted.id,
+        worker=w1,
+        lease_generation=first_claim.lease_generation,
+    )
+
+    # Expire claim 1 and reclaim under claim 2 with a fresh CLI-supplied occurred_at.
+    with SqlTraustUnitOfWork(engine) as uow:
+        row = uow.run_orders.get(submitted.id)
+        uow.run_orders.update(
+            row.model_copy(update={"lease_expires_at": datetime(2000, 1, 1, tzinfo=UTC)})
+        )
+        uow.commit()
+    reclaimed = services.ops.claim(w2, timedelta(minutes=5), order_id=submitted.id)
+    assert reclaimed is not None and reclaimed.lease_generation > first_claim.lease_generation
+
+    later_time = datetime(2026, 11, 20, 13, 0, tzinfo=UTC)
+    replayed_assessment, replayed_decisions = services.assessment.record_audit(
+        audit,
+        ref,
+        unpublished().model_copy(update={"occurred_at": later_time}),
+        run_order_id=submitted.id,
+        worker=w2,
+        lease_generation=reclaimed.lease_generation,
+    )
+    assert replayed_assessment.id == first_assessment.id
+    assert [d.id for d in replayed_decisions] == [d.id for d in first_decisions]
+    assert [a.id for a in services.assessment.list_for_order(submitted.id)] == [first_assessment.id]
+
+    # Mutated bytes under the reclaimed generation must fail with 409 ConflictError.
+    mutated = with_finding(0, rationale="changed rationale on reclaim")
+    with pytest.raises(ConflictError, match="already recorded different bytes"):
+        services.assessment.record_audit(
+            mutated,
+            ref,
+            unpublished().model_copy(update={"occurred_at": later_time}),
+            run_order_id=submitted.id,
+            worker=w2,
+            lease_generation=reclaimed.lease_generation,
+        )
+    assert [a.id for a in services.assessment.list_for_order(submitted.id)] == [first_assessment.id]
+
+
+def test_reclaimed_audit_refuses_to_duplicate_a_generic_record_for_the_same_order(
+    context: Context, engine: Engine
+) -> None:
+    ref, audit = a_ref(engine), doc()
+    writer = ledger_writer(context)
+    services = writer.services()
+    repository_id = services.portfolio.inventory.get_ref(ref).repository_id
+    submitted = services.ops.submit(
+        OrderRequest(asset="cloud_config_audit", priority=1, repository_id=repository_id), ALICE
+    )
+    assert submitted.id is not None
+    w1, w2 = WorkerId("machine:runner-1"), WorkerId("machine:runner-2")
+    first_claim = services.ops.claim(w1, timedelta(minutes=5), order_id=submitted.id)
+    assert first_claim is not None
+
+    first_time = datetime(2026, 11, 20, 12, 0, tzinfo=UTC)
+    naked = services.assessment.record(
+        audit,
+        ref,
+        AssessmentKind.CLOUD_CONFIG_CANONICAL,
+        "skill:test",
+        "1",
+        unpublished().model_copy(update={"occurred_at": first_time}),
+        run_order_id=submitted.id,
+        worker=w1,
+        lease_generation=first_claim.lease_generation,
+    )
+    assert naked.id is not None
+
+    with SqlTraustUnitOfWork(engine) as uow:
+        row = uow.run_orders.get(submitted.id)
+        uow.run_orders.update(
+            row.model_copy(update={"lease_expires_at": datetime(2000, 1, 1, tzinfo=UTC)})
+        )
+        uow.commit()
+    reclaimed = services.ops.claim(w2, timedelta(minutes=5), order_id=submitted.id)
+    assert reclaimed is not None and reclaimed.lease_generation > first_claim.lease_generation
+
+    later_time = datetime(2026, 11, 20, 13, 0, tzinfo=UTC)
+    with pytest.raises(ConflictError, match="without audit decisions"):
+        services.assessment.record_audit(
+            audit,
+            ref,
+            unpublished().model_copy(update={"occurred_at": later_time}),
+            run_order_id=submitted.id,
+            worker=w2,
+            lease_generation=reclaimed.lease_generation,
+        )
+    assert [a.id for a in services.assessment.list_for_order(submitted.id)] == [naked.id]
+    with SqlTraustUnitOfWork(engine) as uow:
+        assert uow.decisions.list_for_assessments([naked.id]) == []

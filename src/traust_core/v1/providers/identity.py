@@ -123,7 +123,8 @@ class TokenIdentityProvider:
             except jwt.PyJWKClientConnectionError:
                 gaps.append(f"{setting}: cannot reach configured JWKS -- check jwks_url")
                 continue
-            except _JWKS_ERRORS:
+            except _JWKS_ERRORS as error:
+                log.warning("identity issuer %r JWKS error: %s", name, error)
                 usable = False
             if not usable:
                 gaps.append(f"{setting}: no supported signing key -- check jwks_url")

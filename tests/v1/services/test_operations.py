@@ -1570,3 +1570,158 @@ def test_a_registered_repository_without_an_imported_line_is_not_a_subject(engin
             OrderRequest(asset="assessment", priority=1, repository_id=repo.id), OPERATOR
         )
     assert denied.value.deny_code == "subject_unknown"
+
+
+def test_fenced_expired_completion_persists_measured_spend_once_without_advancing_order(
+    engine: Engine,
+) -> None:
+    from decimal import Decimal
+
+    from traust_core.v1.models.operations import ModelUsage
+    from traust_core.v1.providers.model_catalog import ModelSpec, RegistryModelCatalog
+
+    spec = ModelSpec(
+        name="claude-test",
+        provider="anthropic",
+        tier="sonnet-class",
+        price_per_mtok_in=Decimal("10"),
+        price_per_mtok_out=Decimal("20"),
+    )
+    catalog = RegistryModelCatalog({"claude-test": spec}, {}, ("sonnet-class",), None)
+    usage = (
+        ModelUsage(
+            provider="anthropic",
+            model="claude-test",
+            skill="triage",
+            tokens_in=100_000,
+            tokens_out=50_000,
+            occurred_at=T0,
+        ),
+    )
+    order = leased(engine)
+    assert order.id is not None
+    uow = SqlTraustUnitOfWork(engine)
+    late_clock = FixedClock(T0 + LEASE + timedelta(minutes=1))
+    late_ops = OpsService(
+        uow,
+        late_clock,
+        ArtifactPublisher(
+            PublishSpecs(PublishSpec(RunManifestArtifact)),
+            _stores.setdefault(engine, InMemoryObjectStore()),
+            uow,
+        ),
+        spend=SpendService(uow, late_clock, (), models=catalog),
+    )
+    result = JobResult(outcome=Outcome.SUCCEEDED, usage=usage)
+    with pytest.raises(ConflictError, match="lease expired"):
+        late_ops.complete(order.id, W1, result, lease_generation=order.lease_generation)
+    assert stored(engine, order) == order
+    with SqlTraustUnitOfWork(engine) as check:
+        events = check.spend_events.list_for_order(order.id)
+    assert len(events) == 1
+    assert events[0].cost_usd == Decimal("2.0")
+    # Retrying the same fenced completion must not duplicate spend events.
+    with pytest.raises(ConflictError, match="lease expired"):
+        late_ops.complete(order.id, W1, result, lease_generation=order.lease_generation)
+    with SqlTraustUnitOfWork(engine) as check:
+        assert len(check.spend_events.list_for_order(order.id)) == 1
+
+
+@pytest.mark.parametrize("case", ["wrong-worker", "requeued", "superseded"])
+def test_fenced_completion_writes_zero_spend_when_holder_cannot_be_verified(
+    engine: Engine, caplog: pytest.LogCaptureFixture, case: str
+) -> None:
+    from decimal import Decimal
+
+    from traust_core.v1.models.operations import ModelUsage
+    from traust_core.v1.providers.model_catalog import ModelSpec, RegistryModelCatalog
+
+    spec = ModelSpec(
+        name="claude-test",
+        provider="anthropic",
+        tier="sonnet-class",
+        price_per_mtok_in=Decimal("10"),
+        price_per_mtok_out=Decimal("20"),
+    )
+    catalog = RegistryModelCatalog({"claude-test": spec}, {}, ("sonnet-class",), None)
+    usage = (
+        ModelUsage(
+            provider="anthropic",
+            model="claude-test",
+            skill="triage",
+            tokens_in=100_000,
+            tokens_out=50_000,
+            occurred_at=T0,
+        ),
+    )
+    order = leased(engine)
+    assert order.id is not None
+    uow = SqlTraustUnitOfWork(engine)
+    late_clock = FixedClock(T0 + LEASE + timedelta(minutes=1))
+    late_ops = OpsService(
+        uow,
+        late_clock,
+        ArtifactPublisher(
+            PublishSpecs(PublishSpec(RunManifestArtifact)),
+            _stores.setdefault(engine, InMemoryObjectStore()),
+            uow,
+        ),
+        spend=SpendService(uow, late_clock, (), models=catalog),
+    )
+    caller = W2
+    if case == "requeued":
+        assert late_ops.requeue_expired() == 1
+    elif case == "superseded":
+        assert late_ops.requeue_expired() == 1
+        reclaimed = late_ops.claim(W2, LEASE, order_id=order.id)
+        assert reclaimed is not None and reclaimed.lease_generation == order.lease_generation + 1
+        caller = W1
+    with (
+        caplog.at_level("WARNING", logger="traust_core.v1.services.operations"),
+        pytest.raises(ConflictError),
+    ):
+        late_ops.complete(
+            order.id,
+            caller,
+            JobResult(outcome=Outcome.SUCCEEDED, usage=usage),
+            lease_generation=order.lease_generation,
+        )
+    with SqlTraustUnitOfWork(engine) as check:
+        assert check.spend_events.list_for_order(order.id) == []
+    assert str(order.id) in caplog.text
+    assert "settled=1" in caplog.text
+
+
+def test_fenced_completion_does_not_commit_orphan_manifest_row(engine: Engine) -> None:
+    from datetime import datetime
+
+    class _ExpiringClock(FixedClock):
+        def __init__(self) -> None:
+            super().__init__(T0)
+            self._calls = 0
+
+        def now(self) -> datetime:
+            self._calls += 1
+            # First check (phase 1) sees a live lease; second check (phase 2) sees expired.
+            return T0 if self._calls == 1 else T0 + LEASE + timedelta(minutes=1)
+
+    order = leased(engine)
+    assert order.id is not None
+    with SqlTraustUnitOfWork(engine) as uow:
+        before = uow.artifacts.latest_imported(RunManifestArtifact.schema)
+    shared_uow = SqlTraustUnitOfWork(engine)
+    shared_manifests = ArtifactPublisher(
+        PublishSpecs(PublishSpec(RunManifestArtifact)),
+        _stores.setdefault(engine, InMemoryObjectStore()),
+        shared_uow,
+    )
+    service = OpsService(shared_uow, _ExpiringClock(), shared_manifests)
+    with pytest.raises(ConflictError, match="lease expired"):
+        service.complete(
+            order.id,
+            W1,
+            JobResult.partly({"unreachable": 1}),
+            lease_generation=order.lease_generation,
+        )
+    with SqlTraustUnitOfWork(engine) as uow:
+        assert uow.artifacts.latest_imported(RunManifestArtifact.schema) == before

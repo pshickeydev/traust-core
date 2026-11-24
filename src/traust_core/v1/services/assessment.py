@@ -919,7 +919,10 @@ class AssessmentService:
         self._gate(doc)
         candidates, judgments = audit_candidates(doc, ref.repository_id), audit_judgments(doc)
         if judgments:
-            self._decisions.require_signable()
+            if run_order_id is not None:
+                self._decisions.require_order_ledger()
+            else:
+                self._decisions.require_signable()
         requested = Assessment(
             repository_ref_id=repository_ref_id,
             run_order_id=run_order_id,
@@ -929,8 +932,24 @@ class AssessmentService:
             assessor_version=doc.metadata.harness_version,
             occurred_at=provenance.occurred_at,
         )
-        prepared, artifact = self._prepare_record(doc, requested, provenance.artifact)
+        prepared, artifact = self._prepare_record(
+            doc, requested, provenance.artifact, authored_order_id=run_order_id
+        )
         with guard, self._uow.write() as uow:
+            if run_order_id is not None:
+                replay = self._log.recorded_order(
+                    run_order_id, requested.kind, repository_ref_id, doc
+                )
+                if replay is not None:
+                    recorded, _report = replay
+                    assert recorded.id is not None
+                    existing_decisions = self._decisions.for_assessments([recorded.id])
+                    if judgments and not existing_decisions:
+                        raise ConflictError(
+                            f"order {run_order_id} already recorded assessment {recorded.id} "
+                            "without audit decisions"
+                        )
+                    return self._read(recorded), existing_decisions
             assessment, report, taken = self._record_findings(
                 prepared, requested, artifact, candidates
             )

@@ -1962,6 +1962,109 @@ class VerificationService:
                 )
         return VerifySweep.of(entries)
 
+    def work_item_covered(
+        self,
+        repository_id: UUID,
+        order_id: UUID,
+        work_item_id: UUID,
+        verification_ids: Collection[UUID],
+    ) -> set[UUID]:
+        """Completed verifications from `order_id` covering every finding on a bound patched work
+        item at its fix commit."""
+        prepared = self.prepare(work_item_id)
+        item = prepared.work_item
+        if prepared.subject.repository_id != repository_id or not (item.fork and item.fix_commit):
+            raise ValidationError("verification order has no bound patched work item")
+        wanted = set(verification_ids)
+        runs = {
+            a.id
+            for a in self._assessment.list_for_order(order_id)
+            if a.id in wanted and a.run_order_id == order_id and a.status == ASSESSMENT_COMPLETED
+        }
+        return {
+            v.verification_id
+            for v in prepared.verifications
+            if v.verification_id in runs
+            and bool(item.finding_ids)
+            and set(item.finding_ids) <= {verdict.finding_id for verdict in v.verdicts}
+            and (
+                (ref := self._inventory.get_ref(v.repository_ref_id)).repository_id == repository_id
+                and ref.sha == item.fix_commit
+            )
+        }
+
+    def sweep_covered(
+        self,
+        repository_id: UUID,
+        verification_ids: Collection[UUID],
+        *,
+        order_id: UUID | None = None,
+    ) -> bool:
+        """Whether `verification_ids` cover every finding selected on the repository's default line.
+
+        Excludes newly discovered regressions whose occurrences originate exclusively from those
+        verification runs.
+        """
+        wanted = set(verification_ids)
+        if not wanted:
+            return False
+        with self._uow:
+            candidates = (
+                self._assessment.list_for_order(order_id)
+                if order_id is not None
+                else self._assessment.list_for_repository(
+                    repository_id, AssessmentKind.VERIFICATION
+                )
+            )
+            runs = [
+                a
+                for a in candidates
+                if a.id in wanted
+                and (order_id is None or a.run_order_id == order_id)
+                and a.status == ASSESSMENT_COMPLETED
+            ]
+            head = self._portfolio.default_ref(repository_id)
+            if not runs or {a.id for a in runs} != wanted or head is None or head.id is None:
+                return False
+            expected = {
+                view.finding.id
+                for view in self._findings.on_ref(head.id)
+                if view.finding.id is not None
+            }
+            recorded = {a.id for a in runs}
+            covered: set[UUID] = set()
+            regressions: set[UUID] = set()
+            current_runs: set[UUID] = set()
+            for v in self._verifications(repository_id):
+                if v.verification_id not in recorded:
+                    continue
+                ref = self._inventory.get_ref(v.repository_ref_id)
+                if (ref.repository_id, ref.name, ref.kind, ref.sha) == (
+                    repository_id,
+                    head.name,
+                    head.kind,
+                    head.sha,
+                ):
+                    current_runs.add(v.verification_id)
+                    covered.update(verdict.finding_id for verdict in v.verdicts)
+                    regressions.update(v.regression_ids)
+            if regressions:
+                origins: dict[UUID, set[UUID]] = {}
+                for occurrence in self._findings.occurrences(finding_ids=regressions):
+                    origins.setdefault(occurrence.finding_id, set()).add(occurrence.assessment_id)
+                expected -= {
+                    finding
+                    for finding in regressions
+                    if origins.get(finding) and origins[finding] <= current_runs
+                }
+            latest = self._portfolio.default_ref(repository_id)
+            return (
+                latest is not None
+                and (latest.id, latest.sha) == (head.id, head.sha)
+                and bool(expected)
+                and expected <= covered
+            )
+
     def sweep_markdown(self, sweep: VerifySweep) -> str:
         """Human-readable companion of the same classified sweep, not a second state store."""
         entries = (*sweep.queued, *sweep.skipped)

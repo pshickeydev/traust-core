@@ -89,7 +89,11 @@ from traust_core.v1.providers.feeds import FeedStatus
 from traust_core.v1.providers.model_catalog import ModelCatalog, ModelSpec
 from traust_core.v1.providers.tools import DatabaseStatus
 from traust_core.v1.repositories.traust_ops import OpsUnitOfWork
-from traust_core.v1.services.artifact_publishing import ArtifactPublisher, AssessmentLog
+from traust_core.v1.services.artifact_publishing import (
+    ArtifactPublisher,
+    AssessmentLog,
+    StagedArtifact,
+)
 from traust_core.v1.services.assessment import AssessmentService
 from traust_core.v1.services.portfolio import Inventory, PortfolioService
 from traust_core.v1.services.provider_catalog import ProviderBinding, ProviderCatalog
@@ -895,7 +899,12 @@ class OpsService:
             prior = uow.run_orders.get_for_update(order_id)
             if prior.state == outcome:
                 return lease.replay(prior, outcome)
-            lease.require(prior, self._clock.now())
+            now = self._clock.now()
+            try:
+                lease.require(prior, now)
+            except ConflictError:
+                self._settle_fenced_spend(uow, prior, lease, now, result.usage)
+                raise
         spend, unpriced = self._spend.settlement(order_id, result.usage)
         _classifiers(reason=result.reason)
         update: dict[str, object] = {
@@ -908,26 +917,51 @@ class OpsService:
         degraded = dict(result.degraded)
         gaps = {SPEND_UNPRICED: len(unpriced)} if unpriced else {}
         outputs = list(dict.fromkeys(str(o) for o in result.outputs))
-        if degraded or gaps or outputs:
-            update["artifact_id"] = self._publish(
+        same_uow = getattr(self._manifests, "_uow", None) is self._uow
+        staged = (
+            self._stage_manifest(
                 prior.artifact_id, lambda m: self._completion(m, degraded, gaps, outputs)
             )
-        with self._uow.write() as uow:
-            order = uow.run_orders.get_for_update(order_id)
-            if order.state == outcome:
-                return lease.replay(order, outcome)
-            now = self._clock.now()
-            lease.require(order, now)
-            update["finished_at"] = now
-            if "artifact_id" in update and order.artifact_id != prior.artifact_id:
-                raise ConflictError(f"order {order_id}: run manifest changed while writing")
-            uow.run_orders.update(order.model_copy(update=update))
-            for event in spend:
-                uow.spend_events.add(event.model_copy(update={"lane": order.lane}))
-            lease.require(order, self._clock.now())
-            # Return the stored timestamps (SQLite rounds them), just as a completion retry does.
-            saved = uow.run_orders.get(order_id)
-            uow.commit()
+            if degraded or gaps or outputs
+            else None
+        )
+        if staged is not None and not same_uow:
+            update["artifact_id"] = self._manifests.publish_staged(staged).artifact_id
+        post_write_conflict = False
+        try:
+            with self._uow.write() as uow:
+                order = uow.run_orders.get_for_update(order_id)
+                if order.state == outcome:
+                    return lease.replay(order, outcome)
+                now = self._clock.now()
+                try:
+                    lease.require(order, now)
+                except ConflictError:
+                    self._settle_fenced_spend(uow, order, lease, now, result.usage)
+                    raise
+                update["finished_at"] = now
+                if staged is not None:
+                    if order.artifact_id != prior.artifact_id:
+                        raise ConflictError(f"order {order_id}: run manifest changed while writing")
+                    if same_uow:
+                        update["artifact_id"] = self._manifests.publish_staged(staged).artifact_id
+                uow.run_orders.update(order.model_copy(update=update))
+                for event in spend:
+                    uow.spend_events.add(event.model_copy(update={"lane": order.lane}))
+                try:
+                    lease.require(order, self._clock.now())
+                except ConflictError:
+                    post_write_conflict = True
+                    raise
+                # Return stored timestamps (SQLite rounds them), matching a completion retry.
+                saved = uow.run_orders.get(order_id)
+                uow.commit()
+        except ConflictError:
+            if post_write_conflict and result.usage:
+                with self._uow.write() as uow:
+                    latest = uow.run_orders.get_for_update(order_id)
+                    self._settle_fenced_spend(uow, latest, lease, self._clock.now(), result.usage)
+            raise
         self._uow.after_commit(
             lambda: log.info(
                 "order %s %s", saved.id, saved.state, extra={"order_id": str(saved.id)}
@@ -953,6 +987,83 @@ class OpsService:
                 )
             )
         return saved
+
+    def _settle_fenced_spend(
+        self,
+        uow: OpsUnitOfWork,
+        order: RunOrder,
+        lease: _Lease,
+        now: datetime,
+        usage: Sequence[ModelUsage],
+    ) -> None:
+        if not usage or order.id is None:
+            return
+        # Only persist when run_order still proves this exact worker held this exact claim.
+        # After requeue or reclaim, historical (generation, holder) pairs are not stored, so
+        # unverified callers log their usage counts without writing budget-affecting SpendEvents.
+        expired_holder = (
+            order.state == OrderState.LEASED
+            and order.lease_holder == lease.worker
+            and order.lease_generation == lease.generation
+            and (order.lease_expires_at is None or order.lease_expires_at <= now)
+        )
+        spend, unpriced = self._spend.settlement(order.id, usage)
+        if not expired_holder:
+            log.warning(
+                "order %s fenced completion could not verify holder; dropped spend "
+                "(settled=%d unpriced=%d)",
+                order.id,
+                len(spend),
+                len(unpriced),
+                extra={"order_id": str(order.id)},
+            )
+            return
+        existing = {
+            (
+                e.provider,
+                e.model,
+                e.skill,
+                e.tokens_in,
+                e.tokens_out,
+                e.cost_usd,
+                e.occurred_at,
+            )
+            for e in uow.spend_events.list_for_order(order.id)
+        }
+        added = 0
+        for event in spend:
+            key = (
+                event.provider,
+                event.model,
+                event.skill,
+                event.tokens_in,
+                event.tokens_out,
+                event.cost_usd,
+                event.occurred_at,
+            )
+            if key in existing:
+                continue
+            uow.spend_events.add(event.model_copy(update={"lane": order.lane}))
+            existing.add(key)
+            added += 1
+        if added:
+            uow.commit()
+            self._uow.after_commit(
+                lambda: log.warning(
+                    "order %s fenced completion settled %d spend events",
+                    order.id,
+                    added,
+                    extra={"order_id": str(order.id)},
+                )
+            )
+        if unpriced:
+            log.warning(
+                "order %s fenced completion: %s count=%d",
+                order.id,
+                SPEND_UNPRICED,
+                len(unpriced),
+                extra={"order_id": str(order.id)},
+            )
 
     def _completion(
         self,
@@ -1067,14 +1178,19 @@ class OpsService:
             )
         return saved
 
-    def _publish(self, prior: UUID | None, change: Change) -> UUID:
+    def _stage_manifest(
+        self, prior: UUID | None, change: Change
+    ) -> StagedArtifact[RunManifestArtifact]:
         current = (
             {"artifact": RunManifestArtifact.name}
             if prior is None
             else json.loads(self._manifests.get(prior).payload)
         )
         manifest = RunManifestArtifact.from_document(change(current))
-        return self._manifests.publish_artifact(manifest).artifact_id
+        return self._manifests.stage(manifest)
+
+    def _publish(self, prior: UUID | None, change: Change) -> UUID:
+        return self._manifests.publish_staged(self._stage_manifest(prior, change)).artifact_id
 
     def _config_manifest(self, config: tuple[ConfigDigest, ...]) -> dict[str, UUID]:
         # A new order's manifest is its config alone; one artifact serves every such order.

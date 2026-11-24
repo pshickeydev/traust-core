@@ -448,7 +448,7 @@ def _filled(path: Path) -> bool:
 
 
 def unresolved_manifests(workspace: Path) -> tuple[UnresolvedManifest, ...]:
-    """Find unresolved declarations, inspecting only containerfiles beneath build directories."""
+    """Find unresolved declarations; beneath build directories, inspecting only containerfiles."""
     if not workspace.is_dir():
         raise ValidationError(f"workspace is not a directory: {workspace}")
     held: dict[PurePosixPath, set[str]] = {}
