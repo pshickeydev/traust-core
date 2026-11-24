@@ -16,7 +16,23 @@ from traust_core.v1.rest.common.problems import PROBLEMS
 
 router = APIRouter(tags=["reports"])
 
-_FILE = {"content": {f.media_type: {"schema": {"type": "string"}} for f in ReportFormat}}
+_FILE = {
+    "description": "The built file, named by `Content-Disposition`",
+    "content": {
+        # json is the report document itself: the view's model, an object whose shape varies
+        # by report; the other formats are its text renders.
+        f.media_type: {
+            "schema": {"type": "object"} if f is ReportFormat.JSON else {"type": "string"}
+        }
+        for f in ReportFormat
+    },
+    "headers": {
+        "Content-Disposition": {
+            "description": "`attachment`; the built file's name",
+            "schema": {"type": "string"},
+        }
+    },
+}
 
 
 @router.post("/v1/reports", responses={**PROBLEMS(401, 422, 409), 202: {"model": Report}})

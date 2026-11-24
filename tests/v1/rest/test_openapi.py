@@ -5,6 +5,7 @@ import re
 import pytest
 from fastapi.testclient import TestClient
 
+from traust_core.v1.models.insight import ReportFormat
 from traust_core.v1.rest.roles import serving_role
 
 
@@ -86,3 +87,18 @@ def test_a_sample_operation_from_each_role(
 ) -> None:
     operation = client.get("/openapi.json").json()["paths"][path][method]
     assert operation["x-traust-role"] == role
+
+
+def test_the_report_file_route_declares_the_media_types_the_handler_serves(
+    client: TestClient,
+) -> None:
+    """Every format the route can return is typed, so an SDK can type the download: json is
+    the report document (an object; its shape varies by report), the rest are text renders."""
+    response = client.get("/openapi.json").json()["paths"]["/v1/reports/{order_id}/file"]["get"][
+        "responses"
+    ]["200"]
+    assert set(response["content"]) == {f.media_type for f in ReportFormat}
+    assert response["content"]["application/json"]["schema"] == {"type": "object"}
+    for media in ("text/markdown", "text/html", "text/csv"):
+        assert response["content"][media]["schema"] == {"type": "string"}
+    assert "Content-Disposition" in response["headers"]
