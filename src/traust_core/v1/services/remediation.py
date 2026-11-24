@@ -169,7 +169,9 @@ class RemediationConfig(Model):
 
     fork_org: OrgName | None = None
     private_forge_hosts: tuple[str, ...] = ()
-    patch_prefix: str = pydantic.Field(default="patch-", pattern=r"^[A-Za-z0-9_][A-Za-z0-9._-]*$")
+    patch_prefix: str = pydantic.Field(
+        default="traust-patch-", pattern=r"^[A-Za-z0-9_][A-Za-z0-9._-]*-$"
+    )
     fix_branch_prefix: str = pydantic.Field(default="fix", pattern=r"^[A-Za-z0-9._-]+$")
 
     @pydantic.field_validator("private_forge_hosts")
@@ -183,7 +185,7 @@ class RemediationConfig(Model):
 
 
 class ForkPolicy:
-    """Where fixes go: the inventory's private mirror, else the sci-patch-<name> convention in
+    """Where fixes go: the inventory's private mirror, else the fork-prefix convention in
     the fork org for GitHub, else the repository itself on the deployment's own forge; never
     a public repository."""
 
@@ -244,7 +246,7 @@ class ForkPolicy:
         )
 
     def before_convention(self, repository_url: str) -> Fork | None:
-        """The fork this policy answered before the sci-patch convention: the bare repository
+        """The fork this policy answered before the prefix convention: the bare repository
         name in the fork org, GitHub only — None where today's answer was already the old
         one's (a registered mirror, or the repository itself on a private forge)."""
         upstream = _url(repository_url)
@@ -589,7 +591,7 @@ class RemediationService:
     def vouched(self, order: RunOrder, forks: dict[UUID, Fork | None] | None = None) -> bool:
         """Whether scheduling vouches for the order's fork facts: its scheduling stamp
         (contracts#130), or, for an order from before the stamp, today's fork policy — or
-        the bare name that policy answered before the sci-patch convention — read once per
+        the bare name that policy answered before the prefix convention — read once per
         repository into `forks` when given."""
         if (
             order.fork_scheduled_at is not None
@@ -608,7 +610,7 @@ class RemediationService:
 
     def _vouched_before_convention(self, order: RunOrder) -> bool:
         """Whether an unstamped order names the bare fork the policy answered before the
-        sci-patch convention: an era's door-set facts stay vouched across the change — the
+        prefix convention: an era's door-set facts stay vouched across the change — the
         bare name is computed from the repository, never read off the order, and a fork the
         inventory has since proven another upstream's never vouches."""
         if order.fork_url is None or order.fork_branch is None:
