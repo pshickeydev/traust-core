@@ -87,6 +87,7 @@ def leased(context: Context, world: World, *, asset: str = "verify") -> RunOrder
         OrderRequest(asset=AssetName(asset), priority=1, repository_id=world.repo.id),
         person(context),
     )
+    ops.admit(queued.id)  # the engine's admission tick queues the planned order
     runner = machine(context)
     order = ops.claim(WorkerId(runner.ref), timedelta(hours=2), (AssetName(asset),))
     assert order is not None and order.id == queued.id
@@ -463,6 +464,7 @@ def test_order_authorization_refusals_leave_rows_and_objects_unchanged(
                 OrderRequest(asset="verify", priority=1, repository_id=world.repo.id),
                 person(context),
             )
+            ops.admit(order.id)  # the engine's admission tick queues the planned order
     else:
         order = leased(context, world)
     assert order.id is not None

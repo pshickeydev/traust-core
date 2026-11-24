@@ -72,19 +72,31 @@ def human(context: Context, identity: str = "asker@example.com") -> Principal:
 def leased(
     context: Context, world: World, *, asset: str = ASSET, work_item_id: UUID | None = None
 ) -> RunOrder:
-    # a person asks for the order (submit re-verifies who may ask); the runner claims it
+    # a runner claims the order a door queued: the scheduling door owns remediate_finding
+    # (a direct submit refuses it), any other asset was asked for and admitted
     principal = machine(context)
     ops = context.services().ops
     assert world.repo.id is not None
-    queued = ops.submit(
-        OrderRequest(
-            asset=AssetName(asset),
-            priority=1,
-            repository_id=world.repo.id,
-            work_item_id=work_item_id,
-        ),
-        human(context),
-    )
+    if asset == ASSET:
+        with SqlTraustUnitOfWork(context.database) as uow:
+            queued = Seed(uow).run_order(
+                asset=asset,
+                priority=1,
+                repository_id=world.repo.id,
+                work_item_id=work_item_id,
+            )
+            uow.commit()
+    else:
+        queued = ops.submit(
+            OrderRequest(
+                asset=AssetName(asset),
+                priority=1,
+                repository_id=world.repo.id,
+                work_item_id=work_item_id,
+            ),
+            human(context),
+        )
+        ops.admit(queued.id)  # the engine's admission tick queues the planned order
     order = ops.claim(WorkerId(principal.ref), timedelta(hours=2), (AssetName(asset),))
     assert order is not None and order.id == queued.id
     return order
@@ -421,12 +433,12 @@ def test_order_authorization_refusals_leave_rows_and_objects_unchanged(
         order = leased(context, world, asset=asset)
     elif case in {"repositoryless order", "queued order"}:
         repository_id = None if case == "repositoryless order" else world.repo.id
-        ops = context.services().ops
-        order = ops.submit(
-            OrderRequest(asset=ASSET, priority=1, repository_id=repository_id), human(context)
-        )
+        # the scheduling door's queued order, unleased (or leased to the wrong scope below)
+        with SqlTraustUnitOfWork(context.database) as uow:
+            order = Seed(uow).run_order(asset=ASSET, priority=1, repository_id=repository_id)
+            uow.commit()
         if case == "repositoryless order":
-            claimed = ops.claim(WorkerId(owner.ref), timedelta(hours=2))
+            claimed = context.services().ops.claim(WorkerId(owner.ref), timedelta(hours=2))
             assert claimed is not None and claimed.id == order.id
             order = claimed
     else:

@@ -56,7 +56,8 @@ class SubmitRequest(Model):
 
 @router.post("/v1/orders", responses=PROBLEMS(401, 403, 422))
 def submit(body: SubmitRequest, ops: Ops, person: Person, request: Request) -> RunOrder:
-    """Queue the order a person asked for, under the config (pack version) it must run with."""
+    """Store the order a person asked for as planned, under the config (pack version) it must
+    run with; the engine's admission (pack menu, approval holds, budget) queues it."""
     order = ops.submit(body.order, person, body.config)
     request.state.order_id = order.id
     return order
@@ -92,7 +93,8 @@ def claim(body: ClaimRequest, ops: Ops, runner: Runner, request: Request) -> Run
     responses=PROBLEMS(401, 403, 404, 409, 422),
 )
 def start(body: StartRecordingRequest, ops: Ops, caller: Caller, request: Request) -> RunOrder:
-    """Start the caller's explicitly dispatched recording run within its server-owned scope."""
+    """Start the caller's explicitly dispatched recording run within its server-owned scope;
+    an order awaiting a person's approval is never taken over."""
     order = ops.start_recording(body.order, caller, timedelta(seconds=body.lease_seconds))
     assert order.id is not None
     request.state.order_id = order.id

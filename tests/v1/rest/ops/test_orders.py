@@ -208,17 +208,33 @@ def test_a_person_submits_an_order_with_its_pack_version(
     submitted = client.post("/v1/orders", json=SUBMIT, headers=bearer(context))
     assert submitted.status_code == 200, submitted.text
     order = submitted.json()
-    assert (order["state"], order["requested_by"]) == ("queued", "human:alice@example.com")
+    assert (order["state"], order["requested_by"]) == ("planned", "human:alice@example.com")
     manifest = client.get(f"/v1/orders/{order['id']}/manifest", headers=bearer(context))
     same_as_in_process(manifest.json(), context.services().ops.manifest(UUID(order["id"])))
     assert manifest.json()["config"] == [{**PACK, "artifact_id": None}]
 
 
-def test_a_submitted_order_is_claimable(context: Context, client: TestClient) -> None:
+def test_a_submitted_order_is_claimable_once_admitted(context: Context, client: TestClient) -> None:
+    """Submit plans the order; the engine's admission tick queues it; a runner claims it."""
     order = client.post("/v1/orders", json=SUBMIT, headers=bearer(context)).json()
     body = {"lease_seconds": 300, "assets": ["command_result"]}
+    unadmitted = client.post("/v1/orders/claim", json=body, headers=runner(context))
+    assert unadmitted.status_code == 204
+    context.services().ops.admit(UUID(order["id"]))
     claimed = client.post("/v1/orders/claim", json=body, headers=runner(context)).json()
     assert claimed["id"] == order["id"]
+
+
+def test_a_door_only_asset_refuses_a_direct_submit(context: Context, client: TestClient) -> None:
+    """remediate_finding is queued only by the remediation scheduling door."""
+    order = {"asset": "remediate_finding", "priority": 0}
+    refused = client.post("/v1/orders", json={"order": order}, headers=bearer(context))
+    assert refused.status_code == 403, refused.text
+    assert "POST /v1/remediations" in refused.json()["detail"]
+    assert (
+        context.services().ops.list(OrderFilter(states=tuple(OrderState)), PageRequest()).items
+        == ()
+    )
 
 
 def test_an_order_without_config_has_an_empty_manifest(

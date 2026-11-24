@@ -194,7 +194,7 @@ def test_an_onboarded_repository_is_a_subject_when_the_forge_names_a_default_bra
     order = onboarding._ops.submit(
         OrderRequest(asset=AUDIT, priority=0, repository_id=repository_id), OPERATOR
     )
-    assert order.state is OrderState.QUEUED
+    assert order.state is OrderState.PLANNED
 
 
 def test_onboarding_shows_a_default_line_it_couldnt_import_and_a_retry_imports_it(
