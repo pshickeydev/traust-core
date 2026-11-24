@@ -220,3 +220,13 @@ def test_a_backslash_before_a_pipe_cannot_split_a_cell() -> None:
     row = next(line for line in render_report(report).splitlines() if "CVE-2024-0001" in line)
     unescaped = re.findall(r"(?<!\\)(?:\\\\)*\|", row)
     assert len(unescaped) == 7, row
+
+
+def test_a_report_with_not_affected_passes_the_contract_and_renders() -> None:
+    """Core's pinned contracts accept the section, and render_report shows it."""
+    from traust_core.v1 import contracts
+
+    report = copy.deepcopy(valid_report())
+    report["not_affected"] = [NOT_AFFECTED]
+    assert contracts.schema_errors("report", report) == []
+    assert "Not Affected (Eliminated with Evidence)" in render_report(report)
