@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+import re
 from pathlib import Path
 
 import pytest
@@ -209,3 +210,13 @@ def test_not_affected_text_cannot_break_out_of_its_cell() -> None:
 
 def test_a_report_without_not_affected_renders_no_such_section() -> None:
     assert "Not Affected" not in render_report(copy.deepcopy(valid_report()))
+
+
+def test_a_backslash_before_a_pipe_cannot_split_a_cell() -> None:
+    report = copy.deepcopy(valid_report())
+    entry = copy.deepcopy(NOT_AFFECTED)
+    entry["rationale"] = "a\\|b"
+    report["not_affected"] = [entry]
+    row = next(line for line in render_report(report).splitlines() if "CVE-2024-0001" in line)
+    unescaped = re.findall(r"(?<!\\)(?:\\\\)*\|", row)
+    assert len(unescaped) == 7, row
