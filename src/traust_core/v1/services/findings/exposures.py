@@ -11,9 +11,7 @@ from traust_core.v1.models.dependencies import Advisory, Ecosystem, package_name
 from traust_core.v1.models.findings import ExposureKey, FindingCandidate
 
 if TYPE_CHECKING:
-    from uuid import UUID
-
-    from traust_core.v1.repositories.contract import TraustUnitOfWork
+    from traust_core.v1.services.exposure import StoredAdvisories
 
 
 def stored_name(ecosystem: str, module: str) -> str:
@@ -36,39 +34,8 @@ def exposure_key(advisory: Advisory, ecosystem: str, module: str) -> ExposureKey
     )
 
 
-class StoredAdvisories:
-    """What core keeps about an advisory: a read, never a fetch."""
-
-    def __init__(self, uow: TraustUnitOfWork) -> None:
-        self._uow = uow
-
-    def canonical(self, identifier: str) -> Advisory | None:
-        """The canonical advisory a stored identifier or alias names."""
-        with self._uow as uow:
-            found = uow.advisories.find_by_identifier(identifier)
-            if found is None or found.alias_of_id is None:
-                return found
-            return uow.advisories.get(found.alias_of_id)
-
-    def ecosystem_of(self, advisory_id: UUID, module: str) -> str | None:
-        """The one ecosystem in which the stored advisory names `module`; None when it names
-        the module in none or in more than one, so an ecosystem is never guessed."""
-        with self._uow as uow:
-            packages = (
-                uow.packages.get(link.package_id)
-                for link in uow.advisory_packages.list_for_advisory(advisory_id)
-            )
-            ecosystems = {
-                p.ecosystem
-                for p in packages
-                if p is not None
-                and stored_name(p.ecosystem, p.name) == stored_name(p.ecosystem, module)
-            }
-        return ecosystems.pop() if len(ecosystems) == 1 else None
-
-
 def with_exposures(
-    doc: Any, candidates: Sequence[FindingCandidate], advisories: StoredAdvisories
+    doc: Any, candidates: Sequence[FindingCandidate], advisories: StoredAdvisories | None
 ) -> list[FindingCandidate]:
     """A report finding whose `dependency` names a stored advisory and its module is identified
     as the dependency finding an impact analysis files for it. An omitted ecosystem is taken
@@ -80,7 +47,7 @@ def with_exposures(
         for e in getattr(doc, "findings", None) or ()
         if getattr(e, "dependency", None) is not None
     }
-    if not stated:
+    if advisories is None or not stated:
         return list(candidates)
     out = []
     for candidate in candidates:

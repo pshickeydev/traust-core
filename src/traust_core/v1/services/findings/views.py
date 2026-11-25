@@ -96,17 +96,13 @@ class FindingViewQuery:
                     held[location.occurrence_id].append(location)
 
             read([seen[-1].id for seen in reported.values() if seen[-1].id])
-            # a latest occurrence with no places (an impact analysis's): the earlier ones are
-            # read for only those findings, so the view shows the newest places reported
-            read(
-                [
-                    o.id
-                    for seen in reported.values()
-                    if seen[-1].id not in held
-                    for o in seen[:-1]
-                    if o.id
-                ]
-            )
+            # a latest occurrence with no places (an impact analysis's): step back one earlier
+            # occurrence per such finding per read, stopping at the newest that has places, so
+            # a long history is never read whole
+            back = {fid: len(seen) - 1 for fid, seen in reported.items() if seen[-1].id not in held}
+            while back := {fid: i - 1 for fid, i in back.items() if i > 0}:
+                read([o.id for fid, i in back.items() if (o := reported[fid][i]).id])
+                back = {fid: i for fid, i in back.items() if reported[fid][i].id not in held}
             places = held
         return [
             view

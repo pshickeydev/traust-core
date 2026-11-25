@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
+import pytest
 from sqlalchemy.engine import Engine
 
 from tests.v1.services.test_exposure_impact import (
@@ -40,14 +41,14 @@ BODY["remediation_roadmap"] = [
 VECTOR = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H"
 
 
-def _report() -> SecurityAuditArtifact:
+def _report(path: str = "go.mod") -> SecurityAuditArtifact:
     body = copy.deepcopy(BODY)
     first = body["findings"][0]
     first.update(
         title=f"{GHSA} in google.golang.org/grpc",
         category="supply-chain",
         cwes=["CWE-400"],
-        locations=[{"path": "go.mod", "lines": "7"}],
+        locations=[{"path": path, "lines": "7"}],
         cvss={"vector": VECTOR, "score": 7.5},
         severity="high",
         dependency={
@@ -108,6 +109,54 @@ def test_an_impact_after_the_report_is_the_same_finding_and_keeps_its_places_and
     assert view.occurrence is not None and view.occurrence.assessment_id == impact.assessment_id
     assert [(p.path, p.line_start) for p in view.locations] == [("go.mod", 7)]
     assert view.cvss is not None and view.cvss.vector == VECTOR
+
+
+def _audit(services: Any, ref: UUID, path: str, day: int) -> UUID:
+    saved = services.assessment.record(
+        _report(path),
+        ref,
+        AssessmentKind.SECURE_CODE_CANONICAL,
+        "skill:secure-code-audit",
+        "0.1.0",
+        Provenance(
+            run_id=uuid4(),
+            source=SourceType.INTERACTIVE,
+            occurred_at=datetime(2026, 10, day, 9, tzinfo=UTC),
+        ),
+    )
+    assert saved.id is not None
+    return saved.id  # type: ignore[no-any-return]
+
+
+def test_the_newest_located_occurrence_is_shown_and_only_it_is_read(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two audits, then an impact analysis: the view shows the newer audit's places, read by
+    stepping back one occurrence, never by reading the whole history."""
+    from traust_core.v1.repositories.traust.assessments import SqlLocationRepository
+
+    [app] = refs(engine, 1)
+    assert app.id is not None
+    exposure = service(engine)
+    exposure.ingest_sbom(SAMPLE, app.id)
+    found = advisory_id(exposure)
+    services = _services(engine, tmp_path)
+    _audit(services, app.id, "go.mod", 20)
+    newer = _audit(services, app.id, "vendor/modules.txt", 21)
+    exposure.record(app.id, affected_doc(one(exposure.prepare(found, app.id))), provenance())
+    with SqlTraustUnitOfWork(engine) as uow:
+        [occurrence] = uow.occurrences.list_for_assessment(newer)
+    asked: list[list[UUID]] = []
+    original = SqlLocationRepository.list_for_occurrences
+
+    def spy(self: Any, ids: Any, **kwargs: Any) -> Any:
+        asked.append(list(ids))
+        return original(self, ids, **kwargs)
+
+    monkeypatch.setattr(SqlLocationRepository, "list_for_occurrences", spy)
+    [view] = services.findings.list_by_ids([occurrence.finding_id])
+    assert [p.path for p in view.locations] == ["vendor/modules.txt"]
+    assert [len(ids) for ids in asked] == [1, 1] and asked[1] == [occurrence.id]
 
 
 def _ids(engine: Engine, assessment_id: UUID) -> set[UUID]:
