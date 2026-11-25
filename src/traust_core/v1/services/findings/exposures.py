@@ -7,7 +7,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
-from traust_core.v1.models.artifacts import AssessmentArtifact, ReportArtifact
+from traust_core.v1.models.artifacts import AssessmentArtifact, ReportArtifact, VulnFindingsArtifact
 from traust_core.v1.models.dependencies import Advisory, Ecosystem, package_name
 from traust_core.v1.models.findings import ExposureKey, FindingCandidate
 
@@ -40,13 +40,14 @@ def with_exposures(
     candidates: Sequence[FindingCandidate],
     advisories: StoredAdvisories | None,
 ) -> list[FindingCandidate]:
-    """A report finding whose `dependency` names a stored advisory and its module is identified
-    as the dependency finding an impact analysis files for it. An omitted ecosystem is taken
-    from the stored advisory only when it names the module in exactly one; a dependency
-    naming an advisory core doesn't keep stays fingerprinted as reported. Recording and the
-    settling of held moves both call this, so a candidate has one identity in either."""
-    if advisories is None or not isinstance(doc, ReportArtifact):
-        # only a report states `finding.dependency` in the pinned contracts
+    """A report or vuln-scan finding whose `dependency` names a stored advisory and its module
+    is identified as the dependency finding an impact analysis files for it. An omitted
+    ecosystem is taken from the stored advisory only when it names the module in exactly one;
+    a dependency naming an advisory core doesn't keep stays fingerprinted as reported.
+    Recording and the settling of held moves both call this, so a candidate has one identity
+    in either."""
+    if advisories is None or not isinstance(doc, ReportArtifact | VulnFindingsArtifact):
+        # a report's and a vuln-scan's findings state `dependency` (traust-contracts#190)
         return list(candidates)
     stated = {str(e.id): e.dependency for e in doc.findings if e.dependency is not None}
     if not stated:

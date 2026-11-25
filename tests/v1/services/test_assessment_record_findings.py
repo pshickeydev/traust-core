@@ -4,6 +4,7 @@ are taken in as findings of the assessment through FindingIntake, as `record_aud
 from __future__ import annotations
 
 import json
+from decimal import Decimal
 from typing import Any
 from uuid import UUID
 
@@ -404,3 +405,62 @@ def test_an_ecosystem_the_advisory_cant_settle_is_never_guessed(
         ),
     )
     assert found.advisory_id is None and found.fingerprint_algo != "exposure-v1"
+
+
+def test_a_vuln_scans_advisory_score_is_kept_on_the_occurrence_and_view(
+    context: Any, ref: UUID
+) -> None:
+    """traust-contracts#190: a vuln-scan finding's `cvss` is taken in as a report's is, so the
+    occurrence holds it and the finding view shows it (risk weight and SLA read it)."""
+    vector = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+    doc = scan(
+        scanned(
+            "REPO-abcdef0-003",
+            "go.mod",
+            3,
+            category="supply-chain",
+            severity="critical",
+            cvss={"vector": vector, "score": 9.8},
+            dependency={"advisory": "CVE-2024-0001", "module": "golang.org/x/net"},
+        )
+    )
+    assessment = record(context, doc, ref, AssessmentKind.VULN_SCAN_CANONICAL)
+    assert assessment.id is not None
+    [occurrence] = _occurrences(context, assessment.id)
+    assert (occurrence.cvss_vector, occurrence.cvss_score) == (vector, Decimal("9.8"))
+    [view] = context.services().findings.list_by_ids([occurrence.finding_id])
+    assert view.cvss is not None and view.cvss.vector == vector
+
+
+def test_a_vuln_scan_dependency_on_a_stored_advisory_is_the_exposure_finding(
+    context: Any, ref: UUID
+) -> None:
+    """A vuln-scan finding's `dependency` (traust-contracts#190) is identified as a report's is:
+    the same advisory and package in one repository is one finding across both kinds."""
+    _store_advisory(context, "GHSA-m425-mq94-257g")
+    audit = _finding_of(
+        context,
+        record(
+            context,
+            report(
+                _with_dependency("DEP-1", "go.mod", module="google.golang.org/grpc", ecosystem="go")
+            ),
+            ref,
+            AssessmentKind.CONTAINER,
+        ),
+    )
+    scanned_finding = scanned(
+        "REPO-abcdef0-009",
+        "vendor/modules.txt",
+        2,
+        category="supply-chain",
+        dependency={
+            "advisory": "GHSA-m425-mq94-257g",
+            "module": "google.golang.org/grpc",
+            "ecosystem": "go",
+        },
+    )
+    swept = _finding_of(
+        context, record(context, scan(scanned_finding), ref, AssessmentKind.VULN_SCAN_CANONICAL)
+    )
+    assert swept.id == audit.id and swept.fingerprint_algo == "exposure-v1"
