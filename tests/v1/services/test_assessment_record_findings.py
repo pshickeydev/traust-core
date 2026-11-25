@@ -4,6 +4,7 @@ are taken in as findings of the assessment through FindingIntake, as `record_aud
 from __future__ import annotations
 
 import json
+from decimal import Decimal
 from typing import Any
 from uuid import UUID
 
@@ -224,3 +225,28 @@ def test_recording_a_vuln_scan_needs_intake(context: Any, ref: UUID) -> None:
         service.record(
             VULN, ref, AssessmentKind.VULN_SCAN_CANONICAL, "skill:test", "0.1.0", provenance()
         )
+
+
+def test_a_vuln_scans_advisory_score_is_kept_on_the_occurrence_and_view(
+    context: Any, ref: UUID
+) -> None:
+    """traust-contracts#190: a vuln-scan finding's `cvss` is taken in as a report's is, so the
+    occurrence holds it and the finding view shows it (risk weight and SLA read it)."""
+    vector = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+    doc = scan(
+        scanned(
+            "REPO-abcdef0-003",
+            "go.mod",
+            3,
+            category="supply-chain",
+            severity="critical",
+            cvss={"vector": vector, "score": 9.8},
+            dependency={"advisory": "CVE-2024-0001", "module": "golang.org/x/net"},
+        )
+    )
+    assessment = record(context, doc, ref, AssessmentKind.VULN_SCAN_CANONICAL)
+    assert assessment.id is not None
+    [occurrence] = _occurrences(context, assessment.id)
+    assert (occurrence.cvss_vector, occurrence.cvss_score) == (vector, Decimal("9.8"))
+    [view] = context.services().findings.list_by_ids([occurrence.finding_id])
+    assert view.cvss is not None and view.cvss.vector == vector

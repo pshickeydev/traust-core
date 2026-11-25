@@ -624,7 +624,8 @@ class FindingCandidate(Model):
     @classmethod
     def of_scan(cls, entries: Iterable[Any], repository_id: UUID) -> list[FindingCandidate]:
         """The unverified findings a vuln-scan states (vuln-findings `findings[]`), rated as the
-        scan rates them; `known_findings` are the baseline's and stay out."""
+        scan rates them, an advisory's `cvss` kept as the report's is; `known_findings` are the
+        baseline's and stay out."""
         return [
             cls(
                 label=Label(e.id),
@@ -636,6 +637,8 @@ class FindingCandidate(Model):
                 locations=(CodeSpan(path=RepoPath(e.file), line=e.line),),
                 reported_severity=ScannerSeverity(e.severity),
                 confidence=Confidence(e.confidence),
+                cvss_vector=e.cvss.vector if e.cvss else None,
+                cvss_score=Decimal(str(e.cvss.score)) if e.cvss else None,
             )
             for e in entries
         ]
