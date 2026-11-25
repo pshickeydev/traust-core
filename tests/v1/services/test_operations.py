@@ -128,8 +128,14 @@ def stored(engine: Engine, order: RunOrder) -> RunOrder:
 
 
 def in_state(state: str) -> dict[str, Any]:
-    lease = {"lease_holder": W1, "lease_expires_at": T0 + LEASE} if state == "leased" else {}
-    return {"state": state, **lease}
+    if state == "leased":
+        return {
+            "state": state,
+            "lease_holder": W1,
+            "lease_expires_at": T0 + LEASE,
+            "lease_generation": 1,
+        }
+    return {"state": state}
 
 
 def seeded_repository(engine: Engine) -> UUID:
@@ -145,6 +151,19 @@ def leased(engine: Engine, worker: WorkerId = W1) -> RunOrder:
     order = ops(engine).claim(worker, LEASE)
     assert order is not None
     return order
+
+
+def reclaim_at_same_clock(engine: Engine, first: RunOrder) -> RunOrder:
+    assert ops(engine, LEASE + timedelta(seconds=1)).requeue_expired() == 1
+    queued = stored(engine, first)
+    assert (queued.state, queued.lease_generation) == (OrderState.QUEUED, first.lease_generation)
+    second = ops(engine).claim(W1, LEASE, order_id=first.id)
+    assert second is not None and second.id == first.id
+    assert second.lease_holder == first.lease_holder == W1
+    assert second.started_at == first.started_at == T0
+    assert second.lease_expires_at == first.lease_expires_at == T0 + LEASE
+    assert second.lease_generation == first.lease_generation + 1
+    return second
 
 
 def test_order_event_does_not_log_requester_email(
@@ -174,6 +193,7 @@ def test_submit_plans_the_asset_for_its_requester(engine: Engine) -> None:
     assert stored(engine, order) == order
     assert (order.asset, order.lane, order.state) == ("feeds_cache", None, OrderState.PLANNED)
     assert order.requested_by == f"human:{OPERATOR.identity}"
+    assert order.lease_generation == 0
 
 
 def test_a_submitted_order_runs_once_admission_queues_it(engine: Engine) -> None:
@@ -209,6 +229,8 @@ def test_claim_leases_the_next_order_and_none_when_the_queue_is_empty(engine: En
     order = service.claim(W1, LEASE)
     assert order is not None and order.id == queued.id
     assert (order.state, order.lease_holder, order.started_at) == (OrderState.LEASED, W1, T0)
+    assert queued.lease_generation == 0
+    assert stored(engine, order).lease_generation == order.lease_generation == 1
     assert service.claim(W2, LEASE) is None
 
 
@@ -218,7 +240,9 @@ def test_claim_of_a_finished_order_cannot_start_its_new_planned_pair(engine: Eng
     service = ops(engine)
     claimed = service.claim(W1, LEASE, order_id=first.id)
     assert claimed is not None and claimed.id == first.id
-    service.complete(first.id, W1, JobResult.succeeded())
+    service.complete(
+        claimed.id, W1, JobResult.succeeded(), lease_generation=claimed.lease_generation
+    )
     planned = seeded(engine, asset="feeds_cache", state="planned")
 
     assert service.claim(W2, LEASE, order_id=first.id) is None
@@ -251,6 +275,7 @@ def test_claim_sweeps_a_dead_runners_expired_lease(engine: Engine) -> None:
     second = service.claim(W2, LEASE)
     assert second is not None and second.id == leased.id
     assert (second.lease_holder, second.state) == (W2, OrderState.LEASED)
+    assert second.lease_generation == first.lease_generation + 1
 
 
 def test_claim_of_no_assets_claims_nothing(engine: Engine) -> None:
@@ -360,7 +385,10 @@ def test_start_stores_a_run_already_underway_leased_to_its_runner(engine: Engine
         T0,
     )
     assert order.requested_by == f"human:{OPERATOR.identity}"
-    done = ops(engine, timedelta(minutes=1)).complete(order.id, W1, JobResult.succeeded())
+    assert order.lease_generation == 1
+    done = ops(engine, timedelta(minutes=1)).complete(
+        order.id, W1, JobResult.succeeded(), lease_generation=order.lease_generation
+    )
     assert done.state == OrderState.SUCCEEDED
 
 
@@ -369,6 +397,7 @@ def test_start_takes_over_the_subjects_queued_order(engine: Engine) -> None:
     order = ops(engine).start(OrderRequest(asset="feeds_cache", priority=1), OPERATOR, W1, LEASE)
     assert order.id == waiting.id
     assert (order.state, order.lease_holder, order.priority) == (OrderState.LEASED, W1, 5)
+    assert (waiting.lease_generation, order.lease_generation) == (0, 1)
     assert ops(engine).claim(W2, LEASE) is None
 
 
@@ -462,42 +491,55 @@ def test_start_leaves_finished_orders_and_other_subjects_alone(engine: Engine) -
 
 
 def test_a_started_order_whose_runner_vanished_is_requeued(engine: Engine) -> None:
-    order = ops(engine).start(OrderRequest(asset="feeds_cache", priority=1), OPERATOR, W1, LEASE)
-    assert ops(engine, LEASE + timedelta(seconds=1)).requeue_expired() == 1
-    assert stored(engine, order).state == OrderState.QUEUED
+    service = ops(engine)
+    request = OrderRequest(asset="feeds_cache", priority=1)
+    order = service.start(request, OPERATOR, W1, LEASE)
+    reaper = ops(engine, LEASE + timedelta(seconds=1))
+    for _ in range(2):
+        assert reaper.requeue_expired() == 1
+        queued = stored(engine, order)
+        assert queued.state == OrderState.QUEUED
+        assert queued.lease_generation == order.lease_generation
+        restarted = service.start(request, OPERATOR, W1, LEASE)
+        assert restarted.id == order.id
+        assert restarted.lease_generation == order.lease_generation + 1
+        order = restarted
 
 
 def test_heartbeat_extends_the_holders_lease(engine: Engine) -> None:
     order = leased(engine)
-    renewed = ops(engine, timedelta(minutes=4)).heartbeat(order.id, W1, LEASE)
+    renewed = ops(engine, timedelta(minutes=4)).heartbeat(
+        order.id, W1, LEASE, lease_generation=order.lease_generation
+    )
     assert renewed.lease_expires_at == T0 + timedelta(minutes=9)
-    assert stored(engine, order).lease_expires_at == renewed.lease_expires_at
+    assert renewed.lease_generation == order.lease_generation
+    assert stored(engine, order) == renewed
 
 
 @pytest.mark.parametrize(
     ("worker", "at"),
-    [(W2, timedelta()), (W1, LEASE + timedelta(seconds=1))],
-    ids=["another worker", "expired lease"],
+    [(W2, timedelta()), (W1, LEASE), (W1, LEASE + timedelta(seconds=1))],
+    ids=["another worker", "at expiry", "after expiry"],
 )
 def test_heartbeat_is_refused(engine: Engine, worker: WorkerId, at: timedelta) -> None:
     order = leased(engine)
     with pytest.raises(ConflictError):
-        ops(engine, at).heartbeat(order.id, worker, LEASE)
-    assert stored(engine, order).lease_expires_at == T0 + LEASE
+        ops(engine, at).heartbeat(order.id, worker, LEASE, lease_generation=order.lease_generation)
+    assert stored(engine, order) == order
 
 
 def test_heartbeat_refuses_an_order_that_is_not_leased(engine: Engine) -> None:
     order = seeded(engine)
     with pytest.raises(ConflictError):
-        ops(engine).heartbeat(order.id, W1, LEASE)
+        ops(engine).heartbeat(order.id, W1, LEASE, lease_generation=1)
 
 
 def test_unknown_orders_are_not_found(engine: Engine) -> None:
     service, missing = ops(engine), uuid4()
     with pytest.raises(NotFoundError):
-        service.heartbeat(missing, W1, LEASE)
+        service.heartbeat(missing, W1, LEASE, lease_generation=1)
     with pytest.raises(NotFoundError):
-        service.complete(missing, W1, JobResult.succeeded())
+        service.complete(missing, W1, JobResult.succeeded(), lease_generation=1)
     with pytest.raises(NotFoundError):
         service.approve(missing, OPERATOR)
 
@@ -506,45 +548,73 @@ def test_unknown_orders_are_not_found(engine: Engine) -> None:
 def test_complete_finishes_the_order_with_its_outcome(engine: Engine, outcome: Outcome) -> None:
     order = leased(engine)
     result = RESULTS[outcome]
-    done = ops(engine, timedelta(minutes=2)).complete(order.id, W1, result)
+    done = ops(engine, timedelta(minutes=2)).complete(
+        order.id, W1, result, lease_generation=order.lease_generation
+    )
     assert stored(engine, order) == done
     assert (done.state, done.reason) == (OrderState(outcome), result.reason)
     assert (done.lease_holder, done.lease_expires_at) == (None, None)
+    assert (done.completed_by, done.lease_generation) == (W1, order.lease_generation)
     assert (done.started_at, done.finished_at) == (T0, T0 + timedelta(minutes=2))
 
 
 def test_complete_retried_with_the_same_outcome_changes_nothing(engine: Engine) -> None:
     order = leased(engine)
-    done = ops(engine).complete(order.id, W1, JobResult.succeeded())
-    assert ops(engine, timedelta(minutes=1)).complete(order.id, W1, JobResult.succeeded()) == done
+    result = JobResult.succeeded()
+    done = ops(engine).complete(order.id, W1, result, lease_generation=order.lease_generation)
+    after_expiry = ops(engine, LEASE + timedelta(hours=1))
+    replay = after_expiry.complete(order.id, W1, result, lease_generation=order.lease_generation)
+    assert replay == done
+    assert stored(engine, order) == done
+
+
+def test_terminal_replay_requires_the_completing_worker_and_generation(engine: Engine) -> None:
+    first = leased(engine)
+    current = reclaim_at_same_clock(engine, first)
+    result = JobResult.succeeded()
+    service = ops(engine)
+    done = service.complete(current.id, W1, result, lease_generation=current.lease_generation)
+    for worker, generation in ((W2, current.lease_generation), (W1, first.lease_generation)):
+        with pytest.raises(ConflictError):
+            service.complete(current.id, worker, result, lease_generation=generation)
+        assert stored(engine, current) == done
 
 
 def test_complete_refuses_a_second_different_outcome(engine: Engine) -> None:
     order = leased(engine)
-    ops(engine).complete(order.id, W1, JobResult.succeeded())
+    generation = order.lease_generation
+    ops(engine).complete(order.id, W1, JobResult.succeeded(), lease_generation=generation)
     with pytest.raises(ConflictError):
-        ops(engine).complete(order.id, W1, JobResult.failed(OrderReason.RUNNER_CRASHED))
+        ops(engine).complete(
+            order.id, W1, JobResult.failed(OrderReason.RUNNER_CRASHED), lease_generation=generation
+        )
     assert stored(engine, order).state == OrderState.SUCCEEDED
 
 
 def test_complete_refuses_a_worker_that_does_not_hold_the_lease(engine: Engine) -> None:
     order = leased(engine)
     with pytest.raises(ConflictError):
-        ops(engine).complete(order.id, W2, JobResult.succeeded())
+        ops(engine).complete(
+            order.id, W2, JobResult.succeeded(), lease_generation=order.lease_generation
+        )
     assert stored(engine, order).state == OrderState.LEASED
 
 
 def test_complete_refuses_an_order_that_was_never_leased(engine: Engine) -> None:
     order = seeded(engine)
     with pytest.raises(ConflictError):
-        ops(engine).complete(order.id, W1, JobResult.succeeded())
+        ops(engine).complete(order.id, W1, JobResult.succeeded(), lease_generation=1)
     assert stored(engine, order).state == OrderState.QUEUED
 
 
-def test_complete_accepts_an_expired_lease_the_reaper_has_not_taken(engine: Engine) -> None:
+@pytest.mark.parametrize("at", [LEASE, LEASE + timedelta(minutes=1)])
+def test_complete_refuses_an_expired_lease_before_requeue(engine: Engine, at: timedelta) -> None:
     order = leased(engine)
-    done = ops(engine, LEASE + timedelta(minutes=1)).complete(order.id, W1, JobResult.succeeded())
-    assert done.state == OrderState.SUCCEEDED
+    with pytest.raises(ConflictError):
+        ops(engine, at).complete(
+            order.id, W1, JobResult.succeeded(), lease_generation=order.lease_generation
+        )
+    assert stored(engine, order) == order
 
 
 def test_complete_after_the_reaper_requeued_is_refused(engine: Engine) -> None:
@@ -552,7 +622,31 @@ def test_complete_after_the_reaper_requeued_is_refused(engine: Engine) -> None:
     later = ops(engine, LEASE + timedelta(seconds=1))
     assert later.requeue_expired() == 1
     with pytest.raises(ConflictError):
-        later.complete(order.id, W1, JobResult.succeeded())
+        later.complete(order.id, W1, JobResult.succeeded(), lease_generation=order.lease_generation)
+
+
+def test_same_worker_cannot_use_its_previous_grant_after_reclaim(engine: Engine) -> None:
+    first = leased(engine)
+    current = reclaim_at_same_clock(engine, first)
+    service = ops(engine)
+    service.save_progress(
+        current.id, OrderProgress(step=2), worker=W1, lease_generation=current.lease_generation
+    )
+    before = stored(engine, current)
+    with pytest.raises(ConflictError):
+        service.heartbeat(first.id, W1, 2 * LEASE, lease_generation=first.lease_generation)
+    assert stored(engine, current) == before
+    with pytest.raises(ConflictError):
+        service.complete(
+            first.id, W1, JobResult.succeeded(), lease_generation=first.lease_generation
+        )
+    assert stored(engine, current) == before
+    with pytest.raises(ConflictError):
+        service.save_progress(
+            first.id, OrderProgress(step=1), worker=W1, lease_generation=first.lease_generation
+        )
+    assert stored(engine, current) == before
+    assert manifest(engine, current)["progress"]["step"] == 2
 
 
 def test_approve_queues_an_order_awaiting_approval(engine: Engine) -> None:
@@ -733,7 +827,7 @@ def test_approve_refuses_an_order_not_awaiting_approval(engine: Engine, state: s
 def test_requeue_expired_returns_lapsed_leases_and_keeps_live_ones(engine: Engine) -> None:
     lapsed = leased(engine, W1)
     live = seeded(engine)
-    ops(engine, LEASE).claim(W2, LEASE)
+    ops(engine, LEASE / 2).claim(W2, LEASE, order_id=live.id)
     service = ops(engine, LEASE + timedelta(seconds=1))
     assert service.requeue_expired() == 1
     assert (stored(engine, lapsed).state, stored(engine, live).state) == (
@@ -753,6 +847,7 @@ def test_plan_stores_a_routed_request_as_planned(engine: Engine) -> None:
     order = ops(engine).plan(request, OPERATOR)
     assert stored(engine, order) == order
     assert (order.state, order.lane, order.rule) == (OrderState.PLANNED, "diff-scan", "rule-4")
+    assert order.lease_generation == 0
     assert ops(engine).claim(W1, LEASE) is None
 
 
@@ -1109,9 +1204,15 @@ def test_approve_records_the_approver(engine: Engine) -> None:
 
 def test_save_progress_records_where_a_leased_order_got_to(engine: Engine) -> None:
     order = leased(engine)
-    first = ops(engine).save_progress(order.id, OrderProgress(step=1))
+    generation = order.lease_generation
+    first = ops(engine).save_progress(
+        order.id, OrderProgress(step=1), worker=W1, lease_generation=generation
+    )
     later = ops(engine, timedelta(minutes=2)).save_progress(
-        order.id, OrderProgress(step=2, shards_done=("a", "b"))
+        order.id,
+        OrderProgress(step=2, shards_done=("a", "b")),
+        worker=W1,
+        lease_generation=generation,
     )
     assert stored(engine, order).artifact_id == later != first
     assert manifest(engine, order)["progress"] == {
@@ -1127,19 +1228,35 @@ def test_save_progress_records_where_a_leased_order_got_to(engine: Engine) -> No
 def test_save_progress_refuses_an_order_that_is_not_running(engine: Engine, state: str) -> None:
     order = seeded(engine, state=state)
     with pytest.raises(ConflictError):
-        ops(engine).save_progress(order.id, OrderProgress(step=1))
-    assert stored(engine, order).artifact_id is None
+        ops(engine).save_progress(order.id, OrderProgress(step=1), worker=W1, lease_generation=1)
+    assert stored(engine, order) == order
+
+
+@pytest.mark.parametrize("worker,at", [(W2, timedelta()), (W1, LEASE)])
+def test_save_progress_requires_the_live_holder(
+    engine: Engine, worker: WorkerId, at: timedelta
+) -> None:
+    order = leased(engine)
+    with pytest.raises(ConflictError):
+        ops(engine, at).save_progress(
+            order.id, OrderProgress(step=1), worker=worker, lease_generation=order.lease_generation
+        )
+    assert stored(engine, order) == order
 
 
 def test_complete_records_degraded_keys(engine: Engine) -> None:
     order = leased(engine)
-    ops(engine).complete(order.id, W1, JobResult.partly({"unreachable": 2, "db-stale": 1}))
+    result = JobResult.partly({"unreachable": 2, "db-stale": 1})
+    ops(engine).complete(order.id, W1, result, lease_generation=order.lease_generation)
     assert manifest(engine, order)["degraded"] == {"unreachable": 2, "db-stale": 1}
 
 
 def test_a_clean_complete_leaves_the_manifest(engine: Engine) -> None:
     order = leased(engine)
-    assert ops(engine).complete(order.id, W1, JobResult.succeeded()).artifact_id is None
+    done = ops(engine).complete(
+        order.id, W1, JobResult.succeeded(), lease_generation=order.lease_generation
+    )
+    assert done.artifact_id is None
 
 
 def test_a_manifest_moved_by_another_writer_is_a_conflict(
@@ -1150,12 +1267,16 @@ def test_a_manifest_moved_by_another_writer_is_a_conflict(
     real = service._publish
 
     def racing(prior: UUID | None, change: Any) -> UUID:
-        ops(engine).save_progress(order.id, OrderProgress(step=9))
+        ops(engine).save_progress(
+            order.id, OrderProgress(step=9), worker=W1, lease_generation=order.lease_generation
+        )
         return real(prior, change)
 
     monkeypatch.setattr(service, "_publish", racing)
     with pytest.raises(ConflictError):
-        service.save_progress(order.id, OrderProgress(step=1))
+        service.save_progress(
+            order.id, OrderProgress(step=1), worker=W1, lease_generation=order.lease_generation
+        )
     assert manifest(engine, order)["progress"]["step"] == 9
 
 
@@ -1590,3 +1711,158 @@ def test_a_registered_repository_without_an_imported_line_is_not_a_subject(engin
             OrderRequest(asset="assessment", priority=1, repository_id=repo.id), OPERATOR
         )
     assert denied.value.deny_code == "subject_unknown"
+
+
+def test_fenced_expired_completion_persists_measured_spend_once_without_advancing_order(
+    engine: Engine,
+) -> None:
+    from decimal import Decimal
+
+    from traust_core.v1.models.operations import ModelUsage
+    from traust_core.v1.providers.model_catalog import ModelSpec, RegistryModelCatalog
+
+    spec = ModelSpec(
+        name="claude-test",
+        provider="anthropic",
+        tier="sonnet-class",
+        price_per_mtok_in=Decimal("10"),
+        price_per_mtok_out=Decimal("20"),
+    )
+    catalog = RegistryModelCatalog({"claude-test": spec}, {}, ("sonnet-class",), None)
+    usage = (
+        ModelUsage(
+            provider="anthropic",
+            model="claude-test",
+            skill="triage",
+            tokens_in=100_000,
+            tokens_out=50_000,
+            occurred_at=T0,
+        ),
+    )
+    order = leased(engine)
+    assert order.id is not None
+    uow = SqlTraustUnitOfWork(engine)
+    late_clock = FixedClock(T0 + LEASE + timedelta(minutes=1))
+    late_ops = OpsService(
+        uow,
+        late_clock,
+        ArtifactPublisher(
+            PublishSpecs(PublishSpec(RunManifestArtifact)),
+            _stores.setdefault(engine, InMemoryObjectStore()),
+            uow,
+        ),
+        spend=SpendService(uow, late_clock, (), models=catalog),
+    )
+    result = JobResult(outcome=Outcome.SUCCEEDED, usage=usage)
+    with pytest.raises(ConflictError, match="lease expired"):
+        late_ops.complete(order.id, W1, result, lease_generation=order.lease_generation)
+    assert stored(engine, order) == order
+    with SqlTraustUnitOfWork(engine) as check:
+        events = check.spend_events.list_for_order(order.id)
+    assert len(events) == 1
+    assert events[0].cost_usd == Decimal("2.0")
+    # Retrying the same fenced completion must not duplicate spend events.
+    with pytest.raises(ConflictError, match="lease expired"):
+        late_ops.complete(order.id, W1, result, lease_generation=order.lease_generation)
+    with SqlTraustUnitOfWork(engine) as check:
+        assert len(check.spend_events.list_for_order(order.id)) == 1
+
+
+@pytest.mark.parametrize("case", ["wrong-worker", "requeued", "superseded"])
+def test_fenced_completion_writes_zero_spend_when_holder_cannot_be_verified(
+    engine: Engine, caplog: pytest.LogCaptureFixture, case: str
+) -> None:
+    from decimal import Decimal
+
+    from traust_core.v1.models.operations import ModelUsage
+    from traust_core.v1.providers.model_catalog import ModelSpec, RegistryModelCatalog
+
+    spec = ModelSpec(
+        name="claude-test",
+        provider="anthropic",
+        tier="sonnet-class",
+        price_per_mtok_in=Decimal("10"),
+        price_per_mtok_out=Decimal("20"),
+    )
+    catalog = RegistryModelCatalog({"claude-test": spec}, {}, ("sonnet-class",), None)
+    usage = (
+        ModelUsage(
+            provider="anthropic",
+            model="claude-test",
+            skill="triage",
+            tokens_in=100_000,
+            tokens_out=50_000,
+            occurred_at=T0,
+        ),
+    )
+    order = leased(engine)
+    assert order.id is not None
+    uow = SqlTraustUnitOfWork(engine)
+    late_clock = FixedClock(T0 + LEASE + timedelta(minutes=1))
+    late_ops = OpsService(
+        uow,
+        late_clock,
+        ArtifactPublisher(
+            PublishSpecs(PublishSpec(RunManifestArtifact)),
+            _stores.setdefault(engine, InMemoryObjectStore()),
+            uow,
+        ),
+        spend=SpendService(uow, late_clock, (), models=catalog),
+    )
+    caller = W2
+    if case == "requeued":
+        assert late_ops.requeue_expired() == 1
+    elif case == "superseded":
+        assert late_ops.requeue_expired() == 1
+        reclaimed = late_ops.claim(W2, LEASE, order_id=order.id)
+        assert reclaimed is not None and reclaimed.lease_generation == order.lease_generation + 1
+        caller = W1
+    with (
+        caplog.at_level("WARNING", logger="traust_core.v1.services.operations"),
+        pytest.raises(ConflictError),
+    ):
+        late_ops.complete(
+            order.id,
+            caller,
+            JobResult(outcome=Outcome.SUCCEEDED, usage=usage),
+            lease_generation=order.lease_generation,
+        )
+    with SqlTraustUnitOfWork(engine) as check:
+        assert check.spend_events.list_for_order(order.id) == []
+    assert str(order.id) in caplog.text
+    assert "settled=1" in caplog.text
+
+
+def test_fenced_completion_does_not_commit_orphan_manifest_row(engine: Engine) -> None:
+    from datetime import datetime
+
+    class _ExpiringClock(FixedClock):
+        def __init__(self) -> None:
+            super().__init__(T0)
+            self._calls = 0
+
+        def now(self) -> datetime:
+            self._calls += 1
+            # First check (phase 1) sees a live lease; second check (phase 2) sees expired.
+            return T0 if self._calls == 1 else T0 + LEASE + timedelta(minutes=1)
+
+    order = leased(engine)
+    assert order.id is not None
+    with SqlTraustUnitOfWork(engine) as uow:
+        before = uow.artifacts.latest_imported(RunManifestArtifact.schema)
+    shared_uow = SqlTraustUnitOfWork(engine)
+    shared_manifests = ArtifactPublisher(
+        PublishSpecs(PublishSpec(RunManifestArtifact)),
+        _stores.setdefault(engine, InMemoryObjectStore()),
+        shared_uow,
+    )
+    service = OpsService(shared_uow, _ExpiringClock(), shared_manifests)
+    with pytest.raises(ConflictError, match="lease expired"):
+        service.complete(
+            order.id,
+            W1,
+            JobResult.partly({"unreachable": 1}),
+            lease_generation=order.lease_generation,
+        )
+    with SqlTraustUnitOfWork(engine) as uow:
+        assert uow.artifacts.latest_imported(RunManifestArtifact.schema) == before

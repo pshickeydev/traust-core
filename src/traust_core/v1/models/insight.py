@@ -52,6 +52,7 @@ from traust_core.v1.models.validation import ValidationRollup
 from traust_core.v1.models.values import canonical_decimal
 from traust_core.v1.models.vocabulary import (
     ComplianceFramework,
+    Ecosystem,
     IsolationDimension,
     OwnershipClass,
     RemediationStatus,
@@ -526,6 +527,13 @@ class PackageReach(Model):
     ecosystem: str
     name: str
     repositories: int
+
+
+class ManifestCoverageCounts(Model):
+    """Missing scan coverage across all ecosystems, and partial scans counted once per ecosystem."""
+
+    without_scan: int
+    unresolved: Mapping[Ecosystem, int]
 
 
 class DependencyReach(ViewModel):
