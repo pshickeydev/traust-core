@@ -93,6 +93,7 @@ from traust_core.v1.services.findings.census import (
 )
 from traust_core.v1.services.findings.claims import FindingClaims, retained_claim_artifact
 from traust_core.v1.services.findings.decisions import FindingDecisions
+from traust_core.v1.services.findings.exposures import StoredAdvisories, with_exposures
 from traust_core.v1.services.findings.facts import FindingFacts
 from traust_core.v1.services.findings.identity import primary_cwe
 from traust_core.v1.services.findings.intake import (
@@ -502,7 +503,11 @@ class FindingService:
             key=lambda pair: (pair[0].created_at, pair[0].occurred_at),
         ):
             doc = _HELD_DOCUMENTS[artifact.kind].parse(stored_bytes(self._objects, artifact))
-            candidates = REPORTED_FINDINGS[AssessmentKind(assessment.kind)](doc, repository_id)
+            candidates = with_exposures(
+                doc,
+                REPORTED_FINDINGS[AssessmentKind(assessment.kind)](doc, repository_id),
+                StoredAdvisories(self._uow),
+            )
             by_label = {c.label: c for c in candidates}
             assert assessment.id is not None
             held += [

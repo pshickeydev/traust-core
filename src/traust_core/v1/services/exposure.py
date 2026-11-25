@@ -119,7 +119,6 @@ from traust_core.v1.models.feed_documents import (
 )
 from traust_core.v1.models.findings import (
     Category,
-    ExposureKey,
     FindingCandidate,
     FindingContext,
     Label,
@@ -171,6 +170,7 @@ from traust_core.v1.services.artifact_publishing import (
     stored_bytes,
 )
 from traust_core.v1.services.findings.cvss import effective
+from traust_core.v1.services.findings.exposures import exposure_key
 from traust_core.v1.services.findings.intake import FindingIntake
 from traust_core.v1.services.findings.records import FindingRecords
 from traust_core.v1.services.portfolio import Inventory, PortfolioService
@@ -2417,22 +2417,6 @@ def _in_range(
     return True if True in verdicts else None if None in verdicts or not verdicts else False
 
 
-class StoredAdvisories:
-    """The canonical advisory a stored identifier or alias names: a read of what core keeps,
-    never a fetch. Report intake uses it to identify a report's dependency finding the way an
-    impact analysis identifies its own (`ExposureKey`)."""
-
-    def __init__(self, uow: TraustUnitOfWork) -> None:
-        self._uow = uow
-
-    def canonical(self, identifier: str) -> Advisory | None:
-        with self._uow as uow:
-            found = uow.advisories.find_by_identifier(identifier)
-            if found is None or found.alias_of_id is None:
-                return found
-            return uow.advisories.get(found.alias_of_id)
-
-
 def _exposure_candidate(
     repository_id: UUID, doc: ImpactAnalysisArtifact, record: AdvisoryRecord, canonical: Advisory
 ) -> FindingCandidate:
@@ -2451,12 +2435,7 @@ def _exposure_candidate(
         ),
         category=Category(SUPPLY_CHAIN),
         reported_severity=record.severity,
-        exposure=ExposureKey(
-            advisory_id=canonical.id,
-            advisory=canonical.identifier,
-            ecosystem=meta.ecosystem,
-            package=meta.module,
-        ),
+        exposure=exposure_key(canonical, meta.ecosystem, meta.module),
     )
 
 

@@ -9,7 +9,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime, time
 from pathlib import Path
 from time import monotonic
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 import pydantic
@@ -75,11 +75,9 @@ from traust_core.v1.models.assessment import (
 from traust_core.v1.models.cloud_config import audit_candidates, audit_judgments
 from traust_core.v1.models.code_facts import SymbolFact
 from traust_core.v1.models.common import ArtifactRef, Page, PageRequest, Provenance
-from traust_core.v1.models.dependencies import Advisory
 from traust_core.v1.models.findings import (
     CandidateFormat,
     Decision,
-    ExposureKey,
     FindingCandidate,
     FindingContext,
     FindingView,
@@ -114,6 +112,7 @@ from traust_core.v1.services.artifact_publishing import (
 )
 from traust_core.v1.services.cloud_config import CloudConfigCitations
 from traust_core.v1.services.findings.decisions import FindingDecisions
+from traust_core.v1.services.findings.exposures import StoredAdvisories, with_exposures
 from traust_core.v1.services.findings.intake import FindingIntake
 from traust_core.v1.services.findings.rating import RatingPolicy
 from traust_core.v1.services.findings.service import FindingService
@@ -168,12 +167,6 @@ def touches(location: str, paths: Collection[str]) -> bool:
     )
 
 
-class KnownAdvisories(Protocol):
-    """The canonical advisory a stored identifier or alias names (`StoredAdvisories`)."""
-
-    def canonical(self, identifier: str) -> Advisory | None: ...
-
-
 class AssessmentService:
     def __init__(
         self,
@@ -190,10 +183,8 @@ class AssessmentService:
         symbols: SymbolIndex | None = None,  # prepare's diff mode
         rating: RatingPolicy | None = None,  # rate_threats only
         recording: OpsService | None = None,
-        advisories: KnownAdvisories | None = None,  # record doors: report dependency identity
     ) -> None:
         self._uow = uow
-        self._advisories = advisories
         self._inventory = Inventory(uow, hosts)
         self._log = AssessmentLog(uow)
         self._intake = intake
@@ -692,7 +683,7 @@ class AssessmentService:
             raise ConfigError(
                 "recording findings needs assessment and intake to share a unit of work"
             )
-        candidates = self._with_exposures(doc, candidates)
+        candidates = with_exposures(doc, candidates, StoredAdvisories(self._intake._uow))
         with self._uow as uow:
             repository_id = self._inventory.get_ref(assessment.repository_ref_id).repository_id
             self._intake.check(repository_id, candidates)
@@ -707,41 +698,6 @@ class AssessmentService:
             taken = self._intake.accept(recorded.id, candidates)
             uow.commit()
         return recorded, report, taken
-
-    def _with_exposures(
-        self, doc: AssessmentArtifact, candidates: Sequence[FindingCandidate]
-    ) -> list[FindingCandidate]:
-        """A report finding whose `dependency` names a stored advisory, ecosystem and module is
-        identified as the dependency finding an impact analysis files for it (repository,
-        advisory, package), so one advisory in one commit is one finding, whichever records first.
-        A dependency naming an advisory core doesn't keep stays fingerprinted as reported."""
-        stated = {
-            str(e.id): e.dependency
-            for e in getattr(doc, "findings", None) or ()
-            if getattr(e, "dependency", None) is not None
-        }
-        if self._advisories is None or not stated:
-            return list(candidates)
-        out = []
-        for candidate in candidates:
-            dependency = stated.get(str(candidate.label))
-            canonical = (
-                self._advisories.canonical(dependency.advisory)
-                if dependency is not None and dependency.ecosystem and dependency.module
-                else None
-            )
-            if dependency is None or canonical is None or candidate.exposure is not None:
-                out.append(candidate)
-                continue
-            assert canonical.id is not None
-            key = ExposureKey(
-                advisory_id=canonical.id,
-                advisory=canonical.identifier,
-                ecosystem=str(dependency.ecosystem),
-                package=dependency.module,
-            )
-            out.append(candidate.model_copy(update={"exposure": key}))
-        return out
 
     def _prepare_record(
         self,

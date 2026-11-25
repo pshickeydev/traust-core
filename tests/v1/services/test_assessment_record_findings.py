@@ -293,3 +293,114 @@ def test_a_report_dependency_on_an_unknown_advisory_keeps_its_report_identity(
     with SqlTraustUnitOfWork(context.database) as uow:
         found = uow.findings.get(o.finding_id)
     assert found.advisory_id is None and found.fingerprint_algo != "exposure-v1"
+
+
+def _link_packages(context: Any, advisory_id: UUID, *packages: tuple[str, str]) -> None:
+    """The stored advisory names each (ecosystem, name) package."""
+    from traust_core.v1.models.dependencies import AdvisoryPackage, Package
+
+    with SqlTraustUnitOfWork(context.database) as uow:
+        for ecosystem, name in packages:
+            stored = uow.packages.get_or_add(Package(ecosystem=ecosystem, name=name))
+            assert stored.id is not None
+            uow.advisory_packages.get_or_add(
+                AdvisoryPackage(advisory_id=advisory_id, package_id=stored.id)
+            )
+        uow.commit()
+
+
+def _finding_of(context: Any, assessment: Assessment) -> Any:
+    assert assessment.id is not None
+    [o] = _occurrences(context, assessment.id)
+    with SqlTraustUnitOfWork(context.database) as uow:
+        return uow.findings.get(o.finding_id)
+
+
+def _with_dependency(label: str, path: str, **dependency: Any) -> dict[str, Any]:
+    entry = _dependency_finding(label, "GHSA-m425-mq94-257g")
+    entry["locations"] = [{"path": path}]
+    entry["dependency"] = {"advisory": "GHSA-m425-mq94-257g", **dependency}
+    return entry
+
+
+@pytest.mark.parametrize(
+    ("ecosystem", "spellings"),
+    [
+        ("pypi", ("Requests", "requests")),
+        ("pypi", ("zope.interface", "Zope_Interface")),
+        ("npm", ("Lodash", "lodash")),
+    ],
+)
+def test_equivalent_package_spellings_are_one_exposure_finding(
+    context: Any, ref: UUID, ecosystem: str, spellings: tuple[str, str]
+) -> None:
+    """The package is keyed as core stores it (`package_name`), so a report's spelling and an
+    impact analysis's stored name land on one finding."""
+    from traust_core.v1.models.dependencies import Advisory
+    from traust_core.v1.services.findings.exposures import exposure_key
+
+    _store_advisory(context, "GHSA-m425-mq94-257g")
+    first, second = (
+        _finding_of(
+            context,
+            record(
+                context,
+                report(_with_dependency(f"DEP-{i}", path, module=name, ecosystem=ecosystem)),
+                ref,
+                AssessmentKind.CONTAINER,
+            ),
+        )
+        for i, (name, path) in enumerate(zip(spellings, ("a/manifest", "b/manifest"), strict=True))
+    )
+    assert first.id == second.id and first.fingerprint_algo == "exposure-v1"
+    advisory = Advisory(id=first.advisory_id, identifier="GHSA-m425-mq94-257g")
+    assert len({exposure_key(advisory, ecosystem, name) for name in spellings}) == 1
+
+
+def test_an_omitted_ecosystem_is_the_one_the_stored_advisory_names(context: Any, ref: UUID) -> None:
+    """The contract lets a report omit `ecosystem`; when the stored advisory names the module
+    in exactly one ecosystem, that is the finding's exposure identity."""
+    canonical = _store_advisory(context, "GHSA-m425-mq94-257g")
+    _link_packages(context, canonical, ("go", "google.golang.org/grpc"))
+    bare = _finding_of(
+        context,
+        record(
+            context,
+            report(_with_dependency("DEP-1", "go.mod", module="google.golang.org/grpc")),
+            ref,
+            AssessmentKind.CONTAINER,
+        ),
+    )
+    stated = _finding_of(
+        context,
+        record(
+            context,
+            report(
+                _with_dependency(
+                    "DEP-2", "vendor/x", module="google.golang.org/grpc", ecosystem="go"
+                )
+            ),
+            ref,
+            AssessmentKind.CONTAINER,
+        ),
+    )
+    assert bare.id == stated.id and bare.fingerprint_algo == "exposure-v1"
+
+
+@pytest.mark.parametrize("names", [(), (("npm", "widget"), ("pypi", "widget"))])
+def test_an_ecosystem_the_advisory_cant_settle_is_never_guessed(
+    context: Any, ref: UUID, names: tuple[tuple[str, str], ...]
+) -> None:
+    """No stored package, or the module named in two ecosystems: the report identity stays."""
+    canonical = _store_advisory(context, "GHSA-m425-mq94-257g")
+    _link_packages(context, canonical, *names)
+    found = _finding_of(
+        context,
+        record(
+            context,
+            report(_with_dependency("DEP-1", "package.json", module="widget")),
+            ref,
+            AssessmentKind.CONTAINER,
+        ),
+    )
+    assert found.advisory_id is None and found.fingerprint_algo != "exposure-v1"
