@@ -464,3 +464,35 @@ def test_a_vuln_scan_dependency_on_a_stored_advisory_is_the_exposure_finding(
         context, record(context, scan(scanned_finding), ref, AssessmentKind.VULN_SCAN_CANONICAL)
     )
     assert swept.id == audit.id and swept.fingerprint_algo == "exposure-v1"
+
+
+@pytest.mark.parametrize("kind", [AssessmentKind.CONTAINER, AssessmentKind.VULN_SCAN_CANONICAL])
+def test_a_vector_without_a_score_is_scored_at_intake(
+    context: Any, ref: UUID, kind: AssessmentKind
+) -> None:
+    """D14: a producer reports the vector; intake computes cvss_score from it with Core's
+    calculator (the data model's `cvss_score`, computed from `cvss_vector` at intake)."""
+    vector = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N"
+    entry = (
+        finding("VEC-1", "Dockerfile", cvss={"vector": vector})
+        if kind is AssessmentKind.CONTAINER
+        else scanned("REPO-abcdef0-010", "go.mod", 3, cvss={"vector": vector})
+    )
+    doc = report(entry) if kind is AssessmentKind.CONTAINER else scan(entry)
+    assessment = record(context, doc, ref, kind)
+    assert assessment.id is not None
+    [occurrence] = _occurrences(context, assessment.id)
+    assert (occurrence.cvss_vector, occurrence.cvss_score) == (vector, Decimal("7.5"))
+
+
+def test_a_stated_score_that_differs_from_the_vector_is_still_refused(
+    context: Any, ref: UUID
+) -> None:
+    vector = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N"
+    with pytest.raises(ValidationError, match="not what its vector computes"):
+        record(
+            context,
+            report(finding("VEC-2", "Dockerfile", cvss={"vector": vector, "score": 9.8})),
+            ref,
+            AssessmentKind.CONTAINER,
+        )

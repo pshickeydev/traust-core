@@ -299,7 +299,12 @@ class FindingIntake:
             raise ValidationError("invalid finding candidate") from error
         if candidate.kind is not None:
             contracts.validate_enum("finding_kind", candidate.kind)
-        return candidate.model_copy(update={"locations": locations, "exposure": exposure})
+        update: dict[str, object] = {"locations": locations, "exposure": exposure}
+        if candidate.cvss_vector is not None and candidate.cvss_score is None:
+            # the data model's cvss_score: computed from cvss_vector at intake (plan D14); a
+            # producer reports the vector, and a vector with no version prefix leaves it null
+            update["cvss_score"] = cvss_computed_score(candidate.cvss_vector)
+        return candidate.model_copy(update=update)
 
     def _fingerprints(
         self, repo: Repository, candidates: Sequence[FindingCandidate], examiner: str
