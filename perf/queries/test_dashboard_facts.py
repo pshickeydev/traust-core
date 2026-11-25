@@ -11,6 +11,8 @@ import sqlalchemy as sa
 from sqlalchemy.engine import Engine
 
 from perf.seed import REPOSITORIES
+from traust_core.v1.models.dashboard import Subject
+from traust_core.v1.repositories.traust.findings.dashboard_facts import _facts_sql
 
 # seconds, whole rig (350k findings): a regression bound, not the budget
 BUDGET_SECONDS = 2.0
@@ -65,5 +67,33 @@ def test_the_dashboard_facts_answer_one_statement_per_card(
     with engine.connect() as conn:
         seconds, rows = _timed(conn, sa.text(FACTS.text + tail), grant=GRANT)
     print(f"{label}: {seconds:.3f}s, {rows} rows, {REPOSITORIES} repositories")
+    assert rows > 0
+    assert seconds < BUDGET_SECONDS
+
+
+def test_the_product_mode_answers_a_small_grant_against_the_estate(engine: Engine) -> None:
+    """The service's own product-mode statement: the grant constrains the estate
+    association walk before its dedup (SQLite cannot flatten a distinct subquery
+    on the right of a left join), so a one-product dashboard of a 366-repository
+    grant never builds the whole estate's associations."""
+    with engine.connect() as conn:
+        granted = [
+            str(row[0])
+            for row in conn.execute(
+                sa.text("SELECT id FROM traust.repository LIMIT :grant"), {"grant": GRANT}
+            ).all()
+        ]
+        statement = sa.text(
+            _facts_sql(Subject.FINDINGS, products=True, scoped=True)
+            + "SELECT product, count(distinct id) FROM facts"
+            " WHERE repository_id IN :repository_ids GROUP BY 1"
+        ).bindparams(
+            sa.bindparam("estate_repository_ids", expanding=True),
+            sa.bindparam("repository_ids", expanding=True),
+        )
+        seconds, rows = _timed(
+            conn, statement, estate_repository_ids=granted, repository_ids=granted
+        )
+    print(f"product mode, a {GRANT}-repository grant: {seconds:.3f}s, {rows} products")
     assert rows > 0
     assert seconds < BUDGET_SECONDS

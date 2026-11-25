@@ -6,7 +6,12 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from traust_core.v1.models.dashboard import DashboardQuery, DashboardResults, DashboardRow
+from traust_core.v1.models.dashboard import (
+    DashboardQuery,
+    DashboardResults,
+    DashboardRow,
+    Dimension,
+)
 from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.repositories.traust.findings.dashboard_facts import SqlDashboardFacts
 from traust_core.v1.services.dashboards import catalog
@@ -32,16 +37,27 @@ class DashboardService:
             tuple(entry.by for entry in query.order),
         )
         ids = self._resolve(query)
+        products = Dimension.PRODUCT in (*query.group_by, *query.where)
         with self._uow as uow:
             facts = SqlDashboardFacts(uow.connection)
             dialect = uow.connection.dialect.name
             columns = catalog.columns(query.group_by, dialect)
-            aggregates = catalog.aggregates(query.measures, dialect)
+            aggregates = catalog.aggregates(query.measures, dialect, products=products)
             where_columns = catalog.columns(tuple(query.where), dialect)
             predicates = list(zip(where_columns, query.where.values(), strict=True))
-            order = [catalog.order_key(entry.by, entry.desc, dialect) for entry in query.order]
+            order = [
+                catalog.order_key(entry.by, entry.desc, dialect, products=products)
+                for entry in query.order
+            ]
             rows = facts.aggregate(
-                query.subject, ids, columns, aggregates, predicates, order, query.limit
+                query.subject,
+                ids,
+                columns,
+                aggregates,
+                predicates,
+                order,
+                query.limit,
+                products=products,
             )
         results = DashboardResults(
             subject=query.subject,
