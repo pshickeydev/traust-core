@@ -227,6 +227,186 @@ def test_recording_a_vuln_scan_needs_intake(context: Any, ref: UUID) -> None:
         )
 
 
+def _store_advisory(context: Any, identifier: str, *aliases: str) -> UUID:
+    from traust_core.v1.models.dependencies import Advisory
+
+    with SqlTraustUnitOfWork(context.database) as uow:
+        canonical = uow.advisories.get_or_add(Advisory(identifier=identifier))
+        assert canonical.id is not None
+        for alias in aliases:
+            uow.advisories.get_or_add(Advisory(identifier=alias, alias_of_id=canonical.id))
+        uow.commit()
+    return canonical.id
+
+
+def _dependency_finding(label: str, advisory: str) -> dict[str, Any]:
+    return finding(
+        label,
+        "go.mod",
+        title=f"{advisory} in google.golang.org/grpc",
+        category="supply-chain",
+        cwes=["CWE-1395"],
+        dependency={
+            "advisory": advisory,
+            "module": "google.golang.org/grpc",
+            "ecosystem": "go",
+            "installed_version": "v1.56.0",
+            "classification": "likely_affected",
+            "evidence_level": "manifest",
+        },
+    )
+
+
+def test_a_report_dependency_on_a_stored_advisory_is_the_exposure_finding(
+    context: Any, ref: UUID
+) -> None:
+    """A report finding whose dependency names a stored advisory is identified the way an
+    impact analysis identifies its dependency finding: (repository, advisory, package)."""
+    canonical = _store_advisory(context, "GHSA-m425-mq94-257g", "CVE-2023-44487")
+    first = record(
+        context,
+        report(_dependency_finding("GRPC-1", "GHSA-m425-mq94-257g")),
+        ref,
+        AssessmentKind.CONTAINER,
+    )
+    # a later audit names the CVE alias, at another path: still the same finding
+    alias = _dependency_finding("GRPC-9", "CVE-2023-44487")
+    alias["locations"] = [{"path": "vendor/modules.txt"}]
+    second = record(context, report(alias), ref, AssessmentKind.CONTAINER)
+    [a] = _occurrences(context, first.id)
+    [b] = _occurrences(context, second.id)
+    assert a.finding_id == b.finding_id
+    with SqlTraustUnitOfWork(context.database) as uow:
+        found = uow.findings.get(a.finding_id)
+    assert (found.advisory_id, found.fingerprint_algo) == (canonical, "exposure-v1")
+
+
+def test_a_report_dependency_on_an_unknown_advisory_keeps_its_report_identity(
+    context: Any, ref: UUID
+) -> None:
+    assessment = record(
+        context,
+        report(_dependency_finding("GRPC-1", "GHSA-xxxx-yyyy-zzzz")),
+        ref,
+        AssessmentKind.CONTAINER,
+    )
+    [o] = _occurrences(context, assessment.id)
+    with SqlTraustUnitOfWork(context.database) as uow:
+        found = uow.findings.get(o.finding_id)
+    assert found.advisory_id is None and found.fingerprint_algo != "exposure-v1"
+
+
+def _link_packages(context: Any, advisory_id: UUID, *packages: tuple[str, str]) -> None:
+    """The stored advisory names each (ecosystem, name) package."""
+    from traust_core.v1.models.dependencies import AdvisoryPackage, Package
+
+    with SqlTraustUnitOfWork(context.database) as uow:
+        for ecosystem, name in packages:
+            stored = uow.packages.get_or_add(Package(ecosystem=ecosystem, name=name))
+            assert stored.id is not None
+            uow.advisory_packages.get_or_add(
+                AdvisoryPackage(advisory_id=advisory_id, package_id=stored.id)
+            )
+        uow.commit()
+
+
+def _finding_of(context: Any, assessment: Assessment) -> Any:
+    assert assessment.id is not None
+    [o] = _occurrences(context, assessment.id)
+    with SqlTraustUnitOfWork(context.database) as uow:
+        return uow.findings.get(o.finding_id)
+
+
+def _with_dependency(label: str, path: str, **dependency: Any) -> dict[str, Any]:
+    entry = _dependency_finding(label, "GHSA-m425-mq94-257g")
+    entry["locations"] = [{"path": path}]
+    entry["dependency"] = {"advisory": "GHSA-m425-mq94-257g", **dependency}
+    return entry
+
+
+@pytest.mark.parametrize(
+    ("ecosystem", "spellings"),
+    [
+        ("pypi", ("Requests", "requests")),
+        ("pypi", ("zope.interface", "Zope_Interface")),
+        ("npm", ("Lodash", "lodash")),
+    ],
+)
+def test_equivalent_package_spellings_are_one_exposure_finding(
+    context: Any, ref: UUID, ecosystem: str, spellings: tuple[str, str]
+) -> None:
+    """The package is keyed as core stores it (`package_name`), so a report's spelling and an
+    impact analysis's stored name land on one finding."""
+    from traust_core.v1.models.dependencies import Advisory
+    from traust_core.v1.services.findings.exposures import exposure_key
+
+    _store_advisory(context, "GHSA-m425-mq94-257g")
+    first, second = (
+        _finding_of(
+            context,
+            record(
+                context,
+                report(_with_dependency(f"DEP-{i}", path, module=name, ecosystem=ecosystem)),
+                ref,
+                AssessmentKind.CONTAINER,
+            ),
+        )
+        for i, (name, path) in enumerate(zip(spellings, ("a/manifest", "b/manifest"), strict=True))
+    )
+    assert first.id == second.id and first.fingerprint_algo == "exposure-v1"
+    advisory = Advisory(id=first.advisory_id, identifier="GHSA-m425-mq94-257g")
+    assert len({exposure_key(advisory, ecosystem, name) for name in spellings}) == 1
+
+
+def test_an_omitted_ecosystem_is_the_one_the_stored_advisory_names(context: Any, ref: UUID) -> None:
+    """The contract lets a report omit `ecosystem`; when the stored advisory names the module
+    in exactly one ecosystem, that is the finding's exposure identity."""
+    canonical = _store_advisory(context, "GHSA-m425-mq94-257g")
+    _link_packages(context, canonical, ("go", "google.golang.org/grpc"))
+    bare = _finding_of(
+        context,
+        record(
+            context,
+            report(_with_dependency("DEP-1", "go.mod", module="google.golang.org/grpc")),
+            ref,
+            AssessmentKind.CONTAINER,
+        ),
+    )
+    stated = _finding_of(
+        context,
+        record(
+            context,
+            report(
+                _with_dependency(
+                    "DEP-2", "vendor/x", module="google.golang.org/grpc", ecosystem="go"
+                )
+            ),
+            ref,
+            AssessmentKind.CONTAINER,
+        ),
+    )
+    assert bare.id == stated.id and bare.fingerprint_algo == "exposure-v1"
+
+
+@pytest.mark.parametrize("names", [(), (("npm", "widget"), ("pypi", "widget"))])
+def test_an_ecosystem_the_advisory_cant_settle_is_never_guessed(
+    context: Any, ref: UUID, names: tuple[tuple[str, str], ...]
+) -> None:
+    """No stored package, or the module named in two ecosystems: the report identity stays."""
+    canonical = _store_advisory(context, "GHSA-m425-mq94-257g")
+    _link_packages(context, canonical, *names)
+    found = _finding_of(
+        context,
+        record(
+            context,
+            report(_with_dependency("DEP-1", "package.json", module="widget")),
+            ref,
+            AssessmentKind.CONTAINER,
+        ),
+    )
+    assert found.advisory_id is None and found.fingerprint_algo != "exposure-v1"
+
+
 def test_a_vuln_scans_advisory_score_is_kept_on_the_occurrence_and_view(
     context: Any, ref: UUID
 ) -> None:
@@ -250,3 +430,37 @@ def test_a_vuln_scans_advisory_score_is_kept_on_the_occurrence_and_view(
     assert (occurrence.cvss_vector, occurrence.cvss_score) == (vector, Decimal("9.8"))
     [view] = context.services().findings.list_by_ids([occurrence.finding_id])
     assert view.cvss is not None and view.cvss.vector == vector
+
+
+def test_a_vuln_scan_dependency_on_a_stored_advisory_is_the_exposure_finding(
+    context: Any, ref: UUID
+) -> None:
+    """A vuln-scan finding's `dependency` (traust-contracts#190) is identified as a report's is:
+    the same advisory and package in one repository is one finding across both kinds."""
+    _store_advisory(context, "GHSA-m425-mq94-257g")
+    audit = _finding_of(
+        context,
+        record(
+            context,
+            report(
+                _with_dependency("DEP-1", "go.mod", module="google.golang.org/grpc", ecosystem="go")
+            ),
+            ref,
+            AssessmentKind.CONTAINER,
+        ),
+    )
+    scanned_finding = scanned(
+        "REPO-abcdef0-009",
+        "vendor/modules.txt",
+        2,
+        category="supply-chain",
+        dependency={
+            "advisory": "GHSA-m425-mq94-257g",
+            "module": "google.golang.org/grpc",
+            "ecosystem": "go",
+        },
+    )
+    swept = _finding_of(
+        context, record(context, scan(scanned_finding), ref, AssessmentKind.VULN_SCAN_CANONICAL)
+    )
+    assert swept.id == audit.id and swept.fingerprint_algo == "exposure-v1"

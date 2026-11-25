@@ -21,7 +21,7 @@ from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.services.artifact_publishing import AssessmentLog
 from traust_core.v1.services.findings.cvss import selection
 from traust_core.v1.services.findings.facts import decision_lines
-from traust_core.v1.services.findings.rating import RatingPolicy
+from traust_core.v1.services.findings.rating import RatingPolicy, rated_occurrence
 from traust_core.v1.services.portfolio import Inventory
 
 if TYPE_CHECKING:
@@ -120,14 +120,16 @@ def fold(
 
 
 def _latest_report(uow: TraustUnitOfWork, occurrences: Sequence[Occurrence]) -> Occurrence | None:
-    # the views' report order: the reporting assessment's time, then the occurrence's own
+    # the views' report order (the reporting assessment's time, then the occurrence's own),
+    # rated as the views rate (`rated_occurrence`)
     if not occurrences:
         return None
     when = {
         a.id: a.occurred_at
         for a in AssessmentLog(uow).list_by_ids({o.assessment_id for o in occurrences})
     }
-    return max(occurrences, key=lambda o: (when[o.assessment_id], o.created_at, str(o.id)))
+    ordered = sorted(occurrences, key=lambda o: (when[o.assessment_id], o.created_at, str(o.id)))
+    return rated_occurrence(ordered)
 
 
 def stamp(
