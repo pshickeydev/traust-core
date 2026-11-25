@@ -29,7 +29,7 @@ from traust_core.v1.context import Config, Context
 from traust_core.v1.models.artifacts import SecurityAuditArtifact
 from traust_core.v1.models.assessment import AssessmentKind
 from traust_core.v1.models.common import Provenance
-from traust_core.v1.models.vocabulary import SourceType
+from traust_core.v1.models.vocabulary import ImpactGovulncheck, SourceType
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 
 BODY = json.loads(
@@ -157,6 +157,45 @@ def test_the_newest_located_occurrence_is_shown_and_only_it_is_read(
     [view] = services.findings.list_by_ids([occurrence.finding_id])
     assert [p.path for p in view.locations] == ["vendor/modules.txt"]
     assert [len(ids) for ids in asked] == [1, 1] and asked[1] == [occurrence.id]
+
+
+def test_many_impact_occurrences_cost_two_reads_not_one_per_occurrence(
+    engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A located audit followed by many placeless impact occurrences: the view finds the audit's
+    places with one ids-only read and one location read, however long the history."""
+    from traust_core.v1.repositories.traust.assessments import SqlLocationRepository
+
+    [app] = refs(engine, 1)
+    assert app.id is not None
+    exposure = service(engine)
+    exposure.ingest_sbom(SAMPLE, app.id)
+    found = advisory_id(exposure)
+    services = _services(engine, tmp_path)
+    audit = _audit(services, app.id, "go.mod", 20)
+    prepared = one(exposure.prepare(found, app.id))
+    reached = prepared.evidence.model_copy(
+        update={"govulncheck": ImpactGovulncheck.SYMBOL_REACHABLE}
+    )
+    for run in range(12):  # distinct analyses: a replayed document adds no occurrence
+        doc = prepared.model_copy(update={"evidence": reached}).document(f"1.0.{run}")
+        exposure.record(app.id, doc, provenance())
+    with SqlTraustUnitOfWork(engine) as uow:
+        [occurrence] = uow.occurrences.list_for_assessment(audit)
+        history = uow.occurrences.list_for_finding(occurrence.finding_id)
+    assert len(history) == 13
+    calls: list[str] = []
+    for name in ("list_for_occurrences", "located"):
+        original = getattr(SqlLocationRepository, name)
+
+        def spy(self: Any, ids: Any, _o: Any = original, _n: str = name, **kw: Any) -> Any:
+            calls.append(_n)
+            return _o(self, ids, **kw)
+
+        monkeypatch.setattr(SqlLocationRepository, name, spy)
+    [view] = services.findings.list_by_ids([occurrence.finding_id])
+    assert [p.path for p in view.locations] == ["go.mod"]
+    assert calls == ["list_for_occurrences", "located", "list_for_occurrences"]
 
 
 def _ids(engine: Engine, assessment_id: UUID) -> set[UUID]:

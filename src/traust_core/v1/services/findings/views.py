@@ -96,13 +96,19 @@ class FindingViewQuery:
                     held[location.occurrence_id].append(location)
 
             read([seen[-1].id for seen in reported.values() if seen[-1].id])
-            # a latest occurrence with no places (an impact analysis's): step back one earlier
-            # occurrence per such finding per read, stopping at the newest that has places, so
-            # a long history is never read whole
-            back = {fid: len(seen) - 1 for fid, seen in reported.items() if seen[-1].id not in held}
-            while back := {fid: i - 1 for fid, i in back.items() if i > 0}:
-                read([o.id for fid, i in back.items() if (o := reported[fid][i]).id])
-                back = {fid: i for fid, i in back.items() if reported[fid][i].id not in held}
+            # a latest occurrence with no places (an impact analysis's): one ids-only read finds
+            # which earlier occurrences have places, then only the newest of them per finding
+            # is read, so neither the queries nor the rows grow with the history
+            unplaced = [seen for seen in reported.values() if seen[-1].id not in held]
+            earlier = [o.id for seen in unplaced for o in seen[:-1] if o.id]
+            placed = uow.locations.located(earlier) if earlier else set()
+            read(
+                [
+                    newest
+                    for seen in unplaced
+                    if (newest := next((o.id for o in reversed(seen[:-1]) if o.id in placed), None))
+                ]
+            )
             places = held
         return [
             view

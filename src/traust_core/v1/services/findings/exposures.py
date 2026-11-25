@@ -5,8 +5,9 @@ repository is one finding, whichever records first."""
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
+from traust_core.v1.models.artifacts import AssessmentArtifact, ReportArtifact
 from traust_core.v1.models.dependencies import Advisory, Ecosystem, package_name
 from traust_core.v1.models.findings import ExposureKey, FindingCandidate
 
@@ -35,19 +36,20 @@ def exposure_key(advisory: Advisory, ecosystem: str, module: str) -> ExposureKey
 
 
 def with_exposures(
-    doc: Any, candidates: Sequence[FindingCandidate], advisories: StoredAdvisories | None
+    doc: AssessmentArtifact,
+    candidates: Sequence[FindingCandidate],
+    advisories: StoredAdvisories | None,
 ) -> list[FindingCandidate]:
     """A report finding whose `dependency` names a stored advisory and its module is identified
     as the dependency finding an impact analysis files for it. An omitted ecosystem is taken
     from the stored advisory only when it names the module in exactly one; a dependency
     naming an advisory core doesn't keep stays fingerprinted as reported. Recording and the
     settling of held moves both call this, so a candidate has one identity in either."""
-    stated = {
-        str(e.id): e.dependency
-        for e in getattr(doc, "findings", None) or ()
-        if getattr(e, "dependency", None) is not None
-    }
-    if advisories is None or not stated:
+    if advisories is None or not isinstance(doc, ReportArtifact):
+        # only a report states `finding.dependency` in the pinned contracts
+        return list(candidates)
+    stated = {str(e.id): e.dependency for e in doc.findings if e.dependency is not None}
+    if not stated:
         return list(candidates)
     out = []
     for candidate in candidates:
