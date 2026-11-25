@@ -230,7 +230,7 @@ def test_crypto_package_report_distinguishes_unbacked_sboms_from_observed_packag
     assert scope.packages and all(p.repositories == 1 for p in scope.packages)
     text = MarkdownRenderer().render(report_output).decode()
     assert "Observed crypto packages (manifest SBOMs)" in text
-    assert "Commits without scan-backed manifest coverage: 2" in text
+    assert "Commits without scan-backed manifest coverage (coverage_unknown): 2" in text
 
 
 def test_crypto_package_report_uses_legacy_gaps_but_keeps_docker_unknown(
@@ -252,7 +252,7 @@ def test_crypto_package_report_uses_legacy_gaps_but_keeps_docker_unknown(
     model, rendered = view.build_report(ViewFilter(), T0)
     assert len(model.scopes[0].repositories) == 3
     text = MarkdownRenderer().render(rendered).decode()
-    assert "Commits without scan-backed manifest coverage: 1" in text
+    assert "Commits without scan-backed manifest coverage (coverage_unknown): 1" in text
     assert "Commits with an unrecognized manifest coverage probe: 1" in text
     assert "docker: coverage unknown in 1 commit with a legacy scan." in text
     assert "pypi: unresolved manifests in 1 commit." in text

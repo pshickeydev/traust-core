@@ -530,10 +530,13 @@ class PackageReach(Model):
 
 
 class ManifestCoverageCounts(Model):
-    """Missing scan coverage across all ecosystems, and partial scans counted once per ecosystem."""
+    """The scope's coverage gaps in D11's names: `coverage_unknown` counts the units with no
+    scan-backed manifest coverage (a missing package proves nothing there, in any ecosystem);
+    `unresolved_manifest` counts, per ecosystem, the units with a manifest the SBOM tool
+    couldn't resolve."""
 
-    without_scan: int
-    unresolved: Mapping[Ecosystem, int]
+    coverage_unknown: int
+    unresolved_manifest: Mapping[Ecosystem, int]
 
 
 class DependencyReach(ViewModel):

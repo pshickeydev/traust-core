@@ -3365,7 +3365,7 @@ def _manifest_gap_counts(
             without_scan -= 1
             unresolved.update({gap.ecosystem for gap in gaps})
     return ManifestCoverageCounts(
-        without_scan=without_scan, unresolved=dict(sorted(unresolved.items()))
+        coverage_unknown=without_scan, unresolved_manifest=dict(sorted(unresolved.items()))
     )
 
 
@@ -3395,7 +3395,7 @@ def _manifest_report_counts(
             docker_unknown += 1
     return _ManifestReportCounts(
         ManifestCoverageCounts(
-            without_scan=without_scan, unresolved=dict(sorted(unresolved.items()))
+            coverage_unknown=without_scan, unresolved_manifest=dict(sorted(unresolved.items()))
         ),
         docker_unknown,
         unknown_probe,
@@ -3408,10 +3408,10 @@ def _manifest_gap_sections(
     detailed = coverage if isinstance(coverage, _ManifestReportCounts) else None
     counts = coverage.counts if isinstance(coverage, _ManifestReportCounts) else coverage
     notes = []
-    if counts.without_scan:
+    if counts.coverage_unknown:
         notes.append(
-            f"{units.capitalize()} without scan-backed manifest coverage: {counts.without_scan} "
-            "(unknown across ecosystems)."
+            f"{units.capitalize()} without scan-backed manifest coverage (coverage_unknown): "
+            f"{counts.coverage_unknown} (unknown across ecosystems)."
         )
     if detailed is not None and detailed.unknown_probe:
         notes.append(
@@ -3425,7 +3425,7 @@ def _manifest_gap_sections(
         )
     notes.extend(
         f"{ecosystem}: unresolved manifests in {count} {unit if count == 1 else units}."
-        for ecosystem, count in counts.unresolved.items()
+        for ecosystem, count in counts.unresolved_manifest.items()
     )
     return (Section(heading="Unknown manifest coverage", body="\n\n".join(notes)),) if notes else ()
 

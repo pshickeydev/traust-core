@@ -100,8 +100,9 @@ def test_stronger_human_evidence_beats_later_weaker_machine_evidence() -> None:
             "E2",
             marks=pytest.mark.xfail(
                 reason=(
-                    "Equal-grade human/machine disposition precedence pending policy decision"
-                    " (XWING-3098)"
+                    "Equal-grade human/machine precedence is adopter configuration, and either"
+                    " side needs evidence (CVSS remediation plan D15); the configured fold"
+                    " lands with plan step 7 (XWING-3098)"
                 ),
                 strict=True,
             ),

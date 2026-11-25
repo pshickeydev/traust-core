@@ -1814,7 +1814,8 @@ class ExposureService:
 
     def dependents(self, package_id: UUID, version: str | None = None) -> list[UUID]:
         """Commits observed holding the package (optionally at `version`), directly or through
-        images or libraries. Commits with unknown manifest coverage can be missing."""
+        images or libraries. Commits whose manifest coverage is `coverage_unknown` can be
+        missing."""
         with self._uow as uow:
             uow.packages.get(package_id)
         reached = self._reach({package_id}, version)

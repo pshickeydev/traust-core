@@ -65,7 +65,7 @@ def test_v1_http_reach_beside_scan_bound_coverage(
         assert set(wire) == {"repositories", "unmeasured", "ecosystems", "shared"}
         assert (wire["repositories"], wire["unmeasured"]) == (1, unmeasured)
         coverage = gaps.model_dump(mode="json")
-        assert coverage == {"without_scan": without_scan, "unresolved": unresolved}
+        assert coverage == {"coverage_unknown": without_scan, "unresolved_manifest": unresolved}
         contracts.validate_view(ViewName.DEPENDENCY_REACH, wire)
         with pytest.raises(ViewContractError):
             contracts.validate_view(ViewName.DEPENDENCY_REACH, {**wire, "coverage": coverage})
@@ -75,7 +75,7 @@ def test_v1_http_reach_beside_scan_bound_coverage(
     assert cases["never-scanned"]["reach"]["shared"] == []
     assert client.get(dependencies, headers=headers).status_code == 404
     report = render_report()
-    assert "Repositories without scan-backed manifest coverage: 1" in report
+    assert "Repositories without scan-backed manifest coverage (coverage_unknown): 1" in report
     assert "No manifests recorded" in report
 
     services.exposure.ingest_sbom(empty, ref.id)

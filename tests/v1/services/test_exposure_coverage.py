@@ -709,7 +709,10 @@ def test_scan_coverage_beside_v1_reach_counts_a_shared_sbom_by_repository(
     wire = insight.serve(view, scope).model.model_dump(mode="json")
     assert "coverage" not in wire
     assert reach.model_dump(mode="json") == wire
-    assert coverage.model_dump(mode="json") == {"without_scan": 1, "unresolved": {"npm": 1}}
+    assert coverage.model_dump(mode="json") == {
+        "coverage_unknown": 1,
+        "unresolved_manifest": {"npm": 1},
+    }
     assert wire["shared"] == [{"ecosystem": "npm", "name": "left-pad", "repositories": 2}]
     report = insight.publish(view, scope)
     assert report.model == reach
@@ -720,7 +723,7 @@ def test_scan_coverage_beside_v1_reach_counts_a_shared_sbom_by_repository(
     assert insight.serve(view, scope).model.model_dump(mode="json") == wire
     current, gaps = reader.with_coverage(scope)
     assert current == reach
-    assert gaps.model_dump(mode="json") == {"without_scan": 2, "unresolved": {}}
+    assert gaps.model_dump(mode="json") == {"coverage_unknown": 2, "unresolved_manifest": {}}
     captured = reader.report(reach, T0, coverage)
     assert any("npm: unresolved manifests in 1 repository." in s.body for s in captured.sections)
     assert "npm: unresolved manifests" not in insight.publish(view, scope).markdown
@@ -760,10 +763,13 @@ def test_reach_report_distinguishes_legacy_unrecognized_and_missing_scans(
     model, report = reader.build_report(ViewFilter(), T0)
     text = "\n".join(section.body for section in report.sections)
     assert model.repositories == 4
-    assert "Repositories without scan-backed manifest coverage: 1" in text
+    assert "Repositories without scan-backed manifest coverage (coverage_unknown): 1" in text
     assert "Repositories with an unrecognized manifest coverage probe: 1" in text
     assert "docker: coverage unknown in 1 repository with a legacy scan." in text
     assert "npm: unresolved manifests in 2 repositories." in text
     # The unchanged sidecar API is conservative; the richer report is not its wire shape.
     _, sidecar = reader.with_coverage(ViewFilter())
-    assert sidecar.model_dump(mode="json") == {"without_scan": 3, "unresolved": {"npm": 1}}
+    assert sidecar.model_dump(mode="json") == {
+        "coverage_unknown": 3,
+        "unresolved_manifest": {"npm": 1},
+    }
