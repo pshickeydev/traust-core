@@ -1218,8 +1218,19 @@ class FindingDecisions:
                     raise IntegrityError(
                         "validation replay is missing its retained recording evidence"
                     )
-                for retained in (artifact, companions[0]):
-                    stored_bytes(self._objects, retained)
+                stored_bytes(self._objects, artifact)
+                retained = ValidationRecordingEvidence.model_validate_json(
+                    stored_bytes(self._objects, companions[0])
+                )
+                # A replay may differ only in its provenance time: different bindings or
+                # outcomes are a different validation, refused rather than recorded under
+                # evidence that describes the first submission.
+                if retained.model_dump(exclude={"provenance"}) != evidence.model_dump(
+                    exclude={"provenance"}
+                ):
+                    raise ConflictError(
+                        f"order {run_order_id}: already recorded different validation evidence"
+                    )
                 return assessment, artifact, companions[0], False
         known = self._log.find_recorded(
             [source.repository_ref_id],

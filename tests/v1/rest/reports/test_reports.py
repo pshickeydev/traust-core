@@ -224,7 +224,8 @@ def test_a_late_report_losing_its_lease_does_not_stop_the_worker(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A lost/reclaimed lease at completion logs a warning and lets the worker keep claiming."""
+    """A lost/reclaimed lease at completion logs a warning, reports no completed order (Core
+    refused the completion), and the worker keeps claiming."""
     from traust_core.v1.errors import ConflictError
 
     report = request(client, context, report="findings-rollup").json()
@@ -236,6 +237,7 @@ def test_a_late_report_losing_its_lease_does_not_stop_the_worker(
 
     monkeypatch.setattr(services.ops, "complete", lost_lease)
     with caplog.at_level("WARNING"):
-        assert str(worker.run_once()) == report["order_id"]
+        assert worker.run_once() is None
     assert "lost its lease before completion" in caplog.text
-    assert worker.run_once() is None
+    assert report["order_id"] in caplog.text
+    assert worker.run_once() is None  # nothing else queued: the worker idles, it doesn't stop

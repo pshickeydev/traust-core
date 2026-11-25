@@ -178,6 +178,43 @@ def test_a_reclaimed_validation_with_a_fresh_event_time_replays_its_order(
         assert len(uow.assessments.list_for_run_order(saved_id(run.order))) == 1
 
 
+def test_a_reclaimed_validation_with_different_bindings_is_refused_not_replayed(
+    context: Context, client: TestClient, harness: ValidationHarness, run: ValidationRun
+) -> None:
+    """A retry may differ only in its provenance time: changed bindings (here install_failed)
+    would compute other outcomes, so the order's recorded validation refuses them with 409
+    instead of recording new decisions under evidence that describes the first submission."""
+    doc = report(harness, finding={"evidence_grade": "E0"})
+    first = client.post(URL, json=run.body(doc, harness.bindings()), headers=run.headers)
+    assert first.status_code == 200, first.text
+    with SqlTraustUnitOfWork(context.database) as uow:
+        uow.run_orders.update(
+            run.order.model_copy(
+                update={"lease_expires_at": context.clock.now() - timedelta(seconds=1)}
+            )
+        )
+        uow.commit()
+    response = client.post(
+        "/v1/orders/claim",
+        json={"order_id": str(run.order.id), "lease_seconds": 60},
+        headers=run.headers,
+    )
+    assert response.status_code == 200, response.text
+    reclaimed = RunOrder.model_validate(response.json())
+    later = run.provenance.model_copy(
+        update={"occurred_at": run.provenance.occurred_at + timedelta(minutes=5)}
+    )
+    changed = harness.bindings().model_copy(
+        update={"install_failed": True, "install_failure": "helm install timed out"}
+    )
+    body = {**run.body(doc, changed, later), "lease_generation": reclaimed.lease_generation}
+    before = snapshot(context.database)
+    refused = client.post(URL, json=body, headers=run.headers)
+    assert refused.status_code == 409, refused.text
+    assert "different validation evidence" in refused.text
+    assert snapshot(context.database) == before
+
+
 @pytest.mark.parametrize(
     ("case", "verdict", "flag", "reason"),
     [

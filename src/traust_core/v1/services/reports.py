@@ -205,10 +205,9 @@ class ReportWorker:
         self._lease_for = lease_for
 
     def run_once(self) -> UUID | None:
-        """Build the next queued report, if any: the order it claimed and ran, or None when
-        idle. The order is returned even when Core refused its completion because the lease was
-        lost (logged as a warning), so the loop claims again rather than idling; the order's
-        state in Core, not this value, says whether it completed."""
+        """Build the next queued report, if any: the order it completed, or None when idle or
+        when Core refused the completion because the lease was lost (logged as a warning; the
+        order now belongs to its new holder). Either way the worker carries on."""
         order = self._ops.claim(self._worker, self._lease_for, (REPORT_ASSET,))
         if order is None:
             return None
@@ -229,6 +228,7 @@ class ReportWorker:
             )
         except ConflictError as error:
             log.warning("report order %s lost its lease before completion: %s", order.id, error)
+            return None
         return order.id
 
     def run(self, stop: threading.Event, idle: float = 2.0) -> None:

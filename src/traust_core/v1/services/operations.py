@@ -220,10 +220,6 @@ def _refuse_door_only(asset: AssetName) -> None:
         )
 
 
-def _to_millisecond(stamp: datetime) -> datetime:
-    return stamp.replace(microsecond=stamp.microsecond // 1000 * 1000)
-
-
 class OpsService:
     def __init__(
         self,
@@ -1063,8 +1059,9 @@ class OpsService:
                 extra={"order_id": str(order.id)},
             )
             return
-        # Stored timestamps keep millisecond precision (SQLite's TEXT form truncates), so the
-        # duplicate key compares at that precision: a retried completion never bills twice.
+        # The duplicate key compares occurred_at at the store's own precision
+        # (`stored_instant`): a retried completion never bills twice on SQLite, whose TEXT keeps
+        # milliseconds, and two distinct events stay two on PostgreSQL, which keeps microseconds.
         existing = {
             (
                 e.provider,
@@ -1073,7 +1070,7 @@ class OpsService:
                 e.tokens_in,
                 e.tokens_out,
                 e.cost_usd,
-                _to_millisecond(e.occurred_at),
+                e.occurred_at,
             )
             for e in uow.spend_events.list_for_order(order.id)
         }
@@ -1086,7 +1083,7 @@ class OpsService:
                 event.tokens_in,
                 event.tokens_out,
                 event.cost_usd,
-                _to_millisecond(event.occurred_at),
+                uow.spend_events.stored_instant(event.occurred_at),
             )
             if key in existing:
                 continue
@@ -1094,15 +1091,18 @@ class OpsService:
             existing.add(key)
             added += 1
         if added:
-            uow.commit()
-            # logged now, not after_commit: the caller re-raises ConflictError, and that exit
-            # discards queued after-commit callbacks although these rows are committed
-            log.warning(
-                "order %s fenced completion settled %d spend events",
-                order.id,
-                added,
-                extra={"order_id": str(order.id)},
+            # Queued before the commit, so it fires exactly when these rows commit: at once when
+            # this is the outermost transaction, at the owner's commit when nested, and never
+            # when the owner rolls back (the re-raised ConflictError) and discards the rows.
+            uow.after_commit(
+                lambda: log.warning(
+                    "order %s fenced completion settled %d spend events",
+                    order.id,
+                    added,
+                    extra={"order_id": str(order.id)},
+                )
             )
+            uow.commit()
         if unpriced:
             log.warning(
                 "order %s fenced completion: %s count=%d",

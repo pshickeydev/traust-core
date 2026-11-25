@@ -1774,6 +1774,84 @@ def test_fenced_expired_completion_persists_measured_spend_once_without_advancin
         assert len(check.spend_events.list_for_order(order.id)) == 1
 
 
+def _late_ops(engine: Engine, uow: SqlTraustUnitOfWork) -> tuple[OpsService, Any]:
+    from decimal import Decimal
+
+    from traust_core.v1.providers.model_catalog import ModelSpec, RegistryModelCatalog
+
+    spec = ModelSpec(
+        name="claude-test",
+        provider="anthropic",
+        tier="sonnet-class",
+        price_per_mtok_in=Decimal("10"),
+        price_per_mtok_out=Decimal("20"),
+    )
+    catalog = RegistryModelCatalog({"claude-test": spec}, {}, ("sonnet-class",), None)
+    late_clock = FixedClock(T0 + LEASE + timedelta(minutes=1))
+    ops = OpsService(
+        uow,
+        late_clock,
+        ArtifactPublisher(
+            PublishSpecs(PublishSpec(RunManifestArtifact)),
+            _stores.setdefault(engine, InMemoryObjectStore()),
+            uow,
+        ),
+        spend=SpendService(uow, late_clock, (), models=catalog),
+    )
+    return ops, catalog
+
+
+def _usage(at: datetime) -> Any:
+    from traust_core.v1.models.operations import ModelUsage
+
+    return (
+        ModelUsage(
+            provider="anthropic",
+            model="claude-test",
+            skill="triage",
+            tokens_in=100_000,
+            tokens_out=50_000,
+            occurred_at=at,
+        ),
+    )
+
+
+def test_distinct_fenced_spend_within_a_millisecond_is_two_events_where_the_store_keeps_it(
+    engine: Engine,
+) -> None:
+    """The duplicate key compares at the store's precision: PostgreSQL keeps microseconds, so
+    two distinct charges 500us apart are two events; SQLite keeps milliseconds, so it can't."""
+    order = leased(engine)
+    assert order.id is not None
+    late_ops, _ = _late_ops(engine, SqlTraustUnitOfWork(engine))
+    for at in (T0 + timedelta(microseconds=100), T0 + timedelta(microseconds=600)):
+        result = JobResult(outcome=Outcome.SUCCEEDED, usage=_usage(at))
+        with pytest.raises(ConflictError, match="lease expired"):
+            late_ops.complete(order.id, W1, result, lease_generation=order.lease_generation)
+    with SqlTraustUnitOfWork(engine) as check:
+        events = check.spend_events.list_for_order(order.id)
+    assert len(events) == (1 if engine.dialect.name == "sqlite" else 2)
+
+
+def test_fenced_spend_rolled_back_by_its_owner_is_neither_kept_nor_logged(
+    engine: Engine, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Inside a caller's own transaction the settlement's commit is the caller's: when the
+    re-raised ConflictError makes the owner roll back, no row stays and no 'settled' line logs."""
+    order = leased(engine)
+    assert order.id is not None
+    uow = SqlTraustUnitOfWork(engine)
+    late_ops, _ = _late_ops(engine, uow)
+    result = JobResult(outcome=Outcome.SUCCEEDED, usage=_usage(T0))
+    with caplog.at_level("WARNING"), uow:
+        with pytest.raises(ConflictError, match="lease expired"):
+            late_ops.complete(order.id, W1, result, lease_generation=order.lease_generation)
+        uow.rollback()
+    assert "fenced completion settled" not in caplog.text
+    with SqlTraustUnitOfWork(engine) as check:
+        assert check.spend_events.list_for_order(order.id) == []
+
+
 @pytest.mark.parametrize("case", ["wrong-worker", "requeued", "superseded"])
 def test_fenced_completion_writes_zero_spend_when_holder_cannot_be_verified(
     engine: Engine, caplog: pytest.LogCaptureFixture, case: str
