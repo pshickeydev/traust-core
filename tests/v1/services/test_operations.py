@@ -7,7 +7,7 @@ import json
 import logging
 import threading
 from collections.abc import Iterator, Sequence
-from datetime import timedelta
+from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -1713,8 +1713,13 @@ def test_a_registered_repository_without_an_imported_line_is_not_a_subject(engin
     assert denied.value.deny_code == "subject_unknown"
 
 
+@pytest.mark.parametrize(
+    "occurred_at",
+    [T0, T0 + timedelta(microseconds=123_456)],
+    ids=["whole-second", "sub-millisecond"],
+)
 def test_fenced_expired_completion_persists_measured_spend_once_without_advancing_order(
-    engine: Engine,
+    engine: Engine, caplog: pytest.LogCaptureFixture, occurred_at: datetime
 ) -> None:
     from decimal import Decimal
 
@@ -1736,7 +1741,7 @@ def test_fenced_expired_completion_persists_measured_spend_once_without_advancin
             skill="triage",
             tokens_in=100_000,
             tokens_out=50_000,
-            occurred_at=T0,
+            occurred_at=occurred_at,
         ),
     )
     order = leased(engine)
@@ -1754,8 +1759,9 @@ def test_fenced_expired_completion_persists_measured_spend_once_without_advancin
         spend=SpendService(uow, late_clock, (), models=catalog),
     )
     result = JobResult(outcome=Outcome.SUCCEEDED, usage=usage)
-    with pytest.raises(ConflictError, match="lease expired"):
+    with caplog.at_level("WARNING"), pytest.raises(ConflictError, match="lease expired"):
         late_ops.complete(order.id, W1, result, lease_generation=order.lease_generation)
+    assert "fenced completion settled 1 spend events" in caplog.text
     assert stored(engine, order) == order
     with SqlTraustUnitOfWork(engine) as check:
         events = check.spend_events.list_for_order(order.id)
@@ -1834,7 +1840,6 @@ def test_fenced_completion_writes_zero_spend_when_holder_cannot_be_verified(
 
 
 def test_fenced_completion_does_not_commit_orphan_manifest_row(engine: Engine) -> None:
-    from datetime import datetime
 
     class _ExpiringClock(FixedClock):
         def __init__(self) -> None:

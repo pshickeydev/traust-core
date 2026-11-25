@@ -141,6 +141,43 @@ def test_reclaimed_validation_fences_identical_replay_with_unchanged_event_and_s
     assert tuple(harness.objects.list()) == objects
 
 
+def test_a_reclaimed_validation_with_a_fresh_event_time_replays_its_order(
+    context: Context, client: TestClient, harness: ValidationHarness, run: ValidationRun
+) -> None:
+    """A reclaimed lease resubmits the same report with a new provenance time: the order's
+    recorded validation answers, and no second assessment opens for the order."""
+    doc = report(harness, finding={"evidence_grade": "E0"})
+    first = client.post(URL, json=run.body(doc, harness.bindings()), headers=run.headers)
+    assert first.status_code == 200, first.text
+    with SqlTraustUnitOfWork(context.database) as uow:
+        uow.run_orders.update(
+            run.order.model_copy(
+                update={"lease_expires_at": context.clock.now() - timedelta(seconds=1)}
+            )
+        )
+        uow.commit()
+    response = client.post(
+        "/v1/orders/claim",
+        json={"order_id": str(run.order.id), "lease_seconds": 60},
+        headers=run.headers,
+    )
+    assert response.status_code == 200, response.text
+    reclaimed = RunOrder.model_validate(response.json())
+    later = run.provenance.model_copy(
+        update={"occurred_at": run.provenance.occurred_at + timedelta(minutes=5)}
+    )
+    body = {
+        **run.body(doc, harness.bindings(), later),
+        "lease_generation": reclaimed.lease_generation,
+    }
+    before = snapshot(context.database)
+    replay = client.post(URL, json=body, headers=run.headers)
+    assert replay.status_code == 200 and replay.json() == first.json(), replay.text
+    assert snapshot(context.database) == before
+    with SqlTraustUnitOfWork(context.database) as uow:
+        assert len(uow.assessments.list_for_run_order(saved_id(run.order))) == 1
+
+
 @pytest.mark.parametrize(
     ("case", "verdict", "flag", "reason"),
     [

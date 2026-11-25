@@ -44,7 +44,9 @@ def request_id(request: Request) -> str:
 def create_app(context: Context, role: Role = Role.ALL) -> FastAPI:
     """The REST API over `context`'s services; each package in `DOMAINS` brings its router,
     and `role` keeps the routes one serving role answers (`roles`)."""
-    check_recording_server(context)
+    if role in (Role.ALL, Role.COMMAND):
+        # only the roles that serve the recording doors need their ledger, identity and salt
+        check_recording_server(context, probe_remote=False)
     app = FastAPI(
         title="traust-core",
         version="v1",

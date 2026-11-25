@@ -62,7 +62,7 @@ def _http_url(value: str) -> bool:
 
 
 class IdentityProvider(Protocol):
-    def check(self) -> Readiness: ...
+    def check(self, *, probe_remote: bool = True) -> Readiness: ...
 
     def authenticate(self, credential: Credential) -> Principal: ...
 
@@ -100,8 +100,11 @@ class TokenIdentityProvider:
             if i.audience is None and i.issuer != LOCAL_ISSUER:
                 log.warning("configured issuer has no audience: tokens for other services pass")
 
-    def check(self) -> Readiness:
-        """Probe each trusted issuer's verification keys without minting a token."""
+    def check(self, *, probe_remote: bool = True) -> Readiness:
+        """Probe each trusted issuer's verification keys without minting a token. With
+        `probe_remote` false, a remote issuer's settings are checked but its JWKS is not
+        fetched: a boot-time check that a transient IdP outage can't fail (a token is still
+        verified against the issuer's keys at request time, and refused when they can't be read)."""
         gaps = []
         for index, (name, _issuer) in enumerate(self._issuers.items()):
             setting = f"identity.issuers[{index}]"
@@ -111,6 +114,8 @@ class TokenIdentityProvider:
                 continue
             if client is None:
                 gaps.append(f"{setting}: set jwks_url to an HTTP(S) URL")
+                continue
+            if not probe_remote:
                 continue
             try:
                 keys = client.get_signing_keys(refresh=True)

@@ -220,6 +220,10 @@ def _refuse_door_only(asset: AssetName) -> None:
         )
 
 
+def _to_millisecond(stamp: datetime) -> datetime:
+    return stamp.replace(microsecond=stamp.microsecond // 1000 * 1000)
+
+
 class OpsService:
     def __init__(
         self,
@@ -1059,6 +1063,8 @@ class OpsService:
                 extra={"order_id": str(order.id)},
             )
             return
+        # Stored timestamps keep millisecond precision (SQLite's TEXT form truncates), so the
+        # duplicate key compares at that precision: a retried completion never bills twice.
         existing = {
             (
                 e.provider,
@@ -1067,7 +1073,7 @@ class OpsService:
                 e.tokens_in,
                 e.tokens_out,
                 e.cost_usd,
-                e.occurred_at,
+                _to_millisecond(e.occurred_at),
             )
             for e in uow.spend_events.list_for_order(order.id)
         }
@@ -1080,7 +1086,7 @@ class OpsService:
                 event.tokens_in,
                 event.tokens_out,
                 event.cost_usd,
-                event.occurred_at,
+                _to_millisecond(event.occurred_at),
             )
             if key in existing:
                 continue
@@ -1089,13 +1095,13 @@ class OpsService:
             added += 1
         if added:
             uow.commit()
-            self._uow.after_commit(
-                lambda: log.warning(
-                    "order %s fenced completion settled %d spend events",
-                    order.id,
-                    added,
-                    extra={"order_id": str(order.id)},
-                )
+            # logged now, not after_commit: the caller re-raises ConflictError, and that exit
+            # discards queued after-commit callbacks although these rows are committed
+            log.warning(
+                "order %s fenced completion settled %d spend events",
+                order.id,
+                added,
+                extra={"order_id": str(order.id)},
             )
         if unpriced:
             log.warning(

@@ -121,9 +121,9 @@ def _decision_writing_findings(ctx: Context) -> list[str]:
     return findings
 
 
-def _identity_findings(ctx: Context) -> list[str]:
+def _identity_findings(ctx: Context, *, probe_remote: bool = True) -> list[str]:
     try:
-        ready = ctx.identity.check() if ctx.identity is not None else None
+        ready = ctx.identity.check(probe_remote=probe_remote) if ctx.identity is not None else None
     except (ConfigError, ValueError, OSError):
         return ["identity: cannot initialize verification -- check issuers and directory"]
     if ready is None or not ready.ready:
@@ -145,8 +145,10 @@ def _salt_findings(ctx: Context) -> list[str]:
     return []
 
 
-def check_recording_server(ctx: Context) -> None:
-    """Check the writer's configured recording doors without opening its store."""
+def check_recording_server(ctx: Context, *, probe_remote: bool = True) -> None:
+    """Check the writer's configured recording doors without opening its store. A server's
+    boot passes `probe_remote=False`: a remote issuer's JWKS is not fetched, so a transient IdP
+    outage doesn't stop the API (configuration and local keys are still checked)."""
     recording = ctx.config.recording
     decision_writer = recording.triage or recording.validation or recording.verification
     if not (decision_writer or recording.assessment):
@@ -158,7 +160,7 @@ def check_recording_server(ctx: Context) -> None:
             LedgerService.require_order_config(ctx.config.ledger, signed=triage)
         except ServiceError as error:
             gaps.append(str(error))
-    gaps.extend(_identity_findings(ctx))
+    gaps.extend(_identity_findings(ctx, probe_remote=probe_remote))
     if triage:
         gaps.extend(_salt_findings(ctx))
     if gaps:

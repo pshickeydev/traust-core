@@ -205,7 +205,10 @@ class ReportWorker:
         self._lease_for = lease_for
 
     def run_once(self) -> UUID | None:
-        """Build the next queued report, if any; the order it ran, or None when idle."""
+        """Build the next queued report, if any: the order it claimed and ran, or None when
+        idle. The order is returned even when Core refused its completion because the lease was
+        lost (logged as a warning), so the loop claims again rather than idling; the order's
+        state in Core, not this value, says whether it completed."""
         order = self._ops.claim(self._worker, self._lease_for, (REPORT_ASSET,))
         if order is None:
             return None

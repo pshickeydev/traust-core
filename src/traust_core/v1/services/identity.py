@@ -49,8 +49,8 @@ class IdentityService:
         self._provider, self._directory = provider, directory
         self._admins = frozenset(a.strip().lower() for a in admins if a.strip())
 
-    def check(self) -> Readiness:
-        verification = self._provider.check()
+    def check(self, *, probe_remote: bool = True) -> Readiness:
+        verification = self._provider.check(probe_remote=probe_remote)
         if self._directory is not None and not (directory := self._directory.check()).ready:
             failures = [r.detail for r in (verification, directory) if not r.ready]
             return Readiness(ready=False, detail="; ".join(failures))

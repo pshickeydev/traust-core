@@ -1196,6 +1196,31 @@ class FindingDecisions:
     ) -> tuple[Assessment, Artifact, Artifact, bool]:
         raw = evidence.model_dump_json().encode()
         digest = sha256_hex(raw)
+        if run_order_id is not None:
+            # An ordered record replays by its order and source (`recorded_order_subject`), as
+            # triage's does by its order: a reclaimed lease resubmits the same report with a
+            # fresh provenance time, which changes the evidence digest but never makes a second
+            # assessment for that order and source.
+            assert source.id is not None
+            replay = self._log.recorded_order_subject(
+                run_order_id,
+                AssessmentKind.VALIDATION,
+                source.repository_ref_id,
+                doc,
+                baseline_id=source.id,
+            )
+            if replay is not None:
+                assessment, artifact = replay
+                companions = [
+                    row for _, row in self._log.documents([assessment], [VALIDATION_RECORDING])
+                ]
+                if len(companions) != 1:
+                    raise IntegrityError(
+                        "validation replay is missing its retained recording evidence"
+                    )
+                for retained in (artifact, companions[0]):
+                    stored_bytes(self._objects, retained)
+                return assessment, artifact, companions[0], False
         known = self._log.find_recorded(
             [source.repository_ref_id],
             AssessmentKind.VALIDATION,
