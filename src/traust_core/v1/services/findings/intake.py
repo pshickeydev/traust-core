@@ -10,6 +10,8 @@ from pydantic import ValidationError as ModelValidationError
 
 from traust_core.v1 import contracts
 from traust_core.v1.errors import ConfigError, ConflictError, ForbiddenError, ValidationError
+from traust_core.v1.models.artifacts import ReportArtifact
+from traust_core.v1.models.assessment import Assessment, AssessmentIntakeBindings
 from traust_core.v1.models.common import CodeHash, CodeSpan
 from traust_core.v1.models.cvss import cvss_computed_score
 from traust_core.v1.models.dependencies import AdvisoryMatch
@@ -23,6 +25,7 @@ from traust_core.v1.models.findings import (
     FindingView,
     IdentityMove,
     IntakeResult,
+    Label,
     Location,
     LocationHash,
     Occurrence,
@@ -232,6 +235,21 @@ class FindingIntake:
             identities, _ = self._claimed_identities(uow, repository_id)
             found = self._match(uow, repository_id, (fp.algo, fp.value), identities)
         return None if found is None else found.id
+
+    def bindings(self, assessment: Assessment, doc: ReportArtifact) -> AssessmentIntakeBindings:
+        """The report's row labels bound to the findings its assessment admitted — the rule
+        the `intake_bindings` doors serve. A row that identifies no admitted finding is left
+        out: the doors refuse that state, a view read just carries no prose for it."""
+        assert assessment.id is not None
+        with self._uow as uow:
+            repository_id = uow.repository_refs.get(assessment.repository_ref_id).repository_id
+            admitted = {o.finding_id for o in uow.occurrences.list_for_assessment(assessment.id)}
+        bound: dict[Label, UUID] = {}
+        for candidate in FindingCandidate.of_report(doc.findings, repository_id):
+            finding_id = self.match(repository_id, candidate)
+            if finding_id is not None and finding_id in admitted:
+                bound[candidate.label] = finding_id
+        return AssessmentIntakeBindings(findings=bound)
 
     def _claimed_identities(
         self, uow: TraustUnitOfWork, repository_id: UUID

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections import Counter
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
@@ -9,20 +10,26 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy.engine import Engine
 
 from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import Seed
+from traust_core.v1.context import Config, Context
 from traust_core.v1.errors import ConflictError, NotFoundError, ValidationError
-from traust_core.v1.models.common import PageRequest, RecordBudget
+from traust_core.v1.models.artifacts import ReportArtifact
+from traust_core.v1.models.assessment import AssessmentKind
+from traust_core.v1.models.common import PageRequest, Provenance, RecordBudget
 from traust_core.v1.models.findings import (
     Finding,
+    FindingCandidate,
+    FindingEvidence,
     FindingFilter,
     FindingSetFilter,
     FindingState,
+    Label,
     RecordDecision,
 )
 from traust_core.v1.models.identity import IdentitySource, Principal
@@ -582,3 +589,91 @@ def test_list_by_validity_is_the_folded_answer_not_any_decision(engine: Engine) 
     views = findings.list_by_ids([undecided.finding.id, refuted.finding.id])  # type: ignore[list-item]
     assert {v.finding.id for v in views} == {undecided.finding.id, refuted.finding.id}
     assert findings.list_by_ids([]) == []
+
+
+# get: the report row's prose
+AUDIT = json.loads(
+    (Path(__file__).parents[3] / "fixtures" / "reporting" / "widget-report.json").read_text()
+)
+
+
+@pytest.fixture
+def context(engine: Engine, tmp_path: Path) -> Context:
+    ctx = Context(Config(home=tmp_path))
+    ctx.__dict__["database"] = engine
+    return ctx
+
+
+def recorded_audit(context: Context) -> tuple[Any, tuple[UUID, ...]]:
+    """A recorded audit report whose intake admitted every row, plus a seeded finding the
+    same assessment reports without intake ever binding it."""
+    services = context.services()
+    with SqlTraustUnitOfWork(context.database) as uow:
+        seed = Seed(uow)
+        repo = seed.repository(url=f"https://github.com/example-org/svc-{uuid4().hex[:8]}")
+        ref = seed.repository_ref(repo)
+        unbound = seed.finding(repo, fingerprint="a" * 64)
+        uow.commit()
+    raw = json.loads(json.dumps(AUDIT))
+    del raw["metadata"]["additional"]  # a legacy, unstamped report: identity is recomputed
+    raw["remediation_roadmap"] = [  # recorded canonically, so priorities are the canonical enum
+        {**item, "priority": item["priority"].lower()} for item in raw["remediation_roadmap"]
+    ]
+    rows = [{k: v for k, v in f.items() if k != "fingerprint"} for f in raw["findings"]]
+    rows[0]["evidence"] = [{"code": 'q := "SELECT * FROM t WHERE id = " + id', "language": "go"}]
+    doc = ReportArtifact.parse(json.dumps({**raw, "findings": rows}).encode())
+    audit = services.assessment.record(
+        doc, ref.id, AssessmentKind.SECURE_CODE_CANONICAL, "skill:audit", "1", provenance()
+    )
+    taken = services.findings.intake.accept(
+        audit.id, FindingCandidate.of_report(doc.findings, repo.id)
+    )
+    bound = tuple(taken.findings[Label(row["id"])] for row in rows)
+    with SqlTraustUnitOfWork(context.database) as uow:
+        Seed(uow).occurrence(unbound, audit)
+        uow.commit()
+    return rows, (*bound, unbound.id)
+
+
+def provenance() -> Provenance:
+    return Provenance(run_id=uuid4(), source=SourceType.TRIAGE_REPORT, occurred_at=T0)
+
+
+def test_get_carries_the_prose_of_the_report_row_it_was_recorded_from(
+    context: Context,
+) -> None:
+    rows, (first, second, third, unbound) = recorded_audit(context)
+    findings = context.services().findings
+    view = findings.get(first)
+    assert view.description == rows[0]["description"]
+    assert view.remediation == rows[0]["remediation"]
+    assert view.evidence == (
+        FindingEvidence(code='q := "SELECT * FROM t WHERE id = " + id', language="go"),
+    )
+    assert sorted(loc.path for loc in view.locations) == ["pkg/db/other.go", "pkg/db/query.go"]
+    assert (findings.get(second).description, findings.get(second).remediation) == (
+        rows[1]["description"],
+        rows[1]["remediation"],
+    )
+    assert findings.get(third).evidence == ()
+    # reported by the same assessment but never bound by its intake: no prose
+    assert (findings.get(unbound).description, findings.get(unbound).evidence) == (None, ())
+
+
+def test_get_leaves_the_prose_empty_without_a_report(context: Context) -> None:
+    """An imported finding (no occurrence) and one reported by an assessment holding no
+    report carry no prose; the locations a report-less occurrence states still stand."""
+    with SqlTraustUnitOfWork(context.database) as uow:
+        seed = Seed(uow)
+        repo = seed.repository()
+        ref = seed.repository_ref(repo)
+        imported = seed.finding(repo)
+        placed = seed.finding(repo)
+        occurrence = seed.occurrence(placed, seed.assessment(ref))
+        seed.location(occurrence, path="pkg/db/query.go")
+        uow.commit()
+    findings = context.services().findings
+    for finding_id in (imported.id, placed.id):
+        view = findings.get(finding_id)  # type: ignore[arg-type]
+        assert (view.description, view.evidence, view.remediation) == (None, (), None)
+    assert [loc.path for loc in findings.get(placed.id).locations] == ["pkg/db/query.go"]  # type: ignore[union-attr]

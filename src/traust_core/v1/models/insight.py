@@ -12,8 +12,10 @@ from pydantic import (
     ConfigDict,
     Field,
     SerializeAsAny,
+    SerializerFunctionWrapHandler,
     computed_field,
     field_serializer,
+    model_serializer,
 )
 
 from traust_core.v1.models.assessment import (
@@ -266,6 +268,15 @@ class ContainerFinding(Model):
     view: FindingView
     occurrences: tuple[Occurrence, ...]
     history: tuple[Decision, ...] = ()
+
+    @model_serializer(mode="wrap")
+    def _view_without_prose(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        # the contracts finding_view shape states no evidence or remediation: the finding's
+        # own read serves the report prose, a container fold never carries it
+        data = handler(self)
+        data["view"].pop("evidence", None)
+        data["view"].pop("remediation", None)
+        return data
 
 
 class ContainerFindings(ViewModel):

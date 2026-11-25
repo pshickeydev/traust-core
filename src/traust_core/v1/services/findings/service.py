@@ -43,6 +43,7 @@ from traust_core.v1.models.findings import (
     FindingCandidate,
     FindingClock,
     FindingDimension,
+    FindingEvidence,
     FindingFilter,
     FindingFix,
     FindingRollup,
@@ -83,6 +84,7 @@ from traust_core.v1.repositories.objects import ObjectStore
 from traust_core.v1.services.artifact_publishing import (
     ArtifactPublisher,
     AssessmentLog,
+    AssessmentReports,
     PublishSpec,
     PublishSpecs,
     stored_bytes,
@@ -294,6 +296,7 @@ class FindingService:
         self.review = review
         self.precedents = precedents
         self._claims = FindingClaims(uow, objects, self.artifacts, intake, decisions)
+        self._reports = AssessmentReports(self._log, self.artifacts)
         self._occurrence_claims = OccurrenceClaims(uow, decisions)
 
     def record_occurrence_claims(
@@ -358,7 +361,35 @@ class FindingService:
     def get(self, finding_id: UUID) -> FindingView:
         with self._uow as uow:
             (view,) = self._views.views(uow, [uow.findings.get(finding_id)])
-        return view
+        return self._prose(view)
+
+    def _prose(self, view: FindingView) -> FindingView:
+        """The report row the finding's occurrence was recorded from, as the view's prose
+        (description, evidence, remediation): only this single-get read pays the report read."""
+        finding, occurrence = view.finding, view.occurrence
+        if occurrence is None or occurrence.assessment_id is None:
+            return view
+        report = self._reports.report(occurrence.assessment_id)
+        if report is None:
+            return view
+        bound = self.intake.bindings(self._log.get(occurrence.assessment_id), report)
+        row = next(
+            (row for row in report.findings if bound.findings.get(row.id) == finding.id), None
+        )
+        if row is None:
+            return view
+        return view.model_copy(
+            update={
+                "description": view.description
+                if view.description is not None
+                else row.description,
+                "evidence": tuple(
+                    FindingEvidence(code=block.code, language=block.language, caption=block.caption)
+                    for block in row.evidence
+                ),
+                "remediation": row.remediation,
+            }
+        )
 
     def get_by_fingerprint(
         self, repository_id: UUID, fingerprint: str, fingerprint_algo: str | None = None
