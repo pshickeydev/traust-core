@@ -279,5 +279,10 @@ def test_an_accepted_move_onto_an_exposure_identity_settles_the_held_audit(
     answer(services, item.id, old.id, AttestationDecision.CONFIRM)
     moved = first_finding(engine, ref)
     assert (moved.id, moved.fingerprint_algo) == (old.id, "exposure-v1")
+    # the move links the advisory too, so the finding's views select its authority score
+    with SqlTraustUnitOfWork(engine) as uow:
+        stored = uow.advisories.find_by_identifier("GHSA-m425-mq94-257g")
+    assert stored is not None
+    assert (moved.advisory_id, moved.advisory_match) == (stored.id, "confirmed")
     assert old.id in reported_by(engine, again)
     assert len(findings(engine, ref)) == len(BODY["findings"])

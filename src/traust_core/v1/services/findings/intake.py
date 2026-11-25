@@ -589,9 +589,14 @@ class FindingIntake:
                 raise ConflictError(
                     f"finding {finding.id}: another finding already holds {move.fingerprint}"
                 )
-            moved = uow.findings.update(
-                finding.model_copy(update={"fingerprint_algo": key[0], "fingerprint": key[1]})
-            )
+            update: dict[str, object] = {"fingerprint_algo": key[0], "fingerprint": key[1]}
+            if move.advisory_id is not None and finding.advisory_id is None:
+                # moving onto an exposure identity links the advisory, as creation does
+                update |= {
+                    "advisory_id": move.advisory_id,
+                    "advisory_match": AdvisoryMatch.CONFIRMED,
+                }
+            moved = uow.findings.update(finding.model_copy(update=update))
             uow.commit()
         self._uow.after_commit(lambda: log.info("finding %s moved", finding.id))
         return [moved]

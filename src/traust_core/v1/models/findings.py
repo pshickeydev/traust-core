@@ -120,6 +120,9 @@ class IdentityMove(Model):
     matched_by: AliasMatchedBy
     similarity: float | None = None
     path_overlap: float | None = None
+    # the candidate's advisory when its identity is an exposure key: the finding takes the
+    # advisory link with the identity, so its views select the advisory's authority score
+    advisory_id: UUID | None = None
 
 
 class IntakeResult(Model):
