@@ -612,8 +612,9 @@ def _scored_per_fingerprint(
     candidates: Sequence[FindingCandidate], keys: Sequence[Fingerprint]
 ) -> tuple[FindingCandidate, ...]:
     """Candidates that share a fingerprint in one assessment are one occurrence, and an
-    occurrence is append-only: its CVSS comes from the first of them that states a vector, so
-    a later entry's (calculator-computed) score is never lost behind an earlier unscored one."""
+    occurrence is append-only: a candidate that states no CVSS at all takes the first stated
+    vector (and its calculator-computed score), so a later entry's score is never lost behind an
+    earlier unscored one. A candidate stating a vector or a score keeps its own."""
     scored: dict[tuple[str, str], FindingCandidate] = {}
     for candidate, key in zip(candidates, keys, strict=True):
         if candidate.cvss_vector is not None:
@@ -621,7 +622,7 @@ def _scored_per_fingerprint(
     out = []
     for candidate, key in zip(candidates, keys, strict=True):
         source = scored.get((key.algo, key.value))
-        if candidate.cvss_vector is None and source is not None:
+        if candidate.cvss_vector is None and candidate.cvss_score is None and source is not None:
             candidate = candidate.model_copy(
                 update={"cvss_vector": source.cvss_vector, "cvss_score": source.cvss_score}
             )

@@ -510,3 +510,28 @@ def test_a_later_entry_s_vector_scores_the_shared_occurrence(context: Any, ref: 
     assert assessment.id is not None
     [occurrence] = _occurrences(context, assessment.id)
     assert (occurrence.cvss_vector, occurrence.cvss_score) == (vector, Decimal("7.5"))
+
+
+def test_a_score_only_entry_keeps_its_own_score(context: Any, ref: UUID) -> None:
+    """Only an entry with no CVSS at all takes a same-fingerprint entry's vector; a score-only
+    entry's stated score is never overwritten."""
+    from traust_core.v1.models.findings import FindingCandidate
+    from traust_core.v1.models.integrity import Fingerprint
+    from traust_core.v1.services.findings.intake import _scored_per_fingerprint
+
+    base = FindingCandidate.model_validate(
+        {
+            "label": "S-1",
+            "repository_id": "00000000-0000-0000-0000-000000000001",
+            "title": "t",
+            "description": "d",
+            "reported_severity": "high",
+        }
+    )
+    score_only = base.model_copy(update={"cvss_score": Decimal("5.0")})
+    unprefixed = base.model_copy(update={"label": "S-2", "cvss_vector": "AV:N/AC:L"})
+    bare = base.model_copy(update={"label": "S-3"})
+    key = Fingerprint("v3", "a" * 64)
+    out = _scored_per_fingerprint([score_only, unprefixed, bare], [key, key, key])
+    assert (out[0].cvss_vector, out[0].cvss_score) == (None, Decimal("5.0"))
+    assert (out[2].cvss_vector, out[2].cvss_score) == ("AV:N/AC:L", None)
