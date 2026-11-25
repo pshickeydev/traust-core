@@ -496,3 +496,17 @@ def test_a_stated_score_that_differs_from_the_vector_is_still_refused(
             ref,
             AssessmentKind.CONTAINER,
         )
+
+
+def test_a_later_entry_s_vector_scores_the_shared_occurrence(context: Any, ref: UUID) -> None:
+    """Two entries with one fingerprint are one append-only occurrence: the first entry with a
+    vector supplies its CVSS, even when an unscored entry comes before it."""
+    vector = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N"
+    doc = report(
+        finding("DUP-1", "Dockerfile"),
+        finding("DUP-2", "Dockerfile", cvss={"vector": vector}),
+    )
+    assessment = record(context, doc, ref, AssessmentKind.CONTAINER)
+    assert assessment.id is not None
+    [occurrence] = _occurrences(context, assessment.id)
+    assert (occurrence.cvss_vector, occurrence.cvss_score) == (vector, Decimal("7.5"))
