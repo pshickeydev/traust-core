@@ -619,7 +619,9 @@ class FindingCandidate(Model):
                 ),
                 reported_severity=ScannerSeverity(e.severity),
                 cvss_vector=e.cvss.vector if e.cvss else None,
-                cvss_score=Decimal(str(e.cvss.score)) if e.cvss else None,
+                cvss_score=(
+                    Decimal(str(e.cvss.score)) if e.cvss and e.cvss.score is not None else None
+                ),
             )
             for e in entries
         ]
@@ -641,7 +643,9 @@ class FindingCandidate(Model):
                 reported_severity=ScannerSeverity(e.severity),
                 confidence=Confidence(e.confidence),
                 cvss_vector=e.cvss.vector if e.cvss else None,
-                cvss_score=Decimal(str(e.cvss.score)) if e.cvss else None,
+                cvss_score=(
+                    Decimal(str(e.cvss.score)) if e.cvss and e.cvss.score is not None else None
+                ),
             )
             for e in entries
         ]
