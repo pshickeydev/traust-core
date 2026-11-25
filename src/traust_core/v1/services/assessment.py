@@ -112,6 +112,7 @@ from traust_core.v1.services.artifact_publishing import (
 )
 from traust_core.v1.services.cloud_config import CloudConfigCitations
 from traust_core.v1.services.findings.decisions import FindingDecisions
+from traust_core.v1.services.findings.exposures import with_exposures
 from traust_core.v1.services.findings.intake import FindingIntake
 from traust_core.v1.services.findings.rating import RatingPolicy
 from traust_core.v1.services.findings.service import FindingService
@@ -122,6 +123,7 @@ from traust_core.v1.services.observation import parse_audit_date
 from traust_core.v1.services.portfolio import Inventory
 
 if TYPE_CHECKING:
+    from traust_core.v1.services.exposure import StoredAdvisories
     from traust_core.v1.services.operations import OpsService
 
 log = logging.getLogger(__name__)
@@ -182,7 +184,9 @@ class AssessmentService:
         symbols: SymbolIndex | None = None,  # prepare's diff mode
         rating: RatingPolicy | None = None,  # rate_threats only
         recording: OpsService | None = None,
+        advisories: StoredAdvisories | None = None,  # record doors: report dependency identity
     ) -> None:
+        self._advisories = advisories
         self._uow = uow
         self._inventory = Inventory(uow, hosts)
         self._log = AssessmentLog(uow)
@@ -682,6 +686,7 @@ class AssessmentService:
             raise ConfigError(
                 "recording findings needs assessment and intake to share a unit of work"
             )
+        candidates = with_exposures(doc, candidates, self._advisories)
         with self._uow as uow:
             repository_id = self._inventory.get_ref(assessment.repository_ref_id).repository_id
             self._intake.check(repository_id, candidates)
