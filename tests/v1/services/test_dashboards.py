@@ -5,13 +5,15 @@ and the refusal of everything the catalog does not serve."""
 from __future__ import annotations
 
 import pytest
+import sqlalchemy as sa
 from sqlalchemy.engine import Engine
 
 from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import T0, Seed
 from traust_core.v1.errors import ValidationError
-from traust_core.v1.models.dashboard import DashboardQuery
+from traust_core.v1.models.dashboard import DashboardQuery, Subject
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
+from traust_core.v1.repositories.traust.findings.dashboard_facts import _facts_sql
 from traust_core.v1.services.dashboards import DashboardService
 from traust_core.v1.services.portfolio import PortfolioPolicy, PortfolioService
 
@@ -309,3 +311,41 @@ def test_product_grouping_and_filtering_read_slugs(backend: str, tmp_path) -> No
                     subject="review_items", measures=("review_items",), group_by=("product",)
                 )
             )
+
+
+@pytest.mark.parametrize("backend", SQL_BACKENDS)
+def test_the_grant_constrains_the_estate_walk_before_the_dedup(backend: str, tmp_path) -> None:
+    """SQLite cannot flatten a distinct subquery on the right of a left join, so
+    the grant must reach inside the estate subquery: the scoped plan walks the
+    granted repositories' components by index, not the estate's."""
+    with contract_db(backend, tmp_path) as engine:
+        _seed_products(engine)
+        explain = "EXPLAIN QUERY PLAN" if backend == "sqlite" else "EXPLAIN"
+        with engine.connect() as conn:
+
+            def plan(scoped: bool) -> str:
+                statement = sa.text(
+                    f"{explain} {_facts_sql(Subject.FINDINGS, True, scoped)}"
+                    "SELECT count(distinct id) FROM facts"
+                )
+                binds: dict[str, object] = {}
+                if scoped:
+                    statement = statement.bindparams(
+                        sa.bindparam("estate_repository_ids", expanding=True)
+                    )
+                    binds["estate_repository_ids"] = ["00000000-0000-4000-8000-000000000001"]
+                return "\n".join(
+                    str(row[-1] if backend == "sqlite" else row[0])
+                    for row in conn.execute(statement, binds).all()
+                )
+
+            whole, granted = plan(False), plan(True)
+        if backend == "sqlite":
+            assert "SCAN c " in whole and "SEARCH rr" in granted  # the estate's walk vs the grant's
+            assert "idx_repository_ref_repository" in granted  # the grant drives the lookup
+            assert "SCAN c " not in granted
+        else:
+            # the planner may rightly seq-scan a small component table; what must
+            # hold is the grant reaching the walk as a repository_id constraint
+            assert "repository_id = '" in granted  # a literal constant, not a join
+            assert "repository_id = '" not in whole

@@ -123,7 +123,8 @@ def _compiled(query: DashboardQuery, dialect: str) -> str:
 def _clause(query: DashboardQuery, sql: str) -> str:
     """The part the request produced: everything after the fixed facts CTE."""
     products = Dimension.PRODUCT in (*query.group_by, *query.where)
-    facts = _facts_sql(Subject.FINDINGS, products)
+    scoped = bool(query.repository_ids or query.product_ids or query.team_ids)
+    facts = _facts_sql(Subject.FINDINGS, products, scoped)
     assert sql.startswith(facts)
     return sql[len(facts) :]
 
