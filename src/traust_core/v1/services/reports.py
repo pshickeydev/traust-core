@@ -226,8 +226,11 @@ class ReportWorker:
             self._ops.complete(
                 order.id, self._worker, result, lease_generation=order.lease_generation
             )
-        except ConflictError as error:
-            log.warning("report order %s lost its lease before completion: %s", order.id, error)
+        except ConflictError:
+            # The lease was reclaimed: Core refused this completion and the new holder finishes
+            # the order. Nothing was handled here, so the worker reports no order (and keeps
+            # running); the refusal is logged with its traceback for the operator.
+            log.warning("report order %s lost its lease before completion", order.id, exc_info=True)
             return None
         return order.id
 

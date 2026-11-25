@@ -10,7 +10,7 @@ from collections.abc import Iterator, Sequence
 from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid4
 from weakref import WeakKeyDictionary
 
@@ -59,6 +59,10 @@ from traust_core.v1.repositories.objects.store import InMemoryObjectStore
 from traust_core.v1.services.artifact_publishing import ArtifactPublisher, PublishSpec, PublishSpecs
 from traust_core.v1.services.operations import OpsService, PolicyDenied, SpendService
 from traust_core.v1.services.portfolio import Inventory
+
+if TYPE_CHECKING:
+    from traust_core.v1.models.operations import ModelUsage
+    from traust_core.v1.providers.model_catalog import RegistryModelCatalog
 
 LEASE = timedelta(minutes=5)
 W1, W2 = WorkerId("w1"), WorkerId("w2")
@@ -1774,7 +1778,7 @@ def test_fenced_expired_completion_persists_measured_spend_once_without_advancin
         assert len(check.spend_events.list_for_order(order.id)) == 1
 
 
-def _late_ops(engine: Engine, uow: SqlTraustUnitOfWork) -> tuple[OpsService, Any]:
+def _late_ops(engine: Engine, uow: SqlTraustUnitOfWork) -> tuple[OpsService, RegistryModelCatalog]:
     from decimal import Decimal
 
     from traust_core.v1.providers.model_catalog import ModelSpec, RegistryModelCatalog
@@ -1801,7 +1805,7 @@ def _late_ops(engine: Engine, uow: SqlTraustUnitOfWork) -> tuple[OpsService, Any
     return ops, catalog
 
 
-def _usage(at: datetime) -> Any:
+def _usage(at: datetime) -> tuple[ModelUsage, ...]:
     from traust_core.v1.models.operations import ModelUsage
 
     return (

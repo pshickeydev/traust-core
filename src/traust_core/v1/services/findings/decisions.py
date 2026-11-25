@@ -1222,12 +1222,11 @@ class FindingDecisions:
                 retained = ValidationRecordingEvidence.model_validate_json(
                     stored_bytes(self._objects, companions[0])
                 )
-                # A replay may differ only in its provenance time: different bindings or
-                # outcomes are a different validation, refused rather than recorded under
-                # evidence that describes the first submission.
-                if retained.model_dump(exclude={"provenance"}) != evidence.model_dump(
-                    exclude={"provenance"}
-                ):
+                # A replay may differ only in its provenance time: different bindings,
+                # outcomes, run, source or artifact are a different validation, refused rather
+                # than recorded under evidence that describes the first submission.
+                only_time = {"provenance": {"occurred_at"}}
+                if retained.model_dump(exclude=only_time) != evidence.model_dump(exclude=only_time):
                     raise ConflictError(
                         f"order {run_order_id}: already recorded different validation evidence"
                     )

@@ -844,3 +844,47 @@ def test_every_report_source_must_belong_to_the_orders_repository(
     retry = client.post(URL, json=run.body(doc, bindings), headers=run.headers)
     assert retry.status_code == 200 and retry.json() == response.json()
     assert snapshot(context.database) == after
+
+
+def test_a_reclaimed_validation_with_a_different_artifact_is_refused_not_replayed(
+    context: Context, client: TestClient, harness: ValidationHarness, run: ValidationRun
+) -> None:
+    """Only the provenance time may differ on a replay: the same bindings naming another
+    provenance artifact are a different submission, refused with 409."""
+    doc = report(harness, finding={"evidence_grade": "E0"})
+    first = client.post(URL, json=run.body(doc, harness.bindings()), headers=run.headers)
+    assert first.status_code == 200, first.text
+    with SqlTraustUnitOfWork(context.database) as uow:
+        uow.run_orders.update(
+            run.order.model_copy(
+                update={"lease_expires_at": context.clock.now() - timedelta(seconds=1)}
+            )
+        )
+        uow.commit()
+    response = client.post(
+        "/v1/orders/claim",
+        json={"order_id": str(run.order.id), "lease_seconds": 60},
+        headers=run.headers,
+    )
+    assert response.status_code == 200, response.text
+    reclaimed = RunOrder.model_validate(response.json())
+    recorded = ValidationRecordResult.model_validate(first.json())
+    with SqlTraustUnitOfWork(context.database) as uow:
+        artifact = uow.artifacts.get(recorded.artifact_ids[0])
+    changed = run.provenance.model_copy(
+        update={
+            "artifact": ArtifactRef(
+                id=saved_id(artifact), name="validation", digest=artifact.digest
+            ),
+            "occurred_at": run.provenance.occurred_at + timedelta(minutes=5),
+        }
+    )
+    body = {
+        **run.body(doc, harness.bindings(), changed),
+        "lease_generation": reclaimed.lease_generation,
+    }
+    before = snapshot(context.database)
+    refused = client.post(URL, json=body, headers=run.headers)
+    assert refused.status_code == 409, refused.text
+    assert "different validation evidence" in refused.text
+    assert snapshot(context.database) == before
