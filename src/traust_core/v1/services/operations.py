@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from statistics import median
-from typing import Any, Final, Protocol, TypeVar
+from typing import Any, Final, NamedTuple, Protocol, TypeVar
 from uuid import UUID
 
 from traust_core.v1.errors import (
@@ -218,6 +218,14 @@ def _refuse_door_only(asset: AssetName) -> None:
         raise ForbiddenError(
             f"{asset} is queued only by its scheduling door: POST /v1/remediations"
         )
+
+
+class _ForkFacts(NamedTuple):
+    """A scheduled fix's fork facts, as RunOrder types them (`plan_fix` only)."""
+
+    url: str
+    branch: str
+    scheduled_at: datetime
 
 
 class OpsService:
@@ -521,18 +529,51 @@ class OpsService:
         run manifest; an open order for the same subject is re-ranked while still planned (a
         person's submitted order keeps the route they chose), otherwise returned unchanged."""
         _refuse_door_only(request.asset)
+        return self._plan(request, principal, config)
+
+    def plan_fix(
+        self,
+        request: OrderRequest,
+        principal: Principal,
+        config: Sequence[ConfigDigest],
+        fork_url: str,
+        fork_branch: str,
+    ) -> RunOrder:
+        """Plan another attempt of a scheduled fix with its fork facts (RemediationSchedulingService
+        only: it re-checked them against ForkPolicy), for the engine's admission to queue."""
+        if request.asset != REMEDIATE_FINDING or request.work_item_id is None:
+            raise ValidationError("fork facts ride only a remediate_finding order naming its item")
+        return self._plan(
+            request, principal, config, _ForkFacts(fork_url, fork_branch, self._clock.now())
+        )
+
+    def _plan(
+        self,
+        request: OrderRequest,
+        principal: Principal,
+        config: Sequence[ConfigDigest],
+        fork: _ForkFacts | None = None,
+    ) -> RunOrder:
         _classifiers(lane=request.lane, event_source=request.event_source)
         self._check_work_item(request)
         manifest = self._config_manifest(tuple(config))
         with self._uow.write() as uow:
+            # A fix attempt is its own work item's: another effort's open order on the same
+            # repository is not this attempt, so the lookup names the work item.
             current = uow.run_orders.find_open(
-                request.asset, request.repository_id, for_update=True
+                request.asset,
+                request.repository_id,
+                None if fork is None else request.work_item_id,
+                for_update=True,
             )
             if current is None:
                 saved = uow.run_orders.add(
                     RunOrder(
                         **request.model_dump(),
                         **manifest,
+                        fork_url=None if fork is None else fork.url,
+                        fork_branch=None if fork is None else fork.branch,
+                        fork_scheduled_at=None if fork is None else fork.scheduled_at,
                         state=OrderState.PLANNED,
                         requested_by=principal.ref,
                     )

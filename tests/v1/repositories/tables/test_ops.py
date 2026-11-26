@@ -306,6 +306,21 @@ def test_find_open_matches_asset_and_subject_and_skips_finished(seed: Seed) -> N
     assert orders.find_open("feeds_cache", None) is None
 
 
+def test_find_open_for_a_work_item_skips_another_items_open_order(seed: Seed) -> None:
+    orders, repo = seed.uow.run_orders, seed.repository()
+    ref = seed.repository_ref(repo)
+    item, other = (saved_id(seed.assessment(ref, kind="remediation")) for _ in range(2))
+    theirs = seed.run_order(
+        asset="remediate_finding", repository_id=repo.id, work_item_id=other, state="queued"
+    )
+    assert orders.find_open("remediate_finding", repo.id) == theirs  # no work item: any
+    assert orders.find_open("remediate_finding", repo.id, item) is None
+    mine = seed.run_order(
+        asset="remediate_finding", repository_id=repo.id, work_item_id=item, state="planned"
+    )
+    assert orders.find_open("remediate_finding", repo.id, item) == mine
+
+
 def test_search_combines_filters_and_pages_by_age(seed: Seed) -> None:
     orders, repo = seed.uow.run_orders, seed.repository()
     batch = seed.run_batch()

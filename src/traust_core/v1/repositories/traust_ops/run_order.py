@@ -107,9 +107,16 @@ class RunOrderRepository(MutableRecordRepository[RunOrder], Protocol):
 
     def list_for_repository(self, repository_id: UUID, state: OrderState) -> list[RunOrder]: ...
     def find_open(
-        self, asset: str, repository_id: UUID | None, *, for_update: bool = False
+        self,
+        asset: str,
+        repository_id: UUID | None,
+        work_item_id: UUID | None = None,
+        *,
+        for_update: bool = False,
     ) -> RunOrder | None:
-        """An open order (planned through leased) for an asset and repository, if any."""
+        """An open order (planned through leased) for an asset and repository, if any; given a
+        work item, only an open order naming that work item (another effort's order on the
+        same repository is not this one's attempt)."""
         ...
 
     def find_by_work_item(self, work_item_id: UUID) -> RunOrder | None:
@@ -327,15 +334,21 @@ class SqlRunOrderRepository(SqlMutableRepository[RunOrder]):
         )
 
     def find_open(
-        self, asset: str, repository_id: UUID | None, *, for_update: bool = False
+        self,
+        asset: str,
+        repository_id: UUID | None,
+        work_item_id: UUID | None = None,
+        *,
+        for_update: bool = False,
     ) -> RunOrder | None:
         c = self.table.c
         subject = (
             c.repository_id.is_(None) if repository_id is None else c.repository_id == repository_id
         )
-        stmt = (
-            self._select().where(c.asset == asset, c.state.in_(OPEN_ORDER_STATES), subject).limit(1)
-        )
+        where = [c.asset == asset, c.state.in_(OPEN_ORDER_STATES), subject]
+        if work_item_id is not None:
+            where.append(c.work_item_id == work_item_id)
+        stmt = self._select().where(*where).limit(1)
         if for_update:
             stmt = stmt.with_for_update()
         row = self._execute(f"find open {asset} for {repository_id}", stmt).mappings().first()
