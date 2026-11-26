@@ -35,9 +35,11 @@ RUN_ORDER = TableSpec(
         text_column("reason", nullable=True),
         text_column("requested_by"),
         text_column("lease_holder", nullable=True),
+        sa.Column("lease_generation", sa.BigInteger, nullable=False),
         timestamp_column("lease_expires_at", nullable=True),
         timestamp_column("started_at", nullable=True),
         timestamp_column("finished_at", nullable=True),
+        text_column("completed_by", nullable=True),
         uuid_column("work_item_id", nullable=True),
         text_column("fork_url", nullable=True),
         text_column("fork_branch", nullable=True),
@@ -105,7 +107,12 @@ class RunOrderRepository(MutableRecordRepository[RunOrder], Protocol):
 
     def list_for_repository(self, repository_id: UUID, state: OrderState) -> list[RunOrder]: ...
     def find_open(
-        self, asset: str, repository_id: UUID | None, work_item_id: UUID | None = None
+        self,
+        asset: str,
+        repository_id: UUID | None,
+        work_item_id: UUID | None = None,
+        *,
+        for_update: bool = False,
     ) -> RunOrder | None:
         """An open order (planned through leased) for an asset and repository, if any; given a
         work item, only an open order naming that work item (another effort's order on the
@@ -286,6 +293,7 @@ class SqlRunOrderRepository(SqlMutableRepository[RunOrder]):
             .values(
                 state=OrderState.LEASED,
                 lease_holder=worker,
+                lease_generation=c.lease_generation + 1,
                 lease_expires_at=now + lease_for,
                 started_at=now,
             )
@@ -306,7 +314,7 @@ class SqlRunOrderRepository(SqlMutableRepository[RunOrder]):
         c = self.table.c
         stmt = (
             sa.update(self.table)
-            .where(c.state == OrderState.LEASED, c.lease_expires_at < now)
+            .where(c.state == OrderState.LEASED, c.lease_expires_at <= now)
             .values(state=OrderState.QUEUED, lease_holder=None, lease_expires_at=None)
         )
         return self._execute(f"requeue expired at {now}", stmt).rowcount
@@ -326,7 +334,12 @@ class SqlRunOrderRepository(SqlMutableRepository[RunOrder]):
         )
 
     def find_open(
-        self, asset: str, repository_id: UUID | None, work_item_id: UUID | None = None
+        self,
+        asset: str,
+        repository_id: UUID | None,
+        work_item_id: UUID | None = None,
+        *,
+        for_update: bool = False,
     ) -> RunOrder | None:
         c = self.table.c
         subject = (
@@ -336,6 +349,8 @@ class SqlRunOrderRepository(SqlMutableRepository[RunOrder]):
         if work_item_id is not None:
             where.append(c.work_item_id == work_item_id)
         stmt = self._select().where(*where).limit(1)
+        if for_update:
+            stmt = stmt.with_for_update()
         row = self._execute(f"find open {asset} for {repository_id}", stmt).mappings().first()
         return None if row is None else self._to_record(row)
 

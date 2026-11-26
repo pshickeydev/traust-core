@@ -52,6 +52,7 @@ from traust_core.v1.models.validation import ValidationRollup
 from traust_core.v1.models.values import canonical_decimal
 from traust_core.v1.models.vocabulary import (
     ComplianceFramework,
+    Ecosystem,
     IsolationDimension,
     OwnershipClass,
     RemediationStatus,
@@ -526,6 +527,18 @@ class PackageReach(Model):
     ecosystem: str
     name: str
     repositories: int
+
+
+class ManifestCoverageCounts(Model):
+    """The scope's coverage gaps in D11's names: `coverage_unknown` counts the units with no
+    scan-backed manifest coverage (a missing package proves nothing there, in any ecosystem);
+    `unresolved_manifest` counts, per ecosystem, the units with a manifest the SBOM tool
+    couldn't resolve; `ecosystem_coverage_unknown` counts, per ecosystem, the units whose scan
+    couldn't assess that one ecosystem (Docker on a legacy scan)."""
+
+    coverage_unknown: int
+    unresolved_manifest: Mapping[Ecosystem, int]
+    ecosystem_coverage_unknown: Mapping[Ecosystem, int] = {}
 
 
 class DependencyReach(ViewModel):
