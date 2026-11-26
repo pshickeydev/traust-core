@@ -3265,8 +3265,10 @@ class DependencyReachView:
     def with_coverage(self, filter: ViewFilter) -> tuple[DependencyReach, ManifestCoverageCounts]:
         """Pair strict v1 reach with scan coverage for the same captured default heads."""
         model, heads = self._snapshot(filter)
-        scans = self._exposure.manifest_coverage(heads)
-        return model, _manifest_gap_counts(scans.values(), model.repositories)
+        scans = self._exposure.manifest_scan_coverage(heads)
+        return model, _manifest_gap_counts(
+            [_measured_gaps(scan) for scan in scans.values()], model.repositories
+        )
 
     def _snapshot(self, filter: ViewFilter) -> tuple[DependencyReach, Collection[RepositoryRef]]:
         if filter.as_of is not None:
@@ -3353,6 +3355,15 @@ class DependencyReachView:
                 *gaps,
             ),
         )
+
+
+def _measured_gaps(scan: ManifestScanCoverage) -> tuple[UnresolvedManifest, ...] | None:
+    """The gaps a scan measured, for counting: a legacy scan keeps its non-Docker gaps (it never
+    measured Docker). Counts only: impact analysis still treats a legacy scan's coverage as
+    unknown, so an old scan never eliminates a match."""
+    if scan.gaps is None:
+        return None
+    return tuple(g for g in scan.gaps if scan.current_probe or g.ecosystem != Ecosystem.DOCKER)
 
 
 def _manifest_gap_counts(

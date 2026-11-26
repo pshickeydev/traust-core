@@ -767,9 +767,13 @@ def test_reach_report_distinguishes_legacy_unrecognized_and_missing_scans(
     assert "Repositories with an unrecognized manifest coverage probe: 1" in text
     assert "docker: coverage unknown in 1 repository with a legacy scan." in text
     assert "npm: unresolved manifests in 2 repositories." in text
-    # The unchanged sidecar API is conservative; the richer report is not its wire shape.
+    # The sidecar keeps a legacy scan's measured gaps, as the report does: npm is unresolved
+    # in the legacy and the current repository; only the document SBOM and the unrecognized
+    # probe are coverage_unknown.
     _, sidecar = reader.with_coverage(ViewFilter())
     assert sidecar.model_dump(mode="json") == {
-        "coverage_unknown": 3,
-        "unresolved_manifest": {"npm": 1},
+        "coverage_unknown": 2,
+        "unresolved_manifest": {"npm": 2},
     }
+    # impact analysis stays conservative: a legacy scan's coverage is still unknown there
+    assert service.unresolved_manifests(legacy.id) is None
