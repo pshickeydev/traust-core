@@ -65,7 +65,11 @@ def test_v1_http_reach_beside_scan_bound_coverage(
         assert set(wire) == {"repositories", "unmeasured", "ecosystems", "shared"}
         assert (wire["repositories"], wire["unmeasured"]) == (1, unmeasured)
         coverage = gaps.model_dump(mode="json")
-        assert coverage == {"coverage_unknown": without_scan, "unresolved_manifest": unresolved}
+        assert coverage == {
+            "coverage_unknown": without_scan,
+            "unresolved_manifest": unresolved,
+            "ecosystem_coverage_unknown": {},
+        }
         contracts.validate_view(ViewName.DEPENDENCY_REACH, wire)
         with pytest.raises(ViewContractError):
             contracts.validate_view(ViewName.DEPENDENCY_REACH, {**wire, "coverage": coverage})

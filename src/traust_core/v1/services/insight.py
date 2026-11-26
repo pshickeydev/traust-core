@@ -3266,9 +3266,15 @@ class DependencyReachView:
         """Pair strict v1 reach with scan coverage for the same captured default heads."""
         model, heads = self._snapshot(filter)
         scans = self._exposure.manifest_scan_coverage(heads)
-        return model, _manifest_gap_counts(
+        counts = _manifest_gap_counts(
             [_measured_gaps(scan) for scan in scans.values()], model.repositories
         )
+        # a legacy scan's Docker coverage is unknown even though its other gaps count
+        legacy = sum(
+            1 for scan in scans.values() if scan.gaps is not None and not scan.current_probe
+        )
+        unknown = {Ecosystem.DOCKER: legacy} if legacy else {}
+        return model, counts.model_copy(update={"ecosystem_coverage_unknown": unknown})
 
     def _snapshot(self, filter: ViewFilter) -> tuple[DependencyReach, Collection[RepositoryRef]]:
         if filter.as_of is not None:
@@ -3429,10 +3435,15 @@ def _manifest_gap_sections(
             f"{units.capitalize()} with an unrecognized manifest coverage probe: "
             f"{detailed.unknown_probe} (unknown across ecosystems)."
         )
-    if detailed is not None and detailed.docker_unknown:
+    docker_unknown = (
+        detailed.docker_unknown
+        if detailed is not None
+        else counts.ecosystem_coverage_unknown.get(Ecosystem.DOCKER, 0)
+    )
+    if docker_unknown:
         notes.append(
-            f"docker: coverage unknown in {detailed.docker_unknown} "
-            f"{unit if detailed.docker_unknown == 1 else units} with a legacy scan."
+            f"docker: coverage unknown in {docker_unknown} "
+            f"{unit if docker_unknown == 1 else units} with a legacy scan."
         )
     notes.extend(
         f"{ecosystem}: unresolved manifests in {count} {unit if count == 1 else units}."

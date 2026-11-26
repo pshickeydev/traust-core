@@ -712,6 +712,7 @@ def test_scan_coverage_beside_v1_reach_counts_a_shared_sbom_by_repository(
     assert coverage.model_dump(mode="json") == {
         "coverage_unknown": 1,
         "unresolved_manifest": {"npm": 1},
+        "ecosystem_coverage_unknown": {},
     }
     assert wire["shared"] == [{"ecosystem": "npm", "name": "left-pad", "repositories": 2}]
     report = insight.publish(view, scope)
@@ -723,7 +724,11 @@ def test_scan_coverage_beside_v1_reach_counts_a_shared_sbom_by_repository(
     assert insight.serve(view, scope).model.model_dump(mode="json") == wire
     current, gaps = reader.with_coverage(scope)
     assert current == reach
-    assert gaps.model_dump(mode="json") == {"coverage_unknown": 2, "unresolved_manifest": {}}
+    assert gaps.model_dump(mode="json") == {
+        "coverage_unknown": 2,
+        "unresolved_manifest": {},
+        "ecosystem_coverage_unknown": {},
+    }
     captured = reader.report(reach, T0, coverage)
     assert any("npm: unresolved manifests in 1 repository." in s.body for s in captured.sections)
     assert "npm: unresolved manifests" not in insight.publish(view, scope).markdown
@@ -774,6 +779,12 @@ def test_reach_report_distinguishes_legacy_unrecognized_and_missing_scans(
     assert sidecar.model_dump(mode="json") == {
         "coverage_unknown": 2,
         "unresolved_manifest": {"npm": 2},
+        "ecosystem_coverage_unknown": {"docker": 1},
     }
+    # a report built from the sidecar keeps the legacy scan's unknown Docker coverage
+    from_sidecar = reader.report(model, T0, sidecar)
+    assert "docker: coverage unknown in 1 repository with a legacy scan." in "\n".join(
+        section.body for section in from_sidecar.sections
+    )
     # impact analysis stays conservative: a legacy scan's coverage is still unknown there
     assert service.unresolved_manifests(legacy.id) is None
