@@ -226,16 +226,17 @@ def test_a_concurrent_progress_update_is_preserved(
 ) -> None:
     order = leased(engine)
     service = ops(engine)
-    publish = service._publish
+    stage = service._stage_manifest
 
     def race(prior, change):
-        artifact_id = publish(prior, change)
+        # another writer moves the manifest between staging and the order lock
+        staged = stage(prior, change)
         ops(engine).save_progress(
             order.id, OrderProgress(step=7), worker=W1, lease_generation=order.lease_generation
         )
-        return artifact_id
+        return staged
 
-    monkeypatch.setattr(service, "_publish", race)
+    monkeypatch.setattr(service, "_stage_manifest", race)
     with pytest.raises(ConflictError, match="manifest changed"):
         service.record_session(order.id, W1, entry(), lease_generation=order.lease_generation)
     assert manifest(engine, order)["progress"]["step"] == 7

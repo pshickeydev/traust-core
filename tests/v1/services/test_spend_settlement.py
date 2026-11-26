@@ -69,7 +69,7 @@ def catalog(tmp_path_factory: pytest.TempPathFactory) -> ModelCatalog:
 def settling(engine: Engine, catalog: ModelCatalog | None) -> OpsService:
     uow, clock = SqlTraustUnitOfWork(engine), FixedClock(T0 + timedelta(minutes=3))
     spend = SpendService(uow, clock, (), catalog)
-    return OpsService(uow, clock, publisher(engine), spend=spend)
+    return OpsService(uow, clock, publisher(engine, uow), spend=spend)
 
 
 def usage(model: str, tokens_in: int = 10**6, tokens_out: int = 0, **kw: Any) -> ModelUsage:

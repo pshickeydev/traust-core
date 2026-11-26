@@ -15,6 +15,7 @@ from uuid import UUID, uuid4
 from weakref import WeakKeyDictionary
 
 import pytest
+import sqlalchemy as sa
 from sqlalchemy.engine import Engine
 
 from tests.v1.conftest import SQL_BACKENDS, contract_db
@@ -95,21 +96,25 @@ def engine(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[Engine]:
 _stores: WeakKeyDictionary[Engine, InMemoryObjectStore] = WeakKeyDictionary()
 
 
-def publisher(engine: Engine) -> ArtifactPublisher:
+def publisher(engine: Engine, uow: SqlTraustUnitOfWork | None = None) -> ArtifactPublisher:
     store = _stores.setdefault(engine, InMemoryObjectStore())
     specs = PublishSpecs(PublishSpec(RunManifestArtifact))
-    return ArtifactPublisher(specs, store, SqlTraustUnitOfWork(engine))
+    return ArtifactPublisher(specs, store, uow or SqlTraustUnitOfWork(engine))
+
+
+def _ops_with(engine: Engine, clock: FixedClock, **kw: Any) -> OpsService:
+    """Ops wired as Context wires it: the run-manifest publisher shares the ops unit of work."""
+    uow = SqlTraustUnitOfWork(engine)
+    return OpsService(uow, clock, publisher(engine, uow), **kw)
 
 
 def ops(engine: Engine, at: timedelta = timedelta()) -> OpsService:
-    return OpsService(SqlTraustUnitOfWork(engine), FixedClock(T0 + at), publisher(engine))
+    return _ops_with(engine, FixedClock(T0 + at))
 
 
 def scoped_ops(engine: Engine, starts: Sequence[RecordingStartScope]) -> OpsService:
     """Ops with `recording.start` scopes: the ServiceAccounts a deployment granted."""
-    return OpsService(
-        SqlTraustUnitOfWork(engine), FixedClock(T0), publisher(engine), recording_starts=starts
-    )
+    return _ops_with(engine, FixedClock(T0), recording_starts=starts)
 
 
 def manifest(engine: Engine, order: RunOrder) -> dict[str, Any]:
@@ -1268,20 +1273,30 @@ def test_a_manifest_moved_by_another_writer_is_a_conflict(
 ) -> None:
     order = leased(engine)
     service = ops(engine)
-    real = service._publish
+    real = service._stage_manifest
 
-    def racing(prior: UUID | None, change: Any) -> UUID:
+    def racing(prior: UUID | None, change: Any) -> Any:
+        # another writer moves the manifest between staging and the order lock
         ops(engine).save_progress(
             order.id, OrderProgress(step=9), worker=W1, lease_generation=order.lease_generation
         )
         return real(prior, change)
 
-    monkeypatch.setattr(service, "_publish", racing)
+    monkeypatch.setattr(service, "_stage_manifest", racing)
+
+    def artifacts() -> int:
+        with SqlTraustUnitOfWork(engine) as uow:
+            count = sa.select(sa.func.count()).select_from(uow.artifacts.table)
+            return int(uow.connection.scalar(count))
+
+    before = artifacts()
     with pytest.raises(ConflictError):
         service.save_progress(
             order.id, OrderProgress(step=1), worker=W1, lease_generation=order.lease_generation
         )
     assert manifest(engine, order)["progress"]["step"] == 9
+    # the refused move published nothing: only the racing writer's manifest is new
+    assert artifacts() == before + 1
 
 
 @pytest.mark.integration
@@ -1444,10 +1459,9 @@ def test_two_budgets_for_one_lane_are_refused(engine: Engine) -> None:
 def gated(engine: Engine, *budgets: Budget) -> OpsService:
     """An OpsService with the doors the policy checks need (inventory, spend with budgets) and
     the deployment's stage assets declared, so the ordering gate applies."""
-    return OpsService(
-        SqlTraustUnitOfWork(engine),
+    return _ops_with(
+        engine,
         FixedClock(T0),
-        publisher(engine),
         spend=spend(engine, *budgets),
         inventory=Inventory(SqlTraustUnitOfWork(engine)),
         recording_assets={"assessment": ("assessment",), "triage": ("triage",)},
@@ -1565,10 +1579,9 @@ def test_submit_accepts_what_preflight_allowed(engine: Engine) -> None:
 def test_the_gate_follows_the_configured_asset_names(engine: Engine) -> None:
     """A deployment whose assessments run as "audit" (not "assessment") still gates triage,
     and one whose assessments are not wired is not gated at all."""
-    audit_gated = OpsService(
-        SqlTraustUnitOfWork(engine),
+    audit_gated = _ops_with(
+        engine,
         FixedClock(T0),
-        publisher(engine),
         inventory=Inventory(SqlTraustUnitOfWork(engine)),
         recording_assets={"assessment": ("audit",), "triage": ("triage",)},
     )
@@ -1602,10 +1615,9 @@ def test_a_gated_stage_cannot_be_submitted_without_a_subject(engine: Engine) -> 
 def test_remediation_follows_triage_not_another_remediation_order(engine: Engine) -> None:
     """Remediation rides the triage allowlist but is its own stage: a completed assessment
     does not unlock it, a completed triage does, and its own orders never do."""
-    remediating = OpsService(
-        SqlTraustUnitOfWork(engine),
+    remediating = _ops_with(
+        engine,
         FixedClock(T0),
-        publisher(engine),
         inventory=Inventory(SqlTraustUnitOfWork(engine)),
         recording_assets={
             "assessment": ("assessment",),
@@ -1635,10 +1647,9 @@ def test_remediation_follows_triage_not_another_remediation_order(engine: Engine
 def test_verification_follows_remediation_not_ordinary_triage(engine: Engine) -> None:
     """Verification's prerequisite is remediation: only the native scheduling asset satisfies
     it — a completed ordinary triage order on the shared allowlist does not."""
-    remediating = OpsService(
-        SqlTraustUnitOfWork(engine),
+    remediating = _ops_with(
+        engine,
         FixedClock(T0),
-        publisher(engine),
         inventory=Inventory(SqlTraustUnitOfWork(engine)),
         recording_assets={
             "assessment": ("assessment",),
@@ -1663,10 +1674,9 @@ def test_verification_follows_remediation_not_ordinary_triage(engine: Engine) ->
 def test_verification_keeps_a_prerequisite_when_remediation_is_not_wired(engine: Engine) -> None:
     """A deployment without remediation on its allowlist falls back to ordinary triage for
     verification's prerequisite: a completed stage before it, never nothing (Qodo 392)."""
-    unwired = OpsService(
-        SqlTraustUnitOfWork(engine),
+    unwired = _ops_with(
+        engine,
         FixedClock(T0),
-        publisher(engine),
         inventory=Inventory(SqlTraustUnitOfWork(engine)),
         recording_assets={
             "assessment": ("assessment",),
@@ -1688,10 +1698,9 @@ def test_an_asset_bound_to_two_kinds_outside_the_config_is_a_config_error(engine
     """RecordingConfig refuses ambiguous bindings, so a service wired with the same asset on
     two kinds was built outside the config: refuse the run rather than guess its stage
     (Qodo 392) — the gate is never silently skipped."""
-    ambiguous = OpsService(
-        SqlTraustUnitOfWork(engine),
+    ambiguous = _ops_with(
+        engine,
         FixedClock(T0),
-        publisher(engine),
         inventory=Inventory(SqlTraustUnitOfWork(engine)),
         recording_assets={
             "assessment": ("audit",),
@@ -1953,3 +1962,46 @@ def test_fenced_completion_does_not_commit_orphan_manifest_row(engine: Engine) -
         )
     with SqlTraustUnitOfWork(engine) as uow:
         assert uow.artifacts.latest_imported(RunManifestArtifact.schema) == before
+
+
+def test_ops_refuses_a_run_manifest_publisher_on_another_unit_of_work(engine: Engine) -> None:
+    """The manifest is published inside the order transaction; a separate publisher would
+    commit it on its own and could leave it attached to no order, so it is refused."""
+    with pytest.raises(ConfigError, match="must share the ops unit of work"):
+        OpsService(SqlTraustUnitOfWork(engine), FixedClock(T0), publisher(engine))
+
+
+def test_a_refused_completion_leaves_no_unattached_run_manifest(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A completion refused after its manifest is staged (here: another writer moved the
+    manifest before the order lock) publishes no run-manifest row: the row is written only
+    inside the order transaction, which the refusal rolls back."""
+    order = leased(engine)
+    service = ops(engine)
+    stage = service._stage_manifest
+
+    def artifacts() -> int:
+        with SqlTraustUnitOfWork(engine) as uow:
+            count = sa.select(sa.func.count()).select_from(uow.artifacts.table)
+            return int(uow.connection.scalar(count))
+
+    def racing(prior: UUID | None, change: Any) -> Any:
+        staged = stage(prior, change)
+        ops(engine).save_progress(
+            order.id, OrderProgress(step=9), worker=W1, lease_generation=order.lease_generation
+        )
+        return staged
+
+    monkeypatch.setattr(service, "_stage_manifest", racing)
+    before = None
+    with pytest.raises(ConflictError, match="manifest changed"):
+        before = artifacts()
+        service.complete(
+            order.id,
+            W1,
+            JobResult.partly({"unreachable": 1}),
+            lease_generation=order.lease_generation,
+        )
+    # the racing writer's own manifest is the only new row
+    assert before is not None and artifacts() == before + 1

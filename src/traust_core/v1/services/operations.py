@@ -234,6 +234,10 @@ class OpsService:
         inventory: Inventory | None = None,
         assessments: AssessmentLog | None = None,
     ) -> None:
+        if getattr(manifests, "_uow", uow) is not uow:
+            # completion and moves publish the run manifest inside the order transaction, so a
+            # refused one rolls it back; a publisher on another unit of work can't share that
+            raise ConfigError("the run-manifest publisher must share the ops unit of work")
         self._uow = uow
         self._clock = clock
         self._manifests = manifests
@@ -958,7 +962,6 @@ class OpsService:
         degraded = dict(result.degraded)
         gaps = {SPEND_UNPRICED: len(unpriced)} if unpriced else {}
         outputs = list(dict.fromkeys(str(o) for o in result.outputs))
-        same_uow = getattr(self._manifests, "_uow", None) is self._uow
         staged = (
             self._stage_manifest(
                 prior.artifact_id, lambda m: self._completion(m, degraded, gaps, outputs)
@@ -966,8 +969,6 @@ class OpsService:
             if degraded or gaps or outputs
             else None
         )
-        if staged is not None and not same_uow:
-            update["artifact_id"] = self._manifests.publish_staged(staged).artifact_id
         post_write_conflict = False
         try:
             with self._uow.write() as uow:
@@ -984,8 +985,11 @@ class OpsService:
                 if staged is not None:
                     if order.artifact_id != prior.artifact_id:
                         raise ConflictError(f"order {order_id}: run manifest changed while writing")
-                    if same_uow:
-                        update["artifact_id"] = self._manifests.publish_staged(staged).artifact_id
+                    # Published only once the lease and manifest checks pass, inside the order
+                    # transaction, so a rejected completion leaves no unattached manifest row.
+                    # NEED(artifacts: orphaned object GC): its staged bytes stay unreferenced
+                    # when this transaction rolls back (as for stage_companion's bytes).
+                    update["artifact_id"] = self._manifests.publish_staged(staged).artifact_id
                 uow.run_orders.update(order.model_copy(update=update))
                 for event in spend:
                     uow.spend_events.add(event.model_copy(update={"lane": order.lane}))
@@ -1184,7 +1188,9 @@ class OpsService:
         lease: _Lease | None = None,
         actor_kind: ActorKind | None = None,
     ) -> RunOrder:
-        """Publish changes before the transaction; attach them only to the manifest read."""
+        """Stage a change's manifest before the transaction; publish and attach it only once the
+        order's state and lease checks pass, so a refused move leaves no unattached manifest."""
+        staged = None
         if change is not None:
             prior = self.get(order_id)
             if lease is not None:
@@ -1192,7 +1198,7 @@ class OpsService:
             else:
                 _require(prior, from_state)
             _classifiers(reason=update.get("reason"))
-            update = {**update, "artifact_id": self._publish(prior.artifact_id, change)}
+            staged = self._stage_manifest(prior.artifact_id, change)
         with self._uow.write() as uow:
             order = uow.run_orders.get_for_update(order_id)
             if lease is not None:
@@ -1203,6 +1209,13 @@ class OpsService:
                 _classifiers(reason=update.get("reason"))
             if change is not None and order.artifact_id != prior.artifact_id:
                 raise ConflictError(f"order {order_id}: run manifest changed while writing")
+            if staged is not None:
+                # NEED(artifacts: orphaned object GC): a refused move leaves its staged bytes
+                # unreferenced when this transaction rolls back (as for stage_companion's bytes).
+                update = {
+                    **update,
+                    "artifact_id": self._manifests.publish_staged(staged).artifact_id,
+                }
             saved = uow.run_orders.update(order.model_copy(update=update))
             if lease is not None:
                 lease.require(order, self._clock.now())
