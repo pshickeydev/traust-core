@@ -239,16 +239,25 @@ class FindingIntake:
     def bindings(self, assessment: Assessment, doc: ReportArtifact) -> AssessmentIntakeBindings:
         """The report's row labels bound to the findings its assessment admitted — the rule
         the `intake_bindings` doors serve. A row that identifies no admitted finding is left
-        out: the doors refuse that state, a view read just carries no prose for it."""
+        out: the doors refuse that state, a view read just carries no prose for it. The
+        repository and its retained claim identities are read once for the whole report,
+        not once per row."""
         assert assessment.id is not None
         with self._uow as uow:
             repository_id = uow.repository_refs.get(assessment.repository_ref_id).repository_id
+            repository = self._inventory.get_repository(repository_id)
             admitted = {o.finding_id for o in uow.occurrences.list_for_assessment(assessment.id)}
-        bound: dict[Label, UUID] = {}
-        for candidate in FindingCandidate.of_report(doc.findings, repository_id):
-            finding_id = self.match(repository_id, candidate)
-            if finding_id is not None and finding_id in admitted:
-                bound[candidate.label] = finding_id
+            identities, _ = self._claimed_identities(uow, repository_id)
+            bound: dict[Label, UUID] = {}
+            for candidate in FindingCandidate.of_report(doc.findings, repository_id):
+                fingerprint = self._fingerprint(
+                    repository, self._validate(candidate), "intake binding"
+                )
+                found = self._match(
+                    uow, repository_id, (fingerprint.algo, fingerprint.value), identities
+                )
+                if found is not None and found.id in admitted:
+                    bound[candidate.label] = found.id
         return AssessmentIntakeBindings(findings=bound)
 
     def _claimed_identities(

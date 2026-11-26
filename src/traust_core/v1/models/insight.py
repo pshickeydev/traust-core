@@ -12,10 +12,8 @@ from pydantic import (
     ConfigDict,
     Field,
     SerializeAsAny,
-    SerializerFunctionWrapHandler,
     computed_field,
     field_serializer,
-    model_serializer,
 )
 
 from traust_core.v1.models.assessment import (
@@ -34,6 +32,7 @@ from traust_core.v1.models.dependencies import ExposureRollup
 from traust_core.v1.models.detection_quality import ComplianceCalibration, CriticalMiss, Scorecard
 from traust_core.v1.models.findings import (
     Decision,
+    FindingEvidence,
     FindingRollup,
     FindingSeriesPoint,
     FindingView,
@@ -264,19 +263,22 @@ class ContainerReport(Model):
     title: str
 
 
+class ContainerFindingView(FindingView):
+    """The view as the container-findings contract states it: no report prose — the
+    finding's own read serves that, a container fold never carries it."""
+
+    evidence: tuple[FindingEvidence, ...] = Field(default=(), exclude=True)
+    remediation: str | None = Field(default=None, exclude=True)
+
+
 class ContainerFinding(Model):
     view: FindingView
     occurrences: tuple[Occurrence, ...]
     history: tuple[Decision, ...] = ()
 
-    @model_serializer(mode="wrap")
-    def _view_without_prose(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
-        # the contracts finding_view shape states no evidence or remediation: the finding's
-        # own read serves the report prose, a container fold never carries it
-        data = handler(self)
-        data["view"].pop("evidence", None)
-        data["view"].pop("remediation", None)
-        return data
+    @field_serializer("view")
+    def _view_without_prose(self, view: FindingView) -> ContainerFindingView:
+        return ContainerFindingView.model_validate(dict(view))
 
 
 class ContainerFindings(ViewModel):

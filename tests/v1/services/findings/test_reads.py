@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from collections import Counter
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
@@ -677,3 +678,54 @@ def test_get_leaves_the_prose_empty_without_a_report(context: Context) -> None:
         view = findings.get(finding_id)  # type: ignore[arg-type]
         assert (view.description, view.evidence, view.remediation) == (None, (), None)
     assert [loc.path for loc in findings.get(placed.id).locations] == ["pkg/db/query.go"]  # type: ignore[union-attr]
+
+
+def test_get_stands_bare_when_the_intake_refuses_the_report(
+    context: Context, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Prose is optional: when the intake can no longer bind the report (a retained claim
+    identity now conflicting, a row today's fingerprinting refuses), the finding's page
+    stands, its prose bare — the doors still refuse the same state."""
+    rows, (first, *_) = recorded_audit(context)
+    findings = context.services().findings
+    assert findings.get(first).description == rows[0]["description"]
+
+    def refused(*args: Any, **kw: Any) -> Any:
+        raise ConflictError("a retained claim identity belongs to another finding")
+
+    monkeypatch.setattr(findings.intake, "bindings", refused)
+    view = findings.get(first)
+    assert (view.description, view.evidence, view.remediation) == (None, (), None)
+
+
+def test_get_stands_bare_when_the_reports_object_is_gone(context: Context) -> None:
+    """The report's stored object lost (an object store failure) leaves the finding's page
+    standing, prose bare: the view's own fields never depended on the report read."""
+    rows, (first, *_) = recorded_audit(context)
+    findings = context.services().findings
+    assert findings.get(first).description == rows[0]["description"]
+    shutil.rmtree(context.config.artifacts_path())
+    view = findings.get(first)
+    assert (view.description, view.evidence, view.remediation) == (None, (), None)
+
+
+def test_a_later_report_less_occurrence_never_hides_the_prose(context: Context) -> None:
+    """An impact analysis re-reporting the finding under no report leaves the prose of the
+    report the finding was recorded from standing — the view's own newest-fit rule."""
+    rows, (first, *_) = recorded_audit(context)
+    findings = context.services().findings
+    (occurrence,) = findings.occurrences(finding_ids=[first])
+    with SqlTraustUnitOfWork(context.database) as uow:
+        seed = Seed(uow)
+        audit = uow.assessments.get(occurrence.assessment_id)
+        ref = uow.repository_refs.get(audit.repository_ref_id)
+        later = seed.assessment(ref, kind="impact", occurred_at=T0 + timedelta(days=1))
+        seed.occurrence(uow.findings.get(first), later, severity="high")
+        uow.commit()
+    view = findings.get(first)
+    assert view.occurrence is not None and view.occurrence.assessment_id == later.id
+    assert view.description == rows[0]["description"]
+    assert view.evidence == (
+        FindingEvidence(code='q := "SELECT * FROM t WHERE id = " + id', language="go"),
+    )
+    assert view.remediation == rows[0]["remediation"]

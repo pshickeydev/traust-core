@@ -12,7 +12,7 @@ from functools import cmp_to_key
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
-from traust_core.v1.errors import ConflictError, NotFoundError, ValidationError
+from traust_core.v1.errors import ConflictError, NotFoundError, TraustError, ValidationError
 from traust_core.v1.models.artifacts import (
     ANALYSIS_ARTIFACTS,
     CodeFactsArtifact,
@@ -364,32 +364,61 @@ class FindingService:
         return self._prose(view)
 
     def _prose(self, view: FindingView) -> FindingView:
-        """The report row the finding's occurrence was recorded from, as the view's prose
-        (description, evidence, remediation): only this single-get read pays the report read."""
-        finding, occurrence = view.finding, view.occurrence
-        if occurrence is None or occurrence.assessment_id is None:
+        """The report row the finding was recorded from, as the view's prose
+        (description, evidence, remediation): only this single-get read pays the report
+        read. Prose is optional enrichment, so a report the intake can no longer bind
+        leaves the view bare instead of failing the finding's page."""
+        finding_id = view.finding.id
+        assert finding_id is not None
+        try:
+            return self._with_report_prose(view)
+        except TraustError as error:
+            log.warning(
+                "finding %s reads without report prose error_type=%s",
+                finding_id,
+                type(error).__name__,
+            )
             return view
-        report = self._reports.report(occurrence.assessment_id)
-        if report is None:
-            return view
-        bound = self.intake.bindings(self._log.get(occurrence.assessment_id), report)
-        row = next(
-            (row for row in report.findings if bound.findings.get(row.id) == finding.id), None
-        )
-        if row is None:
-            return view
-        return view.model_copy(
-            update={
-                "description": view.description
-                if view.description is not None
-                else row.description,
-                "evidence": tuple(
-                    FindingEvidence(code=block.code, language=block.language, caption=block.caption)
-                    for block in row.evidence
-                ),
-                "remediation": row.remediation,
-            }
-        )
+
+    def _with_report_prose(self, view: FindingView) -> FindingView:
+        """The prose of the newest report that states the finding: a later occurrence
+        filed under no report (an impact analysis's, say) never hides an earlier
+        report's prose — the same newest-fit rule the view's rating and places follow."""
+        finding = view.finding
+        assert finding.id is not None
+        occurrences = self.occurrences(finding_ids=[finding.id])
+        assessments = {
+            a.id: a
+            for a in self._log.list_by_ids({o.assessment_id for o in occurrences})
+            if a.id is not None
+        }
+        for occurrence in reversed(
+            sorted(occurrences, key=lambda o: assessments[o.assessment_id].occurred_at)
+        ):
+            report = self._reports.report(occurrence.assessment_id)
+            if report is None:
+                continue
+            bound = self.intake.bindings(assessments[occurrence.assessment_id], report)
+            row = next(
+                (row for row in report.findings if bound.findings.get(row.id) == finding.id),
+                None,
+            )
+            if row is not None:
+                return view.model_copy(
+                    update={
+                        "description": view.description
+                        if view.description is not None
+                        else row.description,
+                        "evidence": tuple(
+                            FindingEvidence(
+                                code=block.code, language=block.language, caption=block.caption
+                            )
+                            for block in row.evidence
+                        ),
+                        "remediation": row.remediation,
+                    }
+                )
+        return view
 
     def get_by_fingerprint(
         self, repository_id: UUID, fingerprint: str, fingerprint_algo: str | None = None
