@@ -485,6 +485,32 @@ class OpsService:
         run manifest; an open order for the same subject is re-ranked while still planned (a
         person's submitted order keeps the route they chose), otherwise returned unchanged."""
         _refuse_door_only(request.asset)
+        return self._plan(request, principal, config, {})
+
+    def plan_fix(
+        self,
+        request: OrderRequest,
+        principal: Principal,
+        config: Sequence[ConfigDigest],
+        fork_url: str,
+        fork_branch: str,
+    ) -> RunOrder:
+        """Plan another attempt of a scheduled fix with its fork facts (RemediationSchedulingService
+        only: it re-checked them against ForkPolicy), for the engine's admission to queue."""
+        if request.asset != REMEDIATE_FINDING or request.work_item_id is None:
+            raise ValidationError("fork facts ride only a remediate_finding order naming its item")
+        fork = {"fork_url": fork_url, "fork_branch": fork_branch}
+        return self._plan(
+            request, principal, config, {**fork, "fork_scheduled_at": self._clock.now()}
+        )
+
+    def _plan(
+        self,
+        request: OrderRequest,
+        principal: Principal,
+        config: Sequence[ConfigDigest],
+        fork: dict[str, object],
+    ) -> RunOrder:
         _classifiers(lane=request.lane, event_source=request.event_source)
         self._check_work_item(request)
         manifest = self._config_manifest(tuple(config))
@@ -495,6 +521,7 @@ class OpsService:
                     RunOrder(
                         **request.model_dump(),
                         **manifest,
+                        **fork,
                         state=OrderState.PLANNED,
                         requested_by=principal.ref,
                     )

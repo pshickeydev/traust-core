@@ -1958,3 +1958,92 @@ def test_tied_verifications_break_by_id_never_by_verdict() -> None:
     )
     assert _verdict_order(a) != _verdict_order(b)  # same times: the id breaks the tie
     assert (_verdict_order(a) < _verdict_order(b)) == (a.id < b.id)  # type: ignore[operator]
+
+
+ENGINE_ROUTER = Principal(identity="traust-engine", kind=ActorKind.MACHINE, display="traust-engine")
+
+
+def _finish(engine: Engine, order_id: UUID, state: OrderState = OrderState.FAILED) -> None:
+    with SqlTraustUnitOfWork(engine) as uow:
+        uow.run_orders.update(uow.run_orders.get(order_id).model_copy(update={"state": state}))
+        uow.commit()
+
+
+def test_reattempt_plans_another_attempt_with_the_efforts_own_fork_facts(
+    service: RemediationSchedulingService, context: Context, engine: Engine
+) -> None:
+    """The engine's trigger asks through the door: the re-attempt is planned (the engine's
+    admission queues it) and carries the fork facts the effort was scheduled with."""
+    repository_id, finding_ids, repository_ids = seeded(engine)
+    request = pairs(finding_ids, repository_ids)
+    scheduled = service.create(fork_of(engine, request), BRANCH, request, PERSON)
+    assert scheduled.order_id is not None
+    _finish(engine, scheduled.order_id)
+    item = scheduled.work_item.work_item_id
+    order = service.reattempt(
+        OrderRequest(
+            asset=REMEDIATE_FINDING,
+            priority=1,
+            repository_id=repository_id,
+            work_item_id=item,
+            rule=f"remediate:{item}",
+        ),
+        ENGINE_ROUTER,
+    )
+    assert (order.asset, order.state, order.work_item_id) == (REMEDIATE_FINDING, "planned", item)
+    assert (order.fork_url, order.fork_branch) == (scheduled.fork_url, scheduled.fork_branch)
+    assert order.fork_scheduled_at is not None
+    assert order.requested_by == ENGINE_ROUTER.ref
+    assert order.id is not None
+    assert context.services().ops.admit(order.id).state == "queued"
+
+
+def test_reattempt_refuses_what_is_not_a_scheduled_effort(
+    service: RemediationSchedulingService, engine: Engine
+) -> None:
+    repository_id, finding_ids, repository_ids = seeded(engine)
+    request = pairs(finding_ids, repository_ids)
+    scheduled = service.create(fork_of(engine, request), BRANCH, request, PERSON)
+    item = scheduled.work_item.work_item_id
+    with pytest.raises(ValidationError, match="naming its work item"):
+        service.reattempt(
+            OrderRequest(asset=REMEDIATE_FINDING, priority=1, repository_id=repository_id),
+            ENGINE_ROUTER,
+        )
+    with pytest.raises(ValidationError, match="naming its work item"):
+        service.reattempt(
+            OrderRequest(
+                asset="verify_remediation",
+                priority=1,
+                repository_id=repository_id,
+                work_item_id=item,
+            ),
+            ENGINE_ROUTER,
+        )
+    with pytest.raises(NotFoundError):
+        service.reattempt(
+            OrderRequest(
+                asset=REMEDIATE_FINDING,
+                priority=1,
+                repository_id=repository_id,
+                work_item_id=uuid4(),
+            ),
+            ENGINE_ROUTER,
+        )
+    other, _, _ = seeded(engine)
+    with pytest.raises(ValidationError, match="patches repository"):
+        service.reattempt(
+            OrderRequest(
+                asset=REMEDIATE_FINDING, priority=1, repository_id=other, work_item_id=item
+            ),
+            ENGINE_ROUTER,
+        )
+
+
+def test_plan_still_refuses_a_bare_remediation(context: Context, engine: Engine) -> None:
+    repository_id, _, _ = seeded(engine)
+    with pytest.raises(ForbiddenError, match="scheduling door"):
+        context.services().ops.plan(
+            OrderRequest(asset=REMEDIATE_FINDING, priority=1, repository_id=repository_id),
+            ENGINE_ROUTER,
+        )
