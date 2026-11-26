@@ -14,7 +14,7 @@ dependencies = [
     "cvss==3.6",
     "jsonschema[format-nongpl]>=4.0",
     "pydantic>=2.11",
-    "pyjwt[crypto]>=2.8",
+    "pyjwt[crypto]>=2.9",
     "pyyaml>=6.0",
     "referencing>=0.30",
     "sqlalchemy>=2.0",
@@ -27,7 +27,7 @@ dependencies = [
     "tree-sitter-java==0.23.5",
     "tree-sitter-rust==0.24.2",
     "tree-sitter-ruby==0.23.1",
-    "traust-contracts @ git+https://github.com/traust-security/traust-contracts.git@f67a95f25b07b36cccbc72b3ba382a4382b304b8",
+    "traust-contracts @ git+https://github.com/traust-security/traust-contracts.git@485578cbe584ad224d57b2c7c778174c0b66ba7c",
     "traust-ledger @ git+https://github.com/traust-security/traust-ledger.git@95fd75ed9b7f548322f528f1fd99263ed6733960"
 ]
 
