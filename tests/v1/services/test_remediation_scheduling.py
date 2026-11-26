@@ -1998,6 +1998,35 @@ def test_reattempt_plans_another_attempt_with_the_efforts_own_fork_facts(
     assert context.services().ops.admit(order.id).state == "queued"
 
 
+def test_reattempt_plans_its_own_effort_beside_another_efforts_open_order(
+    service: RemediationSchedulingService, context: Context, engine: Engine
+) -> None:
+    """Two efforts on one repository: the other effort's open order is not this effort's
+    attempt — the re-attempt plans its own work item with its own fork facts, and a second
+    ask while that attempt is open returns it rather than planning a duplicate."""
+    repository_id, finding_ids, repository_ids = seeded(engine, findings=2)
+    mine_request, theirs_request = (
+        pairs([f], [r]) for f, r in zip(finding_ids, repository_ids, strict=True)
+    )
+    theirs = service.create(fork_of(engine, theirs_request), BRANCH, theirs_request, PERSON)
+    mine = service.create(fork_of(engine, mine_request), BRANCH + "-mine", mine_request, PERSON)
+    assert theirs.order_id is not None and mine.order_id is not None
+    _finish(engine, mine.order_id)  # mine failed; theirs is still queued (open)
+    item = mine.work_item.work_item_id
+    request = OrderRequest(
+        asset=REMEDIATE_FINDING,
+        priority=1,
+        repository_id=repository_id,
+        work_item_id=item,
+        rule=f"remediate:{item}",
+    )
+    order = service.reattempt(request, ENGINE_ROUTER)
+    assert order.id not in (theirs.order_id, mine.order_id)
+    assert (order.state, order.work_item_id) == ("planned", item)
+    assert (order.fork_url, order.fork_branch) == (mine.fork_url, mine.fork_branch)
+    assert service.reattempt(request, ENGINE_ROUTER).id == order.id  # still one open attempt
+
+
 def test_reattempt_refuses_what_is_not_a_scheduled_effort(
     service: RemediationSchedulingService, engine: Engine
 ) -> None:
