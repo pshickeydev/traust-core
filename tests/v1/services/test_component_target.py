@@ -40,7 +40,8 @@ from traust_core.v1.services.component_target import ComponentTargetResolver
 
 def _git(repo: Path, *args: str) -> str:
     env = {
-        **os.environ,
+        # Under a git hook GIT_DIR points at the repo being pushed: inherited, commits land there.
+        **{k: v for k, v in os.environ.items() if not k.startswith("GIT_")},
         "GIT_CONFIG_GLOBAL": "/dev/null",
         "GIT_CONFIG_SYSTEM": "/dev/null",
         "GIT_AUTHOR_NAME": "Fixture",
