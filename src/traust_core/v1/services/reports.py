@@ -205,7 +205,9 @@ class ReportWorker:
         self._lease_for = lease_for
 
     def run_once(self) -> UUID | None:
-        """Build the next queued report, if any; the order it ran, or None when idle."""
+        """Build the next queued report, if any: the order it completed, or None when idle or
+        when Core refused the completion because the lease was lost (logged as a warning; the
+        order now belongs to its new holder). Either way the worker carries on."""
         order = self._ops.claim(self._worker, self._lease_for, (REPORT_ASSET,))
         if order is None:
             return None
@@ -220,7 +222,16 @@ class ReportWorker:
         except Exception:
             log.exception("report order %s failed", order.id)
             result = JobResult.failed(OrderReason.RUNNER_CRASHED)
-        self._ops.complete(order.id, self._worker, result)
+        try:
+            self._ops.complete(
+                order.id, self._worker, result, lease_generation=order.lease_generation
+            )
+        except ConflictError:
+            # The lease was reclaimed: Core refused this completion and the new holder finishes
+            # the order. Nothing was handled here, so the worker reports no order (and keeps
+            # running); the refusal is logged with its traceback for the operator.
+            log.warning("report order %s lost its lease before completion", order.id, exc_info=True)
+            return None
         return order.id
 
     def run(self, stop: threading.Event, idle: float = 2.0) -> None:

@@ -127,21 +127,23 @@ def test_recording_start_rejects_malformed_capabilities(scope: dict[str, object]
         Config.model_validate({"recording": {"start": [scope]}})
 
 
+CHANNEL = ["0001_repository_disposition", "0002_run_order_lease_generation"]
+
+
 def test_a_fresh_local_store_bootstraps_with_the_channel_stamped(tmp_path: Path) -> None:
     engine = Context(Config(home=tmp_path)).database
     inspector = sa.inspect(engine)
     assert inspector.has_table("db_upgrade")
     assert "disposition" in {c["name"] for c in inspector.get_columns("repository")}
     with engine.connect() as connection:
-        stamps = connection.exec_driver_sql("SELECT name FROM db_upgrade").fetchall()
-        assert [name for (name,) in stamps] == [
-            "0001_repository_disposition",
-            "0002_finding_state_columns",
-            "0003_run_order_input",
-        ]
+        shipped = [upgrade.name for upgrade in contracts.shipped_db_upgrades("sqlite")]
+        stamps = connection.exec_driver_sql("SELECT name FROM db_upgrade ORDER BY name").fetchall()
+        assert [name for (name,) in stamps] == shipped
     again = Context(Config(home=tmp_path)).database  # re-open: nothing re-applied
     with again.connect() as connection:
-        assert connection.exec_driver_sql("SELECT count(*) FROM db_upgrade").fetchone()[0] == 3
+        assert connection.exec_driver_sql("SELECT count(*) FROM db_upgrade").scalar_one() == len(
+            shipped
+        )
 
 
 def test_a_fresh_store_logs_its_bootstrap_and_channel_trail(

@@ -18,7 +18,7 @@ from sqlalchemy.engine import Engine
 from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import Seed
 from traust_core.v1.context import Config, Context
-from traust_core.v1.errors import ConflictError, ValidationError
+from traust_core.v1.errors import ConflictError, IntegrityError, ValidationError
 from traust_core.v1.models.artifacts import SecurityAuditArtifact
 from traust_core.v1.models.assessment import AssessmentKind
 from traust_core.v1.models.attestation import AttestationDecision
@@ -136,10 +136,27 @@ def test_a_reaudit_holds_a_finding_it_names_differently_instead_of_duplicating_i
     with SqlTraustUnitOfWork(engine) as uow:
         reported = {o.finding_id for o in uow.occurrences.list_for_assessment(again)}
     assert old.id not in reported and len(reported) == len(BODY["findings"]) - 1
+    bindings = services.assessment.intake_bindings(again).findings
+    assert set(bindings) == {f["id"] for f in BODY["findings"][1:]}
+    assert set(bindings.values()) == reported
     [item] = mapping_reviews(services, old.id)
     assert item.status == ReviewItemStatus.PENDING
     with pytest.raises(ConflictError, match="pending"):
         services.findings.settle_move(item.id)
+
+
+def test_the_bindings_door_refuses_an_admitted_finding_no_report_row_covers(
+    services: Any, engine: Engine, ref: UUID
+) -> None:
+    # #551's rule kept over #554's merge: an unbound label is skipped, an uncovered admission is not
+    audit = record(services, ref, report(20), 20)
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        repository = uow.repositories.get(uow.repository_refs.get(ref).repository_id)
+        seed.occurrence(seed.finding(repository), services.assessment.get(audit))
+        uow.commit()
+    with pytest.raises(IntegrityError, match="do not cover its admitted findings"):
+        services.assessment.intake_bindings(audit)
 
 
 def test_an_accepted_move_keeps_the_findings_id_and_takes_the_reaudits_occurrence(

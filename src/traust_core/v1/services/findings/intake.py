@@ -129,6 +129,7 @@ class FindingIntake:
             pending: dict[UUID, dict[tuple[str, int | None], CodeSpan]] = {}
             baselines: dict[UUID, set[tuple[str, int | None]]] = {}
             keys, kinds = self._fingerprints(repo, candidates, f"assessment {assessment_id}")
+            candidates = _scored_per_fingerprint(candidates, keys)
             identities, immutable_occurrences = self._claimed_identities(uow, repo.id)
             took = [
                 (
@@ -239,9 +240,9 @@ class FindingIntake:
     def bindings(self, assessment: Assessment, doc: ReportArtifact) -> AssessmentIntakeBindings:
         """The report's row labels bound to the findings its assessment admitted — the rule
         the `intake_bindings` doors serve. A row that identifies no admitted finding is left
-        out: the doors refuse that state, a view read just carries no prose for it. The
-        repository and its retained claim identities are read once for the whole report,
-        not once per row."""
+        out (the doors refuse only an admitted finding no row covers); a view read just
+        carries no prose for it. The repository and its retained claim identities are read
+        once for the whole report, not once per row."""
         assert assessment.id is not None
         with self._uow as uow:
             repository_id = uow.repository_refs.get(assessment.repository_ref_id).repository_id
@@ -326,7 +327,12 @@ class FindingIntake:
             raise ValidationError("invalid finding candidate") from error
         if candidate.kind is not None:
             contracts.validate_enum("finding_kind", candidate.kind)
-        return candidate.model_copy(update={"locations": locations, "exposure": exposure})
+        update: dict[str, object] = {"locations": locations, "exposure": exposure}
+        if candidate.cvss_vector is not None and candidate.cvss_score is None:
+            # the data model's cvss_score: computed from cvss_vector at intake (plan D14); a
+            # producer reports the vector, and a vector with no version prefix leaves it null
+            update["cvss_score"] = cvss_computed_score(candidate.cvss_vector)
+        return candidate.model_copy(update=update)
 
     def _fingerprints(
         self, repo: Repository, candidates: Sequence[FindingCandidate], examiner: str
@@ -627,3 +633,25 @@ class FindingIntake:
             uow.commit()
         self._uow.after_commit(lambda: log.info("finding %s moved", finding.id))
         return [moved]
+
+
+def _scored_per_fingerprint(
+    candidates: Sequence[FindingCandidate], keys: Sequence[Fingerprint]
+) -> tuple[FindingCandidate, ...]:
+    """Candidates that share a fingerprint in one assessment are one occurrence, and an
+    occurrence is append-only: a candidate that states no CVSS at all takes the first stated
+    vector (and its calculator-computed score), so a later entry's score is never lost behind an
+    earlier unscored one. A candidate stating a vector or a score keeps its own."""
+    scored: dict[tuple[str, str], FindingCandidate] = {}
+    for candidate, key in zip(candidates, keys, strict=True):
+        if candidate.cvss_vector is not None:
+            scored.setdefault((key.algo, key.value), candidate)
+    out = []
+    for candidate, key in zip(candidates, keys, strict=True):
+        source = scored.get((key.algo, key.value))
+        if candidate.cvss_vector is None and candidate.cvss_score is None and source is not None:
+            candidate = candidate.model_copy(
+                update={"cvss_vector": source.cvss_vector, "cvss_score": source.cvss_score}
+            )
+        out.append(candidate)
+    return tuple(out)
