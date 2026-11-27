@@ -1293,16 +1293,7 @@ class AssessmentService:
             doc = self.report(assessment_id)
             if doc is None:
                 raise NotFoundError(f"assessment {assessment_id} has no report artifact")
-            bound = self._intake.bindings(assessment, doc)
-            admitted = {
-                occurrence.finding_id
-                for occurrence in self._findings.occurrences(assessment_id=assessment_id)
-            }
-            if set(bound.findings.values()) != admitted:
-                raise IntegrityError(
-                    f"assessment {assessment_id}: report labels do not cover its admitted findings"
-                )
-            return bound
+            return self._intake.bindings(assessment, doc, strict=True)
 
     def observation_target(
         self, *, repository_id: UUID | None = None, repo_url: str | None = None

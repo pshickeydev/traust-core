@@ -159,6 +159,21 @@ def test_the_bindings_door_refuses_an_admitted_finding_no_report_row_covers(
         services.assessment.intake_bindings(audit)
 
 
+def test_a_label_repeated_across_rows_naming_different_findings_still_covers_both(
+    services: Any, engine: Engine, ref: UUID
+) -> None:
+    # coverage counts rows, not the label map: the repeated label keeps one entry
+    body = json.loads(report(20).payload)
+    body["findings"][1]["id"] = body["findings"][0]["id"]
+    audit = record(services, ref, SecurityAuditArtifact.from_document(body), 20)
+    with SqlTraustUnitOfWork(engine) as uow:
+        admitted = {o.finding_id for o in uow.occurrences.list_for_assessment(audit)}
+    assert len(admitted) == len(BODY["findings"])
+    bindings = services.assessment.intake_bindings(audit).findings
+    assert len(bindings) == len(BODY["findings"]) - 1
+    assert set(bindings.values()) < admitted
+
+
 def test_an_accepted_move_keeps_the_findings_id_and_takes_the_reaudits_occurrence(
     services: Any, engine: Engine, ref: UUID
 ) -> None:

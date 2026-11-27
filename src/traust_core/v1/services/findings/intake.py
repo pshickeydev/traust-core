@@ -9,7 +9,13 @@ from uuid import UUID
 from pydantic import ValidationError as ModelValidationError
 
 from traust_core.v1 import contracts
-from traust_core.v1.errors import ConfigError, ConflictError, ForbiddenError, ValidationError
+from traust_core.v1.errors import (
+    ConfigError,
+    ConflictError,
+    ForbiddenError,
+    IntegrityError,
+    ValidationError,
+)
 from traust_core.v1.models.artifacts import ReportArtifact
 from traust_core.v1.models.assessment import Assessment, AssessmentIntakeBindings
 from traust_core.v1.models.common import CodeHash, CodeSpan
@@ -237,12 +243,16 @@ class FindingIntake:
             found = self._match(uow, repository_id, (fp.algo, fp.value), identities)
         return None if found is None else found.id
 
-    def bindings(self, assessment: Assessment, doc: ReportArtifact) -> AssessmentIntakeBindings:
+    def bindings(
+        self, assessment: Assessment, doc: ReportArtifact, *, strict: bool = False
+    ) -> AssessmentIntakeBindings:
         """The report's row labels bound to the findings its assessment admitted — the rule
         the `intake_bindings` doors serve. A row that identifies no admitted finding is left
-        out (the doors refuse only an admitted finding no row covers); a view read just
-        carries no prose for it. The repository and its retained claim identities are read
-        once for the whole report, not once per row."""
+        out; a view read just carries no prose for it. `strict` (the doors) refuses an
+        admitted finding no row covers. Coverage counts every row, not the label map: a
+        report may repeat a label across rows naming different findings. The repository
+        and its retained claim identities are read once for the whole report, not once
+        per row."""
         assert assessment.id is not None
         with self._uow as uow:
             _, repository = self._inventory.resolve(assessment.repository_ref_id)
@@ -251,6 +261,7 @@ class FindingIntake:
             admitted = {o.finding_id for o in uow.occurrences.list_for_assessment(assessment.id)}
             identities, _ = self._claimed_identities(uow, repository_id)
             bound: dict[Label, UUID] = {}
+            covered: set[UUID] = set()
             for candidate in FindingCandidate.of_report(doc.findings, repository_id):
                 fingerprint = self._fingerprint(
                     repository, self._validate(candidate), "intake binding"
@@ -260,6 +271,11 @@ class FindingIntake:
                 )
                 if found is not None and found.id in admitted:
                     bound[candidate.label] = found.id
+                    covered.add(found.id)
+        if strict and covered != admitted:
+            raise IntegrityError(
+                f"assessment {assessment.id}: report labels do not cover its admitted findings"
+            )
         return AssessmentIntakeBindings(findings=bound)
 
     def _claimed_identities(
