@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -19,8 +18,6 @@ from tests.v1.services.test_insight import FakePortfolio
 from traust_core.v1.context import Config, Context
 from traust_core.v1.errors import DocumentError, ValidationError
 from traust_core.v1.models.assessment import (
-    Assessment,
-    AssessmentKind,
     Coverage,
     CoverageGap,
     GapSignal,
@@ -244,26 +241,6 @@ def test_a_coverage_view_outside_its_contract_is_refused_by_the_build() -> None:
     with pytest.raises(DocumentError) as error:
         view.build(ViewFilter())
     assert "gaps/gaps/0/signals" in {issue.path for issue in error.value.issues}
-
-
-@pytest.mark.parametrize("target_purl", [None, "pkg:maven/org.example/beans@7.1.0"])
-def test_a_coverage_row_states_a_component_target_only_when_it_has_one(
-    target_purl: str | None,
-) -> None:
-    # Consumers decode the view strictly; one built before the column sees no new key on
-    # whole-repository rows, so only component-scoped rows need the regenerated types.
-    latest = Assessment(
-        repository_ref_id=uuid4(),
-        kind=AssessmentKind.SECURE_CODE_CANONICAL,
-        status="completed",
-        assessor="skill:secure-code-audit",
-        assessor_version="1",
-        occurred_at=T0,
-        target_purl=target_purl,
-    )
-    row = PopulationRow(repository_id=uuid4(), kind="secure_code", latest=latest)
-    for dumped in (row.model_dump(mode="json"), json.loads(row.model_dump_json())):
-        assert dumped["latest"].get("target_purl", "omitted") == (target_purl or "omitted")
 
 
 @pytest.fixture(params=SQL_BACKENDS)

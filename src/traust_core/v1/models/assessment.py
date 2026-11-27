@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, NamedTuple, NewType, Self
 from uuid import UUID, uuid5
 
-from pydantic import Field, SerializerFunctionWrapHandler, computed_field, field_serializer
+from pydantic import Field, computed_field
 
 from traust_core.v1 import contracts
 from traust_core.v1.errors import ValidationError
@@ -272,15 +272,6 @@ class PopulationRow(Model):
     latest: Assessment | None = None
     default_line: int = 0
     branches: int = 0
-
-    @field_serializer("latest", mode="wrap")
-    def _latest(self, latest: Assessment | None, handler: SerializerFunctionWrapHandler) -> Any:
-        # A whole-repository row omits the null component target: consumers decoding the
-        # coverage view strictly against types from before the column keep reading it.
-        out = handler(latest)
-        if isinstance(out, dict) and out.get("target_purl") is None:
-            out.pop("target_purl", None)
-        return out
 
 
 class AssessmentFilter(Model):
