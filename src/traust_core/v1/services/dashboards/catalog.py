@@ -20,6 +20,11 @@ def _columns(dialect: str) -> dict[Dimension, str]:
     )
     return {
         Dimension.REPOSITORY: "repository_id",
+        # The shipped product's slug, present only when the facts carry the estate
+        # join (the service asks for it exactly when a query groups or filters by
+        # product); a repository can ship in several products, so the join fans a
+        # finding out per product and the count measures go distinct in that mode.
+        Dimension.PRODUCT: "product",
         Dimension.STATE: "state",
         Dimension.SEVERITY: "severity",
         Dimension.CATEGORY: "category",
@@ -37,12 +42,16 @@ _AGE_DAYS = {
 }
 
 
-def _aggregates(dialect: str) -> dict[Measure, str]:
+def _aggregates(dialect: str, products: bool = False) -> dict[Measure, str]:
+    # Under the estate join a finding has a row per product that ships its
+    # repository: count(*) would double-count a shared repository's findings,
+    # so the counts go distinct (identical without the join, one row per finding).
+    counted = "count(distinct id)" if products else "count(*)"
     return {
-        Measure.FINDINGS: "count(*)",
+        Measure.FINDINGS: counted,
         Measure.REPOSITORIES: "count(distinct repository_id)",
         Measure.OLDEST_OPEN_AGE: _AGE_DAYS.get(dialect, _AGE_DAYS["postgresql"]),
-        Measure.REVIEW_ITEMS: "count(*)",
+        Measure.REVIEW_ITEMS: counted,
     }
 
 
@@ -52,6 +61,7 @@ _SERVED_MEASURES = frozenset({Measure.FINDINGS, Measure.REPOSITORIES, Measure.OL
 _FINDING_DIMENSIONS = frozenset(
     {
         Dimension.REPOSITORY,
+        Dimension.PRODUCT,
         Dimension.STATE,
         Dimension.SEVERITY,
         Dimension.CATEGORY,
@@ -118,12 +128,12 @@ def columns(dimensions: tuple[Dimension, ...], dialect: str) -> list[str]:
     return [served[dimension] for dimension in dimensions]
 
 
-def aggregates(measures: tuple[Measure, ...], dialect: str) -> list[str]:
-    served = _aggregates(dialect)
+def aggregates(measures: tuple[Measure, ...], dialect: str, *, products: bool = False) -> list[str]:
+    served = _aggregates(dialect, products)
     return [served[measure] for measure in measures]
 
 
-def order_key(by: Measure | Dimension, desc: bool, dialect: str) -> str:
-    expression = _aggregates(dialect).get(by) or _columns(dialect).get(by)
+def order_key(by: Measure | Dimension, desc: bool, dialect: str, *, products: bool = False) -> str:
+    expression = _aggregates(dialect, products).get(by) or _columns(dialect).get(by)
     assert expression is not None, by  # require() refused the rest
     return f"{expression} desc" if desc else expression

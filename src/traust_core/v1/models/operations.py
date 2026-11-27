@@ -8,7 +8,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from enum import StrEnum
 from functools import cache
-from typing import TYPE_CHECKING, Any, NewType
+from typing import TYPE_CHECKING, Any, Final, NewType
 from uuid import UUID
 
 import pydantic
@@ -51,6 +51,11 @@ class RecordKind(StrEnum):
 # The native remediation-scheduling asset: contracts' recording config has no remediation
 # section yet, so its orders ride the triage allowlist and only this name tells them apart.
 REMEDIATE_FINDING = AssetName("remediate_finding")
+
+# Assets one door owns: every door that stores an order refuses them (a direct submit,
+# preflight, plan, a start with no order to take over), because only their door checks the
+# facts they need (remediate_finding's fork facts) before queueing them.
+DOOR_ONLY_ASSETS: Final[frozenset[AssetName]] = frozenset({REMEDIATE_FINDING})
 
 # The rules the remediation trigger's orders carry, keyed by the work item that is the
 # effort: "remediation:<id>" (an attempt) and "verify-remediation:<id>" (its verification).
@@ -319,12 +324,20 @@ class SessionRecord(Model):
     task_sha256: Sha256
     inputs: tuple[SessionFile, ...]
     output: SessionOutput
+    lease_generation: int | None = Field(default=None, gt=0, strict=True)
 
     def __init__(self, **data: object) -> None:
         super().__init__(**data)
         contracts.validate("run-manifest#/$defs/session", self.model_dump(mode="json"))
         if any(a.path >= b.path for a, b in zip(self.inputs, self.inputs[1:], strict=False)):
             raise ValidationError("session inputs must have unique, sorted paths")
+
+    @model_serializer(mode="wrap")
+    def serialize(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        document = handler(self)
+        if self.lease_generation is None:
+            document.pop("lease_generation", None)
+        return document
 
 
 class ConfigDigest(Model):
@@ -712,6 +725,8 @@ class RunBatch(Entity):
 class RunOrder(Entity):
     """4a · one unit of work; queued, leased by a worker, finished with an outcome."""
 
+    model_config = pydantic.ConfigDict(json_schema_serialization_defaults_required=True)
+
     run_batch_id: UUID | None = None
     repository_id: UUID | None = None
     artifact_id: UUID | None = None
@@ -724,9 +739,11 @@ class RunOrder(Entity):
     reason: str | None = None
     requested_by: str
     lease_holder: str | None = None
+    lease_generation: int = Field(default=0, ge=0, strict=True)
     lease_expires_at: datetime | None = None
     started_at: datetime | None = None
     finished_at: datetime | None = None
+    completed_by: str | None = None
     work_item_id: UUID | None = None  # the remediation work item the order runs, if any
     fork_url: str | None = None  # the mirror the effort runs on (remediate_finding only)
     fork_branch: str | None = None  # its fix branch

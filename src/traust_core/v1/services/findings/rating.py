@@ -141,6 +141,15 @@ class SeverityLabel(Model):
     basis: SeverityBasis
 
 
+def rated_occurrence(reported: Sequence[Occurrence]) -> Occurrence | None:
+    """The occurrence a finding is rated from, `reported` in report order: the newest that
+    carries a CVSS vector or score, else the newest. A later occurrence with no CVSS (an impact
+    analysis's, filed under a report's exposure identity) never hides an earlier score, and
+    none is invented for it. The views, the census and the decision stamp all rate from this."""
+    scored = [o for o in reported if o.cvss_vector or o.cvss_score is not None]
+    return scored[-1] if scored else reported[-1] if reported else None
+
+
 def finding_cvss(
     occurrence: Occurrence | None, label: SeverityLabel, picked: EffectiveCvss | None = None
 ) -> FindingCvss | None:

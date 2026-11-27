@@ -16,6 +16,7 @@ from pydantic import Field
 from traust_core.v1 import contracts
 from traust_core.v1.errors import ConflictError, ForbiddenError, ValidationError
 from traust_core.v1.models import candidate_formats
+from traust_core.v1.models.artifacts import SchemaView
 from traust_core.v1.models.base import AppendOnly, Entity, Model
 from traust_core.v1.models.candidate_formats import SuppressionStatus
 from traust_core.v1.models.common import CodeHash, CodeSpan, RepoPath
@@ -120,6 +121,9 @@ class IdentityMove(Model):
     matched_by: AliasMatchedBy
     similarity: float | None = None
     path_overlap: float | None = None
+    # the candidate's advisory when its identity is an exposure key: the finding takes the
+    # advisory link with the identity, so its views select the advisory's authority score
+    advisory_id: UUID | None = None
 
 
 class IntakeResult(Model):
@@ -479,11 +483,12 @@ class ExposureKey(Model):
     package: str
 
 
-def _owasp_llm(entry: Any) -> tuple[OwaspLlmCategory, ...]:
-    # Only report findings declare the field; a verification's regressions don't.
-    if "owasp_llm_references" not in dir(entry):
-        return ()
-    return tuple(OwaspLlmCategory(c) for c in entry.owasp_llm_references)
+def _owasp_llm(entry: SchemaView) -> tuple[OwaspLlmCategory, ...]:
+    try:
+        references = entry.owasp_llm_references
+    except AttributeError as exc:
+        raise ValidationError("report finding schema must declare owasp_llm_references") from exc
+    return tuple(OwaspLlmCategory(category) for category in references)
 
 
 class Suppression(Model):
@@ -594,37 +599,53 @@ class FindingCandidate(Model):
         return out
 
     @classmethod
-    def of_report(cls, entries: Iterable[Any], repository_id: UUID) -> list[FindingCandidate]:
-        """The findings a contracts report states (`findings[]`, a verification's `regressions[]`),
-        rated as the report rates them; a location keeps its first line."""
-        return [
-            cls(
-                label=Label(e.id),
-                repository_id=repository_id,
-                title=e.title,
-                kind=getattr(e, "kind", None),
-                description=e.description,
-                cwes=tuple(CweId(c) for c in e.cwes),
-                category=Category(e.category) if e.category else None,
-                owasp_llm_references=_owasp_llm(e),
-                locations=tuple(
-                    CodeSpan(
-                        path=RepoPath(loc.path),
-                        line=_first_line(loc.lines),
-                    )
-                    for loc in e.locations
-                ),
-                reported_severity=ScannerSeverity(e.severity),
-                cvss_vector=e.cvss.vector if e.cvss else None,
-                cvss_score=Decimal(str(e.cvss.score)) if e.cvss else None,
-            )
-            for e in entries
-        ]
+    def of_report(
+        cls, entries: Iterable[SchemaView], repository_id: UUID
+    ) -> list[FindingCandidate]:
+        """The findings an authored report states, rated as the report rates them."""
+        return [cls._report_entry(e, repository_id, _owasp_llm(e)) for e in entries]
+
+    @classmethod
+    def of_regressions(
+        cls, entries: Iterable[SchemaView], repository_id: UUID
+    ) -> list[FindingCandidate]:
+        """Verification regressions use a schema without OWASP LLM references."""
+        return [cls._report_entry(e, repository_id, ()) for e in entries]
+
+    @classmethod
+    def _report_entry(
+        cls,
+        entry: SchemaView,
+        repository_id: UUID,
+        owasp_llm_references: tuple[OwaspLlmCategory, ...],
+    ) -> FindingCandidate:
+        return cls(
+            label=Label(entry.id),
+            repository_id=repository_id,
+            title=entry.title,
+            kind=getattr(entry, "kind", None),
+            description=entry.description,
+            cwes=tuple(CweId(c) for c in entry.cwes),
+            category=Category(entry.category) if entry.category else None,
+            owasp_llm_references=owasp_llm_references,
+            locations=tuple(
+                CodeSpan(path=RepoPath(loc.path), line=_first_line(loc.lines))
+                for loc in entry.locations
+            ),
+            reported_severity=ScannerSeverity(entry.severity),
+            cvss_vector=entry.cvss.vector if entry.cvss else None,
+            cvss_score=(
+                Decimal(str(entry.cvss.score))
+                if entry.cvss and entry.cvss.score is not None
+                else None
+            ),
+        )
 
     @classmethod
     def of_scan(cls, entries: Iterable[Any], repository_id: UUID) -> list[FindingCandidate]:
         """The unverified findings a vuln-scan states (vuln-findings `findings[]`), rated as the
-        scan rates them; `known_findings` are the baseline's and stay out."""
+        scan rates them, an advisory's `cvss` kept as the report's is; `known_findings` are the
+        baseline's and stay out."""
         return [
             cls(
                 label=Label(e.id),
@@ -636,6 +657,10 @@ class FindingCandidate(Model):
                 locations=(CodeSpan(path=RepoPath(e.file), line=e.line),),
                 reported_severity=ScannerSeverity(e.severity),
                 confidence=Confidence(e.confidence),
+                cvss_vector=e.cvss.vector if e.cvss else None,
+                cvss_score=(
+                    Decimal(str(e.cvss.score)) if e.cvss and e.cvss.score is not None else None
+                ),
             )
             for e in entries
         ]

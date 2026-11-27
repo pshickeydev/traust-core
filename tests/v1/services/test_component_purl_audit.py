@@ -275,6 +275,7 @@ def test_two_child_purls_at_one_commit_reuse_context_and_stay_distinct(
         "1.0.0",
         Provenance(run_id=order_a.id, source=SourceType.VULN_SCAN_REPORT, occurred_at=T0),
         run_order_id=order_a.id,
+        lease_generation=order_a.lease_generation,
         principal=runner,
     )
     rec_b = assessments.record_secure_code(
@@ -288,6 +289,7 @@ def test_two_child_purls_at_one_commit_reuse_context_and_stay_distinct(
         "1.0.0",
         Provenance(run_id=order_b.id, source=SourceType.VULN_SCAN_REPORT, occurred_at=T0),
         run_order_id=order_b.id,
+        lease_generation=order_b.lease_generation,
         principal=runner,
     )
 
@@ -372,6 +374,7 @@ def test_lease_rejects_valid_sibling_b_report_on_sibling_a_order(
             "1.0.0",
             Provenance(run_id=order_a.id, source=SourceType.VULN_SCAN_REPORT, occurred_at=T0),
             run_order_id=order_a.id,
+            lease_generation=order_a.lease_generation,
             principal=runner,
         )
 
@@ -383,6 +386,7 @@ def test_lease_rejects_valid_sibling_b_report_on_sibling_a_order(
             "1.0.0",
             Provenance(run_id=order_a.id, source=SourceType.VULN_SCAN_REPORT, occurred_at=T0),
             run_order_id=order_a.id,
+            lease_generation=order_a.lease_generation,
             principal=runner,
         )
 
@@ -395,6 +399,7 @@ def test_lease_rejects_valid_sibling_b_report_on_sibling_a_order(
             "1.0.0",
             Provenance(run_id=order_a.id, source=SourceType.VULN_SCAN_REPORT, occurred_at=T0),
             run_order_id=order_a.id,
+            lease_generation=order_a.lease_generation,
             principal=runner,
         )
 
@@ -409,6 +414,8 @@ def test_lease_rejects_valid_sibling_b_report_on_sibling_a_order(
             "1.0.0",
             Provenance(run_id=order_a.id, source=SourceType.VULN_SCAN_REPORT, occurred_at=T0),
             run_order_id=order_a.id,
+            worker=order_a.lease_holder,
+            lease_generation=order_a.lease_generation,
         )
 
     # Nothing was persisted by any rejected attempt.
@@ -428,6 +435,7 @@ def test_lease_rejects_valid_sibling_b_report_on_sibling_a_order(
             Provenance(run_id=whole_order.id, source=SourceType.VULN_SCAN_REPORT, occurred_at=T0),
             run_order_id=whole_order.id,
             principal=runner,
+            lease_generation=whole_order.lease_generation,
         )
 
 
@@ -536,6 +544,7 @@ def test_tenant_cache_three_location_report_and_langchain_resolution(
         "1.0.0",
         Provenance(run_id=order.id, source=SourceType.VULN_SCAN_REPORT, occurred_at=T0),
         run_order_id=order.id,
+        lease_generation=order.lease_generation,
         principal=runner,
     )
     assert len(recorded.intake.findings) == 1

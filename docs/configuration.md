@@ -40,6 +40,12 @@ identity:                                 # absent: no caller can be verified (R
 | `identity.restatement_approvers` | how many approvers besides its author a correction must name |
 | `identity.login` | the provider `traust auth` logs in against; tokens are kept in `<home>/credentials.json` (owner-only) |
 
+A server with report-recording asset bindings probes its own identity verifier
+at startup; a planner passing preflight is not evidence that the writer is ready.
+Decision writers need a ledger. A triage writer also needs a working required
+signing pair and a nonblank secret in the variable named by `review.valve_salt_env`.
+A read-only server with no recording bindings does not require these credentials.
+
 ## From traust-ledger's service settings
 
 | traust-ledger (env) | traust-core |
@@ -82,7 +88,8 @@ identity:                                 # absent: no caller can be verified (R
 | `feeds.api_keys` | feed source -> the environment variable holding its API key (`{nvd: NVD_API_KEY}`). Optional: a source not named goes keyless at its lower rate limit, with no warnings; a named variable that is unset or empty logs an error and the source goes keyless. See [Feed API keys](#feed-api-keys) |
 | `execution.sandbox` | `none` (default) or `podman`: how lanes run a target's own build and test code |
 | `campaign.tracking_reference`, `campaign.display_name` | the tracking key and title reports cite |
-| `remediation.fork_org`, `remediation.patch_prefix`, `remediation.private_forge_hosts` | where fixes are pushed: the mirror org, the patch-repository name prefix the convention computes (`patch-` by default; a deployment running SCI's provisioner sets `sci-patch-`), and the deployment's own forge hosts |
+| `remediation.fork_org`, `remediation.patch_prefix`, `remediation.private_forge_hosts` | where fixes are pushed: the mirror org, the patch-repository name prefix the convention computes (`patch-` by default), and the deployment's own forge hosts |
+| `remediation.committer` | the machine identity fix commits are authored under (`traust-remediation` by default; a name ending in `-remediation`, email `<name>@localhost`), handed to the skill with the fork |
 | `forge_tokens` | forge host -> the environment variable holding its API token, beside `forge_hosts` |
 | `overrides.rule_pack_allowlist` | enables explicitly selected supplemental rule packs; absent: none. Sources may be local directories relative to the allowlist or HTTPS Git repositories pinned to a 40-hex commit. Enabled packs must pass the same native quality gates as the shipped rules |
 

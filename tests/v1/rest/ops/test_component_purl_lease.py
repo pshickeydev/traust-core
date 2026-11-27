@@ -283,6 +283,7 @@ def test_mismatched_purl_and_module_path_cannot_obtain_a_lease_or_queue(
         headers=_auth(runner_tok),
         json={
             "run_order_id": order["id"],
+            "lease_generation": order["lease_generation"],
             "repository_ref_id": ref_id,
             "assessor_version": "1.0.0",
             "provenance": {
@@ -301,6 +302,7 @@ def test_mismatched_purl_and_module_path_cannot_obtain_a_lease_or_queue(
         headers=_auth(runner_tok),
         json={
             "run_order_id": order["id"],
+            "lease_generation": order["lease_generation"],
             "repository_ref_id": ref_id,
             "assessor_version": "1.0.0",
             "provenance": {
@@ -325,6 +327,7 @@ def test_mismatched_purl_and_module_path_cannot_obtain_a_lease_or_queue(
         headers=_auth(runner_tok),
         json={
             "run_order_id": order["id"],
+            "lease_generation": order["lease_generation"],
             "repository_ref_id": ref_id,
             "assessor_version": "1.0.0",
             "provenance": {
@@ -505,6 +508,11 @@ def test_open_order_dedup_keys_by_purl_and_sha_and_verifies_external_provenance(
         == p_sha1.id
     )
 
+    # The start door takes over only an admitted (queued) order (traust-core c129551d): the
+    # engine's admission queues these planned orders first.
+    context.services().ops.admit(p_sha1.id)
+    context.services().ops.admit(p_sha2.id)
+
     # 2. Leasing sha_1 does NOT collide with leasing sha_2 via POST /v1/orders/start.
     lease_1 = client.post(
         "/v1/orders/start",
@@ -629,6 +637,7 @@ def test_open_order_dedup_keys_by_purl_and_sha_and_verifies_external_provenance(
         headers=_auth(runner_tok),
         json={
             "run_order_id": ext_order["id"],
+            "lease_generation": ext_order["lease_generation"],
             "repository_ref_id": str(ref_2.id),
             "assessor_version": "1.0.0",
             "provenance": {
@@ -681,7 +690,8 @@ def test_open_order_dedup_keys_by_purl_and_sha_and_verifies_external_provenance(
     )
     assert adhoc_no_env.status_code == 422, adhoc_no_env.text
 
-    # 5b. Queue via POST /v1/orders with valid envelope -> state=queued, no raw envelope on order.
+    # 5b. Submit via POST /v1/orders with valid envelope -> planned (the engine's admission
+    # queues it, traust-core c129551d), no raw envelope on order.
     queued_resp = ext_client.post(
         "/v1/orders",
         headers=_auth(person_tok),
@@ -699,7 +709,7 @@ def test_open_order_dedup_keys_by_purl_and_sha_and_verifies_external_provenance(
     )
     assert queued_resp.status_code == 200, queued_resp.text
     queued_order = queued_resp.json()
-    assert queued_order["state"] == "queued"
+    assert queued_order["state"] == "planned"
     assert "target_provenance" not in queued_order
 
     # 5c. Forged target_provenance on start STILL fails closed (422) even with queued order.
@@ -741,6 +751,8 @@ def test_open_order_dedup_keys_by_purl_and_sha_and_verifies_external_provenance(
     assert wrong_mod_start.status_code == 409, wrong_mod_start.text
 
     # 5e. Exact queued takeover WITHOUT envelope leases the same order and keeps verified manifest.
+    # Only an admitted (queued) order can be taken over (traust-core c129551d).
+    context.services().ops.admit(UUID(queued_order["id"]))
     takeover = ext_client.post(
         "/v1/orders/start",
         headers=_auth(runner_tok),
@@ -787,6 +799,7 @@ def test_open_order_dedup_keys_by_purl_and_sha_and_verifies_external_provenance(
         headers=_auth(runner_tok),
         json={
             "run_order_id": taken_order["id"],
+            "lease_generation": taken_order["lease_generation"],
             "repository_ref_id": str(ref_2.id),
             "assessor_version": "1.0.0",
             "provenance": {

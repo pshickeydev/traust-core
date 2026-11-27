@@ -248,9 +248,10 @@ class CensusReads(SqlRepository):
     def occurrences_for_repositories(
         self, repository_ids: Collection[UUID], until: datetime | None = None
     ) -> list[tuple[UUID, str | None, str | None, Decimal | None, datetime]]:
-        """Each of the repositories' findings' latest occurrence's (severity, cvss_vector,
-        cvss_score) in the report order the views fold (the reporting assessment's time,
-        then the occurrence's own), with its first report's assessment time — the clock
+        """Each of the repositories' findings' rated occurrence's (severity, cvss_vector,
+        cvss_score) — the newest carrying a CVSS vector or score, else the newest — in the
+        report order the views fold (the reporting assessment's time, then the occurrence's
+        own), with its first report's assessment time — the clock
         an SLA reads — reports after `until` left out: one windowed read, never an
         occurrence row per finding through the caller. The vector rides along so the
         census bands the same severity the views compute from it."""
@@ -264,6 +265,17 @@ class CensusReads(SqlRepository):
                     .over(
                         partition_by=o.c.finding_id,
                         order_by=(
+                            # rated as the views rate (`rated_occurrence`): the newest
+                            # occurrence carrying a CVSS vector or score, else the newest
+                            sa.case(
+                                (
+                                    sa.or_(
+                                        o.c.cvss_vector.is_not(None), o.c.cvss_score.is_not(None)
+                                    ),
+                                    0,
+                                ),
+                                else_=1,
+                            ),
                             a.c.occurred_at.desc(),
                             o.c.created_at.desc(),
                             o.c.id.desc(),

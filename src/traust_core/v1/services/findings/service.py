@@ -93,6 +93,7 @@ from traust_core.v1.services.findings.census import (
 )
 from traust_core.v1.services.findings.claims import FindingClaims, retained_claim_artifact
 from traust_core.v1.services.findings.decisions import FindingDecisions
+from traust_core.v1.services.findings.exposures import with_exposures
 from traust_core.v1.services.findings.facts import FindingFacts
 from traust_core.v1.services.findings.identity import primary_cwe
 from traust_core.v1.services.findings.intake import (
@@ -111,7 +112,7 @@ from traust_core.v1.services.findings.windows import WindowMemo, memo_keys
 from traust_core.v1.services.portfolio import Inventory
 
 if TYPE_CHECKING:
-    from traust_core.v1.services.exposure import AdvisoryCvssReader
+    from traust_core.v1.services.exposure import AdvisoryCvssReader, StoredAdvisories
 
 log = logging.getLogger(__name__)
 
@@ -260,8 +261,10 @@ class FindingService:
         *,
         windows: WindowMemo | None = None,
         advisory_cvss: AdvisoryCvssReader | None = None,
+        advisories: StoredAdvisories | None = None,  # settling held moves: dependency identity
     ) -> None:
         self._uow = uow
+        self._advisories = advisories
         self._inventory = Inventory(uow)
         self._log = AssessmentLog(uow)
         self.records = FindingRecords(uow)
@@ -502,7 +505,11 @@ class FindingService:
             key=lambda pair: (pair[0].created_at, pair[0].occurred_at),
         ):
             doc = _HELD_DOCUMENTS[artifact.kind].parse(stored_bytes(self._objects, artifact))
-            candidates = REPORTED_FINDINGS[AssessmentKind(assessment.kind)](doc, repository_id)
+            candidates = with_exposures(
+                doc,
+                REPORTED_FINDINGS[AssessmentKind(assessment.kind)](doc, repository_id),
+                self._advisories,
+            )
             by_label = {c.label: c for c in candidates}
             assert assessment.id is not None
             held += [
