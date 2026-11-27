@@ -245,8 +245,9 @@ class FindingIntake:
         once for the whole report, not once per row."""
         assert assessment.id is not None
         with self._uow as uow:
-            repository_id = uow.repository_refs.get(assessment.repository_ref_id).repository_id
-            repository = self._inventory.get_repository(repository_id)
+            _, repository = self._inventory.resolve(assessment.repository_ref_id)
+            assert repository.id is not None
+            repository_id = repository.id
             admitted = {o.finding_id for o in uow.occurrences.list_for_assessment(assessment.id)}
             identities, _ = self._claimed_identities(uow, repository_id)
             bound: dict[Label, UUID] = {}
