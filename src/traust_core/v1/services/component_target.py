@@ -6,6 +6,8 @@ associations. Every resolution is verified from build/workspace metadata and git
 
 from __future__ import annotations
 
+import re
+import threading
 from collections.abc import Sequence
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -18,17 +20,21 @@ from traust_core.v1.models.component_target import (
     ComponentTargetStrategy,
     ComponentTargetVerification,
     PackageManifestCandidate,
-    ParsedPurl,
     UnresolvedTargetReason,
     canonical_component_purl,
     normalize_component_commit,
     normalize_module_path,
+    parse_component_purl,
 )
+from traust_core.v1.models.purl import Purl
+from traust_core.v1.models.vocabulary import RefKind
 from traust_core.v1.providers.checkout import GitCheckout
 from traust_core.v1.providers.package_manifests import PackageManifestScanner
-from traust_core.v1.providers.provenance import ProvenanceVerifier
+from traust_core.v1.providers.provenance import DsseProvenanceVerifier
 
 _PKG_TAG_SEPARATORS = ("==", "@", "-v", "-", "/v", "/")
+# what follows a package-tag separator when the tag names a release: a version, optionally v-led
+_RELEASED_VERSION = re.compile(r"v?\d")
 _PROJECT_TAG_SEPARATORS = ("-", "_", "/")
 
 
@@ -63,7 +69,7 @@ def _is_shared_release_tag(tag: str, version: str, project_names: Sequence[str] 
     return False
 
 
-def _package_tag_names(purl: ParsedPurl) -> tuple[str, ...]:
+def _package_tag_names(purl: Purl) -> tuple[str, ...]:
     names = [purl.name]
     if purl.type == "pypi":
         names.extend([purl.package_id, purl.name.replace("_", "-"), purl.name.replace("-", "_")])
@@ -72,7 +78,7 @@ def _package_tag_names(purl: ParsedPurl) -> tuple[str, ...]:
     return tuple(dict.fromkeys(names))
 
 
-def _is_package_release_tag(tag: str, purl: ParsedPurl) -> bool:
+def _is_package_release_tag(tag: str, purl: Purl) -> bool:
     for pkg in _package_tag_names(purl):
         for sep in _PKG_TAG_SEPARATORS:
             if tag == f"{pkg}{sep}{purl.version}":
@@ -80,20 +86,28 @@ def _is_package_release_tag(tag: str, purl: ParsedPurl) -> bool:
     return False
 
 
-def _conflicting_package_tag(tags: Sequence[str], purl: ParsedPurl) -> str | None:
-    """Detect when a tag at the pinned commit releases this package at another version."""
+def _conflicting_package_tag(tags: Sequence[str], purl: Purl) -> str | None:
+    """Detect when a tag at the pinned commit releases this package at another version, under
+    any separator `_is_package_release_tag` accepts (`==`, `@`, hyphenated and path forms)."""
     for tag in tags:
+        if _is_package_release_tag(tag, purl):
+            continue
         for pkg in _package_tag_names(purl):
-            for sep in ("==", "@"):
+            for sep in _PKG_TAG_SEPARATORS:
                 prefix = f"{pkg}{sep}"
-                if tag.startswith(prefix) and tag[len(prefix) :] != purl.version:
+                if not tag.startswith(prefix):
+                    continue
+                rest = tag[len(prefix) :]
+                # `pkg-extra-1.0.0` names another package; only a version after the separator
+                # releases this one
+                if rest != purl.version and _RELEASED_VERSION.match(rest):
                     return tag
     return None
 
 
 def _classify_candidate(
     candidate: PackageManifestCandidate,
-    purl: ParsedPurl,
+    purl: Purl,
     tags: Sequence[str],
     requested_release_ref: str | None,
     project_names: Sequence[str] = (),
@@ -149,16 +163,29 @@ class ComponentTargetResolver:
         self,
         git: GitCheckout,
         scanner: PackageManifestScanner | None = None,
-        provenance_verifier: ProvenanceVerifier | None = None,
+        provenance_verifier: DsseProvenanceVerifier | None = None,
+        *,
+        trust_policy: Path | None = None,
     ) -> None:
+        """`trust_policy` is read once, on the first order that carries provenance: a missing
+        or broken policy fails those orders only, never every request."""
         self._git = git
         self._scanner = scanner or PackageManifestScanner()
         self._provenance_verifier = provenance_verifier
+        self._trust_policy = trust_policy
+        self._verifier_lock = threading.Lock()
+
+    def _verifier(self) -> DsseProvenanceVerifier | None:
+        if self._provenance_verifier is None and self._trust_policy is not None:
+            with self._verifier_lock:
+                if self._provenance_verifier is None:
+                    self._provenance_verifier = DsseProvenanceVerifier.from_file(self._trust_policy)
+        return self._provenance_verifier
 
     def resolve(self, request: ComponentTargetRequest, checkout: Path) -> ComponentTarget:
-        purl = ParsedPurl.parse(request.purl)
+        purl = parse_component_purl(request.purl)
 
-        if request.ref_kind in ("default", "branch") and not request.commit:
+        if request.ref_kind in (RefKind.DEFAULT, RefKind.BRANCH) and not request.commit:
             raise UnresolvedTargetError(
                 UnresolvedTargetReason.DEFAULT_BRANCH_DISALLOWED,
                 f"mutable ref kind {request.ref_kind!r} without an immutable commit pin",
@@ -208,7 +235,7 @@ class ComponentTargetResolver:
             supplied_path = purl.subpath
 
         candidates = self._scanner.scan(checkout)
-        same_eco = [c for c in candidates if c.ecosystem == purl.type]
+        same_eco = [c for c in candidates if c.ecosystem == purl.ecosystem]
         matched_name = [c for c in same_eco if c.package_id == purl.package_id]
 
         if not matched_name:
@@ -311,19 +338,20 @@ class ComponentTargetResolver:
         self,
         *,
         request: ComponentTargetRequest,
-        purl: ParsedPurl,
+        purl: Purl,
         commit: str,
         release_ref: str | None,
         supplied_path: str | None,
         matched_name: Sequence[PackageManifestCandidate],
     ) -> ComponentTarget:
         assert request.provenance_record is not None
-        if self._provenance_verifier is None:
+        verifier = self._verifier()
+        if verifier is None:
             raise UnresolvedTargetError(
                 UnresolvedTargetReason.PROVENANCE_UNVERIFIED,
                 "no provenance verifier or trust policy configured",
             )
-        claim = self._provenance_verifier.verify(request.provenance_record)
+        claim = verifier.verify(request.provenance_record)
         try:
             claim_purl = canonical_component_purl(claim.purl)
             claim_commit = normalize_component_commit(claim.commit)
@@ -346,6 +374,12 @@ class ComponentTargetResolver:
             raise UnresolvedTargetError(
                 UnresolvedTargetReason.PROVENANCE_MISMATCH,
                 f"provenance commit {claim_commit} does not match pinned commit {commit}",
+            )
+        if release_ref is not None and claim.ref != release_ref:
+            # the stored provenance and the verified tag must describe the same release
+            raise UnresolvedTargetError(
+                UnresolvedTargetReason.PROVENANCE_MISMATCH,
+                f"provenance ref {claim.ref!r} does not match release tag {release_ref!r}",
             )
 
         non_private = [c for c in matched_name if not c.is_private]

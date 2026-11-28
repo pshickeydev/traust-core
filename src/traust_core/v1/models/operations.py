@@ -8,7 +8,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from enum import StrEnum
 from functools import cache
-from typing import TYPE_CHECKING, Any, Final, NewType
+from typing import TYPE_CHECKING, Final, NewType
 from uuid import UUID
 
 import pydantic
@@ -22,7 +22,7 @@ from traust_core.v1.models.artifacts import SessionTask as SessionTask
 from traust_core.v1.models.assessment import Assessment
 from traust_core.v1.models.base import AppendOnly, Dto, Entity, Model
 from traust_core.v1.models.common import Cursor, Sha256, TimeWindow, encode_cursor
-from traust_core.v1.models.component_target import ComponentTarget
+from traust_core.v1.models.component_target import ComponentTarget, DsseEnvelope
 from traust_core.v1.models.inventory import Release
 from traust_core.v1.models.vocabulary import BudgetEnforcement
 
@@ -221,7 +221,7 @@ class OrderRequest(Model):
     target_sha: str | None = None
     target_module_path: str | None = None
     target_release_ref: str | None = None
-    target_provenance: dict[str, Any] | None = None
+    target_provenance: DsseEnvelope | None = None  # DSSE-signed in-toto provenance
 
     @pydantic.model_validator(mode="after")
     def _component_target_fields(self) -> OrderRequest:
@@ -229,11 +229,11 @@ class OrderRequest(Model):
             raise ValueError("target_module_path must be non-empty when supplied")
         if self.target_release_ref is not None and not self.target_release_ref.strip():
             raise ValueError("target_release_ref must be non-empty when supplied")
-        if self.target_provenance is not None:
-            if not self.target_provenance:
-                raise ValueError("target_provenance must be non-empty when supplied")
-            if len(json.dumps(self.target_provenance)) > MAX_TARGET_PROVENANCE_BYTES:
-                raise ValueError(f"target_provenance exceeds {MAX_TARGET_PROVENANCE_BYTES} bytes")
+        if (
+            self.target_provenance is not None
+            and len(self.target_provenance.model_dump_json()) > MAX_TARGET_PROVENANCE_BYTES
+        ):
+            raise ValueError(f"target_provenance exceeds {MAX_TARGET_PROVENANCE_BYTES} bytes")
         fields = (
             self.target_purl,
             self.target_sha,

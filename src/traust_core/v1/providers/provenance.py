@@ -8,7 +8,7 @@ import hashlib
 import json
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 
 import pydantic
 from cryptography.exceptions import InvalidSignature
@@ -19,15 +19,13 @@ from pydantic import Field
 from traust_core.v1.errors import ConfigError, UnresolvedTargetError
 from traust_core.v1.models.base import Model
 from traust_core.v1.models.component_target import (
+    IN_TOTO_PAYLOAD_TYPE,
+    DsseEnvelope,
     UnresolvedTargetReason,
     VerifiedProvenanceClaim,
 )
 
 MAX_PROVENANCE_PAYLOAD_BYTES = 65_536
-
-
-class ProvenanceVerifier(Protocol):
-    def verify(self, record: Mapping[str, Any]) -> VerifiedProvenanceClaim: ...
 
 
 class TrustedProvenanceKey(Model):
@@ -73,38 +71,38 @@ def _verify_signature(public_key: object, signature: bytes, data: bytes) -> bool
     return False
 
 
+_IN_TOTO_STATEMENT = "https://in-toto.io/Statement/"
+
+
 def _extract_statement_fields(statement: Mapping[str, Any]) -> dict[str, Any]:
+    """The release claims of an in-toto Statement; anything else is not provenance."""
     stmt_type = statement.get("_type")
-    if isinstance(stmt_type, str) and stmt_type.startswith("https://in-toto.io/Statement/"):
-        predicate = statement.get("predicate")
-        if not isinstance(predicate, Mapping):
-            raise UnresolvedTargetError(
-                UnresolvedTargetReason.PROVENANCE_UNVERIFIED,
-                "in-toto statement predicate must be an object",
-            )
-        purl = predicate.get("purl")
-        subjects = statement.get("subject")
-        if not purl and isinstance(subjects, list) and subjects:
-            first_subj = subjects[0]
-            if isinstance(first_subj, Mapping):
-                cand = first_subj.get("uri") or first_subj.get("name")
-                if isinstance(cand, str) and cand.startswith("pkg:"):
-                    purl = cand
-        return {
-            "purl": purl,
-            "repository": predicate.get("repository"),
-            "commit": predicate.get("commit"),
-            "source": statement.get("predicateType") or predicate.get("source"),
-            "ref": predicate.get("ref"),
-            "manifest_version": predicate.get("manifest_version"),
-        }
+    if not isinstance(stmt_type, str) or not stmt_type.startswith(_IN_TOTO_STATEMENT):
+        raise UnresolvedTargetError(
+            UnresolvedTargetReason.PROVENANCE_UNVERIFIED,
+            f"provenance payload is not an in-toto Statement (_type {stmt_type!r})",
+        )
+    predicate = statement.get("predicate")
+    if not isinstance(predicate, Mapping):
+        raise UnresolvedTargetError(
+            UnresolvedTargetReason.PROVENANCE_UNVERIFIED,
+            "in-toto statement predicate must be an object",
+        )
+    purl = predicate.get("purl")
+    subjects = statement.get("subject")
+    if not purl and isinstance(subjects, list) and subjects:
+        first_subj = subjects[0]
+        if isinstance(first_subj, Mapping):
+            cand = first_subj.get("uri") or first_subj.get("name")
+            if isinstance(cand, str) and cand.startswith("pkg:"):
+                purl = cand
     return {
-        "purl": statement.get("purl"),
-        "repository": statement.get("repository"),
-        "commit": statement.get("commit"),
-        "source": statement.get("source"),
-        "ref": statement.get("ref"),
-        "manifest_version": statement.get("manifest_version"),
+        "purl": purl,
+        "repository": predicate.get("repository"),
+        "commit": predicate.get("commit"),
+        "source": statement.get("predicateType") or predicate.get("source"),
+        "ref": predicate.get("ref"),
+        "manifest_version": predicate.get("manifest_version"),
     }
 
 
@@ -132,32 +130,21 @@ class DsseProvenanceVerifier:
             raise ConfigError(f"invalid provenance trust policy at {path}: {exc}") from exc
         return cls(policy)
 
-    def verify(self, record: Mapping[str, Any]) -> VerifiedProvenanceClaim:
+    def verify(self, envelope: DsseEnvelope) -> VerifiedProvenanceClaim:
         if not self._keys:
             raise UnresolvedTargetError(
                 UnresolvedTargetReason.PROVENANCE_UNVERIFIED,
                 "no trusted provenance keys configured in trust policy",
             )
-        if not isinstance(record, Mapping):
+        # DSSE's payload type is how signers keep one protocol's payloads from another's: a
+        # trusted key's signature over any other type is not release provenance.
+        payload_type = envelope.payload_type
+        if payload_type != IN_TOTO_PAYLOAD_TYPE:
             raise UnresolvedTargetError(
                 UnresolvedTargetReason.PROVENANCE_UNVERIFIED,
-                "provenance record must be a JSON object",
+                f"provenance payloadType must be {IN_TOTO_PAYLOAD_TYPE!r}, not {payload_type!r}",
             )
-        payload_type = record.get("payloadType")
-        payload_b64 = record.get("payload")
-        signatures = record.get("signatures")
-        if (
-            not isinstance(payload_type, str)
-            or not payload_type.strip()
-            or not isinstance(payload_b64, str)
-            or not payload_b64.strip()
-            or not isinstance(signatures, list)
-            or not signatures
-        ):
-            raise UnresolvedTargetError(
-                UnresolvedTargetReason.PROVENANCE_UNVERIFIED,
-                "malformed DSSE provenance envelope",
-            )
+        payload_b64 = envelope.payload
         try:
             payload_bytes = base64.b64decode(payload_b64, validate=True)
         except (binascii.Error, ValueError) as exc:
@@ -173,18 +160,12 @@ class DsseProvenanceVerifier:
 
         pae = dsse_pae(payload_type, payload_bytes)
         matched_key: TrustedProvenanceKey | None = None
-        for sig_entry in signatures:
-            if not isinstance(sig_entry, Mapping):
-                continue
-            key_id = sig_entry.get("keyid")
-            sig_b64 = sig_entry.get("sig")
-            if not isinstance(key_id, str) or not isinstance(sig_b64, str):
-                continue
-            trusted = self._keys.get(key_id)
+        for sig_entry in envelope.signatures:
+            trusted = self._keys.get(sig_entry.keyid)
             if trusted is None:
                 continue
             try:
-                sig_bytes = base64.b64decode(sig_b64, validate=True)
+                sig_bytes = base64.b64decode(sig_entry.sig, validate=True)
             except (binascii.Error, ValueError):
                 continue
             if _verify_signature(trusted[1], sig_bytes, pae):

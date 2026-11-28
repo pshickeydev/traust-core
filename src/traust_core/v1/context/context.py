@@ -133,7 +133,11 @@ from traust_core.v1.providers.identity import (
 from traust_core.v1.providers.impact import GovulncheckAnalyzer, SourceScanAnalyzer
 from traust_core.v1.providers.llm_app import LlmAppDetector
 from traust_core.v1.providers.local import LocalCheckout
-from traust_core.v1.providers.mirror import FETCH_TIMEOUT_SECONDS, MirrorCheckout
+from traust_core.v1.providers.mirror import (
+    FETCH_TIMEOUT_SECONDS,
+    LOCAL_SHARED_DIR,
+    MirrorCheckout,
+)
 from traust_core.v1.providers.model_catalog import ModelCatalog, RegistryModelCatalog
 from traust_core.v1.providers.osv import ExportedAdvisoryLookup
 from traust_core.v1.providers.package_manifests import PackageManifestScanner
@@ -142,7 +146,7 @@ from traust_core.v1.providers.pqc import PqcScanner, PqcScanTool
 from traust_core.v1.providers.priv_profile import PrivProfiler
 from traust_core.v1.providers.process import ProcessRunner
 from traust_core.v1.providers.product_definitions import ProductDefinitionsCache
-from traust_core.v1.providers.provenance import DsseProvenanceVerifier, ProvenanceVerifier
+from traust_core.v1.providers.provenance import DsseProvenanceVerifier
 from traust_core.v1.providers.report_files import ReportFiles
 from traust_core.v1.providers.route_guards import RouteGuardMatrix
 from traust_core.v1.providers.rule_drafts import RuleDraftDirectory
@@ -357,7 +361,7 @@ class Context:
         clock: Clock | None = None,
         object_store: ObjectStore | None = None,
         process: ProcessRunner | None = None,
-        provenance_verifier: ProvenanceVerifier | None = None,
+        provenance_verifier: DsseProvenanceVerifier | None = None,
     ) -> None:
         self.config = config
         self.clock: Clock = clock or SystemClock()
@@ -467,8 +471,19 @@ class Context:
             LocalCheckout(
                 self.process,
                 self.clock,
-                self.config.locations.mirror_cache_dir(self.config.home) / "_local-shared",
+                self.config.locations.mirror_cache_dir(self.config.home) / LOCAL_SHARED_DIR,
             ),
+        )
+
+    @cached_property
+    def component_targets(self) -> ComponentTargetResolver:
+        """One resolver per Context: the trust policy is read once, on the first order that
+        carries provenance, not on every request's wiring."""
+        return ComponentTargetResolver(
+            self.git,
+            PackageManifestScanner(yaml_documents),
+            provenance_verifier=self._provenance_verifier,
+            trust_policy=self.config.locations.provenance_trust_path(),
         )
 
     @cached_property
@@ -1008,16 +1023,7 @@ class Context:
             self.model_catalog,
             inventory=Inventory(uow, hosts),
         )
-        provenance_verifier = self._provenance_verifier
-        if provenance_verifier is None and (
-            trust_path := self.config.locations.provenance_trust_path()
-        ):
-            provenance_verifier = DsseProvenanceVerifier.from_file(trust_path)
-        component_targets = ComponentTargetResolver(
-            self.git,
-            PackageManifestScanner(yaml_documents),
-            provenance_verifier=provenance_verifier,
-        )
+        component_targets = self.component_targets
         ops = OpsService(
             uow,
             self.clock,

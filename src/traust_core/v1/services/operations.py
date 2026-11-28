@@ -229,6 +229,13 @@ class PolicyDenied(ForbiddenError):
         return self.deny_issues[0].code
 
 
+def _binding_form(target: ComponentTarget) -> dict[str, Any]:
+    """A verified target as recording binds it: the canonical PURL and every verified field."""
+    return target.model_copy(update={"purl": canonical_component_purl(target.purl)}).model_dump(
+        mode="json", exclude_none=True
+    )
+
+
 def _refuse_door_only(asset: AssetName) -> None:
     if asset in DOOR_ONLY_ASSETS:
         raise ForbiddenError(
@@ -980,6 +987,20 @@ class OpsService:
                     raise ConflictError(
                         f"order {current.id} targets {current_target!r}, not {requested_target!r}"
                     )
+                stored_target = self._verified_manifest_target(current)
+                if (
+                    resolved_target is not None
+                    and stored_target is not None
+                    and _binding_form(stored_target) != _binding_form(resolved_target)
+                ):
+                    # recording binds the whole verified target (release_ref, verification): a
+                    # lease on a different one could never record, only hold the order
+                    raise ConflictError(
+                        f"order {current.id} was verified for release "
+                        f"{stored_target.release_ref!r} ({stored_target.verification.strategy}), "
+                        f"not {resolved_target.release_ref!r} "
+                        f"({resolved_target.verification.strategy})"
+                    )
                 extra = (
                     self._initial_manifest((), resolved_target)
                     if current.artifact_id is None and resolved_target is not None
@@ -1241,13 +1262,7 @@ class OpsService:
             raw_expected = doc.get("component_target")
             if raw_expected is not None:
                 expected = ComponentTarget.model_validate(raw_expected)
-                expected_norm = expected.model_copy(
-                    update={"purl": canonical_component_purl(expected.purl)}
-                )
-                actual_norm = target.model_copy(update={"purl": actual_purl})
-                if actual_norm.model_dump(
-                    mode="json", exclude_none=True
-                ) != expected_norm.model_dump(mode="json", exclude_none=True):
+                if _binding_form(target) != _binding_form(expected):
                     raise ForbiddenError(
                         f"order {order.id}: report metadata.target does not match server-resolved "
                         "manifest target verification"

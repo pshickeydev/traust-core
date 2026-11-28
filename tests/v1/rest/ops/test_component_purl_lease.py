@@ -557,12 +557,15 @@ def test_open_order_dedup_keys_by_purl_and_sha_and_verifies_external_provenance(
     )
     ext_purl = "pkg:maven/org.springframework/spring-beans@7.1.0.rebuild-2"
     stmt = {
-        "purl": ext_purl,
-        "repository": spring.repo_url,
-        "commit": sha_2,
-        "source": "https://slsa.dev/provenance/v1",
-        "ref": "attestation:rebuild-2",
-        "manifest_version": "7.1.0",
+        "_type": "https://in-toto.io/Statement/v1",
+        "subject": [{"uri": ext_purl}],
+        "predicateType": "https://slsa.dev/provenance/v1",
+        "predicate": {
+            "repository": spring.repo_url,
+            "commit": sha_2,
+            "ref": "release-7.1.0",
+            "manifest_version": "7.1.0",
+        },
     }
     payload_bytes = json.dumps(stmt, sort_keys=True).encode("utf-8")
     payload_digest = f"sha256:{hashlib.sha256(payload_bytes).hexdigest()}"
@@ -598,6 +601,7 @@ def test_open_order_dedup_keys_by_purl_and_sha_and_verifies_external_provenance(
             allowed_sources=("https://slsa.dev/provenance/v1",),
         )
     )
+    context.__dict__.pop("component_targets", None)  # the resolver holds the verifier
     ext_client = TestClient(create_app(context))
     ext_lease = ext_client.post(
         "/v1/orders/start",
@@ -623,7 +627,7 @@ def test_open_order_dedup_keys_by_purl_and_sha_and_verifies_external_provenance(
     assert manifest_target["verification"]["strategy"] == "external_provenance"
     assert manifest_target["verification"]["provenance"] == {
         "source": "https://slsa.dev/provenance/v1",
-        "ref": "attestation:rebuild-2",
+        "ref": "release-7.1.0",
         "digest": payload_digest,
         "manifest_version": "7.1.0",
     }
@@ -656,12 +660,15 @@ def test_open_order_dedup_keys_by_purl_and_sha_and_verifies_external_provenance(
     #    still fail closed.
     ext_purl_queued = "pkg:maven/org.springframework/spring-beans@7.1.0.rebuild-3"
     stmt_q = {
-        "purl": ext_purl_queued,
-        "repository": spring.repo_url,
-        "commit": sha_2,
-        "source": "https://slsa.dev/provenance/v1",
-        "ref": "attestation:rebuild-3",
-        "manifest_version": "7.1.0",
+        "_type": "https://in-toto.io/Statement/v1",
+        "subject": [{"uri": ext_purl_queued}],
+        "predicateType": "https://slsa.dev/provenance/v1",
+        "predicate": {
+            "repository": spring.repo_url,
+            "commit": sha_2,
+            "ref": "release-7.1.0",
+            "manifest_version": "7.1.0",
+        },
     }
     payload_q = json.dumps(stmt_q, sort_keys=True).encode("utf-8")
     digest_q = f"sha256:{hashlib.sha256(payload_q).hexdigest()}"
@@ -778,7 +785,7 @@ def test_open_order_dedup_keys_by_purl_and_sha_and_verifies_external_provenance(
     assert taken_manifest["verification"]["strategy"] == "external_provenance"
     assert taken_manifest["verification"]["provenance"] == {
         "source": "https://slsa.dev/provenance/v1",
-        "ref": "attestation:rebuild-3",
+        "ref": "release-7.1.0",
         "digest": digest_q,
         "manifest_version": "7.1.0",
     }
@@ -811,3 +818,58 @@ def test_open_order_dedup_keys_by_purl_and_sha_and_verifies_external_provenance(
         },
     )
     assert recorded_q.status_code == 200, recorded_q.text
+
+
+def test_a_takeover_naming_another_release_tag_is_refused_not_leased(
+    engine: Engine, tmp_path: Path
+) -> None:
+    # Recording binds the whole verified target, release tag included: a lease on another tag
+    # of the same commit could never record, only hold the order until its lease ran out.
+    from tests.fixtures.component_purl.builder import _fixture_git
+    from traust_core.v1.models.identity import Principal
+    from traust_core.v1.models.operations import OrderRequest
+    from traust_core.v1.models.vocabulary import ActorKind
+
+    context, client, spring, repo_id, _ref_id, runner_tok, _person = _setup(engine, tmp_path)
+    _fixture_git(spring.path, "tag", "release-7.1.0")  # a second release tag at the same commit
+    purl = "pkg:maven/org.springframework/spring-beans@7.1.0"
+    planner = Principal(
+        identity="engine", display="Engine", kind=ActorKind.MACHINE, verified_by="oidc"
+    )
+    planned = context.services().ops.plan(
+        OrderRequest(
+            asset=AssetName("sci_scan"),
+            priority=1,
+            repository_id=UUID(repo_id),
+            target_purl=purl,
+            target_sha=spring.commit,
+            target_release_ref=spring.tag,
+        ),
+        planner,
+    )
+    context.services().ops.admit(planned.id)
+
+    def start(release_ref: str) -> Any:
+        return client.post(
+            "/v1/orders/start",
+            headers=_auth(runner_tok),
+            json={
+                "order": {
+                    "asset": "sci_scan",
+                    "priority": 1,
+                    "repository_id": repo_id,
+                    "target_purl": purl,
+                    "target_sha": spring.commit,
+                    "target_module_path": "spring-beans",
+                    "target_release_ref": release_ref,
+                },
+                "lease_seconds": 300,
+            },
+        )
+
+    other = start("release-7.1.0")
+    assert other.status_code == 409, other.text
+    assert context.services().ops.get(planned.id).state == "queued"  # not held by a dead lease
+    same = start(spring.tag)
+    assert same.status_code == 200, same.text
+    assert same.json()["id"] == str(planned.id)

@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from dataclasses import replace
 from enum import StrEnum
-from typing import Any
 from urllib.parse import unquote
 
 from pydantic import (
+    ConfigDict,
     Field,
     SerializerFunctionWrapHandler,
     field_validator,
@@ -17,9 +17,9 @@ from pydantic import (
 
 from traust_core.v1.errors import UnresolvedTargetError, ValidationError
 from traust_core.v1.models.base import Model
-from traust_core.v1.models.purl import canonical_package_id, parse_purl
+from traust_core.v1.models.purl import Purl
 from traust_core.v1.models.values import GitSha
-from traust_core.v1.models.vocabulary import ComponentTargetStrategy
+from traust_core.v1.models.vocabulary import ComponentTargetStrategy, Ecosystem, RefKind
 
 
 class UnresolvedTargetReason(StrEnum):
@@ -64,60 +64,40 @@ def normalize_component_commit(raw: str) -> str:
     return str(GitSha.parse(raw.strip().lower()))
 
 
-class ParsedPurl(Model):
-    raw: str
-    canonical: str
-    type: str
-    namespace: str | None = None
-    name: str
-    version: str
-    subpath: str | None = None
-
-    @property
-    def package_id(self) -> str:
-        return canonical_package_id(self.type, self.namespace, self.name)
-
-    @classmethod
-    def parse(cls, raw: str) -> ParsedPurl:
-        """Strictly parse a versioned PURL (`pkg:<type>/[<ns>/]<name>@<version>[?...][#...]`)."""
-        text = raw.strip()
-        raw_subpath: str | None = None
-        if "#" in text:
-            _, raw_sub = text.split("#", 1)
-            raw_subpath = normalize_module_path(unquote(raw_sub)) if raw_sub.strip() else None
-        try:
-            parsed = parse_purl(text)
-        except ValueError as exc:
-            raise UnresolvedTargetError(UnresolvedTargetReason.INVALID_PURL, str(exc)) from exc
-        if not parsed.version:
-            raise UnresolvedTargetError(
-                UnresolvedTargetReason.MISSING_VERSION,
-                f"PURL must carry an explicit @version pin: {raw!r}",
-            )
-        if parsed.type == "maven" and not parsed.namespace:
-            raise UnresolvedTargetError(
-                UnresolvedTargetReason.INVALID_PURL,
-                f"Maven PURL requires groupId namespace: {raw!r}",
-            )
-        subpath = (
-            raw_subpath
-            if raw_subpath is not None
-            else (normalize_module_path(parsed.subpath) if parsed.subpath else None)
+def parse_component_purl(raw: str) -> Purl:
+    """Strictly parse a component target's versioned PURL
+    (`pkg:<type>/[<ns>/]<name>@<version>[?...][#...]`): `Purl.parse` plus the target rules (an
+    explicit version, Maven's groupId, a normalized repo-relative subpath)."""
+    text = raw.strip()
+    raw_subpath: str | None = None
+    if "#" in text:
+        _, raw_sub = text.split("#", 1)
+        raw_subpath = normalize_module_path(unquote(raw_sub)) if raw_sub.strip() else None
+    try:
+        parsed = Purl.parse(text)
+    except ValueError as exc:
+        raise UnresolvedTargetError(UnresolvedTargetReason.INVALID_PURL, str(exc)) from exc
+    if not parsed.version:
+        raise UnresolvedTargetError(
+            UnresolvedTargetReason.MISSING_VERSION,
+            f"PURL must carry an explicit @version pin: {raw!r}",
         )
-        return cls(
-            raw=text,
-            canonical=parsed.canonical,
-            type=parsed.type,
-            namespace=parsed.namespace,
-            name=parsed.name,
-            version=parsed.version,
-            subpath=subpath,
+    if parsed.type == "maven" and not parsed.namespace:
+        raise UnresolvedTargetError(
+            UnresolvedTargetReason.INVALID_PURL,
+            f"Maven PURL requires groupId namespace: {raw!r}",
         )
+    subpath = (
+        raw_subpath
+        if raw_subpath is not None
+        else (normalize_module_path(parsed.subpath) if parsed.subpath else None)
+    )
+    return replace(parsed, subpath=subpath)
 
 
 def canonical_component_purl(raw: str) -> str:
     """Return the canonical versioned PURL string used as the dedup/lookup/binding key."""
-    return ParsedPurl.parse(raw).canonical
+    return parse_component_purl(raw).canonical
 
 
 class ComponentTargetProvenance(Model):
@@ -195,18 +175,42 @@ class ComponentTarget(Model):
             raise ValueError(str(exc)) from exc
 
 
+IN_TOTO_PAYLOAD_TYPE = "application/vnd.in-toto+json"
+
+
+class DsseSignature(Model):
+    """One DSSE signature: the signing key's id and the base64 signature over the PAE."""
+
+    keyid: str = Field(min_length=1)
+    sig: str = Field(min_length=1)
+
+
+class DsseEnvelope(Model):
+    """A DSSE v1 envelope carrying a signed provenance statement (structure only: the
+    verifier checks the payload type, the encoding and the signatures)."""
+
+    # the wire form is DSSE's own field names, whatever the caller dumps with
+    model_config = ConfigDict(
+        frozen=True, extra="forbid", populate_by_name=True, serialize_by_alias=True
+    )
+
+    payload_type: str = Field(alias="payloadType", min_length=1)
+    payload: str = Field(min_length=1)
+    signatures: tuple[DsseSignature, ...] = Field(min_length=1)
+
+
 class ComponentTargetRequest(Model):
     purl: str
     repository: str
     commit: str | None = None
     release_ref: str | None = None
     module_path: str | None = None
-    ref_kind: str | None = None
-    provenance_record: Mapping[str, Any] | None = None
+    ref_kind: RefKind | None = None
+    provenance_record: DsseEnvelope | None = None
 
 
 class PackageManifestCandidate(Model):
-    ecosystem: str
+    ecosystem: Ecosystem
     package_id: str
     version: str | None = None
     module_path: str

@@ -10,10 +10,10 @@ Sanitized, synthetic monorepos derived from real ecosystem packaging patterns:
 from __future__ import annotations
 
 import json
-import os
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+
+from traust_core.v1.providers.process import ProcessRunner
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,19 +24,21 @@ class PinnedFixture:
     tag: str
 
 
+# Through the runtime's own seam: the allowlist applies, and the child env is its keep-list, so
+# a git hook's GIT_DIR / GIT_INDEX_FILE never reach the fixture's git.
+_GIT = ProcessRunner(("git",))
+_FIXTURE_ENV = {"GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"}
+
+
 def _fixture_git(root: Path, *args: str) -> str:
-    env = {
-        **{k: v for k, v in os.environ.items() if not k.startswith("GIT_")},
-        "GIT_CONFIG_GLOBAL": "/dev/null",
-        "GIT_CONFIG_SYSTEM": "/dev/null",
-    }
-    return subprocess.run(
-        ["git", "-C", str(root), "-c", "user.email=t@example.com", "-c", "user.name=T", *args],
-        check=True,
-        capture_output=True,
-        text=True,
-        env=env,
-    ).stdout.strip()
+    return (
+        _GIT.run(
+            ["git", "-C", str(root), "-c", "user.email=t@example.com", "-c", "user.name=T", *args],
+            env=_FIXTURE_ENV,
+        )
+        .stdout.decode()
+        .strip()
+    )
 
 
 def _build_git_repo(root: Path, repo_url: str, files: dict[str, str], tag: str) -> PinnedFixture:

@@ -49,6 +49,8 @@ def canonical_package_id(purl_type: str, namespace: str | None, name: str) -> st
 
 @dataclass(frozen=True, slots=True)
 class Purl:
+    """A parsed Package URL: the one value type for PURLs. `Purl.parse` is its only parser."""
+
     raw: str
     type: str
     namespace: str | None
@@ -65,34 +67,34 @@ class Purl:
     def package_id(self) -> str:
         return canonical_package_id(self.type, self.namespace, self.name)
 
+    @classmethod
+    def parse(cls, raw: str) -> Purl:
+        """Parse a PURL string via `packageurl-python`; raises `ValueError` on invalid input."""
+        text = raw.strip()
+        parsed = PackageURL.from_string(text)
+        canonical = PackageURL(
+            type=parsed.type,
+            namespace=parsed.namespace,
+            name=parsed.name,
+            version=parsed.version,
+            subpath=parsed.subpath,
+        ).to_string()
+        return cls(
+            raw=text,
+            type=parsed.type,
+            namespace=parsed.namespace or None,
+            name=parsed.name,
+            version=parsed.version or None,
+            subpath=parsed.subpath or None,
+            canonical=canonical,
+        )
 
-def parse_purl(raw: str) -> Purl:
-    """Parse a PURL string via `packageurl-python`; raises `ValueError` on invalid input."""
-    text = raw.strip()
-    parsed = PackageURL.from_string(text)
-    canonical = PackageURL(
-        type=parsed.type,
-        namespace=parsed.namespace,
-        name=parsed.name,
-        version=parsed.version,
-        subpath=parsed.subpath,
-    ).to_string()
-    return Purl(
-        raw=text,
-        type=parsed.type,
-        namespace=parsed.namespace or None,
-        name=parsed.name,
-        version=parsed.version or None,
-        subpath=parsed.subpath or None,
-        canonical=canonical,
-    )
-
-
-def try_parse_purl(raw: str) -> Purl | None:
-    """`parse_purl`, returning `None` for empty or malformed PURLs."""
-    if not raw or not raw.strip():
-        return None
-    try:
-        return parse_purl(raw)
-    except ValueError:
-        return None
+    @classmethod
+    def try_parse(cls, raw: str) -> Purl | None:
+        """`Purl.parse`, returning `None` for empty or malformed PURLs."""
+        if not raw or not raw.strip():
+            return None
+        try:
+            return cls.parse(raw)
+        except ValueError:
+            return None

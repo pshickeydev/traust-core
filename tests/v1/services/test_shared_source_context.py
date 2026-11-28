@@ -372,3 +372,125 @@ def test_mirror_checkout_handles_sha256_remote_repository(
         mirror.release(ws_solo)
     assert not ws_shared.path.exists()
     assert not ws_solo.path.exists()
+
+
+class _MovingClock:
+    """A clock a test advances: the tag-refresh TTL needs time to pass."""
+
+    def __init__(self, at: datetime) -> None:
+        self.at = at
+
+    def now(self) -> datetime:
+        return self.at
+
+
+def _mirror_for(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, forge: Forge, clock: object = None
+) -> MirrorCheckout:
+    cfg = tmp_path / "gitconfig"
+    cfg.write_text(f'[url "file://{forge.bare}"]\n\tinsteadOf = {URL}\n', encoding="utf-8")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(cfg))
+    runner = LocalForge(allowed=("git",), keep_env=("PATH", "HOME", "GIT_CONFIG_GLOBAL"))
+    return MirrorCheckout(
+        runner,
+        clock or FixedClock(AT),  # type: ignore[arg-type]
+        tmp_path / "mirrors",
+        ForgeApi(NoHttp(), {}),  # type: ignore[arg-type]
+    )
+
+
+def test_eviction_never_walks_into_a_live_shared_worktree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # An audited repository may carry a bare-repo fixture: it is source, never a mirror.
+    forge = Forge(tmp_path)
+    (forge.work / "tests" / "data" / "x.git").mkdir(parents=True)
+    (forge.work / "tests" / "data" / "x.git" / "objects").mkdir()
+    (forge.work / "tests" / "data" / "x.git" / "objects" / ".keep").write_text("")
+    sha = forge.commit("tests/data/x.git/HEAD", b"ref: refs/heads/main\n")
+    mirror = _mirror_for(tmp_path, monkeypatch, forge)
+    held = mirror.checkout(CheckoutRequest(repo=URL, ref=sha, shared=True)).data
+    fixture = held.path / "tests" / "data" / "x.git"
+    old = (AT - timedelta(days=40)).timestamp()
+    os.utime(fixture, (old, old))
+    assert mirror.evict(0) == []
+    assert (fixture / "HEAD").is_file()
+    assert not (fixture.parent / "x.git.lock").exists()
+    mirror.release(held)
+
+
+def test_a_torn_holder_count_keeps_the_shared_tree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    forge = Forge(tmp_path)
+    sha = forge.commit("a.txt", b"a\n")
+    mirror = _mirror_for(tmp_path, monkeypatch, forge)
+    first = mirror.checkout(CheckoutRequest(repo=URL, ref=sha, shared=True)).data
+    second = mirror.checkout(CheckoutRequest(repo=URL, ref=sha, shared=True)).data
+    [refs] = (tmp_path / "mirrors").rglob(f"{sha}.refs")
+    refs.write_text("", encoding="utf-8")  # a write interrupted mid-way
+    mirror.release(first)
+    assert second.path.is_dir()  # another holder may still be reading it
+
+
+def test_a_torn_holder_count_keeps_the_local_shared_tree(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init", "-q")
+    (repo / "a.txt").write_text("a\n")
+    sha = GitSha.parse(commit_all(repo, "a"))
+    local_url = LocalRepoUrl.parse(repo.as_uri())
+    local = LocalCheckout(ProcessRunner(allowed=("git",)), FixedClock(AT), tmp_path / "shared")
+    first = local.checkout(CheckoutRequest(repo=local_url, ref=sha, shared=True)).data
+    second = local.checkout(CheckoutRequest(repo=local_url, ref=sha, shared=True)).data
+    [refs] = (tmp_path / "shared").rglob(f"{sha}.refs")
+    refs.write_text("", encoding="utf-8")
+    local.release(first)
+    assert second.path.is_dir()
+
+
+def test_a_shared_tree_whose_first_count_fails_is_removed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    forge = Forge(tmp_path)
+    sha = forge.commit("a.txt", b"a\n")
+    mirror = _mirror_for(tmp_path, monkeypatch, forge)
+    blocked = tmp_path / "mirrors" / "github.com" / "o" / "r.shared" / f"{sha}.refs"
+    blocked.mkdir(parents=True)  # the count can't be written
+    with pytest.raises(OSError):
+        mirror.checkout(CheckoutRequest(repo=URL, ref=sha, shared=True))
+    assert not (blocked.parent / str(sha)).exists()
+    listed = git(tmp_path / "mirrors" / "github.com" / "o" / "r.git", "worktree", "list")
+    assert len(listed.splitlines()) == 1  # only the bare mirror: no orphan blocks eviction
+
+
+def test_a_local_shared_tree_whose_first_count_fails_is_removed(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init", "-q")
+    (repo / "a.txt").write_text("a\n")
+    sha = GitSha.parse(commit_all(repo, "a"))
+    local_url = LocalRepoUrl.parse(repo.as_uri())
+    local = LocalCheckout(ProcessRunner(allowed=("git",)), FixedClock(AT), tmp_path / "shared")
+    worktree, refs = local._shared_paths(repo, str(sha))
+    refs.mkdir(parents=True)
+    with pytest.raises(OSError):
+        local.checkout(CheckoutRequest(repo=local_url, ref=sha, shared=True))
+    assert not worktree.exists()
+    assert len(git(repo, "worktree", "list").splitlines()) == 1
+
+
+def test_a_cached_commit_checks_out_while_the_forge_is_unreachable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    forge = Forge(tmp_path)
+    sha = forge.commit("a.txt", b"a\n")
+    clock = _MovingClock(AT)
+    mirror = _mirror_for(tmp_path, monkeypatch, forge, clock)
+    first = mirror.checkout(CheckoutRequest(repo=URL, ref=sha, shared=True)).data
+    forge.bare.rename(forge.bare.with_name("gone.git"))  # the forge is down
+    clock.at = AT + timedelta(minutes=5)  # past the tag-refresh TTL
+    second = mirror.checkout(CheckoutRequest(repo=URL, ref=sha, shared=True)).data
+    assert second.path == first.path
+    mirror.release(first)
+    mirror.release(second)

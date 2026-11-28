@@ -16,6 +16,7 @@ from pathlib import Path
 
 from traust_core.v1.errors import NotFoundError, ValidationError
 from traust_core.v1.models.values import LocalRepoUrl
+from traust_core.v1.providers import shared_tree
 from traust_core.v1.providers.base import Acquisition, Readiness, Result
 from traust_core.v1.providers.checkout import HARDENED, GitCheckout
 from traust_core.v1.providers.clock import Clock
@@ -51,12 +52,6 @@ class LocalCheckout:
         base = self._shared_base(repo_path)
         return (base / sha).resolve(), base / f"{sha}.refs"
 
-    def _read_refs(self, refs_file: Path) -> int:
-        try:
-            return max(0, int(refs_file.read_text(encoding="utf-8").strip()))
-        except (OSError, ValueError):
-            return 0
-
     @contextmanager
     def _locked(self, repo_path: Path) -> Iterator[None]:
         base = self._shared_base(repo_path)
@@ -87,8 +82,7 @@ class LocalCheckout:
                     and self._reader.is_checkout(worktree)
                     and self._reader.head(worktree) == sha
                 ):
-                    refs = self._read_refs(refs_file) + 1
-                    refs_file.write_text(f"{refs}\n", encoding="utf-8")
+                    shared_tree.acquire(refs_file)
                     return Result(
                         Workspace(
                             repo=repo,
@@ -117,15 +111,17 @@ class LocalCheckout:
                     self._git(
                         repo.path, "worktree", "lock", "--reason", "traust-shared", str(worktree)
                     )
+                    # inside the cleanup: a tree whose first count never landed has no holder
+                    shared_tree.write_holders(refs_file, 1)
                 except BaseException:
                     self._git(repo.path, "worktree", "unlock", str(worktree), check=False)
                     self._git(
                         repo.path, "worktree", "remove", "--force", str(worktree), check=False
                     )
                     shutil.rmtree(worktree, ignore_errors=True)
+                    refs_file.unlink(missing_ok=True)
                     self._git(repo.path, "worktree", "prune", check=False)
                     raise
-                refs_file.write_text("1\n", encoding="utf-8")
                 return Result(
                     Workspace(
                         repo=repo,
@@ -165,11 +161,8 @@ class LocalCheckout:
                         f"workspace {workspace.path} is not the shared worktree for "
                         f"{repo}@{workspace.sha}; refusing to remove"
                     )
-                remaining = self._read_refs(refs_file) - 1
-                if remaining > 0:
-                    refs_file.write_text(f"{remaining}\n", encoding="utf-8")
+                if not shared_tree.release(refs_file):
                     return
-                refs_file.unlink(missing_ok=True)
                 self._git(repo.path, "worktree", "unlock", str(target), check=False)
             elif target not in owned:
                 raise ValidationError(

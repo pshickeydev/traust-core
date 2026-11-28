@@ -18,6 +18,7 @@ from pydantic import TypeAdapter
 
 from traust_core.v1.errors import NotFoundError, ValidationError
 from traust_core.v1.models.values import GitSha, HttpsRepoUrl
+from traust_core.v1.providers import shared_tree
 from traust_core.v1.providers.base import Acquisition, Readiness, Result
 from traust_core.v1.providers.checkout import HARDENED, GitCheckout
 from traust_core.v1.providers.clock import Clock
@@ -34,6 +35,10 @@ _LAST_USE = "traust-last-checkout"
 TAG_REFRESH_TTL_SECONDS = 60.0
 _TAGS_REFRESHED = "traust-tags-refreshed"
 _REPO_URL = TypeAdapter(HttpsRepoUrl)
+# shared worktrees sit beside their mirror (`<repo>.shared/`) and LocalCheckout's under
+# `_local-shared/`: checked-out source, never mirrors, so eviction never walks into them
+_SHARED_SUFFIX = ".shared"
+LOCAL_SHARED_DIR = "_local-shared"
 
 
 class MirrorCheckout:
@@ -83,7 +88,7 @@ class MirrorCheckout:
         )
 
     def _shared_paths(self, mirror: Path, sha: str) -> tuple[Path, Path]:
-        base = mirror.parent / f"{mirror.stem}.shared"
+        base = mirror.parent / f"{mirror.stem}{_SHARED_SUFFIX}"
         return (base / sha).resolve(), base / f"{sha}.refs"
 
     def _acquire_shared(
@@ -97,8 +102,7 @@ class MirrorCheckout:
         ):
             self._maybe_fetch_tags(mirror, repo, force=refresh_tags)
             self._touch(mirror)
-            refs = self._read_refs(refs_file) + 1
-            refs_file.write_text(f"{refs}\n", encoding="utf-8")
+            shared_tree.acquire(refs_file)
             return worktree
         if _healthy(mirror) and self._reachable(mirror, sha):
             self._maybe_fetch_tags(mirror, repo, force=refresh_tags)
@@ -111,17 +115,16 @@ class MirrorCheckout:
             shutil.rmtree(worktree, ignore_errors=True)
         try:
             self._git(mirror, "worktree", "add", "--quiet", "--detach", str(worktree), sha)
+            # inside the cleanup: a tree whose first count never landed has no holder to
+            # release it, and a registered worktree blocks the mirror's eviction
+            shared_tree.write_holders(refs_file, 1)
         except BaseException:
+            self._git(mirror, "worktree", "remove", "--force", str(worktree), check=False)
             shutil.rmtree(worktree, ignore_errors=True)
+            refs_file.unlink(missing_ok=True)
+            self._git(mirror, "worktree", "prune", check=False)
             raise
-        refs_file.write_text("1\n", encoding="utf-8")
         return worktree
-
-    def _read_refs(self, refs_file: Path) -> int:
-        try:
-            return max(0, int(refs_file.read_text(encoding="utf-8").strip()))
-        except (OSError, ValueError):
-            return 0
 
     def release(self, workspace: Workspace) -> None:
         mirror = self._mirror(workspace.repo)
@@ -142,11 +145,8 @@ class MirrorCheckout:
                         f"workspace {workspace.path} is not the shared worktree for "
                         f"{workspace.repo}@{workspace.sha}; refusing to remove"
                     )
-                remaining = self._read_refs(refs_file) - 1
-                if remaining > 0:
-                    refs_file.write_text(f"{remaining}\n", encoding="utf-8")
+                if not shared_tree.release(refs_file):
                     return
-                refs_file.unlink(missing_ok=True)
             elif target not in owned:
                 raise ValidationError(
                     f"workspace {workspace.path} is not a worktree of {workspace.repo}; "
@@ -194,6 +194,13 @@ class MirrorCheckout:
         mirrors = []
         for top, dirs, files in os.walk(self._root, followlinks=False):
             path = Path(top)
+            # checked-out source (a shared tree) can hold its own `x.git/HEAD` fixtures
+            dirs[:] = [
+                d
+                for d in dirs
+                if not d.endswith(_SHARED_SUFFIX)
+                and not (path == self._root and d == LOCAL_SHARED_DIR)
+            ]
             if path.name.endswith(".git") and ("HEAD" in files or _LAST_USE in files):
                 # Loose refs can end in .git; never descend into a mirror's contents.
                 dirs.clear()
@@ -327,9 +334,19 @@ class MirrorCheckout:
         return False
 
     def _maybe_fetch_tags(self, mirror: Path, repo: HttpsRepoUrl, *, force: bool = False) -> None:
+        """Refresh tags past their TTL. The commit is already local: an unreachable forge
+        leaves the cached tags in use (and backs off for a TTL) rather than failing the
+        checkout. A forced refresh, asked for because the cached tags didn't verify, still
+        raises: without the forge there is nothing newer to check."""
         if not force and self._tags_fresh(mirror):
             return
-        self._fetch_tags(mirror, repo)
+        try:
+            self._fetch_tags(mirror, repo)
+        except ProcessError as e:
+            if force:
+                raise
+            log.warning("tag refresh for %s failed; using cached tags: %s", repo, e)
+            self._mark_tags_refreshed(mirror)
 
     def _tags_fresh(self, mirror: Path) -> bool:
         marker = mirror / _TAGS_REFRESHED

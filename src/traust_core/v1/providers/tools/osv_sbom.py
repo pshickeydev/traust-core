@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from traust_core.v1.errors import ValidationError
-from traust_core.v1.models.purl import try_parse_purl
+from traust_core.v1.models.purl import Purl
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.osv import OsvAdvisoryLookup
 from traust_core.v1.providers.process import ProcessResult, ProcessRunner
@@ -40,7 +40,7 @@ class SbomFormatError(ValidationError):
 
 def parse_purl(purl: str) -> Key | None:
     """(OSV ecosystem, package, version) for a supported language purl."""
-    parsed = try_parse_purl(purl)
+    parsed = Purl.try_parse(purl)
     if parsed is None:
         return None
     eco = PURL_ECOSYSTEM.get(parsed.type)

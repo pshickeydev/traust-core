@@ -5,8 +5,6 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
-import os
-import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +14,7 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 from pydantic import ValidationError as PydanticValidationError
 
 from traust_core.v1.context.documents import yaml_documents
-from traust_core.v1.errors import UnresolvedTargetError
+from traust_core.v1.errors import ConfigError, UnresolvedTargetError
 from traust_core.v1.models.component_target import (
     ComponentTarget,
     ComponentTargetRequest,
@@ -31,31 +29,25 @@ from traust_core.v1.providers.process import ProcessRunner
 from traust_core.v1.providers.provenance import (
     DsseProvenanceVerifier,
     ProvenanceTrustPolicy,
-    ProvenanceVerifier,
     TrustedProvenanceKey,
     dsse_pae,
 )
 from traust_core.v1.services.component_target import ComponentTargetResolver
 
+_GIT = ProcessRunner(("git",))
+# The runtime's seam: its keep-list env means a git hook's GIT_DIR never reaches fixture git.
+_FIXTURE_ENV = {
+    "GIT_CONFIG_GLOBAL": "/dev/null",
+    "GIT_CONFIG_SYSTEM": "/dev/null",
+    "GIT_AUTHOR_NAME": "Fixture",
+    "GIT_AUTHOR_EMAIL": "fixture@example.invalid",
+    "GIT_COMMITTER_NAME": "Fixture",
+    "GIT_COMMITTER_EMAIL": "fixture@example.invalid",
+}
+
 
 def _git(repo: Path, *args: str) -> str:
-    env = {
-        # Under a git hook GIT_DIR points at the repo being pushed: inherited, commits land there.
-        **{k: v for k, v in os.environ.items() if not k.startswith("GIT_")},
-        "GIT_CONFIG_GLOBAL": "/dev/null",
-        "GIT_CONFIG_SYSTEM": "/dev/null",
-        "GIT_AUTHOR_NAME": "Fixture",
-        "GIT_AUTHOR_EMAIL": "fixture@example.invalid",
-        "GIT_COMMITTER_NAME": "Fixture",
-        "GIT_COMMITTER_EMAIL": "fixture@example.invalid",
-    }
-    return subprocess.run(
-        ["git", "-C", str(repo), *args],
-        check=True,
-        capture_output=True,
-        text=True,
-        env=env,
-    ).stdout.strip()
+    return _GIT.run(["git", "-C", str(repo), *args], env=_FIXTURE_ENV).stdout.decode().strip()
 
 
 def _init_repo(
@@ -82,7 +74,7 @@ def _init_repo(
     return sha
 
 
-def _resolver(verifier: ProvenanceVerifier | None = None) -> ComponentTargetResolver:
+def _resolver(verifier: DsseProvenanceVerifier | None = None) -> ComponentTargetResolver:
     return ComponentTargetResolver(
         GitCheckout(ProcessRunner(allowed=("git",))),
         PackageManifestScanner(yaml_documents),
@@ -1141,3 +1133,269 @@ def test_external_provenance_verification_and_mandatory_negatives(tmp_path: Path
     assert resolved.verification.provenance.ref == "build-ref/7.1.0-rebuild-1"
     assert resolved.verification.provenance.digest == expected_digest
     assert resolved.verification.provenance.manifest_version == "7.1.0"
+
+
+def _signed_policy() -> tuple[ed25519.Ed25519PrivateKey, DsseProvenanceVerifier]:
+    priv = ed25519.Ed25519PrivateKey.generate()
+    pem = (
+        priv.public_key()
+        .public_bytes(serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo)
+        .decode("utf-8")
+    )
+    return priv, DsseProvenanceVerifier(
+        ProvenanceTrustPolicy(trusted_keys=(TrustedProvenanceKey(key_id="k", public_key_pem=pem),))
+    )
+
+
+def _rebuilt_reactor(tmp_path: Path) -> tuple[Path, str, str]:
+    repo = tmp_path / "reactor"
+    sha = _init_repo(
+        repo,
+        {
+            "pom.xml": (
+                "<project><groupId>org.example</groupId><artifactId>reactor</artifactId>"
+                "<version>7.1.0</version><packaging>pom</packaging>"
+                "<modules><module>beans</module></modules></project>\n"
+            ),
+            "beans/pom.xml": (
+                "<project><parent><groupId>org.example</groupId><artifactId>reactor</artifactId>"
+                "<version>7.1.0</version></parent><artifactId>beans</artifactId></project>\n"
+            ),
+        },
+        tags=("v7.1.0", "build-7.1.0-r1", "build-7.1.0-r2"),
+    )
+    return repo, "https://github.com/example/reactor", sha
+
+
+def _statement(purl: str, repo_url: str, sha: str, ref: str) -> dict[str, Any]:
+    return {
+        "_type": "https://in-toto.io/Statement/v1",
+        "subject": [{"uri": purl}],
+        "predicateType": "https://slsa.dev/provenance/v1",
+        "predicate": {
+            "repository": repo_url,
+            "commit": sha,
+            "ref": ref,
+            "manifest_version": "7.1.0",
+        },
+    }
+
+
+REBUILT = "pkg:maven/org.example/beans@7.1.0.r1"
+
+
+def test_a_trusted_signature_over_another_payload_type_is_not_provenance(tmp_path: Path) -> None:
+    repo, repo_url, sha = _rebuilt_reactor(tmp_path)
+    priv, verifier = _signed_policy()
+    statement = _statement(REBUILT, repo_url, sha, "build-7.1.0-r1")
+    env, _ = _sign_dsse(priv, "k", statement, payload_type="application/json")
+    with pytest.raises(UnresolvedTargetError) as exc:
+        _resolver(verifier).resolve(
+            ComponentTargetRequest(
+                purl=REBUILT, repository=repo_url, commit=sha, provenance_record=env
+            ),
+            repo,
+        )
+    assert exc.value.reason == UnresolvedTargetReason.PROVENANCE_UNVERIFIED
+
+
+def test_a_signed_json_document_that_is_no_in_toto_statement_is_not_provenance(
+    tmp_path: Path,
+) -> None:
+    repo, repo_url, sha = _rebuilt_reactor(tmp_path)
+    priv, verifier = _signed_policy()
+    flat = {"purl": REBUILT, "repository": repo_url, "commit": sha, "source": "s", "ref": "r"}
+    env, _ = _sign_dsse(priv, "k", flat)
+    with pytest.raises(UnresolvedTargetError) as exc:
+        _resolver(verifier).resolve(
+            ComponentTargetRequest(
+                purl=REBUILT, repository=repo_url, commit=sha, provenance_record=env
+            ),
+            repo,
+        )
+    assert exc.value.reason == UnresolvedTargetReason.PROVENANCE_UNVERIFIED
+
+
+def test_signed_provenance_for_another_release_ref_is_a_mismatch(tmp_path: Path) -> None:
+    repo, repo_url, sha = _rebuilt_reactor(tmp_path)
+    priv, verifier = _signed_policy()
+    env, _ = _sign_dsse(priv, "k", _statement(REBUILT, repo_url, sha, "build-7.1.0-r2"))
+    with pytest.raises(UnresolvedTargetError) as exc:
+        _resolver(verifier).resolve(
+            ComponentTargetRequest(
+                purl=REBUILT,
+                repository=repo_url,
+                commit=sha,
+                release_ref="build-7.1.0-r1",
+                provenance_record=env,
+            ),
+            repo,
+        )
+    assert exc.value.reason == UnresolvedTargetReason.PROVENANCE_MISMATCH
+
+
+def test_the_trust_policy_is_read_on_first_use_only(tmp_path: Path) -> None:
+    # a broken policy fails the orders that carry provenance, never resolution without it
+    repo, repo_url, sha = _rebuilt_reactor(tmp_path)
+    broken = tmp_path / "trust.json"
+    broken.write_text("{not json", encoding="utf-8")
+    resolver = ComponentTargetResolver(
+        GitCheckout(ProcessRunner(allowed=("git",))),
+        PackageManifestScanner(yaml_documents),
+        trust_policy=broken,
+    )
+    resolved = resolver.resolve(
+        ComponentTargetRequest(
+            purl="pkg:maven/org.example/beans@7.1.0", repository=repo_url, commit=sha
+        ),
+        repo,
+    )
+    assert resolved.module_path == "beans"
+    priv, _ = _signed_policy()
+    env, _ = _sign_dsse(priv, "k", _statement(REBUILT, repo_url, sha, "build-7.1.0-r1"))
+    with pytest.raises(ConfigError):
+        resolver.resolve(
+            ComponentTargetRequest(
+                purl=REBUILT, repository=repo_url, commit=sha, provenance_record=env
+            ),
+            repo,
+        )
+
+
+def test_a_hyphenated_tag_for_another_version_conflicts(tmp_path: Path) -> None:
+    repo = tmp_path / "ws"
+    sha = _init_repo(
+        repo,
+        {
+            "package.json": json.dumps(
+                {"name": "root", "private": True, "workspaces": ["packages/*"]}
+            ),
+            "packages/pkg/package.json": json.dumps({"name": "@acme/pkg", "version": "1.0.0"}),
+        },
+        tags=("v1.0.0", "@acme/pkg-2.0.0"),
+    )
+    with pytest.raises(UnresolvedTargetError) as exc:
+        _resolver().resolve(
+            ComponentTargetRequest(
+                purl="pkg:npm/%40acme/pkg@1.0.0",
+                repository="https://github.com/acme/ws",
+                commit=sha,
+            ),
+            repo,
+        )
+    assert exc.value.reason == UnresolvedTargetReason.VERSION_MISMATCH
+
+
+def test_a_hyphenated_tag_for_another_package_is_no_conflict(tmp_path: Path) -> None:
+    repo = tmp_path / "ws"
+    sha = _init_repo(
+        repo,
+        {
+            "package.json": json.dumps(
+                {"name": "root", "private": True, "workspaces": ["packages/*"]}
+            ),
+            "packages/pkg/package.json": json.dumps({"name": "@acme/pkg", "version": "1.0.0"}),
+        },
+        tags=("v1.0.0", "@acme/pkg-extra-2.0.0", "@acme/pkg-v1.0.0"),
+    )
+    resolved = _resolver().resolve(
+        ComponentTargetRequest(
+            purl="pkg:npm/%40acme/pkg@1.0.0", repository="https://github.com/acme/ws", commit=sha
+        ),
+        repo,
+    )
+    assert resolved.module_path == "packages/pkg"
+
+
+@pytest.mark.parametrize(
+    "child_version", ["${project.parent.version}", "${revision}"], ids=["builtin", "chained"]
+)
+def test_maven_versions_through_model_and_chained_properties_resolve(
+    tmp_path: Path, child_version: str
+) -> None:
+    repo = tmp_path / "reactor"
+    sha = _init_repo(
+        repo,
+        {
+            "pom.xml": (
+                "<project><groupId>org.example</groupId><artifactId>reactor</artifactId>"
+                "<version>7.1.0</version><packaging>pom</packaging>"
+                "<properties><release.version>7.1.0</release.version>"
+                "<revision>${release.version}</revision></properties>"
+                "<modules><module>beans</module></modules></project>\n"
+            ),
+            "beans/pom.xml": (
+                "<project><parent><groupId>org.example</groupId><artifactId>reactor</artifactId>"
+                "<version>7.1.0</version></parent><artifactId>beans</artifactId>"
+                f"<version>{child_version}</version></project>\n"
+            ),
+        },
+        tags=("v7.1.0",),
+    )
+    resolved = _resolver().resolve(
+        ComponentTargetRequest(
+            purl="pkg:maven/org.example/beans@7.1.0",
+            repository="https://github.com/example/reactor",
+            commit=sha,
+        ),
+        repo,
+    )
+    assert resolved.module_path == "beans"
+
+
+def test_component_purls_parse_into_the_one_purl_value_type() -> None:
+    from traust_core.v1.models.component_target import parse_component_purl
+    from traust_core.v1.models.purl import Purl
+
+    parsed = parse_component_purl("pkg:maven/org.example/beans@7.1.0#beans")
+    assert isinstance(parsed, Purl)
+    assert parsed == Purl.parse("pkg:maven/org.example/beans@7.1.0#beans")
+    assert Purl.try_parse("not a purl") is None
+
+
+@pytest.mark.parametrize(
+    ("field", "value"), [("ref_kind", "Branch"), ("ref_kind", "trunk")], ids=["case", "unknown"]
+)
+def test_a_target_request_refuses_an_unknown_ref_kind(field: str, value: str) -> None:
+    with pytest.raises(PydanticValidationError):
+        ComponentTargetRequest(purl="pkg:npm/a@1.0.0", repository="r", **{field: value})
+
+
+def test_a_manifest_candidate_refuses_an_unknown_ecosystem() -> None:
+    from traust_core.v1.models.component_target import PackageManifestCandidate
+
+    with pytest.raises(PydanticValidationError):
+        PackageManifestCandidate(
+            ecosystem="pypy", package_id="a", module_path=".", manifest_paths=("setup.py",)
+        )
+
+
+def test_a_target_request_refuses_a_provenance_record_that_is_no_dsse_envelope() -> None:
+    with pytest.raises(PydanticValidationError):
+        ComponentTargetRequest(
+            purl="pkg:npm/a@1.0.0", repository="r", provenance_record={"purl": "pkg:npm/a@1.0.0"}
+        )
+
+
+def test_provenance_has_one_verifier_and_no_single_implementation_protocol() -> None:
+    import traust_core.v1.providers.provenance as provenance
+
+    assert not hasattr(provenance, "ProvenanceVerifier")
+
+
+def test_fixture_git_runs_through_the_runtime_process_seam(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tests.fixtures.component_purl import builder
+
+    calls: list[tuple[str, ...]] = []
+    real_run = ProcessRunner.run
+
+    def spy(self: ProcessRunner, argv: Any, **kwargs: Any) -> Any:
+        calls.append(tuple(argv))
+        return real_run(self, argv, **kwargs)
+
+    monkeypatch.setattr(ProcessRunner, "run", spy)
+    builder.build_spring_fixture(tmp_path)
+    assert calls and all(argv[0] == "git" for argv in calls)
+    assert any("commit" in argv for argv in calls)

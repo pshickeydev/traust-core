@@ -21,6 +21,7 @@ from typing import Any
 from traust_core.v1.errors import ConfigError, ServiceError, ValidationError
 from traust_core.v1.models.component_target import PackageManifestCandidate
 from traust_core.v1.models.purl import canonical_package_id
+from traust_core.v1.models.vocabulary import Ecosystem
 from traust_core.v1.providers.tree import SKIP_DIRS as TREE_SKIP_DIRS
 from traust_core.v1.providers.tree import TreeFile, tree_files
 
@@ -98,11 +99,37 @@ def _xml_properties(root_el: ET.Element) -> dict[str, str]:
     return props
 
 
+_MAX_PROP_PASSES = 10
+
+
 def _resolve_maven_prop(value: str | None, props: dict[str, str]) -> str | None:
+    """Substitute `${...}` until nothing changes, so a property defined through another
+    (`${revision}` → `${release.version}` → `7.1.0`) resolves; a cycle or an unknown key
+    stays unresolved (None), never guessed."""
     if value is None:
         return None
-    resolved = _XML_PROP.sub(lambda m: props.get(m.group(1), m.group(0)), value)
+    resolved = value
+    for _ in range(_MAX_PROP_PASSES):
+        substituted = _XML_PROP.sub(lambda m: props.get(m.group(1), m.group(0)), resolved)
+        if substituted == resolved:
+            break
+        resolved = substituted
     return None if "${" in resolved else resolved
+
+
+def _maven_builtin_props(
+    parent_group: str | None, parent_version: str | None, group_id: str | None = None
+) -> dict[str, str]:
+    """Maven's model properties a POM may reference: the parent's coordinates, and the
+    project's own groupId once known (`${project.version}` is the value being resolved)."""
+    props: dict[str, str] = {}
+    if parent_version is not None:
+        props["project.parent.version"] = props["parent.version"] = parent_version
+    if parent_group is not None:
+        props["project.parent.groupId"] = props["parent.groupId"] = parent_group
+    if group_id is not None:
+        props["project.groupId"] = group_id
+    return props
 
 
 def _resolve_maven_parent_rel(mod_dir: str, relative_path: str) -> str | None:
@@ -218,11 +245,13 @@ def _scan_maven(files: list[TreeFile]) -> list[PackageManifestCandidate]:
             parent_version = _resolve_maven_prop(raw_p_version, local_props)
             manifests = (rel_path,)
 
-        group_id = _resolve_maven_prop(_xml_child_text(el, "groupId"), merged_props) or parent_group
-        artifact_id = _resolve_maven_prop(_xml_child_text(el, "artifactId"), merged_props)
+        model_props = {**merged_props, **_maven_builtin_props(parent_group, parent_version)}
+        group_id = _resolve_maven_prop(_xml_child_text(el, "groupId"), model_props) or parent_group
+        model_props.update(_maven_builtin_props(parent_group, parent_version, group_id))
+        artifact_id = _resolve_maven_prop(_xml_child_text(el, "artifactId"), model_props)
         raw_explicit_ver = _xml_child_text(el, "version")
         if raw_explicit_ver is not None:
-            version = _resolve_maven_prop(raw_explicit_ver, merged_props)
+            version = _resolve_maven_prop(raw_explicit_ver, model_props)
             inherits = False
         else:
             version = parent_version
@@ -240,7 +269,7 @@ def _scan_maven(files: list[TreeFile]) -> list[PackageManifestCandidate]:
             continue
         raw_candidates.append(
             PackageManifestCandidate(
-                ecosystem="maven",
+                ecosystem=Ecosystem.MAVEN,
                 package_id=canonical_package_id("maven", group_id, artifact_id),
                 version=version,
                 module_path=mod_dir,
@@ -383,7 +412,7 @@ def _scan_gradle(files: list[TreeFile]) -> list[PackageManifestCandidate]:
                 manifests.append("gradle.properties")
             candidates.append(
                 PackageManifestCandidate(
-                    ecosystem="maven",
+                    ecosystem=Ecosystem.MAVEN,
                     package_id=canonical_package_id("maven", eff_g, art),
                     version=eff_v,
                     module_path=".",
@@ -421,7 +450,7 @@ def _scan_gradle(files: list[TreeFile]) -> list[PackageManifestCandidate]:
             manifests.append(root_build_rel)
         candidates.append(
             PackageManifestCandidate(
-                ecosystem="maven",
+                ecosystem=Ecosystem.MAVEN,
                 package_id=canonical_package_id("maven", eff_g, m_art or mod_name),
                 version=eff_v,
                 module_path=mod_dir,
@@ -497,7 +526,7 @@ def _scan_python(files: list[TreeFile]) -> list[PackageManifestCandidate]:
             manifests.append("pyproject.toml")
         pkg_id = canonical_package_id("pypi", None, name.strip())
         by_key[(mod_dir, pkg_id)] = PackageManifestCandidate(
-            ecosystem="pypi",
+            ecosystem=Ecosystem.PYPI,
             package_id=pkg_id,
             version=ver_str,
             module_path=mod_dir,
@@ -549,7 +578,7 @@ def _scan_python(files: list[TreeFile]) -> list[PackageManifestCandidate]:
         if is_member:
             manifests.append("pyproject.toml")
         by_key[(mod_dir, pkg_id)] = PackageManifestCandidate(
-            ecosystem="pypi",
+            ecosystem=Ecosystem.PYPI,
             package_id=pkg_id,
             version=ver_str,
             module_path=mod_dir,
@@ -675,7 +704,7 @@ def _scan_npm(
         )
         candidates.append(
             PackageManifestCandidate(
-                ecosystem="npm",
+                ecosystem=Ecosystem.NPM,
                 package_id=canonical_package_id("npm", ns, pkg_name),
                 version=version,
                 module_path=mod_dir,

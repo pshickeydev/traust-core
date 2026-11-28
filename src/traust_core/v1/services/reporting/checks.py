@@ -14,7 +14,7 @@ from urllib.parse import urlparse
 
 from traust_core.v1 import contracts
 from traust_core.v1.errors import UnresolvedTargetError
-from traust_core.v1.models.component_target import ParsedPurl, normalize_module_path
+from traust_core.v1.models.component_target import normalize_module_path, parse_component_purl
 from traust_core.v1.models.ledger import DocumentVerification
 from traust_core.v1.providers.report_files import ReportFiles
 from traust_core.v1.services.artifact_publishing import RedactionPolicy
@@ -393,7 +393,7 @@ def check_metadata_target(report: Report, result: ReportValidation) -> None:
     purl = target.get("purl")
     if isinstance(purl, str):
         try:
-            ParsedPurl.parse(purl)
+            parse_component_purl(purl)
         except UnresolvedTargetError as e:
             result.error(f"metadata.target.purl: {e}")
     commit = target.get("commit")
@@ -432,8 +432,17 @@ def check_metadata_target(report: Report, result: ReportValidation) -> None:
                 )
     verification = target.get("verification")
     if isinstance(verification, dict):
-        for mp in verification.get("manifest_paths") or ():
-            if isinstance(mp, str):
+        manifest_paths = verification.get("manifest_paths")
+        if manifest_paths is not None and not isinstance(manifest_paths, list):
+            # runs after schema errors too: a malformed shape is a finding, never a crash
+            result.error("metadata.target.verification.manifest_paths must be an array of paths")
+            manifest_paths = None
+        for mp in manifest_paths or ():
+            if not isinstance(mp, str):
+                result.error(
+                    f"metadata.target.verification.manifest_paths entry {mp!r} must be a string"
+                )
+            else:
                 try:
                     norm_mp = normalize_module_path(mp)
                 except UnresolvedTargetError as e:

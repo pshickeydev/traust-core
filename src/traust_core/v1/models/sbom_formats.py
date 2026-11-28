@@ -12,7 +12,7 @@ from typing import Any
 
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.dependencies import SbomContents, SbomEntry, Version
-from traust_core.v1.models.purl import try_parse_purl
+from traust_core.v1.models.purl import Purl
 from traust_core.v1.models.vocabulary import Ecosystem
 
 Component = tuple[str, str | None, str | None]  # (ref, purl, version)
@@ -126,7 +126,7 @@ def _direct(roots: set[str], edges: Mapping[str, set[str]], parts: list[Componen
 
 def _purl(raw: str) -> tuple[Ecosystem, str, str | None] | None:
     """pkg:type/namespace/name@version?qualifiers#subpath -> (ecosystem, name, version)."""
-    parsed = try_parse_purl(raw)
+    parsed = Purl.try_parse(raw)
     if parsed is None or parsed.ecosystem is None:
         return None
     return parsed.ecosystem, parsed.package_id, parsed.version
