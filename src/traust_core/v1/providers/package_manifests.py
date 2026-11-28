@@ -100,17 +100,22 @@ def _xml_properties(root_el: ET.Element) -> dict[str, str]:
 
 
 _MAX_PROP_PASSES = 10
+# a coordinate is short; the repository is untrusted, so a property chain that multiplies
+# (`<a>${b}${b}</a>`, `<b>${c}${c}</b>`, ...) stops at this bound instead of exhausting memory
+_MAX_PROP_LENGTH = 1024
 
 
 def _resolve_maven_prop(value: str | None, props: dict[str, str]) -> str | None:
     """Substitute `${...}` until nothing changes, so a property defined through another
-    (`${revision}` → `${release.version}` → `7.1.0`) resolves; a cycle or an unknown key
-    stays unresolved (None), never guessed."""
+    (`${revision}` → `${release.version}` → `7.1.0`) resolves; a cycle, an unknown key or an
+    expansion past `_MAX_PROP_LENGTH` stays unresolved (None), never guessed."""
     if value is None:
         return None
     resolved = value
     for _ in range(_MAX_PROP_PASSES):
         substituted = _XML_PROP.sub(lambda m: props.get(m.group(1), m.group(0)), resolved)
+        if len(substituted) > _MAX_PROP_LENGTH:
+            return None
         if substituted == resolved:
             break
         resolved = substituted
@@ -118,7 +123,10 @@ def _resolve_maven_prop(value: str | None, props: dict[str, str]) -> str | None:
 
 
 def _maven_builtin_props(
-    parent_group: str | None, parent_version: str | None, group_id: str | None = None
+    parent_group: str | None,
+    parent_artifact: str | None,
+    parent_version: str | None,
+    group_id: str | None = None,
 ) -> dict[str, str]:
     """Maven's model properties a POM may reference: the parent's coordinates, and the
     project's own groupId once known (`${project.version}` is the value being resolved)."""
@@ -127,6 +135,8 @@ def _maven_builtin_props(
         props["project.parent.version"] = props["parent.version"] = parent_version
     if parent_group is not None:
         props["project.parent.groupId"] = props["parent.groupId"] = parent_group
+    if parent_artifact is not None:
+        props["project.parent.artifactId"] = props["parent.artifactId"] = parent_artifact
     if group_id is not None:
         props["project.groupId"] = group_id
     return props
@@ -245,9 +255,24 @@ def _scan_maven(files: list[TreeFile]) -> list[PackageManifestCandidate]:
             parent_version = _resolve_maven_prop(raw_p_version, local_props)
             manifests = (rel_path,)
 
-        model_props = {**merged_props, **_maven_builtin_props(parent_group, parent_version)}
-        group_id = _resolve_maven_prop(_xml_child_text(el, "groupId"), model_props) or parent_group
-        model_props.update(_maven_builtin_props(parent_group, parent_version, group_id))
+        parent_artifact = (
+            matched_parent[1]
+            if matched_parent is not None
+            else _resolve_maven_prop(raw_p_artifact, local_props)
+        )
+        model_props = {
+            **merged_props,
+            **_maven_builtin_props(parent_group, parent_artifact, parent_version),
+        }
+        raw_group = _xml_child_text(el, "groupId")
+        # an inherited groupId only when the POM states none: one it states but that can't
+        # resolve fails closed (None), never borrows the parent's
+        group_id = (
+            _resolve_maven_prop(raw_group, model_props) if raw_group is not None else parent_group
+        )
+        model_props.update(
+            _maven_builtin_props(parent_group, parent_artifact, parent_version, group_id)
+        )
         artifact_id = _resolve_maven_prop(_xml_child_text(el, "artifactId"), model_props)
         raw_explicit_ver = _xml_child_text(el, "version")
         if raw_explicit_ver is not None:

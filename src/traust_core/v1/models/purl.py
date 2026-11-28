@@ -30,6 +30,12 @@ PURL_ECOSYSTEMS: dict[str, Ecosystem] = {
     "deb": Ecosystem.DEB,
     "apk": Ecosystem.APK,
 }
+# The PURL spec's informational qualifiers: where a package was found or fetched, never which
+# package it is. Every other qualifier (maven's classifier / type, a distro's arch) is part of
+# the identity, so `?classifier=sources` is a different target from the plain artifact.
+_INFORMATIONAL_QUALIFIERS = frozenset(
+    {"repository_url", "download_url", "vcs_url", "file_name", "checksum"}
+)
 # Distro PURLs carry the vendor as namespace (`pkg:deb/debian/openssl`); the package is `name`.
 _VENDOR_NAMESPACE = frozenset({Ecosystem.RPM, Ecosystem.DEB, Ecosystem.APK})
 
@@ -57,7 +63,8 @@ class Purl:
     name: str
     version: str | None
     subpath: str | None
-    canonical: str
+    canonical: str  # every identity part, identity qualifiers included
+    qualifiers: tuple[tuple[str, str], ...] = ()
 
     @property
     def ecosystem(self) -> Ecosystem | None:
@@ -72,11 +79,14 @@ class Purl:
         """Parse a PURL string via `packageurl-python`; raises `ValueError` on invalid input."""
         text = raw.strip()
         parsed = PackageURL.from_string(text)
+        stated = parsed.qualifiers if isinstance(parsed.qualifiers, dict) else {}
+        qualifiers = {k: v for k, v in stated.items() if k not in _INFORMATIONAL_QUALIFIERS}
         canonical = PackageURL(
             type=parsed.type,
             namespace=parsed.namespace,
             name=parsed.name,
             version=parsed.version,
+            qualifiers=qualifiers or None,
             subpath=parsed.subpath,
         ).to_string()
         return cls(
@@ -87,6 +97,7 @@ class Purl:
             version=parsed.version or None,
             subpath=parsed.subpath or None,
             canonical=canonical,
+            qualifiers=tuple(sorted(qualifiers.items())),
         )
 
     @classmethod

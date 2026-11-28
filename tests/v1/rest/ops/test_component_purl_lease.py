@@ -358,7 +358,11 @@ def test_mismatched_purl_and_module_path_cannot_obtain_a_lease_or_queue(
         headers=_auth(person_tok),
         params={
             "repository_ids": [repo_id],
-            "target_purl": "pkg:maven/org.springframework/spring-beans@7.1.0?classifier=sources",
+            # an informational qualifier is the same target; an identity one (classifier) isn't
+            "target_purl": (
+                "pkg:maven/org.springframework/spring-beans@7.1.0"
+                "?repository_url=https://repo.example.invalid"
+            ),
         },
     )
     assert listed_beans.status_code == 200, listed_beans.text

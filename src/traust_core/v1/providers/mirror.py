@@ -16,7 +16,7 @@ from pathlib import Path
 
 from pydantic import TypeAdapter
 
-from traust_core.v1.errors import NotFoundError, ValidationError
+from traust_core.v1.errors import NotFoundError, ServiceError, ValidationError
 from traust_core.v1.models.values import GitSha, HttpsRepoUrl
 from traust_core.v1.providers import shared_tree
 from traust_core.v1.providers.base import Acquisition, Readiness, Result
@@ -334,19 +334,21 @@ class MirrorCheckout:
         return False
 
     def _maybe_fetch_tags(self, mirror: Path, repo: HttpsRepoUrl, *, force: bool = False) -> None:
-        """Refresh tags past their TTL. The commit is already local: an unreachable forge
-        leaves the cached tags in use (and backs off for a TTL) rather than failing the
-        checkout. A forced refresh, asked for because the cached tags didn't verify, still
-        raises: without the forge there is nothing newer to check."""
+        """Refresh tags past their TTL. Tags are mutable release evidence: cached tags past
+        their TTL are not current, so an unreachable forge fails the checkout closed, as a
+        typed transient error (the commit being local proves nothing about its tags), and
+        stamps nothing, so the next checkout retries."""
         if not force and self._tags_fresh(mirror):
             return
         try:
             self._fetch_tags(mirror, repo)
         except ProcessError as e:
-            if force:
-                raise
-            log.warning("tag refresh for %s failed; using cached tags: %s", repo, e)
-            self._mark_tags_refreshed(mirror)
+            log.warning("tag refresh for %s failed", repo, exc_info=True)
+            raise ServiceError(
+                f"cannot refresh the release tags of {repo}: the forge is unreachable and "
+                "cached tags are not current release evidence",
+                operation="mirror.refresh_tags",
+            ) from e
 
     def _tags_fresh(self, mirror: Path) -> bool:
         marker = mirror / _TAGS_REFRESHED

@@ -229,11 +229,9 @@ class PolicyDenied(ForbiddenError):
         return self.deny_issues[0].code
 
 
-def _binding_form(target: ComponentTarget) -> dict[str, Any]:
-    """A verified target as recording binds it: the canonical PURL and every verified field."""
-    return target.model_copy(update={"purl": canonical_component_purl(target.purl)}).model_dump(
-        mode="json", exclude_none=True
-    )
+def _binding_form(target: ComponentTarget) -> ComponentTarget:
+    """A verified target as recording binds it: every verified field, the PURL canonical."""
+    return target.model_copy(update={"purl": canonical_component_purl(target.purl)})
 
 
 def _refuse_door_only(asset: AssetName) -> None:

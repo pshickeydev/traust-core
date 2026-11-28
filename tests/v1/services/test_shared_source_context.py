@@ -11,7 +11,7 @@ import pytest
 
 from tests.v1.conftest import commit_all, git
 from tests.v1.providers.test_mirror import Forge, LocalForge, NoHttp, SpyRunner
-from traust_core.v1.errors import ValidationError
+from traust_core.v1.errors import ServiceError, ValidationError
 from traust_core.v1.models.values import GitSha, HttpsRepoUrl, LocalRepoUrl
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.forge_api import ForgeApi
@@ -480,17 +480,25 @@ def test_a_local_shared_tree_whose_first_count_fails_is_removed(tmp_path: Path) 
     assert len(git(repo, "worktree", "list").splitlines()) == 1
 
 
-def test_a_cached_commit_checks_out_while_the_forge_is_unreachable(
+def test_stale_tags_fail_the_checkout_closed_and_the_next_one_retries(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # tags are mutable release evidence: past their TTL, cached ones are not current, so an
+    # unreachable forge is a typed transient failure, never a silent stale success
     forge = Forge(tmp_path)
     sha = forge.commit("a.txt", b"a\n")
     clock = _MovingClock(AT)
     mirror = _mirror_for(tmp_path, monkeypatch, forge, clock)
     first = mirror.checkout(CheckoutRequest(repo=URL, ref=sha, shared=True)).data
-    forge.bare.rename(forge.bare.with_name("gone.git"))  # the forge is down
+    gone = forge.bare.with_name("gone.git")
+    forge.bare.rename(gone)  # the forge is down
     clock.at = AT + timedelta(minutes=5)  # past the tag-refresh TTL
+    with pytest.raises(ServiceError, match="release tags") as failed:
+        mirror.checkout(CheckoutRequest(repo=URL, ref=sha, shared=True))
+    assert failed.value.operation == "mirror.refresh_tags"
+    gone.rename(forge.bare)  # back: the failure stamped nothing, so this one refreshes
+    git(forge.bare, "update-ref", "refs/tags/v2", str(sha))
     second = mirror.checkout(CheckoutRequest(repo=URL, ref=sha, shared=True)).data
-    assert second.path == first.path
+    assert "v2" in git(second.path, "tag", "--points-at", str(sha)).splitlines()
     mirror.release(first)
     mirror.release(second)

@@ -21,6 +21,7 @@ from traust_core.v1.models.component_target import (
     ComponentTargetStrategy,
     ComponentTargetVerification,
     UnresolvedTargetReason,
+    canonical_component_purl,
     normalize_module_path,
 )
 from traust_core.v1.providers.checkout import GitCheckout
@@ -743,7 +744,8 @@ def test_equivalent_purl_spellings_canonicalize_to_same_key(tmp_path: Path) -> N
 
     py_mixed = resolver.resolve(
         ComponentTargetRequest(
-            purl="pkg:PyPI/LangChain_Core@1.8.4?classifier=wheel",
+            # an informational qualifier (where it was fetched) is no part of the identity
+            purl="pkg:PyPI/LangChain_Core@1.8.4?repository_url=https://pypi.example.invalid",
             repository="https://github.com/example/canon-purls",
             commit=sha,
         ),
@@ -1399,3 +1401,187 @@ def test_fixture_git_runs_through_the_runtime_process_seam(
     builder.build_spring_fixture(tmp_path)
     assert calls and all(argv[0] == "git" for argv in calls)
     assert any("commit" in argv for argv in calls)
+
+
+def test_a_qualified_target_keeps_its_identity() -> None:
+    sources = canonical_component_purl("pkg:maven/org.example/beans@7.1.0?classifier=sources")
+    assert sources != canonical_component_purl("pkg:maven/org.example/beans@7.1.0")
+    assert "classifier=sources" in sources
+
+
+def test_signed_provenance_for_the_unqualified_artifact_does_not_verify_a_qualified_one(
+    tmp_path: Path,
+) -> None:
+    repo, repo_url, sha = _rebuilt_reactor(tmp_path)
+    priv, verifier = _signed_policy()
+    env, _ = _sign_dsse(priv, "k", _statement(REBUILT, repo_url, sha, "build-7.1.0-r1"))
+    with pytest.raises(UnresolvedTargetError) as exc:
+        _resolver(verifier).resolve(
+            ComponentTargetRequest(
+                purl=f"{REBUILT}?classifier=sources",
+                repository=repo_url,
+                commit=sha,
+                provenance_record=env,
+            ),
+            repo,
+        )
+    assert exc.value.reason == UnresolvedTargetReason.PROVENANCE_MISMATCH
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("_type", "https://in-toto.io/Statement/v0.9-draft"),
+        ("predicateType", "https://in-toto.io/attestation/test-result/v0.1"),
+    ],
+    ids=["statement-type", "predicate-type"],
+)
+def test_only_an_in_toto_v1_slsa_provenance_statement_verifies_a_release(
+    tmp_path: Path, field: str, value: str
+) -> None:
+    repo, repo_url, sha = _rebuilt_reactor(tmp_path)
+    priv, verifier = _signed_policy()
+    statement = {**_statement(REBUILT, repo_url, sha, "build-7.1.0-r1"), field: value}
+    env, _ = _sign_dsse(priv, "k", statement)
+    with pytest.raises(UnresolvedTargetError) as exc:
+        _resolver(verifier).resolve(
+            ComponentTargetRequest(
+                purl=REBUILT, repository=repo_url, commit=sha, provenance_record=env
+            ),
+            repo,
+        )
+    assert exc.value.reason == UnresolvedTargetReason.PROVENANCE_UNVERIFIED
+
+
+def _reactor_with(tmp_path: Path, tags: tuple[str, ...], child: str = "") -> tuple[Path, str]:
+    repo = tmp_path / "reactor"
+    sha = _init_repo(
+        repo,
+        {
+            "pom.xml": (
+                "<project><groupId>org.example</groupId><artifactId>reactor</artifactId>"
+                "<version>1.0.0</version><packaging>pom</packaging>"
+                "<modules><module>foo</module></modules></project>\n"
+            ),
+            "foo/pom.xml": child
+            or (
+                "<project><parent><groupId>org.example</groupId><artifactId>reactor</artifactId>"
+                "<version>1.0.0</version></parent><artifactId>foo</artifactId></project>\n"
+            ),
+        },
+        tags=tags,
+    )
+    return repo, sha
+
+
+def _resolve_foo(repo: Path, sha: str, version: str = "1.0.0") -> ComponentTarget:
+    return _resolver().resolve(
+        ComponentTargetRequest(
+            purl=f"pkg:maven/org.example/foo@{version}",
+            repository="https://github.com/example/reactor",
+            commit=sha,
+        ),
+        repo,
+    )
+
+
+def test_a_final_release_tagged_on_its_rc_commit_resolves(tmp_path: Path) -> None:
+    repo, sha = _reactor_with(tmp_path, ("foo-1.0.0-rc.2", "foo-1.0.0"))
+    assert _resolve_foo(repo, sha).module_path == "foo"
+
+
+def test_a_label_version_tag_for_the_package_conflicts(tmp_path: Path) -> None:
+    repo, sha = _reactor_with(tmp_path, ("v1.0.0", "foo-RC1"))
+    with pytest.raises(UnresolvedTargetError) as exc:
+        _resolve_foo(repo, sha)
+    assert exc.value.reason == UnresolvedTargetReason.VERSION_MISMATCH
+
+
+def test_a_sibling_package_tag_does_not_block_this_package(tmp_path: Path) -> None:
+    repo = tmp_path / "ws"
+    sha = _init_repo(
+        repo,
+        {
+            "package.json": json.dumps(
+                {"name": "root", "private": True, "workspaces": ["packages/*"]}
+            ),
+            "packages/client/package.json": json.dumps({"name": "client", "version": "1.0.0"}),
+            "packages/client-v2/package.json": json.dumps(
+                {"name": "client-v2", "version": "1.0.0"}
+            ),
+            "packages/foo/package.json": json.dumps({"name": "foo", "version": "1.0.0"}),
+            "packages/foo-3d/package.json": json.dumps({"name": "foo-3d", "version": "2.0.0"}),
+        },
+        tags=("client@1.0.0", "client-v2@1.0.0", "foo@1.0.0", "foo-3d-2.0.0"),
+    )
+    for name in ("client", "foo"):
+        resolved = _resolver().resolve(
+            ComponentTargetRequest(
+                purl=f"pkg:npm/{name}@1.0.0", repository="https://github.com/acme/ws", commit=sha
+            ),
+            repo,
+        )
+        assert resolved.module_path == f"packages/{name}"
+
+
+def test_a_child_artifact_through_the_parent_artifact_id_resolves(tmp_path: Path) -> None:
+    child = (
+        "<project><parent><groupId>org.example</groupId><artifactId>reactor</artifactId>"
+        "<version>1.0.0</version></parent>"
+        "<artifactId>${project.parent.artifactId}-foo</artifactId></project>\n"
+    )
+    repo, sha = _reactor_with(tmp_path, ("v1.0.0",), child)
+    resolved = _resolver().resolve(
+        ComponentTargetRequest(
+            purl="pkg:maven/org.example/reactor-foo@1.0.0",
+            repository="https://github.com/example/reactor",
+            commit=sha,
+        ),
+        repo,
+    )
+    assert resolved.module_path == "foo"
+
+
+def test_a_stated_groupid_that_cannot_resolve_does_not_borrow_the_parents(tmp_path: Path) -> None:
+    child = (
+        "<project><parent><groupId>org.example</groupId><artifactId>reactor</artifactId>"
+        "<version>1.0.0</version></parent><groupId>${elsewhere.group}</groupId>"
+        "<artifactId>foo</artifactId></project>\n"
+    )
+    repo, sha = _reactor_with(tmp_path, ("v1.0.0",), child)
+    with pytest.raises(UnresolvedTargetError) as exc:
+        _resolve_foo(repo, sha)
+    assert exc.value.reason == UnresolvedTargetReason.NO_MANIFEST_MATCH
+
+
+def test_a_multiplying_property_chain_is_bounded(tmp_path: Path) -> None:
+    levels = (
+        "".join(f"<p{i}>" + f"${{p{i + 1}}}" * 50 + f"</p{i}>" for i in range(8)) + "<p8>x</p8>"
+    )
+    child = (
+        "<project><parent><groupId>org.example</groupId><artifactId>reactor</artifactId>"
+        f"<version>1.0.0</version></parent><properties>{levels}</properties>"
+        "<artifactId>foo</artifactId><version>${p0}</version></project>\n"
+    )
+    repo, sha = _reactor_with(tmp_path, ("v1.0.0",), child)
+    with pytest.raises(UnresolvedTargetError) as exc:
+        _resolve_foo(repo, sha)  # fails closed in bounded memory, never expands 50^8 copies
+    assert exc.value.reason == UnresolvedTargetReason.VERSION_MISMATCH
+
+
+def test_the_takeover_binding_compares_typed_targets() -> None:
+    from traust_core.v1.services.operations import _binding_form
+
+    target = ComponentTarget(
+        purl="pkg:maven/org.example/beans@7.1.0",
+        repository="https://github.com/example/reactor",
+        commit="a" * 40,
+        module_path="beans",
+        release_ref="v7.1.0",
+        verification=ComponentTargetVerification(
+            strategy=ComponentTargetStrategy.SHARED_RELEASE, manifest_paths=("beans/pom.xml",)
+        ),
+    )
+    bound = _binding_form(target)
+    assert isinstance(bound, ComponentTarget)
+    assert bound != _binding_form(target.model_copy(update={"release_ref": "release-7.1.0"}))

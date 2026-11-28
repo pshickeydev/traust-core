@@ -71,16 +71,26 @@ def _verify_signature(public_key: object, signature: bytes, data: bytes) -> bool
     return False
 
 
-_IN_TOTO_STATEMENT = "https://in-toto.io/Statement/"
+IN_TOTO_STATEMENT_V1 = "https://in-toto.io/Statement/v1"
+# the one predicate family that states a build's provenance; a trusted key's other signed
+# statements (test results, vulnerability scans, SBOMs) are no release evidence
+SLSA_PROVENANCE_PREFIX = "https://slsa.dev/provenance/"
 
 
 def _extract_statement_fields(statement: Mapping[str, Any]) -> dict[str, Any]:
-    """The release claims of an in-toto Statement; anything else is not provenance."""
+    """The release claims of an in-toto v1 SLSA-provenance Statement; anything else is not
+    provenance."""
     stmt_type = statement.get("_type")
-    if not isinstance(stmt_type, str) or not stmt_type.startswith(_IN_TOTO_STATEMENT):
+    if stmt_type != IN_TOTO_STATEMENT_V1:
         raise UnresolvedTargetError(
             UnresolvedTargetReason.PROVENANCE_UNVERIFIED,
-            f"provenance payload is not an in-toto Statement (_type {stmt_type!r})",
+            f"provenance payload is not an in-toto v1 Statement (_type {stmt_type!r})",
+        )
+    predicate_type = statement.get("predicateType")
+    if not isinstance(predicate_type, str) or not predicate_type.startswith(SLSA_PROVENANCE_PREFIX):
+        raise UnresolvedTargetError(
+            UnresolvedTargetReason.PROVENANCE_UNVERIFIED,
+            f"provenance predicateType {predicate_type!r} is not SLSA provenance",
         )
     predicate = statement.get("predicate")
     if not isinstance(predicate, Mapping):
@@ -100,7 +110,7 @@ def _extract_statement_fields(statement: Mapping[str, Any]) -> dict[str, Any]:
         "purl": purl,
         "repository": predicate.get("repository"),
         "commit": predicate.get("commit"),
-        "source": statement.get("predicateType") or predicate.get("source"),
+        "source": predicate_type,
         "ref": predicate.get("ref"),
         "manifest_version": predicate.get("manifest_version"),
     }

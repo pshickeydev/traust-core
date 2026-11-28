@@ -33,8 +33,16 @@ from traust_core.v1.providers.package_manifests import PackageManifestScanner
 from traust_core.v1.providers.provenance import DsseProvenanceVerifier
 
 _PKG_TAG_SEPARATORS = ("==", "@", "-v", "-", "/v", "/")
-# what follows a package-tag separator when the tag names a release: a version, optionally v-led
-_RELEASED_VERSION = re.compile(r"v?\d")
+# what follows a package-tag separator when the tag names a release: a digit-led version
+# (`1.0.0`, `v2`, `1.0.0-rc.2`) or a bare label-and-number one (`RC1`, `M2`). A hyphenated
+# word before the digits names another package (`pkg-extra-2.0.0`), and so does any further
+# name or separator (`client-v2@1.0.0` releases `client-v2`).
+_VERSION_TOKEN = re.compile(r"v?\d[0-9A-Za-z.+_-]*|[A-Za-z]+\d+[0-9A-Za-z.+_]*")
+# a pre-release label after the version: the RC commit promoted to the final release keeps
+# both tags (`foo-1.0.0-rc.2` and `foo-1.0.0`), which is one release, not a conflict
+_PRERELEASE = re.compile(
+    r"[-.+_]?(?:rc|alpha|beta|pre|preview|dev|milestone|m|cr|a|b)[.-]?\d*", re.IGNORECASE
+)
 _PROJECT_TAG_SEPARATORS = ("-", "_", "/")
 
 
@@ -86,22 +94,58 @@ def _is_package_release_tag(tag: str, purl: Purl) -> bool:
     return False
 
 
-def _conflicting_package_tag(tags: Sequence[str], purl: Purl) -> str | None:
-    """Detect when a tag at the pinned commit releases this package at another version, under
-    any separator `_is_package_release_tag` accepts (`==`, `@`, hyphenated and path forms)."""
+def _released_version(tag: str, names: Sequence[str]) -> str | None:
+    """The version `tag` releases for one of `names`, or None when it names no such release."""
+    for pkg in names:
+        for sep in _PKG_TAG_SEPARATORS:
+            prefix = f"{pkg}{sep}"
+            if tag.startswith(prefix):
+                rest = tag[len(prefix) :]
+                if _VERSION_TOKEN.fullmatch(rest):
+                    return rest.removeprefix("v") if sep in ("-", "/") else rest
+    return None
+
+
+def _candidate_tag_names(candidate: PackageManifestCandidate) -> tuple[str, ...]:
+    """The names a sibling package's release tags carry (its own name, and its scoped or
+    grouped form)."""
+    package_id = candidate.package_id
+    name = package_id.rsplit(":", 1)[-1].rsplit("/", 1)[-1]
+    return tuple(dict.fromkeys((package_id, name, package_id.replace(":", "/"))))
+
+
+def _conflicting_package_tag(
+    tags: Sequence[str],
+    purl: Purl,
+    siblings: Sequence[PackageManifestCandidate] = (),
+) -> str | None:
+    """A tag at the pinned commit that releases this package at another version, under any
+    separator `_is_package_release_tag` accepts. Not a conflict: a release tag of this
+    version, a pre-release of it (an RC commit promoted to the final release), or a tag
+    that releases a sibling package whose name extends this one's (`foo-3d-1.0.0`)."""
+    names = _package_tag_names(purl)
+    sibling_names = tuple(
+        dict.fromkeys(
+            n
+            for c in siblings
+            if c.package_id != purl.package_id
+            for n in _candidate_tag_names(c)
+            if n not in names
+        )
+    )
     for tag in tags:
         if _is_package_release_tag(tag, purl):
             continue
-        for pkg in _package_tag_names(purl):
-            for sep in _PKG_TAG_SEPARATORS:
-                prefix = f"{pkg}{sep}"
-                if not tag.startswith(prefix):
-                    continue
-                rest = tag[len(prefix) :]
-                # `pkg-extra-1.0.0` names another package; only a version after the separator
-                # releases this one
-                if rest != purl.version and _RELEASED_VERSION.match(rest):
-                    return tag
+        version = _released_version(tag, names)
+        if version is None or version == purl.version:
+            continue
+        if purl.version and version.startswith(purl.version):
+            label = version[len(purl.version) :]
+            if _PRERELEASE.fullmatch(label):
+                continue
+        if _released_version(tag, sibling_names) is not None:
+            continue
+        return tag
     return None
 
 
@@ -271,7 +315,7 @@ class ComponentTargetResolver:
             )
 
         tags = self._git.tags_at(checkout, commit)
-        if conflict_tag := _conflicting_package_tag(tags, purl):
+        if conflict_tag := _conflicting_package_tag(tags, purl, same_eco):
             raise UnresolvedTargetError(
                 UnresolvedTargetReason.VERSION_MISMATCH,
                 f"commit {commit} carries conflicting tag {conflict_tag!r} for {purl.raw}",
