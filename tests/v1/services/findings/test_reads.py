@@ -697,7 +697,7 @@ def test_get_stands_bare_when_the_intake_refuses_the_report(
     def refused(*args: Any, **kw: Any) -> Any:
         raise ConflictError("a retained claim identity belongs to another finding")
 
-    monkeypatch.setattr(findings.intake, "bindings", refused)
+    monkeypatch.setattr(findings.intake, "row_findings", refused)
     with caplog.at_level(logging.ERROR, logger="traust_core.v1.services.findings.service"):
         view = findings.get(first)
     assert (view.description, view.evidence, view.remediation) == (None, (), None)
@@ -843,3 +843,29 @@ def test_report_less_occurrences_cost_the_prose_read_nothing(context: Context) -
     few = statements()
     analysed(15, 2)
     assert statements() == few
+
+
+def test_rows_sharing_a_label_each_give_their_own_finding_its_prose(context: Context) -> None:
+    """Two rows may share a label while naming different findings: each finding's page and
+    fix hint read its own row, never the other's (the per-row binding, Qodo #554)."""
+    services = context.services()
+    with SqlTraustUnitOfWork(context.database) as uow:
+        seed = Seed(uow)
+        repo = seed.repository(url=f"https://github.com/example-org/svc-{uuid4().hex[:8]}")
+        ref = seed.repository_ref(repo)
+        uow.commit()
+    rows = [{k: v for k, v in f.items() if k != "fingerprint"} for f in AUDIT["findings"]]
+    rows[1]["id"] = rows[0]["id"]
+    doc = report_doc(rows)
+    audit = services.assessment.record(
+        doc, ref.id, AssessmentKind.SECURE_CODE_CANONICAL, "skill:audit", "1", provenance()
+    )
+    services.findings.intake.accept(audit.id, FindingCandidate.of_report(doc.findings, repo.id))
+    findings = services.findings
+    admitted = [o.finding_id for o in findings.occurrences(assessment_id=audit.id)]
+    assert len(admitted) == len(rows)
+    by_title = {row["title"]: row for row in rows}
+    for finding_id in admitted:
+        view = findings.get(finding_id)
+        row = by_title[view.finding.title]
+        assert (view.description, view.remediation) == (row["description"], row["remediation"])

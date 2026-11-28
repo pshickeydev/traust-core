@@ -395,19 +395,19 @@ class FindingService:
 
     def report_row(self, finding_id: UUID) -> SchemaView | None:
         """The row of the newest report that states the finding, chosen through the intake's
-        label-to-finding binding: the one selector the finding's page and the remediation
-        hint share. Every report artifact of every assessment reporting the finding is a
-        candidate, newest first; one batched query lists them, so report-less assessments
-        (a later impact analysis's, say) cost no read and never hide an earlier report.
-        A candidate that can't be read or bound is logged with its context and traceback
-        and skipped, so an older report still supplies the row. None when no readable
-        report states the finding."""
+        per-row binding (two rows may share a label): the one selector the finding's page
+        and the remediation hint share. Every report artifact of every assessment reporting
+        the finding is a candidate, newest first; one batched query lists them, so
+        report-less assessments (a later impact analysis's, say) cost no read and never
+        hide an earlier report. A candidate that can't be read or bound is logged with its
+        context and traceback and skipped, so an older report still supplies the row. None
+        when no readable report states the finding."""
         occurrences = self.occurrences(finding_ids=[finding_id])
         assessments = self._log.list_by_ids({o.assessment_id for o in occurrences})
         for assessment, artifact in self._reports.held(assessments):
             try:
                 report = self._reports.read(artifact)
-                bound = self.intake.bindings(assessment, report)
+                rows = self.intake.row_findings(assessment, report)
             except (ConflictError, IntegrityError):
                 # the stored report contradicts what intake admitted: someone must act
                 log.error(
@@ -428,7 +428,11 @@ class FindingService:
                 )
                 continue
             row = next(
-                (row for row in report.findings if bound.findings.get(row.id) == finding_id),
+                (
+                    row
+                    for row, bound in zip(report.findings, rows, strict=True)
+                    if bound == finding_id
+                ),
                 None,
             )
             if row is not None:
