@@ -12,7 +12,13 @@ from functools import cmp_to_key
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
-from traust_core.v1.errors import ConflictError, NotFoundError, TraustError, ValidationError
+from traust_core.v1.errors import (
+    ConflictError,
+    IntegrityError,
+    NotFoundError,
+    TraustError,
+    ValidationError,
+)
 from traust_core.v1.models.artifacts import (
     ANALYSIS_ARTIFACTS,
     CodeFactsArtifact,
@@ -21,6 +27,7 @@ from traust_core.v1.models.artifacts import (
     ImpactAnalysisArtifact,
     IsolationReviewArtifact,
     ReportArtifact,
+    SchemaView,
     VulnFindingsArtifact,
 )
 from traust_core.v1.models.assessment import (
@@ -366,59 +373,67 @@ class FindingService:
     def _prose(self, view: FindingView) -> FindingView:
         """The report row the finding was recorded from, as the view's prose
         (description, evidence, remediation): only this single-get read pays the report
-        read. Prose is optional enrichment, so a report the intake can no longer bind
-        leaves the view bare instead of failing the finding's page."""
-        finding_id = view.finding.id
-        assert finding_id is not None
-        try:
-            return self._with_report_prose(view)
-        except TraustError as error:
-            log.warning(
-                "finding %s reads without report prose error_type=%s",
-                finding_id,
-                type(error).__name__,
-            )
+        read. Prose is optional enrichment, so a report that can't be read or bound never
+        fails the finding's page: `report_row` logs it with its context and traceback (the
+        view carries no marker for it: its contract has no such field)."""
+        assert view.finding.id is not None
+        row = self.report_row(view.finding.id)
+        if row is None:
             return view
+        return view.model_copy(
+            update={
+                "description": view.description
+                if view.description is not None
+                else row.description,
+                "evidence": tuple(
+                    FindingEvidence(code=block.code, language=block.language, caption=block.caption)
+                    for block in row.evidence
+                ),
+                "remediation": row.remediation,
+            }
+        )
 
-    def _with_report_prose(self, view: FindingView) -> FindingView:
-        """The prose of the newest report that states the finding: a later occurrence
-        filed under no report (an impact analysis's, say) never hides an earlier
-        report's prose — the same newest-fit rule the view's rating and places follow."""
-        finding = view.finding
-        assert finding.id is not None
-        occurrences = self.occurrences(finding_ids=[finding.id])
-        assessments = {
-            a.id: a
-            for a in self._log.list_by_ids({o.assessment_id for o in occurrences})
-            if a.id is not None
-        }
-        for occurrence in reversed(
-            sorted(occurrences, key=lambda o: assessments[o.assessment_id].occurred_at)
-        ):
-            report = self._reports.report(occurrence.assessment_id)
-            if report is None:
+    def report_row(self, finding_id: UUID) -> SchemaView | None:
+        """The row of the newest report that states the finding, chosen through the intake's
+        label-to-finding binding: the one selector the finding's page and the remediation
+        hint share. Every report artifact of every assessment reporting the finding is a
+        candidate, newest first; one batched query lists them, so report-less assessments
+        (a later impact analysis's, say) cost no read and never hide an earlier report.
+        A candidate that can't be read or bound is logged with its context and traceback
+        and skipped, so an older report still supplies the row. None when no readable
+        report states the finding."""
+        occurrences = self.occurrences(finding_ids=[finding_id])
+        assessments = self._log.list_by_ids({o.assessment_id for o in occurrences})
+        for assessment, artifact in self._reports.held(assessments):
+            try:
+                report = self._reports.read(artifact)
+                bound = self.intake.bindings(assessment, report)
+            except (ConflictError, IntegrityError):
+                # the stored report contradicts what intake admitted: someone must act
+                log.error(
+                    "finding %s: report artifact %s of assessment %s cannot be bound",
+                    finding_id,
+                    artifact.id,
+                    assessment.id,
+                    exc_info=True,
+                )
                 continue
-            bound = self.intake.bindings(assessments[occurrence.assessment_id], report)
+            except TraustError:
+                log.warning(
+                    "finding %s: report artifact %s of assessment %s cannot be read or bound",
+                    finding_id,
+                    artifact.id,
+                    assessment.id,
+                    exc_info=True,
+                )
+                continue
             row = next(
-                (row for row in report.findings if bound.findings.get(row.id) == finding.id),
+                (row for row in report.findings if bound.findings.get(row.id) == finding_id),
                 None,
             )
             if row is not None:
-                return view.model_copy(
-                    update={
-                        "description": view.description
-                        if view.description is not None
-                        else row.description,
-                        "evidence": tuple(
-                            FindingEvidence(
-                                code=block.code, language=block.language, caption=block.caption
-                            )
-                            for block in row.evidence
-                        ),
-                        "remediation": row.remediation,
-                    }
-                )
-        return view
+                return row
+        return None
 
     def get_by_fingerprint(
         self, repository_id: UUID, fingerprint: str, fingerprint_algo: str | None = None

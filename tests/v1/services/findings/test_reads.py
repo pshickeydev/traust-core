@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 from collections import Counter
 from collections.abc import Iterator, Mapping
@@ -14,6 +15,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
+from sqlalchemy import event
 from sqlalchemy.engine import Engine
 
 from tests.v1.conftest import SQL_BACKENDS, contract_db
@@ -34,6 +36,7 @@ from traust_core.v1.models.findings import (
     RecordDecision,
 )
 from traust_core.v1.models.identity import IdentitySource, Principal
+from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.models.inventory import Repository, RepositoryRef
 from traust_core.v1.models.vocabulary import (
     ActorKind,
@@ -46,6 +49,7 @@ from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.repositories import InMemoryObjectStore
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.repositories.tables import SqlTableRepository
+from traust_core.v1.services.artifact_publishing import AssessmentLog
 from traust_core.v1.services.findings import (
     FindingDecisions,
     FindingIntake,
@@ -681,7 +685,7 @@ def test_get_leaves_the_prose_empty_without_a_report(context: Context) -> None:
 
 
 def test_get_stands_bare_when_the_intake_refuses_the_report(
-    context: Context, monkeypatch: pytest.MonkeyPatch
+    context: Context, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Prose is optional: when the intake can no longer bind the report (a retained claim
     identity now conflicting, a row today's fingerprinting refuses), the finding's page
@@ -694,19 +698,31 @@ def test_get_stands_bare_when_the_intake_refuses_the_report(
         raise ConflictError("a retained claim identity belongs to another finding")
 
     monkeypatch.setattr(findings.intake, "bindings", refused)
-    view = findings.get(first)
+    with caplog.at_level(logging.ERROR, logger="traust_core.v1.services.findings.service"):
+        view = findings.get(first)
     assert (view.description, view.evidence, view.remediation) == (None, (), None)
+    # a broken report is told apart from an absent one: the log says which report, at
+    # ERROR (the stored report contradicts its admissions), with the traceback (Qodo #554)
+    (record,) = [r for r in caplog.records if "cannot be bound" in r.getMessage()]
+    assert record.levelno == logging.ERROR and record.exc_info is not None
+    (occurrence,) = findings.occurrences(finding_ids=[first])
+    assert str(occurrence.assessment_id) in record.getMessage()
 
 
-def test_get_stands_bare_when_the_reports_object_is_gone(context: Context) -> None:
+def test_get_stands_bare_when_the_reports_object_is_gone(
+    context: Context, caplog: pytest.LogCaptureFixture
+) -> None:
     """The report's stored object lost (an object store failure) leaves the finding's page
     standing, prose bare: the view's own fields never depended on the report read."""
     rows, (first, *_) = recorded_audit(context)
     findings = context.services().findings
     assert findings.get(first).description == rows[0]["description"]
     shutil.rmtree(context.config.artifacts_path())
-    view = findings.get(first)
+    with caplog.at_level(logging.WARNING, logger="traust_core.v1.services.findings.service"):
+        view = findings.get(first)
     assert (view.description, view.evidence, view.remediation) == (None, (), None)
+    (record,) = [r for r in caplog.records if "cannot be read" in r.getMessage()]
+    assert record.levelno == logging.WARNING and record.exc_info is not None
 
 
 def test_a_later_report_less_occurrence_never_hides_the_prose(context: Context) -> None:
@@ -729,3 +745,101 @@ def test_a_later_report_less_occurrence_never_hides_the_prose(context: Context) 
         FindingEvidence(code='q := "SELECT * FROM t WHERE id = " + id', language="go"),
     )
     assert view.remediation == rows[0]["remediation"]
+
+
+def report_doc(rows: list[dict[str, Any]]) -> ReportArtifact:
+    raw = json.loads(json.dumps(AUDIT))
+    del raw["metadata"]["additional"]
+    raw["remediation_roadmap"] = [
+        {**item, "priority": item["priority"].lower()} for item in raw["remediation_roadmap"]
+    ]
+    return ReportArtifact.parse(json.dumps({**raw, "findings": rows}).encode())
+
+
+def test_a_newer_unreadable_report_leaves_the_older_reports_prose(context: Context) -> None:
+    """A newer assessment's report that can't be read is skipped, not the end of the
+    search: the older report's prose still stands."""
+    rows, (first, *_) = recorded_audit(context)
+    findings = context.services().findings
+    (occurrence,) = findings.occurrences(finding_ids=[first])
+    with SqlTraustUnitOfWork(context.database) as uow:
+        seed = Seed(uow)
+        audit = uow.assessments.get(occurrence.assessment_id)
+        ref = uow.repository_refs.get(audit.repository_ref_id)
+        later = seed.assessment(ref, occurred_at=T0 + timedelta(days=1))
+        seed.artifact(later, kind=ReportArtifact.schema)  # its stored object never existed
+        seed.occurrence(uow.findings.get(first), later)
+        uow.commit()
+    view = findings.get(first)
+    assert view.occurrence is not None and view.occurrence.assessment_id == later.id
+    assert (view.description, view.remediation) == (rows[0]["description"], rows[0]["remediation"])
+
+
+def test_a_finding_admitted_from_an_assessments_second_report_carries_its_prose(
+    context: Context,
+) -> None:
+    """Every report artifact the assessment holds is a candidate, not only its first."""
+    rows, (first, *_) = recorded_audit(context)
+    services = context.services()
+    findings = services.findings
+    (occurrence,) = findings.occurrences(finding_ids=[first])
+    audit = services.assessment.get(occurrence.assessment_id)
+    extra = {
+        **rows[0],
+        "id": "F-EXTRA",
+        "title": "Unbounded upload size in the import handler",
+        "description": "The import handler reads the whole request body into memory.",
+        "remediation": "Cap the request body with http.MaxBytesReader.",
+        "locations": [{"path": "pkg/api/import.go", "lines": "12"}],
+    }
+    second = report_doc([extra])
+    published = findings.artifacts.publish_artifact(second)
+    with SqlTraustUnitOfWork(context.database) as uow:
+        AssessmentLog(uow).attach(
+            occurrence.assessment_id, published.artifact_id, sha256_hex(second.payload)
+        )
+        uow.commit()
+    repository_id = findings.get(first).finding.repository_id
+    taken = findings.intake.accept(
+        audit.id, FindingCandidate.of_report(second.findings, repository_id)
+    )
+    view = findings.get(taken.findings[Label("F-EXTRA")])
+    assert (view.description, view.remediation) == (extra["description"], extra["remediation"])
+    assert findings.get(first).description == rows[0]["description"]  # the first still reads
+
+
+def test_report_less_occurrences_cost_the_prose_read_nothing(context: Context) -> None:
+    """Later report-less occurrences (impact analyses, say) are skipped by one batched
+    listing, not one assessment-and-artifact read each: the statements a detail read runs
+    don't grow with the finding's history."""
+    rows, (first, *_) = recorded_audit(context)
+    findings = context.services().findings
+    (occurrence,) = findings.occurrences(finding_ids=[first])
+
+    def analysed(times: int, start: int) -> None:
+        with SqlTraustUnitOfWork(context.database) as uow:
+            seed = Seed(uow)
+            audit = uow.assessments.get(occurrence.assessment_id)
+            ref = uow.repository_refs.get(audit.repository_ref_id)
+            for day in range(start, start + times):
+                later = seed.assessment(ref, kind="impact", occurred_at=T0 + timedelta(days=day))
+                seed.occurrence(uow.findings.get(first), later)
+            uow.commit()
+
+    def statements() -> int:
+        seen: list[str] = []
+
+        def count(conn: Any, cursor: Any, statement: str, *args: Any) -> None:
+            seen.append(statement)
+
+        event.listen(context.database, "before_cursor_execute", count)
+        try:
+            assert findings.get(first).description == rows[0]["description"]
+        finally:
+            event.remove(context.database, "before_cursor_execute", count)
+        return len(seen)
+
+    analysed(1, 1)
+    few = statements()
+    analysed(15, 2)
+    assert statements() == few
